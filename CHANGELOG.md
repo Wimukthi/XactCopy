@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.1.3] - 2026-02-13
+
+### Fixed
+
+- Updater apply phase no longer gets stuck showing `Canceling...` while waiting to exit/restart.
+- Release notes text in updater now normalizes escaped newlines for readable formatting.
+
 ## [1.0.0.9] - 2026-02-13
 
 ### Added

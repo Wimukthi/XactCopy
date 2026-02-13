@@ -29,6 +29,9 @@ Friend Class UpdateForm
     Private _cancellation As CancellationTokenSource
     Private _tempRoot As String = String.Empty
     Private _downloadPath As String = String.Empty
+    Private _isDownloading As Boolean
+    Private _isApplying As Boolean
+    Private _allowCloseDuringApply As Boolean
 
     Public Sub New(release As UpdateReleaseInfo, currentVersion As Version, settings As AppSettings)
         If release Is Nothing Then
@@ -204,7 +207,7 @@ Friend Class UpdateForm
         _currentValueLabel.Text = FormatVersionDisplay(_currentVersion, Nothing)
         _latestValueLabel.Text = FormatVersionDisplay(_release.Version, _release.TagName)
         _packageValueLabel.Text = If(_asset IsNot Nothing, _asset.Name, "No compatible package found in release assets.")
-        _notesTextBox.Text = If(String.IsNullOrWhiteSpace(_release.Notes), "No release notes provided.", _release.Notes)
+        _notesTextBox.Text = If(String.IsNullOrWhiteSpace(_release.Notes), "No release notes provided.", NormalizeReleaseNotes(_release.Notes))
 
         If _asset Is Nothing Then
             _downloadButton.Enabled = False
@@ -238,9 +241,13 @@ Friend Class UpdateForm
             Return
         End If
 
+        _isDownloading = True
+        _isApplying = False
+        _allowCloseDuringApply = False
         _downloadButton.Enabled = False
         _releaseButton.Enabled = False
         _closeButton.Text = "Cancel"
+        _closeButton.Enabled = True
         _progressBar.Value = 0
         _statusLabel.Text = "Downloading update package..."
         _cancellation = New CancellationTokenSource()
@@ -261,6 +268,9 @@ Friend Class UpdateForm
                 Return
             End If
 
+            _isDownloading = False
+            _isApplying = True
+            _closeButton.Enabled = False
             _statusLabel.Text = "Preparing update..."
             Await ApplyUpdateAsync(_downloadPath)
         Catch ex As OperationCanceledException
@@ -271,18 +281,26 @@ Friend Class UpdateForm
         Catch ex As Exception
             _statusLabel.Text = "Update failed: " & ex.Message
             _closeButton.Text = "Close"
+            _closeButton.Enabled = True
             _downloadButton.Enabled = True
             _releaseButton.Enabled = Not String.IsNullOrWhiteSpace(_release.HtmlUrl)
+            _isApplying = False
         Finally
+            _isDownloading = False
             _cancellation?.Dispose()
             _cancellation = Nothing
         End Try
     End Sub
 
     Private Sub CloseButton_Click(sender As Object, e As EventArgs)
-        If _cancellation IsNot Nothing Then
+        If _isDownloading AndAlso _cancellation IsNot Nothing Then
             _statusLabel.Text = "Canceling..."
             _cancellation.Cancel()
+            Return
+        End If
+
+        If _isApplying Then
+            _statusLabel.Text = "Applying update. XactCopy will close and restart automatically."
             Return
         End If
 
@@ -323,6 +341,7 @@ Friend Class UpdateForm
         End If
 
         If extension = ".exe" Then
+            _allowCloseDuringApply = True
             Process.Start(New ProcessStartInfo(downloadPath) With {.UseShellExecute = True})
             Application.Exit()
             Return
@@ -348,6 +367,7 @@ Friend Class UpdateForm
         End If
 
         LaunchUpdateScript(sourceDirectory, targetDirectory, executableName, _tempRoot)
+        _allowCloseDuringApply = True
         Application.Exit()
     End Function
 
@@ -424,13 +444,30 @@ Friend Class UpdateForm
     End Sub
 
     Protected Overrides Sub OnFormClosing(e As FormClosingEventArgs)
-        If _cancellation IsNot Nothing Then
+        If _isDownloading AndAlso _cancellation IsNot Nothing Then
             _statusLabel.Text = "Canceling..."
             _cancellation.Cancel()
             e.Cancel = True
             Return
         End If
 
+        If _isApplying AndAlso Not _allowCloseDuringApply Then
+            _statusLabel.Text = "Applying update. Please wait..."
+            e.Cancel = True
+            Return
+        End If
+
         MyBase.OnFormClosing(e)
     End Sub
+
+    Private Shared Function NormalizeReleaseNotes(value As String) As String
+        If String.IsNullOrWhiteSpace(value) Then
+            Return String.Empty
+        End If
+
+        Dim normalized = value.Replace("\r\n", Environment.NewLine).
+                                Replace("\n", Environment.NewLine).
+                                Replace("\r", Environment.NewLine)
+        Return normalized
+    End Function
 End Class

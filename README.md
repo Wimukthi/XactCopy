@@ -54,6 +54,7 @@ dotnet run --project src/XactCopy.UI/XactCopy.UI.vbproj
 
 ## Brief Version History
 
+- `v1.0.1.3` Fixed updater apply hang on `Canceling...` and improved release notes formatting in the update dialog.
 - `v1.0.0.9` Updater upgraded to download/apply releases in-app with progress, replacing page-only update prompts.
 - `v1.0.0.7` Worker renamed to `XactCopyExecutive`, shared app icon applied to worker, and standalone worker startup hardened.
 - `v1.0.0.3` Default update URL now targets XactCopy latest GitHub release endpoint.
