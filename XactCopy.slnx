@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/XactCopy.Core/XactCopy.Core.vbproj" />
+    <Project Path="src/XactCopy.Storage/XactCopy.Storage.vbproj" />
+    <Project Path="src/XactCopy.UI/XactCopy.UI.vbproj" />
+    <Project Path="src/XactCopy.Worker/XactCopy.Worker.vbproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/XactCopy.Tests/XactCopy.Tests.vbproj" />
+  </Folder>
+</Solution>

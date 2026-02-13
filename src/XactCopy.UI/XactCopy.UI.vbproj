@@ -1,0 +1,66 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <AssemblyName>XactCopy</AssemblyName>
+    <RootNamespace>XactCopy</RootNamespace>
+    <StartupObject>Sub Main</StartupObject>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationIcon>..\..\Icons\xactcopy.ico</ApplicationIcon>
+    <Win32Icon>..\..\Icons\xactcopy.ico</Win32Icon>
+    <OptionStrict>On</OptionStrict>
+    <OptionInfer>On</OptionInfer>
+    <OptionExplicit>On</OptionExplicit>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <VersionFile>$(MSBuildProjectDirectory)\BuildVersion.txt</VersionFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Import Include="System.Data" />
+    <Import Include="System.Drawing" />
+    <Import Include="System.Windows.Forms" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\XactCopy.Core\XactCopy.Core.vbproj" />
+    <ProjectReference Include="..\XactCopy.Storage\XactCopy.Storage.vbproj" />
+    <ProjectReference Include="..\XactCopy.Worker\XactCopy.Worker.vbproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\Icons\xactcopy.ico" Link="Icons\xactcopy.ico" />
+    <None Include="BuildVersion.txt" />
+  </ItemGroup>
+
+  <Target Name="EnsureBuildVersionFile" BeforeTargets="ComputeBuildVersion">
+    <WriteLinesToFile Condition="!Exists('$(VersionFile)')" File="$(VersionFile)" Lines="0" Overwrite="true" />
+  </Target>
+
+  <Target Name="ComputeBuildVersion" BeforeTargets="GetAssemblyVersion">
+    <ReadLinesFromFile File="$(VersionFile)">
+      <Output TaskParameter="Lines" ItemName="BuildVersionLines" />
+    </ReadLinesFromFile>
+    <PropertyGroup>
+      <BuildNumber Condition="'@(BuildVersionLines)' != ''">$([System.Int32]::Parse('%(BuildVersionLines.Identity)'))</BuildNumber>
+      <BuildNumber Condition="'@(BuildVersionLines)' == ''">0</BuildNumber>
+      <BuildNumber>$([MSBuild]::Add($(BuildNumber), 1))</BuildNumber>
+      <BaseMajor>1</BaseMajor>
+      <MajorNumber>$([MSBuild]::Add($(BaseMajor), $([MSBuild]::Divide($(BuildNumber), 1000))))</MajorNumber>
+      <MinorNumber>$([MSBuild]::Divide($([MSBuild]::Modulo($(BuildNumber), 1000)), 100))</MinorNumber>
+      <PatchNumber>$([MSBuild]::Divide($([MSBuild]::Modulo($(BuildNumber), 100)), 10))</PatchNumber>
+      <RevisionNumber>$([MSBuild]::Modulo($(BuildNumber), 10))</RevisionNumber>
+      <Version>$(MajorNumber).$(MinorNumber).$(PatchNumber).$(RevisionNumber)</Version>
+      <AssemblyVersion>$(Version)</AssemblyVersion>
+      <FileVersion>$(Version)</FileVersion>
+      <InformationalVersion>$(Version)</InformationalVersion>
+    </PropertyGroup>
+  </Target>
+
+  <Target Name="SaveBuildVersion" AfterTargets="AfterBuild">
+    <WriteLinesToFile File="$(VersionFile)" Lines="$(BuildNumber)" Overwrite="true" />
+  </Target>
+
+</Project>

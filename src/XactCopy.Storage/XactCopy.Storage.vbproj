@@ -1,0 +1,15 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\XactCopy.Core\XactCopy.Core.vbproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <RootNamespace>XactCopy</RootNamespace>
+    <TargetFramework>net10.0</TargetFramework>
+    <OptionStrict>On</OptionStrict>
+    <OptionInfer>On</OptionInfer>
+    <OptionExplicit>On</OptionExplicit>
+  </PropertyGroup>
+
+</Project>

@@ -1,0 +1,115 @@
+Imports System.IO
+Imports System.Text.Json
+
+Namespace Configuration
+    Public NotInheritable Class AppSettingsStore
+        Private ReadOnly _settingsPath As String
+
+        Public Sub New(Optional settingsPath As String = Nothing)
+            If String.IsNullOrWhiteSpace(settingsPath) Then
+                Dim root = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "XactCopy")
+                _settingsPath = Path.Combine(root, "settings.json")
+            Else
+                _settingsPath = settingsPath
+            End If
+        End Sub
+
+        Public ReadOnly Property SettingsPath As String
+            Get
+                Return _settingsPath
+            End Get
+        End Property
+
+        Public Function Load() As AppSettings
+            If Not File.Exists(_settingsPath) Then
+                Return New AppSettings()
+            End If
+
+            Try
+                Dim json = File.ReadAllText(_settingsPath)
+                Dim options As New JsonSerializerOptions() With {
+                    .PropertyNameCaseInsensitive = True
+                }
+
+                Dim settings = JsonSerializer.Deserialize(Of AppSettings)(json, options)
+                If settings Is Nothing Then
+                    Return New AppSettings()
+                End If
+
+                Return Normalize(settings)
+            Catch
+                Return New AppSettings()
+            End Try
+        End Function
+
+        Public Sub Save(settings As AppSettings)
+            If settings Is Nothing Then
+                Throw New ArgumentNullException(NameOf(settings))
+            End If
+
+            Dim settingsDirectory = Path.GetDirectoryName(_settingsPath)
+            If Not String.IsNullOrWhiteSpace(settingsDirectory) Then
+                Directory.CreateDirectory(settingsDirectory)
+            End If
+
+            Dim normalized = Normalize(settings)
+            Dim options As New JsonSerializerOptions() With {
+                .WriteIndented = True
+            }
+            Dim json = JsonSerializer.Serialize(normalized, options)
+            File.WriteAllText(_settingsPath, json)
+        End Sub
+
+        Private Shared Function Normalize(settings As AppSettings) As AppSettings
+            If settings Is Nothing Then
+                Return New AppSettings()
+            End If
+
+            settings.Theme = If(String.IsNullOrWhiteSpace(settings.Theme), "dark", settings.Theme.Trim())
+            settings.UserAgent = If(settings.UserAgent, String.Empty).Trim()
+            settings.UpdateReleaseUrl = If(settings.UpdateReleaseUrl, String.Empty).Trim()
+
+            settings.RecoveryTouchIntervalSeconds =
+                SettingsValueConverter.ClampInteger(settings.RecoveryTouchIntervalSeconds, 1, 60, 2)
+
+            settings.ExplorerSelectionMode =
+                SettingsValueConverter.ExplorerSelectionModeToString(
+                    SettingsValueConverter.ToExplorerSelectionMode(settings.ExplorerSelectionMode))
+
+            settings.DefaultBufferSizeMb =
+                SettingsValueConverter.ClampInteger(settings.DefaultBufferSizeMb, 1, 256, 4)
+            settings.DefaultMaxRetries =
+                SettingsValueConverter.ClampInteger(settings.DefaultMaxRetries, 0, 1000, 12)
+            settings.DefaultOperationTimeoutSeconds =
+                SettingsValueConverter.ClampInteger(settings.DefaultOperationTimeoutSeconds, 1, 3600, 10)
+            settings.DefaultPerFileTimeoutSeconds =
+                SettingsValueConverter.ClampInteger(settings.DefaultPerFileTimeoutSeconds, 0, 86400, 0)
+            settings.DefaultMaxThroughputMbPerSecond =
+                SettingsValueConverter.ClampInteger(settings.DefaultMaxThroughputMbPerSecond, 0, 4096, 0)
+            settings.DefaultSampleVerificationChunkKb =
+                SettingsValueConverter.ClampInteger(settings.DefaultSampleVerificationChunkKb, 32, 4096, 128)
+            settings.DefaultSampleVerificationChunkCount =
+                SettingsValueConverter.ClampInteger(settings.DefaultSampleVerificationChunkCount, 1, 64, 3)
+
+            settings.DefaultOverwritePolicy =
+                SettingsValueConverter.OverwritePolicyToString(
+                    SettingsValueConverter.ToOverwritePolicy(settings.DefaultOverwritePolicy))
+            settings.DefaultSymlinkHandling =
+                SettingsValueConverter.SymlinkHandlingToString(
+                    SettingsValueConverter.ToSymlinkHandling(settings.DefaultSymlinkHandling))
+            settings.DefaultVerificationMode =
+                SettingsValueConverter.VerificationModeToString(
+                    SettingsValueConverter.ToVerificationMode(settings.DefaultVerificationMode))
+            settings.DefaultVerificationHashAlgorithm =
+                SettingsValueConverter.VerificationHashAlgorithmToString(
+                    SettingsValueConverter.ToVerificationHashAlgorithm(settings.DefaultVerificationHashAlgorithm))
+            settings.DefaultSalvageFillPattern =
+                SettingsValueConverter.SalvageFillPatternToString(
+                    SettingsValueConverter.ToSalvageFillPattern(settings.DefaultSalvageFillPattern))
+
+            Return settings
+        End Function
+    End Class
+End Namespace
