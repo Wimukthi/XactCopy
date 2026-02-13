@@ -12,6 +12,9 @@ Namespace Models
         Public Property RecoveredFiles As Integer
         Public Property SkippedFiles As Integer
         Public Property TotalFiles As Integer
+        Public Property RescuePass As String = String.Empty
+        Public Property RescueBadRegionCount As Integer
+        Public Property RescueRemainingBytes As Long
 
         Public ReadOnly Property OverallProgress As Double
             Get

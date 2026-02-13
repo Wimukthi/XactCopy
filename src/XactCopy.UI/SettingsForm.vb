@@ -32,6 +32,14 @@ Friend Class SettingsForm
     Private ReadOnly _defaultOperationTimeoutNumeric As New ThemedNumericUpDown()
     Private ReadOnly _defaultPerFileTimeoutNumeric As New ThemedNumericUpDown()
     Private ReadOnly _defaultMaxThroughputNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _rescueFastChunkKbNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _rescueTrimChunkKbNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _rescueScrapeChunkKbNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _rescueRetryChunkKbNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _rescueSplitMinimumKbNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _rescueFastRetriesNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _rescueTrimRetriesNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _rescueScrapeRetriesNumeric As New ThemedNumericUpDown()
 
     Private ReadOnly _defaultVerifyCheckBox As New CheckBox()
     Private ReadOnly _defaultVerificationModeComboBox As New ComboBox()
@@ -158,6 +166,14 @@ Friend Class SettingsForm
         _toolTip.SetToolTip(_defaultOperationTimeoutNumeric, "Default operation timeout in seconds (1-3600).")
         _toolTip.SetToolTip(_defaultPerFileTimeoutNumeric, "Default per-file timeout in seconds (0 disables per-file timeout).")
         _toolTip.SetToolTip(_defaultMaxThroughputNumeric, "Optional throughput cap in MB/s (0 means unlimited).")
+        _toolTip.SetToolTip(_rescueFastChunkKbNumeric, "AegisRescueCore FastScan chunk size in KB (0 = auto from buffer).")
+        _toolTip.SetToolTip(_rescueTrimChunkKbNumeric, "AegisRescueCore TrimSweep chunk size in KB (0 = auto).")
+        _toolTip.SetToolTip(_rescueScrapeChunkKbNumeric, "AegisRescueCore Scrape chunk size in KB (0 = auto).")
+        _toolTip.SetToolTip(_rescueRetryChunkKbNumeric, "AegisRescueCore RetryBad chunk size in KB (0 = auto, usually 4 KB).")
+        _toolTip.SetToolTip(_rescueSplitMinimumKbNumeric, "Minimum split block size in KB when isolating bad ranges (0 = auto).")
+        _toolTip.SetToolTip(_rescueFastRetriesNumeric, "Read retries used by FastScan pass.")
+        _toolTip.SetToolTip(_rescueTrimRetriesNumeric, "Read retries used by TrimSweep pass.")
+        _toolTip.SetToolTip(_rescueScrapeRetriesNumeric, "Read retries used by Scrape pass.")
 
         _toolTip.SetToolTip(_defaultVerifyCheckBox, "Enable post-copy verification by default.")
         _toolTip.SetToolTip(_defaultVerificationModeComboBox, "Verification strategy for new runs.")
@@ -320,7 +336,7 @@ Friend Class SettingsForm
     End Function
 
     Private Function BuildPerformancePage() As Control
-        Dim page = CreatePageContainer(1)
+        Dim page = CreatePageContainer(2)
 
         Dim body = CreateFieldGrid(6)
 
@@ -346,7 +362,36 @@ Friend Class SettingsForm
         body.Controls.Add(CreateFieldLabel("Max throughput (MB/s, 0=unlimited)"), 0, 5)
         body.Controls.Add(_defaultMaxThroughputNumeric, 1, 5)
 
+        Dim rescue = CreateFieldGrid(8)
+
+        ConfigureNumeric(_rescueFastChunkKbNumeric, 0D, 262144D, 0D)
+        ConfigureNumeric(_rescueTrimChunkKbNumeric, 0D, 262144D, 0D)
+        ConfigureNumeric(_rescueScrapeChunkKbNumeric, 0D, 262144D, 0D)
+        ConfigureNumeric(_rescueRetryChunkKbNumeric, 0D, 262144D, 0D)
+        ConfigureNumeric(_rescueSplitMinimumKbNumeric, 0D, 65536D, 0D)
+        ConfigureNumeric(_rescueFastRetriesNumeric, 0D, 1000D, 0D)
+        ConfigureNumeric(_rescueTrimRetriesNumeric, 0D, 1000D, 1D)
+        ConfigureNumeric(_rescueScrapeRetriesNumeric, 0D, 1000D, 2D)
+
+        rescue.Controls.Add(CreateFieldLabel("FastScan chunk KB (0=auto)"), 0, 0)
+        rescue.Controls.Add(_rescueFastChunkKbNumeric, 1, 0)
+        rescue.Controls.Add(CreateFieldLabel("TrimSweep chunk KB (0=auto)"), 0, 1)
+        rescue.Controls.Add(_rescueTrimChunkKbNumeric, 1, 1)
+        rescue.Controls.Add(CreateFieldLabel("Scrape chunk KB (0=auto)"), 0, 2)
+        rescue.Controls.Add(_rescueScrapeChunkKbNumeric, 1, 2)
+        rescue.Controls.Add(CreateFieldLabel("RetryBad chunk KB (0=auto)"), 0, 3)
+        rescue.Controls.Add(_rescueRetryChunkKbNumeric, 1, 3)
+        rescue.Controls.Add(CreateFieldLabel("Split minimum KB (0=auto)"), 0, 4)
+        rescue.Controls.Add(_rescueSplitMinimumKbNumeric, 1, 4)
+        rescue.Controls.Add(CreateFieldLabel("FastScan retries"), 0, 5)
+        rescue.Controls.Add(_rescueFastRetriesNumeric, 1, 5)
+        rescue.Controls.Add(CreateFieldLabel("TrimSweep retries"), 0, 6)
+        rescue.Controls.Add(_rescueTrimRetriesNumeric, 1, 6)
+        rescue.Controls.Add(CreateFieldLabel("Scrape retries"), 0, 7)
+        rescue.Controls.Add(_rescueScrapeRetriesNumeric, 1, 7)
+
         page.Controls.Add(CreateSection("Transfer Tuning", body), 0, 0)
+        page.Controls.Add(CreateSection("AegisRescueCore Tuning", rescue), 0, 1)
         Return page
     End Function
 
@@ -689,6 +734,14 @@ Friend Class SettingsForm
         _defaultOperationTimeoutNumeric.Value = ClampNumeric(_defaultOperationTimeoutNumeric, _workingSettings.DefaultOperationTimeoutSeconds)
         _defaultPerFileTimeoutNumeric.Value = ClampNumeric(_defaultPerFileTimeoutNumeric, _workingSettings.DefaultPerFileTimeoutSeconds)
         _defaultMaxThroughputNumeric.Value = ClampNumeric(_defaultMaxThroughputNumeric, _workingSettings.DefaultMaxThroughputMbPerSecond)
+        _rescueFastChunkKbNumeric.Value = ClampNumeric(_rescueFastChunkKbNumeric, _workingSettings.DefaultRescueFastScanChunkKb)
+        _rescueTrimChunkKbNumeric.Value = ClampNumeric(_rescueTrimChunkKbNumeric, _workingSettings.DefaultRescueTrimChunkKb)
+        _rescueScrapeChunkKbNumeric.Value = ClampNumeric(_rescueScrapeChunkKbNumeric, _workingSettings.DefaultRescueScrapeChunkKb)
+        _rescueRetryChunkKbNumeric.Value = ClampNumeric(_rescueRetryChunkKbNumeric, _workingSettings.DefaultRescueRetryChunkKb)
+        _rescueSplitMinimumKbNumeric.Value = ClampNumeric(_rescueSplitMinimumKbNumeric, _workingSettings.DefaultRescueSplitMinimumKb)
+        _rescueFastRetriesNumeric.Value = ClampNumeric(_rescueFastRetriesNumeric, _workingSettings.DefaultRescueFastScanRetries)
+        _rescueTrimRetriesNumeric.Value = ClampNumeric(_rescueTrimRetriesNumeric, _workingSettings.DefaultRescueTrimRetries)
+        _rescueScrapeRetriesNumeric.Value = ClampNumeric(_rescueScrapeRetriesNumeric, _workingSettings.DefaultRescueScrapeRetries)
 
         _defaultVerifyCheckBox.Checked = _workingSettings.DefaultVerifyAfterCopy
         _sampleChunkKbNumeric.Value = ClampNumeric(_sampleChunkKbNumeric, _workingSettings.DefaultSampleVerificationChunkKb)
@@ -852,6 +905,14 @@ Friend Class SettingsForm
         _workingSettings.DefaultOperationTimeoutSeconds = CInt(_defaultOperationTimeoutNumeric.Value)
         _workingSettings.DefaultPerFileTimeoutSeconds = CInt(_defaultPerFileTimeoutNumeric.Value)
         _workingSettings.DefaultMaxThroughputMbPerSecond = CInt(_defaultMaxThroughputNumeric.Value)
+        _workingSettings.DefaultRescueFastScanChunkKb = CInt(_rescueFastChunkKbNumeric.Value)
+        _workingSettings.DefaultRescueTrimChunkKb = CInt(_rescueTrimChunkKbNumeric.Value)
+        _workingSettings.DefaultRescueScrapeChunkKb = CInt(_rescueScrapeChunkKbNumeric.Value)
+        _workingSettings.DefaultRescueRetryChunkKb = CInt(_rescueRetryChunkKbNumeric.Value)
+        _workingSettings.DefaultRescueSplitMinimumKb = CInt(_rescueSplitMinimumKbNumeric.Value)
+        _workingSettings.DefaultRescueFastScanRetries = CInt(_rescueFastRetriesNumeric.Value)
+        _workingSettings.DefaultRescueTrimRetries = CInt(_rescueTrimRetriesNumeric.Value)
+        _workingSettings.DefaultRescueScrapeRetries = CInt(_rescueScrapeRetriesNumeric.Value)
 
         Select Case _overwritePolicyComboBox.SelectedIndex
             Case 1
@@ -936,6 +997,14 @@ Friend Class SettingsForm
             .DefaultOperationTimeoutSeconds = source.DefaultOperationTimeoutSeconds,
             .DefaultPerFileTimeoutSeconds = source.DefaultPerFileTimeoutSeconds,
             .DefaultMaxThroughputMbPerSecond = source.DefaultMaxThroughputMbPerSecond,
+            .DefaultRescueFastScanChunkKb = source.DefaultRescueFastScanChunkKb,
+            .DefaultRescueTrimChunkKb = source.DefaultRescueTrimChunkKb,
+            .DefaultRescueScrapeChunkKb = source.DefaultRescueScrapeChunkKb,
+            .DefaultRescueRetryChunkKb = source.DefaultRescueRetryChunkKb,
+            .DefaultRescueSplitMinimumKb = source.DefaultRescueSplitMinimumKb,
+            .DefaultRescueFastScanRetries = source.DefaultRescueFastScanRetries,
+            .DefaultRescueTrimRetries = source.DefaultRescueTrimRetries,
+            .DefaultRescueScrapeRetries = source.DefaultRescueScrapeRetries,
             .DefaultPreserveTimestamps = source.DefaultPreserveTimestamps,
             .DefaultCopyEmptyDirectories = source.DefaultCopyEmptyDirectories,
             .DefaultOverwritePolicy = source.DefaultOverwritePolicy,

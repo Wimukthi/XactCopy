@@ -16,6 +16,9 @@ Public Class MainForm
     Private Const AppTitle As String = "XactCopy"
     Private Const LayoutWindowKey As String = "MainForm"
     Private Const TaskbarProgressScale As ULong = 1000UL
+    Private Const MaxLogCharacters As Integer = 400000
+    Private Const LogTrimTargetCharacters As Integer = 280000
+    Private Const ProgressRenderIntervalMs As Integer = 50
 
     Private Shared ReadOnly AppDataRoot As String = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -54,6 +57,7 @@ Public Class MainForm
     Private ReadOnly _throughputLabel As New Label()
     Private ReadOnly _etaLabel As New Label()
     Private ReadOnly _bufferUsageLabel As New Label()
+    Private ReadOnly _rescueTelemetryLabel As New Label()
     Private ReadOnly _jobSummaryLabel As New Label()
     Private ReadOnly _journalLabel As New Label()
 
@@ -118,6 +122,10 @@ Public Class MainForm
     Private _suspendSourceTextChanged As Boolean
     Private _activeSalvageFillPattern As SalvageFillPattern = SalvageFillPattern.Zero
     Private _lastProgressSnapshot As CopyProgressSnapshot
+    Private ReadOnly _progressDispatchLock As New Object()
+    Private _pendingProgressSnapshot As CopyProgressSnapshot
+    Private _progressDispatchQueued As Integer
+    Private _lastProgressRenderTick As Long
 
     Public Sub New(Optional launchOptions As LaunchOptions = Nothing)
         Text = AppTitle
@@ -340,15 +348,19 @@ Public Class MainForm
         _bufferUsageLabel.AutoSize = True
         _bufferUsageLabel.Text = "Buffer Use: last - / -  avg -"
 
+        _rescueTelemetryLabel.AutoSize = True
+        _rescueTelemetryLabel.Text = "Rescue: -"
+
         _journalLabel.AutoSize = True
         _journalLabel.Text = "Journal: -"
 
         Dim progressLayout As New TableLayoutPanel() With {
             .Dock = DockStyle.Fill,
             .ColumnCount = 1,
-            .RowCount = 9,
+            .RowCount = 10,
             .AutoSize = True
         }
+        progressLayout.RowStyles.Add(New RowStyle(SizeType.AutoSize))
         progressLayout.RowStyles.Add(New RowStyle(SizeType.AutoSize))
         progressLayout.RowStyles.Add(New RowStyle(SizeType.AutoSize))
         progressLayout.RowStyles.Add(New RowStyle(SizeType.AutoSize))
@@ -366,7 +378,8 @@ Public Class MainForm
         progressLayout.Controls.Add(_throughputLabel, 0, 5)
         progressLayout.Controls.Add(_etaLabel, 0, 6)
         progressLayout.Controls.Add(_bufferUsageLabel, 0, 7)
-        progressLayout.Controls.Add(_journalLabel, 0, 8)
+        progressLayout.Controls.Add(_rescueTelemetryLabel, 0, 8)
+        progressLayout.Controls.Add(_journalLabel, 0, 9)
         rootLayout.Controls.Add(progressLayout, 0, 4)
 
         _logTextBox.Dock = DockStyle.Fill
@@ -562,8 +575,9 @@ Public Class MainForm
         _toolTip.SetToolTip(_throughputLabel, "Instantaneous and smoothed transfer speed.")
         _toolTip.SetToolTip(_etaLabel, "Estimated remaining time based on current average speed.")
         _toolTip.SetToolTip(_bufferUsageLabel, "Recent and average buffer utilization.")
+        _toolTip.SetToolTip(_rescueTelemetryLabel, "AegisRescueCore pass status, unreadable region count, and remaining unrecovered bytes.")
         _toolTip.SetToolTip(_journalLabel, "Active journal file used for resume/recovery.")
-        _toolTip.SetToolTip(_logTextBox, "Live operation log. Horizontal and vertical scrolling are enabled.")
+        _toolTip.SetToolTip(_logTextBox, "Event-focused operation log (errors, retries, rescue pass summaries). Horizontal and vertical scrolling are enabled.")
     End Sub
 
     Private Sub SourceTextBox_TextChanged(sender As Object, e As EventArgs)
@@ -1449,6 +1463,7 @@ Public Class MainForm
             _logTextBox.Clear()
         End If
 
+        ResetPendingProgressState()
         _overallProgressBar.Value = 0
         _currentProgressBar.Value = 0
         _jobSummaryLabel.Text = "Status: Starting"
@@ -1458,6 +1473,7 @@ Public Class MainForm
         _throughputLabel.Text = "Speed: 0 B/s (avg 0 B/s)"
         _etaLabel.Text = "ETA: -"
         _bufferUsageLabel.Text = $"Buffer Use: last - / {FormatBytes(CLng(_bufferMbNumeric.Value) * 1024L * 1024L)}  avg -"
+        _rescueTelemetryLabel.Text = "Rescue: -"
         _journalLabel.Text = "Journal: -"
         ResetCopyTelemetry()
         _lastProgressSnapshot = Nothing
@@ -1520,7 +1536,15 @@ Public Class MainForm
             .SalvageFillPattern = SettingsValueConverter.ToSalvageFillPattern(safeSettings.DefaultSalvageFillPattern),
             .ContinueOnFileError = safeSettings.DefaultContinueOnFileError,
             .PreserveTimestamps = safeSettings.DefaultPreserveTimestamps,
-            .WorkerProcessPriorityClass = "Normal"
+            .WorkerProcessPriorityClass = "Normal",
+            .RescueFastScanChunkBytes = Math.Max(0, safeSettings.DefaultRescueFastScanChunkKb) * 1024,
+            .RescueTrimChunkBytes = Math.Max(0, safeSettings.DefaultRescueTrimChunkKb) * 1024,
+            .RescueScrapeChunkBytes = Math.Max(0, safeSettings.DefaultRescueScrapeChunkKb) * 1024,
+            .RescueRetryChunkBytes = Math.Max(0, safeSettings.DefaultRescueRetryChunkKb) * 1024,
+            .RescueSplitMinimumBytes = Math.Max(0, safeSettings.DefaultRescueSplitMinimumKb) * 1024,
+            .RescueFastScanRetries = Math.Max(0, safeSettings.DefaultRescueFastScanRetries),
+            .RescueTrimRetries = Math.Max(0, safeSettings.DefaultRescueTrimRetries),
+            .RescueScrapeRetries = Math.Max(0, safeSettings.DefaultRescueScrapeRetries)
         }
     End Function
 
@@ -1623,6 +1647,28 @@ Public Class MainForm
             Case Else
                 Return "Attempt to recover unreadable source regions and fill missing bytes with 0x00."
         End Select
+    End Function
+
+    Private Shared Function ClampRescueChunkBytes(value As Integer) As Integer
+        Const maxChunkBytes As Integer = 256 * 1024 * 1024
+        If value <= 0 Then
+            Return 0
+        End If
+
+        Return Math.Max(4096, Math.Min(maxChunkBytes, value))
+    End Function
+
+    Private Shared Function ClampRescueSplitMinimumBytes(value As Integer) As Integer
+        Const maxSplitBytes As Integer = 64 * 1024 * 1024
+        If value <= 0 Then
+            Return 0
+        End If
+
+        Return Math.Max(4096, Math.Min(maxSplitBytes, value))
+    End Function
+
+    Private Shared Function ClampRescueRetries(value As Integer) As Integer
+        Return Math.Max(0, Math.Min(1000, value))
     End Function
 
     Private Function NormalizeAndValidateOptions(options As CopyJobOptions, showDialogs As Boolean) As CopyJobOptions
@@ -1735,7 +1781,15 @@ Public Class MainForm
             .SalvageFillPattern = options.SalvageFillPattern,
             .ContinueOnFileError = options.ContinueOnFileError,
             .PreserveTimestamps = options.PreserveTimestamps,
-            .WorkerProcessPriorityClass = If(options.WorkerProcessPriorityClass, "Normal")
+            .WorkerProcessPriorityClass = If(options.WorkerProcessPriorityClass, "Normal"),
+            .RescueFastScanChunkBytes = ClampRescueChunkBytes(options.RescueFastScanChunkBytes),
+            .RescueTrimChunkBytes = ClampRescueChunkBytes(options.RescueTrimChunkBytes),
+            .RescueScrapeChunkBytes = ClampRescueChunkBytes(options.RescueScrapeChunkBytes),
+            .RescueRetryChunkBytes = ClampRescueChunkBytes(options.RescueRetryChunkBytes),
+            .RescueSplitMinimumBytes = ClampRescueSplitMinimumBytes(options.RescueSplitMinimumBytes),
+            .RescueFastScanRetries = ClampRescueRetries(options.RescueFastScanRetries),
+            .RescueTrimRetries = ClampRescueRetries(options.RescueTrimRetries),
+            .RescueScrapeRetries = ClampRescueRetries(options.RescueScrapeRetries)
         }
     End Function
 
@@ -1747,15 +1801,124 @@ Public Class MainForm
     End Sub
 
     Private Sub Supervisor_ProgressChanged(sender As Object, progress As CopyProgressSnapshot)
-        If InvokeRequired Then
-            BeginInvoke(New Action(Of CopyProgressSnapshot)(AddressOf ApplyProgress), progress)
+        If progress Is Nothing Then
             Return
         End If
 
-        ApplyProgress(progress)
+        SyncLock _progressDispatchLock
+            _pendingProgressSnapshot = progress
+        End SyncLock
+
+        If Interlocked.CompareExchange(_progressDispatchQueued, 1, 0) <> 0 Then
+            Return
+        End If
+
+        PostProgressDrain()
+    End Sub
+
+    Private Sub PostProgressDrain()
+        If IsDisposed OrElse Disposing Then
+            Interlocked.Exchange(_progressDispatchQueued, 0)
+            Return
+        End If
+
+        If InvokeRequired Then
+            Try
+                BeginInvoke(New MethodInvoker(AddressOf DrainPendingProgressUpdates))
+            Catch
+                Interlocked.Exchange(_progressDispatchQueued, 0)
+            End Try
+            Return
+        End If
+
+        DrainPendingProgressUpdates()
+    End Sub
+
+    Private Sub DrainPendingProgressUpdates()
+        If IsDisposed OrElse Disposing Then
+            Interlocked.Exchange(_progressDispatchQueued, 0)
+            Return
+        End If
+
+        Dim deferredDelayMs As Integer = 0
+        Dim deferredSnapshot As CopyProgressSnapshot = Nothing
+
+        Do
+            Dim snapshot As CopyProgressSnapshot = Nothing
+            SyncLock _progressDispatchLock
+                snapshot = _pendingProgressSnapshot
+                _pendingProgressSnapshot = Nothing
+            End SyncLock
+
+            If snapshot Is Nothing Then
+                Exit Do
+            End If
+
+            Dim nowTick = Environment.TickCount64
+            If _lastProgressRenderTick > 0 Then
+                Dim elapsed = nowTick - _lastProgressRenderTick
+                If elapsed < ProgressRenderIntervalMs Then
+                    deferredDelayMs = CInt(Math.Max(1L, ProgressRenderIntervalMs - elapsed))
+                    deferredSnapshot = snapshot
+                    Exit Do
+                End If
+            End If
+
+            ApplyProgress(snapshot)
+            _lastProgressRenderTick = Environment.TickCount64
+        Loop
+
+        If deferredSnapshot IsNot Nothing Then
+            SyncLock _progressDispatchLock
+                If _pendingProgressSnapshot Is Nothing Then
+                    _pendingProgressSnapshot = deferredSnapshot
+                End If
+            End SyncLock
+        End If
+
+        Interlocked.Exchange(_progressDispatchQueued, 0)
+
+        Dim hasPendingSnapshot As Boolean
+        SyncLock _progressDispatchLock
+            hasPendingSnapshot = _pendingProgressSnapshot IsNot Nothing
+        End SyncLock
+
+        If hasPendingSnapshot AndAlso Interlocked.CompareExchange(_progressDispatchQueued, 1, 0) = 0 Then
+            If deferredDelayMs > 0 Then
+                ScheduleProgressDrain(deferredDelayMs)
+            Else
+                PostProgressDrain()
+            End If
+        End If
+    End Sub
+
+    Private Sub ScheduleProgressDrain(delayMs As Integer)
+        Dim safeDelayMs = Math.Max(1, delayMs)
+        Dim drainTask = Task.Run(
+            Async Function() As Task
+                Try
+                    Await Task.Delay(safeDelayMs).ConfigureAwait(False)
+                    PostProgressDrain()
+                Catch
+                    Interlocked.Exchange(_progressDispatchQueued, 0)
+                End Try
+            End Function)
+        Dim ignoredDrainTask = drainTask
+    End Sub
+
+    Private Sub ResetPendingProgressState()
+        SyncLock _progressDispatchLock
+            _pendingProgressSnapshot = Nothing
+        End SyncLock
+        Interlocked.Exchange(_progressDispatchQueued, 0)
+        _lastProgressRenderTick = 0
     End Sub
 
     Private Sub ApplyProgress(progress As CopyProgressSnapshot)
+        If progress Is Nothing OrElse Not _isRunning Then
+            Return
+        End If
+
         _lastProgressSnapshot = progress
         _overallProgressBar.Value = ToProgressBarValue(progress.OverallProgress)
         _currentProgressBar.Value = ToProgressBarValue(progress.CurrentFileProgress)
@@ -1764,6 +1927,7 @@ Public Class MainForm
         _currentFileLabel.Text = $"Current: {progress.CurrentFile}"
         _bytesLabel.Text = $"Bytes: {FormatBytes(progress.TotalBytesCopied)} / {FormatBytes(progress.TotalBytes)}"
         UpdateTransferTelemetry(progress)
+        UpdateRescueTelemetry(progress)
         UpdateShellIndicatorsFromProgress(progress)
 
         If _activeRun IsNot Nothing Then
@@ -1839,12 +2003,18 @@ Public Class MainForm
     End Sub
 
     Private Sub ApplyJobCompleted(result As CopyJobResult)
+        If result Is Nothing Then
+            result = New CopyJobResult()
+        End If
+
         Dim completedRun = _activeRun
 
         _isRunning = False
         _isPaused = False
+        ResetPendingProgressState()
         SetRunningState(isRunning:=False)
         UpdatePauseResumeUi()
+        ApplyTerminalProgressFromResult(result)
         _journalLabel.Text = $"Journal: {result.JournalPath}"
         _activeRun = Nothing
         _activeRunJournalPath = String.Empty
@@ -1882,11 +2052,122 @@ Public Class MainForm
         Dim ignoredQueuedTask = queuedTask
     End Sub
 
+    Private Sub ApplyTerminalProgressFromResult(result As CopyJobResult)
+        Dim previousSnapshot = _lastProgressSnapshot
+
+        Dim totalFiles = Math.Max(0, result.TotalFiles)
+        If totalFiles <= 0 AndAlso previousSnapshot IsNot Nothing Then
+            totalFiles = Math.Max(0, previousSnapshot.TotalFiles)
+        End If
+
+        If totalFiles <= 0 Then
+            totalFiles = Math.Max(0, result.CompletedFiles + result.FailedFiles + result.SkippedFiles)
+        End If
+
+        Dim completedFiles = Math.Max(0, result.CompletedFiles)
+        Dim failedFiles = Math.Max(0, result.FailedFiles)
+        Dim recoveredFiles = Math.Max(0, result.RecoveredFiles)
+        Dim skippedFiles = Math.Max(0, result.SkippedFiles)
+
+        Dim totalBytes = Math.Max(0L, result.TotalBytes)
+        If totalBytes <= 0 AndAlso previousSnapshot IsNot Nothing Then
+            totalBytes = Math.Max(0L, previousSnapshot.TotalBytes)
+        End If
+
+        Dim copiedBytes = Math.Max(0L, result.CopiedBytes)
+        If previousSnapshot IsNot Nothing Then
+            copiedBytes = Math.Max(copiedBytes, previousSnapshot.TotalBytesCopied)
+        End If
+
+        If result.Succeeded AndAlso Not result.Cancelled AndAlso totalBytes > 0 Then
+            copiedBytes = totalBytes
+        End If
+
+        Dim overallProgress As Double
+        If result.Succeeded AndAlso Not result.Cancelled Then
+            overallProgress = 1.0R
+        ElseIf totalBytes > 0 Then
+            overallProgress = Math.Clamp(CDbl(copiedBytes) / CDbl(totalBytes), 0.0R, 1.0R)
+        ElseIf totalFiles > 0 Then
+            overallProgress = Math.Clamp(
+                CDbl(completedFiles + failedFiles + skippedFiles) / CDbl(totalFiles),
+                0.0R,
+                1.0R)
+        Else
+            overallProgress = 0.0R
+        End If
+
+        _overallProgressBar.Value = ToProgressBarValue(overallProgress)
+
+        If result.Succeeded AndAlso Not result.Cancelled Then
+            _currentProgressBar.Value = 1000
+            _currentFileLabel.Text = "Current: -"
+            _etaLabel.Text = "ETA: 00:00:00"
+        Else
+            _currentProgressBar.Value = If(previousSnapshot IsNot Nothing, ToProgressBarValue(previousSnapshot.CurrentFileProgress), 0)
+            _currentFileLabel.Text = If(previousSnapshot IsNot Nothing AndAlso Not String.IsNullOrWhiteSpace(previousSnapshot.CurrentFile),
+                $"Current: {previousSnapshot.CurrentFile}",
+                "Current: -")
+        End If
+
+        _overallStatsLabel.Text = $"Files: {completedFiles}/{totalFiles}  Failed: {failedFiles}  Recovered: {recoveredFiles}  Skipped: {skippedFiles}"
+        _bytesLabel.Text = $"Bytes: {FormatBytes(copiedBytes)} / {FormatBytes(totalBytes)}"
+
+        Dim finalRescuePass = If(result.Succeeded AndAlso Not result.Cancelled, "Complete", If(previousSnapshot IsNot Nothing, previousSnapshot.RescuePass, String.Empty))
+        Dim finalRescueBadRegions = If(result.Succeeded AndAlso Not result.Cancelled, 0, If(previousSnapshot IsNot Nothing, previousSnapshot.RescueBadRegionCount, 0))
+        Dim finalRescueRemainingBytes = If(result.Succeeded AndAlso Not result.Cancelled, 0L, If(previousSnapshot IsNot Nothing, previousSnapshot.RescueRemainingBytes, 0L))
+
+        _lastProgressSnapshot = New CopyProgressSnapshot() With {
+            .CurrentFile = If(result.Succeeded AndAlso Not result.Cancelled, String.Empty, If(previousSnapshot IsNot Nothing, previousSnapshot.CurrentFile, String.Empty)),
+            .CurrentFileBytesCopied = If(result.Succeeded AndAlso Not result.Cancelled, 0L, If(previousSnapshot IsNot Nothing, previousSnapshot.CurrentFileBytesCopied, 0L)),
+            .CurrentFileBytesTotal = If(result.Succeeded AndAlso Not result.Cancelled, 0L, If(previousSnapshot IsNot Nothing, previousSnapshot.CurrentFileBytesTotal, 0L)),
+            .TotalBytesCopied = copiedBytes,
+            .TotalBytes = totalBytes,
+            .LastChunkBytesTransferred = If(previousSnapshot IsNot Nothing, previousSnapshot.LastChunkBytesTransferred, 0),
+            .BufferSizeBytes = If(previousSnapshot IsNot Nothing, previousSnapshot.BufferSizeBytes, 0),
+            .CompletedFiles = completedFiles,
+            .FailedFiles = failedFiles,
+            .RecoveredFiles = recoveredFiles,
+            .SkippedFiles = skippedFiles,
+            .TotalFiles = totalFiles,
+            .RescuePass = If(finalRescuePass, String.Empty),
+            .RescueBadRegionCount = Math.Max(0, finalRescueBadRegions),
+            .RescueRemainingBytes = Math.Max(0L, finalRescueRemainingBytes)
+        }
+
+        UpdateRescueTelemetry(_lastProgressSnapshot)
+    End Sub
+
     Private Sub AppendLog(message As String)
+        If String.IsNullOrWhiteSpace(message) Then
+            Return
+        End If
+
         _logTextBox.AppendText(message)
         _logTextBox.AppendText(Environment.NewLine)
+        TrimLogBufferIfNeeded()
         _logTextBox.SelectionStart = _logTextBox.TextLength
         _logTextBox.ScrollToCaret()
+    End Sub
+
+    Private Sub TrimLogBufferIfNeeded()
+        If _logTextBox.TextLength <= MaxLogCharacters Then
+            Return
+        End If
+
+        Dim cutIndex = Math.Max(0, _logTextBox.TextLength - LogTrimTargetCharacters)
+        If cutIndex > 0 Then
+            Dim newlineIndex = _logTextBox.Text.IndexOf(Environment.NewLine, cutIndex, StringComparison.Ordinal)
+            If newlineIndex >= 0 Then
+                cutIndex = newlineIndex + Environment.NewLine.Length
+            End If
+        End If
+
+        If cutIndex <= 0 OrElse cutIndex >= _logTextBox.TextLength Then
+            Return
+        End If
+
+        _logTextBox.Text = "[Log trimmed to recent events]" & Environment.NewLine & _logTextBox.Text.Substring(cutIndex)
     End Sub
 
     Private Sub SetRunningState(isRunning As Boolean)
@@ -2021,6 +2302,18 @@ Public Class MainForm
         _bufferUsageLabel.Text = $"Buffer Use: last {lastChunkText}  avg {avgText}"
     End Sub
 
+    Private Sub UpdateRescueTelemetry(progress As CopyProgressSnapshot)
+        If progress Is Nothing Then
+            _rescueTelemetryLabel.Text = "Rescue: -"
+            Return
+        End If
+
+        Dim passText = If(String.IsNullOrWhiteSpace(progress.RescuePass), "-", progress.RescuePass.Trim())
+        Dim badRegions = Math.Max(0, progress.RescueBadRegionCount)
+        Dim remainingBytes = Math.Max(0L, progress.RescueRemainingBytes)
+        _rescueTelemetryLabel.Text = $"Rescue: {passText}  Bad regions: {badRegions}  Remaining: {FormatBytes(remainingBytes)}"
+    End Sub
+
     Private Sub UpdateShellIndicatorsForStarting()
         Text = $"{AppTitle} - Starting..."
         If IsHandleCreated Then
@@ -2107,7 +2400,14 @@ Public Class MainForm
         Dim speedBytesPerSecond = Math.Max(0L, CLng(Math.Round(_smoothedBytesPerSecond)))
         Dim speedText = $"{FormatBytes(speedBytesPerSecond)}/s"
         Dim etaText = EstimateEtaText(progress)
-        Return $"{AppTitle} - {statusText} {percent:0.0}% ({completedFiles}/{totalFiles} files) - {speedText} - ETA {etaText}"
+        Dim rescueText = String.Empty
+        If Not String.IsNullOrWhiteSpace(progress.RescuePass) Then
+            Dim badRegions = Math.Max(0, progress.RescueBadRegionCount)
+            Dim remainingText = FormatBytes(Math.Max(0L, progress.RescueRemainingBytes))
+            rescueText = $" - {progress.RescuePass} [{badRegions} bad, {remainingText} rem]"
+        End If
+
+        Return $"{AppTitle} - {statusText} {percent:0.0}% ({completedFiles}/{totalFiles} files) - {speedText} - ETA {etaText}{rescueText}"
     End Function
 
     Private Function EstimateEtaText(progress As CopyProgressSnapshot) As String

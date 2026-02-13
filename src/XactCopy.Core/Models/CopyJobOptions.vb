@@ -28,5 +28,13 @@ Namespace Models
         Public Property ContinueOnFileError As Boolean = True
         Public Property PreserveTimestamps As Boolean = True
         Public Property WorkerProcessPriorityClass As String = "Normal"
+        Public Property RescueFastScanChunkBytes As Integer = 0
+        Public Property RescueTrimChunkBytes As Integer = 0
+        Public Property RescueScrapeChunkBytes As Integer = 0
+        Public Property RescueRetryChunkBytes As Integer = 0
+        Public Property RescueSplitMinimumBytes As Integer = 0
+        Public Property RescueFastScanRetries As Integer = 0
+        Public Property RescueTrimRetries As Integer = 1
+        Public Property RescueScrapeRetries As Integer = 2
     End Class
 End Namespace

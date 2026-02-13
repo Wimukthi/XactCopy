@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.2.4] - 2026-02-13
+
+### Added
+
+- New `AegisRescueCore` multi-pass recovery engine for per-file resilient copy (`FastScan`, `TrimSweep`, `Scrape`, `RetryBad`) with split-on-failure bad-block isolation.
+- Journal persistence now tracks per-file rescue ranges (`Pending`, `Good`, `Bad`, `Recovered`) and last rescue pass for stronger crash-resume continuity.
+- Copy progress IPC/model telemetry now includes rescue pass, bad-region count, and remaining unrecovered bytes.
+- Performance settings now expose `AegisRescueCore` pass tuning defaults (per-pass chunk sizes, split minimum, and pass retries).
+
+### Changed
+
+- Main window live status now displays rescue telemetry and includes active rescue-pass details in the running title text.
+- Write path no longer flushes every chunk, reducing overhead during sustained throughput.
+- Runtime log is now event-focused (retries/errors/rescue summaries) instead of per-file/pass noise, and the UI log buffer auto-trims to recent events.
+- Progress rendering now coalesces high-frequency worker snapshots and caps redraw rate to keep UI telemetry smooth during very fast copies.
+
+### Fixed
+
+- Main progress labels/bars no longer remain at zero until completion under bursty high-throughput runs.
+- Final UI progress state now snaps to the job result to prevent completion percentages from stopping short of expected totals.
+
 ## [1.0.1.3] - 2026-02-13
 
 ### Fixed

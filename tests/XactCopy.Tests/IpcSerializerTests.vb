@@ -13,7 +13,9 @@ Public Class IpcSerializerTests
                 .DestinationRoot = "D:\dst",
                 .UseAdaptiveBufferSizing = True,
                 .WaitForMediaAvailability = True,
-                .MaxRetries = 5
+                .MaxRetries = 5,
+                .RescueTrimChunkBytes = 64 * 1024,
+                .RescueScrapeRetries = 4
             }
         }
 
@@ -29,6 +31,8 @@ Public Class IpcSerializerTests
         Assert.True(envelope.Payload.Options.UseAdaptiveBufferSizing)
         Assert.True(envelope.Payload.Options.WaitForMediaAvailability)
         Assert.Equal(5, envelope.Payload.Options.MaxRetries)
+        Assert.Equal(64 * 1024, envelope.Payload.Options.RescueTrimChunkBytes)
+        Assert.Equal(4, envelope.Payload.Options.RescueScrapeRetries)
     End Sub
 
     <Fact>
@@ -44,5 +48,30 @@ Public Class IpcSerializerTests
 
         Assert.False(parsed)
         Assert.True(String.IsNullOrWhiteSpace(parsedType))
+    End Sub
+
+    <Fact>
+    Public Sub SerializeAndDeserializeEnvelope_RoundTripsWorkerProgressRescueTelemetry()
+        Dim payload As New WorkerProgressEvent() With {
+            .JobId = "job-456",
+            .Snapshot = New CopyProgressSnapshot() With {
+                .CurrentFile = "data.bin",
+                .CurrentFileBytesCopied = 512,
+                .CurrentFileBytesTotal = 2048,
+                .TotalBytesCopied = 1024,
+                .TotalBytes = 4096,
+                .RescuePass = "Scrape",
+                .RescueBadRegionCount = 3,
+                .RescueRemainingBytes = 8192
+            }
+        }
+
+        Dim json = IpcSerializer.SerializeEnvelope(IpcMessageTypes.WorkerProgressEvent, payload)
+        Dim envelope = IpcSerializer.DeserializeEnvelope(Of WorkerProgressEvent)(json)
+
+        Assert.Equal("job-456", envelope.Payload.JobId)
+        Assert.Equal("Scrape", envelope.Payload.Snapshot.RescuePass)
+        Assert.Equal(3, envelope.Payload.Snapshot.RescueBadRegionCount)
+        Assert.Equal(8192, envelope.Payload.Snapshot.RescueRemainingBytes)
     End Sub
 End Class

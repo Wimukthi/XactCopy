@@ -33,6 +33,14 @@ Namespace Configuration
         Public Property DefaultCopyEmptyDirectories As Boolean = True
         Public Property DefaultOverwritePolicy As String = "overwrite"
         Public Property DefaultSymlinkHandling As String = "skip"
+        Public Property DefaultRescueFastScanChunkKb As Integer = 0
+        Public Property DefaultRescueTrimChunkKb As Integer = 0
+        Public Property DefaultRescueScrapeChunkKb As Integer = 0
+        Public Property DefaultRescueRetryChunkKb As Integer = 0
+        Public Property DefaultRescueSplitMinimumKb As Integer = 0
+        Public Property DefaultRescueFastScanRetries As Integer = 0
+        Public Property DefaultRescueTrimRetries As Integer = 1
+        Public Property DefaultRescueScrapeRetries As Integer = 2
         Public Property DefaultVerificationMode As String = "full"
         Public Property DefaultVerificationHashAlgorithm As String = "sha256"
         Public Property DefaultSampleVerificationChunkKb As Integer = 128

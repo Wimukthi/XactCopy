@@ -488,7 +488,15 @@ Namespace Services
                 .SalvageFillPattern = options.SalvageFillPattern,
                 .ContinueOnFileError = options.ContinueOnFileError,
                 .PreserveTimestamps = options.PreserveTimestamps,
-                .WorkerProcessPriorityClass = options.WorkerProcessPriorityClass
+                .WorkerProcessPriorityClass = options.WorkerProcessPriorityClass,
+                .RescueFastScanChunkBytes = options.RescueFastScanChunkBytes,
+                .RescueTrimChunkBytes = options.RescueTrimChunkBytes,
+                .RescueScrapeChunkBytes = options.RescueScrapeChunkBytes,
+                .RescueRetryChunkBytes = options.RescueRetryChunkBytes,
+                .RescueSplitMinimumBytes = options.RescueSplitMinimumBytes,
+                .RescueFastScanRetries = options.RescueFastScanRetries,
+                .RescueTrimRetries = options.RescueTrimRetries,
+                .RescueScrapeRetries = options.RescueScrapeRetries
             }
         End Function
     End Class

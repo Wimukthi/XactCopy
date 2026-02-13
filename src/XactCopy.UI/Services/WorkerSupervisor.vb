@@ -272,7 +272,19 @@ Namespace Services
                 Case IpcMessageTypes.WorkerProgressEvent
                     Dim envelope = IpcSerializer.DeserializeEnvelope(Of WorkerProgressEvent)(rawMessage)
                     _lastHeartbeatUtc = envelope.Payload.TimestampUtc
-                    RaiseEvent ProgressChanged(Me, envelope.Payload.Snapshot)
+                    If Not _isJobRunning Then
+                        Return Task.CompletedTask
+                    End If
+
+                    Dim messageJobId = If(envelope.Payload.JobId, String.Empty)
+                    If Not String.IsNullOrWhiteSpace(_currentJobId) AndAlso
+                        Not String.Equals(messageJobId, _currentJobId, StringComparison.OrdinalIgnoreCase) Then
+                        Return Task.CompletedTask
+                    End If
+
+                    If envelope.Payload.Snapshot IsNot Nothing Then
+                        RaiseEvent ProgressChanged(Me, envelope.Payload.Snapshot)
+                    End If
 
                 Case IpcMessageTypes.WorkerLogEvent
                     Dim envelope = IpcSerializer.DeserializeEnvelope(Of WorkerLogEvent)(rawMessage)
@@ -516,7 +528,15 @@ Namespace Services
                 .SalvageFillPattern = options.SalvageFillPattern,
                 .ContinueOnFileError = options.ContinueOnFileError,
                 .PreserveTimestamps = options.PreserveTimestamps,
-                .WorkerProcessPriorityClass = options.WorkerProcessPriorityClass
+                .WorkerProcessPriorityClass = options.WorkerProcessPriorityClass,
+                .RescueFastScanChunkBytes = options.RescueFastScanChunkBytes,
+                .RescueTrimChunkBytes = options.RescueTrimChunkBytes,
+                .RescueScrapeChunkBytes = options.RescueScrapeChunkBytes,
+                .RescueRetryChunkBytes = options.RescueRetryChunkBytes,
+                .RescueSplitMinimumBytes = options.RescueSplitMinimumBytes,
+                .RescueFastScanRetries = options.RescueFastScanRetries,
+                .RescueTrimRetries = options.RescueTrimRetries,
+                .RescueScrapeRetries = options.RescueScrapeRetries
             }
         End Function
 

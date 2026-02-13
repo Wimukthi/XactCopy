@@ -1,3 +1,4 @@
+Imports System.Collections.Generic
 Imports System.IO
 Imports System.Threading
 Imports System.Threading.Tasks
@@ -24,7 +25,12 @@ Public Class JobJournalStoreTests
                 .RelativePath = "a.txt",
                 .SourceLength = 100,
                 .BytesCopied = 64,
-                .State = FileCopyState.InProgress
+                .State = FileCopyState.InProgress,
+                .LastRescuePass = "TrimSweep",
+                .RescueRanges = New List(Of RescueRange) From {
+                    New RescueRange() With {.Offset = 0, .Length = 64, .State = RescueRangeState.Good},
+                    New RescueRange() With {.Offset = 64, .Length = 36, .State = RescueRangeState.Bad}
+                }
             }
 
             Await store.SaveAsync(journalPath, journal, CancellationToken.None)
@@ -35,6 +41,9 @@ Public Class JobJournalStoreTests
             Assert.True(loaded.Files.ContainsKey("a.txt"))
             Assert.Equal(64, loaded.Files("a.txt").BytesCopied)
             Assert.Equal(FileCopyState.InProgress, loaded.Files("a.txt").State)
+            Assert.Equal("TrimSweep", loaded.Files("a.txt").LastRescuePass)
+            Assert.Equal(2, loaded.Files("a.txt").RescueRanges.Count)
+            Assert.Equal(RescueRangeState.Bad, loaded.Files("a.txt").RescueRanges(1).State)
         Finally
             If Directory.Exists(tempDirectory) Then
                 Directory.Delete(tempDirectory, recursive:=True)

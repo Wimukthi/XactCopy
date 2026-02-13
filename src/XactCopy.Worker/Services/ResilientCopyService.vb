@@ -1,3 +1,4 @@
+Imports System.Collections.Generic
 Imports System.IO
 Imports System.Linq
 Imports System.Security.Cryptography
@@ -11,6 +12,9 @@ Namespace Services
         Public Event LogMessage As EventHandler(Of String)
 
         Private Const JournalFlushIntervalSeconds As Integer = 1
+        Private Const RescueCoreName As String = "AegisRescueCore"
+        Private Const MinimumRescueBlockSize As Integer = 4096
+        Private Const MaximumIoBufferSize As Integer = 256 * 1024 * 1024
 
         Private ReadOnly _options As CopyJobOptions
         Private ReadOnly _executionControl As CopyExecutionControl
@@ -242,6 +246,20 @@ Namespace Services
             If _options.SampleVerificationChunkCount <= 0 Then
                 Throw New InvalidOperationException("SampleVerificationChunkCount must be greater than zero.")
             End If
+
+            If _options.RescueFastScanChunkBytes < 0 OrElse
+                _options.RescueTrimChunkBytes < 0 OrElse
+                _options.RescueScrapeChunkBytes < 0 OrElse
+                _options.RescueRetryChunkBytes < 0 OrElse
+                _options.RescueSplitMinimumBytes < 0 Then
+                Throw New InvalidOperationException("Rescue chunk/split tuning values cannot be negative.")
+            End If
+
+            If _options.RescueFastScanRetries < 0 OrElse
+                _options.RescueTrimRetries < 0 OrElse
+                _options.RescueScrapeRetries < 0 Then
+                Throw New InvalidOperationException("Rescue pass retries cannot be negative.")
+            End If
         End Sub
 
         Private Function MergeJournal(
@@ -291,7 +309,9 @@ Namespace Services
                         .BytesCopied = 0,
                         .State = FileCopyState.Pending,
                         .LastError = String.Empty,
-                        .RecoveredRanges = New List(Of ByteRange)()
+                        .RecoveredRanges = New List(Of ByteRange)(),
+                        .RescueRanges = New List(Of RescueRange)(),
+                        .LastRescuePass = String.Empty
                     }
                     journal.Files(descriptor.RelativePath) = entry
                     Continue For
@@ -307,11 +327,17 @@ Namespace Services
                     entry.RecoveredRanges = New List(Of ByteRange)()
                 End If
 
+                If entry.RescueRanges Is Nothing Then
+                    entry.RescueRanges = New List(Of RescueRange)()
+                End If
+
                 If sourceChanged Then
                     entry.BytesCopied = 0
                     entry.State = FileCopyState.Pending
                     entry.LastError = String.Empty
                     entry.RecoveredRanges.Clear()
+                    entry.RescueRanges.Clear()
+                    entry.LastRescuePass = String.Empty
                 End If
             Next
 
@@ -395,83 +421,98 @@ Namespace Services
             End If
 
             Dim destinationLength = GetExistingFileLength(destinationPath)
-            Dim offset = DetermineResumeOffset(entry, descriptor, destinationLength)
+            Dim hasPersistedCoverage =
+                entry IsNot Nothing AndAlso
+                entry.RescueRanges IsNot Nothing AndAlso
+                entry.RescueRanges.Any(
+                    Function(range)
+                        If range Is Nothing OrElse range.Length <= 0 Then
+                            Return False
+                        End If
 
-            If offset = 0 Then
-                Using resetStream = New FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.Read)
-                End Using
-            ElseIf destinationLength > descriptor.Length Then
-                Using trimStream = New FileStream(destinationPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read)
-                    trimStream.SetLength(descriptor.Length)
-                End Using
-            End If
+                        Dim state = NormalizeRescueRangeState(range.State)
+                        Return state = RescueRangeState.Good OrElse state = RescueRangeState.Recovered
+                    End Function)
+            Dim shouldPreserveExisting = _options.ResumeFromJournal AndAlso
+                destinationLength > 0 AndAlso
+                ((entry IsNot Nothing AndAlso entry.BytesCopied > 0) OrElse hasPersistedCoverage)
 
-            entry.BytesCopied = offset
-            If offset > 0 Then
-                EmitLog($"Resuming: {descriptor.RelativePath} at {FormatBytes(offset)}")
-            Else
-                EmitLog($"Copying: {descriptor.RelativePath} ({FormatBytes(descriptor.Length)})")
-            End If
+            PrepareDestinationFile(destinationPath, descriptor.Length, destinationLength, shouldPreserveExisting)
+            destinationLength = GetExistingFileLength(destinationPath)
 
             Dim activeBufferSize = ResolveBufferSizeForFile(descriptor.Length)
-            If _options.UseAdaptiveBufferSizing Then
-                EmitLog($"Adaptive buffer selected for {descriptor.RelativePath}: {FormatBytes(activeBufferSize)}")
-            End If
 
-            progress.TotalBytesCopied += offset
+            entry.RescueRanges = BuildRescueRanges(entry, descriptor.Length, destinationLength)
+            entry.LastRescuePass = "Init"
+
+            Dim alreadySatisfiedBytes = GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Good, RescueRangeState.Recovered)
+            entry.BytesCopied = alreadySatisfiedBytes
+
+            progress.TotalBytesCopied += alreadySatisfiedBytes
             EmitProgress(
                 progress,
                 descriptor.RelativePath,
-                offset,
+                alreadySatisfiedBytes,
                 descriptor.Length,
                 lastChunkBytesTransferred:=0,
-                bufferSizeBytes:=activeBufferSize)
+                bufferSizeBytes:=activeBufferSize,
+                rescuePass:=entry.LastRescuePass,
+                rescueBadRegionCount:=GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad),
+                rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad))
 
-            Dim recoveredAny = False
-            While offset < descriptor.Length
-                cancellationToken.ThrowIfCancellationRequested()
-                Await _executionControl.WaitIfPausedAsync(cancellationToken).ConfigureAwait(False)
-                Await WaitForMediaAvailabilityAsync(_options.SourceRoot, destinationRoot, cancellationToken).ConfigureAwait(False)
-
-                Dim chunkLength = CInt(Math.Min(CLng(activeBufferSize), descriptor.Length - offset))
-                Dim readResult = Await ReadChunkWithRetriesAsync(
-                    descriptor.FullPath,
-                    descriptor.RelativePath,
-                    offset,
-                    chunkLength,
-                    activeBufferSize,
-                    cancellationToken).ConfigureAwait(False)
-
-                If readResult.UsedRecovery Then
-                    recoveredAny = True
-                    entry.RecoveredRanges.Add(New ByteRange() With {
-                        .Offset = offset,
-                        .Length = readResult.Count
-                    })
+            Dim passPlan = BuildRescuePassPlan(activeBufferSize)
+            For Each passDefinition In passPlan
+                Dim targetCount = GetRescueRegionCount(entry.RescueRanges, passDefinition.TargetState)
+                If targetCount <= 0 Then
+                    Continue For
                 End If
 
-                Await WriteChunkWithRetriesAsync(
-                    destinationPath,
-                    descriptor.RelativePath,
-                    offset,
-                    readResult.Buffer,
-                    readResult.Count,
-                    activeBufferSize,
-                    cancellationToken).ConfigureAwait(False)
-                Await ApplyThroughputThrottleAsync(readResult.Count, cancellationToken).ConfigureAwait(False)
+                entry.LastRescuePass = passDefinition.Name
 
-                offset += readResult.Count
-                entry.BytesCopied = offset
-                progress.TotalBytesCopied += readResult.Count
-                EmitProgress(
+                Dim passOutcome = Await ExecuteRescuePassAsync(
+                    passDefinition,
+                    descriptor,
+                    entry,
+                    destinationPath,
                     progress,
-                    descriptor.RelativePath,
-                    offset,
-                    descriptor.Length,
-                    lastChunkBytesTransferred:=readResult.Count,
-                    bufferSizeBytes:=activeBufferSize)
-                Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
-            End While
+                    journal,
+                    journalPath,
+                    cancellationToken).ConfigureAwait(False)
+
+                Dim remainingBadRegions = GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad)
+                Dim passRemainingBadBytes = GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Bad)
+                If ShouldLogRescuePassSummary(passDefinition, passOutcome, remainingBadRegions) Then
+                    EmitLog(
+                        $"[{RescueCoreName}] {passDefinition.Name} {descriptor.RelativePath}: attempts {passOutcome.AttemptedSegments}, recovered {FormatBytes(passOutcome.RecoveredBytes)}, failed {passOutcome.FailedSegments}, remaining bad {remainingBadRegions} ({FormatBytes(passRemainingBadBytes)}).")
+                End If
+
+                SyncEntryBytesCopied(entry)
+                Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+            Next
+
+            Dim recoveredAny = GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Recovered) > 0
+            Dim remainingBadBytes = GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Bad)
+            If remainingBadBytes > 0 Then
+                If Not _options.SalvageUnreadableBlocks Then
+                    Throw New IOException(
+                        $"[{RescueCoreName}] Unrecoverable regions remain on {descriptor.RelativePath}: {FormatBytes(remainingBadBytes)} in {GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad)} block(s).")
+                End If
+
+                entry.LastRescuePass = "SalvageFill"
+                EmitLog($"[{RescueCoreName}] Salvaging remaining unreadable regions on {descriptor.RelativePath}.")
+                recoveredAny = Await SalvageRemainingRangesAsync(
+                    descriptor,
+                    entry,
+                    destinationPath,
+                    activeBufferSize,
+                    progress,
+                    journal,
+                    journalPath,
+                    cancellationToken).ConfigureAwait(False) OrElse recoveredAny
+                SyncEntryBytesCopied(entry)
+                entry.RecoveredRanges = MergeByteRanges(entry.RecoveredRanges)
+                Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+            End If
 
             If _options.PreserveTimestamps Then
                 File.SetLastWriteTimeUtc(destinationPath, descriptor.LastWriteTimeUtc)
@@ -494,17 +535,679 @@ Namespace Services
             Return recoveredAny
         End Function
 
-        Private Function DetermineResumeOffset(entry As JournalFileEntry, descriptor As SourceFileDescriptor, destinationLength As Long) As Long
-            If Not _options.ResumeFromJournal Then
-                Return 0
+        Private Shared Sub PrepareDestinationFile(
+            destinationPath As String,
+            expectedLength As Long,
+            existingLength As Long,
+            preserveExisting As Boolean)
+            If existingLength < 0 Then
+                existingLength = 0
             End If
 
-            If entry.BytesCopied <= 0 OrElse destinationLength <= 0 Then
-                Return 0
+            If existingLength = 0 OrElse Not preserveExisting Then
+                Using resetStream = New FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.Read)
+                End Using
+                Return
             End If
 
-            Return Math.Min(descriptor.Length, Math.Min(entry.BytesCopied, destinationLength))
+            If existingLength > expectedLength Then
+                Using trimStream = New FileStream(destinationPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read)
+                    trimStream.SetLength(expectedLength)
+                End Using
+            End If
+        End Sub
+
+        Private Function BuildRescueRanges(entry As JournalFileEntry, fileLength As Long, destinationLength As Long) As List(Of RescueRange)
+            If fileLength <= 0 Then
+                Return New List(Of RescueRange)()
+            End If
+
+            Dim ranges As New List(Of RescueRange)()
+
+            If entry IsNot Nothing AndAlso entry.RescueRanges IsNot Nothing AndAlso entry.RescueRanges.Count > 0 Then
+                For Each range In entry.RescueRanges
+                    If range Is Nothing Then
+                        Continue For
+                    End If
+
+                    ranges.Add(New RescueRange() With {
+                        .Offset = range.Offset,
+                        .Length = range.Length,
+                        .State = NormalizeRescueRangeState(range.State)
+                    })
+                Next
+            Else
+                Dim legacyCopiedBytes = 0L
+                If _options.ResumeFromJournal AndAlso entry IsNot Nothing Then
+                    legacyCopiedBytes = Math.Max(0L, Math.Min(fileLength, Math.Min(destinationLength, entry.BytesCopied)))
+                End If
+
+                If legacyCopiedBytes > 0 Then
+                    AppendRescueRange(ranges, 0L, legacyCopiedBytes, RescueRangeState.Good)
+                End If
+
+                If legacyCopiedBytes < fileLength Then
+                    AppendRescueRange(ranges, legacyCopiedBytes, fileLength - legacyCopiedBytes, RescueRangeState.Pending)
+                End If
+            End If
+
+            Dim normalized = NormalizeRescueRanges(ranges, fileLength)
+            Return DowngradeRescueCoverageBeyondDestination(normalized, destinationLength, fileLength)
         End Function
+
+        Private Shared Function NormalizeRescueRangeState(value As RescueRangeState) As RescueRangeState
+            Select Case value
+                Case RescueRangeState.Pending, RescueRangeState.Good, RescueRangeState.Bad, RescueRangeState.Recovered
+                    Return value
+                Case Else
+                    Return RescueRangeState.Pending
+            End Select
+        End Function
+
+        Private Shared Function NormalizeRescueRanges(ranges As IEnumerable(Of RescueRange), fileLength As Long) As List(Of RescueRange)
+            Dim normalized As New List(Of RescueRange)()
+            If fileLength <= 0 Then
+                Return normalized
+            End If
+
+            Dim orderedRanges = ranges.
+                Where(Function(item) item IsNot Nothing AndAlso item.Length > 0).
+                Select(
+                    Function(item)
+                        Dim startOffset = Math.Max(0L, item.Offset)
+                        Dim endOffset = Math.Min(fileLength, startOffset + CLng(item.Length))
+                        Return New RescueRange() With {
+                            .Offset = startOffset,
+                            .Length = CInt(Math.Max(0L, endOffset - startOffset)),
+                            .State = NormalizeRescueRangeState(item.State)
+                        }
+                    End Function).
+                Where(Function(item) item.Length > 0).
+                OrderBy(Function(item) item.Offset).
+                ToList()
+
+            Dim cursor = 0L
+            For Each item In orderedRanges
+                Dim itemStart = Math.Max(cursor, item.Offset)
+                Dim itemEnd = Math.Min(fileLength, item.Offset + CLng(item.Length))
+                If itemEnd <= itemStart Then
+                    Continue For
+                End If
+
+                If itemStart > cursor Then
+                    AppendRescueRange(normalized, cursor, itemStart - cursor, RescueRangeState.Pending)
+                End If
+
+                AppendRescueRange(normalized, itemStart, itemEnd - itemStart, item.State)
+                cursor = itemEnd
+            Next
+
+            If cursor < fileLength Then
+                AppendRescueRange(normalized, cursor, fileLength - cursor, RescueRangeState.Pending)
+            End If
+
+            Return MergeRescueRanges(normalized)
+        End Function
+
+        Private Shared Function DowngradeRescueCoverageBeyondDestination(
+            ranges As List(Of RescueRange),
+            destinationLength As Long,
+            fileLength As Long) As List(Of RescueRange)
+
+            If fileLength <= 0 Then
+                Return New List(Of RescueRange)()
+            End If
+
+            Dim effectiveDestinationLength = Math.Max(0L, Math.Min(destinationLength, fileLength))
+            Dim adjusted As New List(Of RescueRange)()
+
+            For Each item In ranges
+                Dim itemStart = Math.Max(0L, item.Offset)
+                Dim itemEnd = Math.Min(fileLength, itemStart + CLng(item.Length))
+                If itemEnd <= itemStart Then
+                    Continue For
+                End If
+
+                Dim state = NormalizeRescueRangeState(item.State)
+                If (state = RescueRangeState.Good OrElse state = RescueRangeState.Recovered) AndAlso itemStart >= effectiveDestinationLength Then
+                    AppendRescueRange(adjusted, itemStart, itemEnd - itemStart, RescueRangeState.Pending)
+                    Continue For
+                End If
+
+                If (state = RescueRangeState.Good OrElse state = RescueRangeState.Recovered) AndAlso itemEnd > effectiveDestinationLength Then
+                    If effectiveDestinationLength > itemStart Then
+                        AppendRescueRange(adjusted, itemStart, effectiveDestinationLength - itemStart, state)
+                    End If
+                    AppendRescueRange(adjusted, effectiveDestinationLength, itemEnd - effectiveDestinationLength, RescueRangeState.Pending)
+                    Continue For
+                End If
+
+                AppendRescueRange(adjusted, itemStart, itemEnd - itemStart, state)
+            Next
+
+            Return NormalizeRescueRanges(adjusted, fileLength)
+        End Function
+
+        Private Shared Sub AppendRescueRange(target As List(Of RescueRange), offset As Long, length As Long, state As RescueRangeState)
+            If target Is Nothing OrElse length <= 0 Then
+                Return
+            End If
+
+            Dim remaining = length
+            Dim currentOffset = offset
+            While remaining > 0
+                Dim segmentLength = CInt(Math.Min(CLng(Integer.MaxValue), remaining))
+                target.Add(New RescueRange() With {
+                    .Offset = currentOffset,
+                    .Length = segmentLength,
+                    .State = NormalizeRescueRangeState(state)
+                })
+                currentOffset += segmentLength
+                remaining -= segmentLength
+            End While
+        End Sub
+
+        Private Shared Function MergeRescueRanges(ranges As IEnumerable(Of RescueRange)) As List(Of RescueRange)
+            Dim merged As New List(Of RescueRange)()
+            For Each item In ranges.
+                Where(Function(value) value IsNot Nothing AndAlso value.Length > 0).
+                OrderBy(Function(value) value.Offset)
+
+                Dim state = NormalizeRescueRangeState(item.State)
+                Dim start = item.Offset
+                Dim [end] = start + CLng(item.Length)
+                If [end] <= start Then
+                    Continue For
+                End If
+
+                If merged.Count = 0 Then
+                    merged.Add(New RescueRange() With {
+                        .Offset = start,
+                        .Length = item.Length,
+                        .State = state
+                    })
+                    Continue For
+                End If
+
+                Dim previous = merged(merged.Count - 1)
+                Dim previousEnd = previous.Offset + CLng(previous.Length)
+                If previous.State = state AndAlso previousEnd = start AndAlso CLng(previous.Length) + CLng(item.Length) <= Integer.MaxValue Then
+                    previous.Length += item.Length
+                ElseIf previousEnd > start Then
+                    Dim overlapAdjustedStart = previousEnd
+                    If [end] > overlapAdjustedStart Then
+                        AppendRescueRange(merged, overlapAdjustedStart, [end] - overlapAdjustedStart, state)
+                    End If
+                Else
+                    merged.Add(New RescueRange() With {
+                        .Offset = start,
+                        .Length = item.Length,
+                        .State = state
+                    })
+                End If
+            Next
+
+            Return merged
+        End Function
+
+        Private Shared Function GetRescueRangeBytes(ranges As IEnumerable(Of RescueRange), ParamArray states() As RescueRangeState) As Long
+            If ranges Is Nothing OrElse states Is Nothing OrElse states.Length = 0 Then
+                Return 0L
+            End If
+
+            Dim allowedStates = New HashSet(Of RescueRangeState)(states.Select(AddressOf NormalizeRescueRangeState))
+            Dim totalBytes = 0L
+            For Each item In ranges
+                If item Is Nothing OrElse item.Length <= 0 Then
+                    Continue For
+                End If
+
+                If allowedStates.Contains(NormalizeRescueRangeState(item.State)) Then
+                    totalBytes += item.Length
+                End If
+            Next
+
+            Return totalBytes
+        End Function
+
+        Private Shared Function GetRescueRegionCount(ranges As IEnumerable(Of RescueRange), state As RescueRangeState) As Integer
+            If ranges Is Nothing Then
+                Return 0
+            End If
+
+            Dim targetState = NormalizeRescueRangeState(state)
+            Return ranges.Count(Function(item) item IsNot Nothing AndAlso item.Length > 0 AndAlso NormalizeRescueRangeState(item.State) = targetState)
+        End Function
+
+        Private Shared Function SnapshotRangesByState(ranges As IEnumerable(Of RescueRange), state As RescueRangeState) As List(Of ByteRange)
+            Dim snapshots As New List(Of ByteRange)()
+            If ranges Is Nothing Then
+                Return snapshots
+            End If
+
+            Dim targetState = NormalizeRescueRangeState(state)
+            For Each item In ranges
+                If item Is Nothing OrElse item.Length <= 0 Then
+                    Continue For
+                End If
+
+                If NormalizeRescueRangeState(item.State) <> targetState Then
+                    Continue For
+                End If
+
+                snapshots.Add(New ByteRange() With {
+                    .Offset = item.Offset,
+                    .Length = item.Length
+                })
+            Next
+
+            Return snapshots
+        End Function
+
+        Private Shared Sub SetRescueRangeState(ranges As List(Of RescueRange), offset As Long, length As Integer, newState As RescueRangeState)
+            If ranges Is Nothing OrElse ranges.Count = 0 OrElse length <= 0 Then
+                Return
+            End If
+
+            Dim targetStart = offset
+            Dim targetEnd = offset + CLng(length)
+            If targetEnd <= targetStart Then
+                Return
+            End If
+
+            Dim updated As New List(Of RescueRange)()
+            For Each item In ranges
+                If item Is Nothing OrElse item.Length <= 0 Then
+                    Continue For
+                End If
+
+                Dim itemStart = item.Offset
+                Dim itemEnd = itemStart + CLng(item.Length)
+                If itemEnd <= targetStart OrElse itemStart >= targetEnd Then
+                    AppendRescueRange(updated, itemStart, itemEnd - itemStart, item.State)
+                    Continue For
+                End If
+
+                If itemStart < targetStart Then
+                    AppendRescueRange(updated, itemStart, targetStart - itemStart, item.State)
+                End If
+
+                Dim overlapStart = Math.Max(itemStart, targetStart)
+                Dim overlapEnd = Math.Min(itemEnd, targetEnd)
+                AppendRescueRange(updated, overlapStart, overlapEnd - overlapStart, newState)
+
+                If itemEnd > targetEnd Then
+                    AppendRescueRange(updated, targetEnd, itemEnd - targetEnd, item.State)
+                End If
+            Next
+
+            ranges.Clear()
+            ranges.AddRange(MergeRescueRanges(updated))
+        End Sub
+
+        Private Sub SyncEntryBytesCopied(entry As JournalFileEntry)
+            If entry Is Nothing Then
+                Return
+            End If
+
+            entry.BytesCopied = GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Good, RescueRangeState.Recovered)
+        End Sub
+
+        Private Function BuildRescuePassPlan(activeBufferSize As Integer) As IReadOnlyList(Of RescuePassDefinition)
+            Dim fastAuto = NormalizeIoBufferSize(activeBufferSize)
+            Dim trimAuto = NormalizeIoBufferSize(Math.Max(MinimumRescueBlockSize * 16, fastAuto \ 8))
+            Dim scrapeAuto = NormalizeIoBufferSize(Math.Max(MinimumRescueBlockSize * 2, trimAuto \ 4))
+            Dim retryAuto = NormalizeIoBufferSize(MinimumRescueBlockSize)
+
+            Dim fastChunkSize = ResolveRescueChunkSize(_options.RescueFastScanChunkBytes, fastAuto)
+            Dim trimChunkSize = ResolveRescueChunkSize(_options.RescueTrimChunkBytes, trimAuto)
+            Dim scrapeChunkSize = ResolveRescueChunkSize(_options.RescueScrapeChunkBytes, scrapeAuto)
+            Dim retryChunkSize = ResolveRescueChunkSize(_options.RescueRetryChunkBytes, retryAuto)
+
+            Dim splitMinimum = ResolveRescueSplitMinimum(_options.RescueSplitMinimumBytes, retryChunkSize)
+            Dim trimSplitMinimum = CapSplitMinimumForPass(splitMinimum, trimChunkSize)
+            Dim scrapeSplitMinimum = CapSplitMinimumForPass(splitMinimum, scrapeChunkSize)
+
+            Dim fastRetries = ResolveRescueRetries(_options.RescueFastScanRetries, 0)
+            Dim trimRetries = ResolveRescueRetries(_options.RescueTrimRetries, 1)
+            Dim scrapeRetries = ResolveRescueRetries(_options.RescueScrapeRetries, 2)
+
+            Return New List(Of RescuePassDefinition) From {
+                New RescuePassDefinition(
+                    name:="FastScan",
+                    targetState:=RescueRangeState.Pending,
+                    chunkSizeBytes:=fastChunkSize,
+                    maxReadRetries:=fastRetries,
+                    splitOnFailure:=False,
+                    minimumSplitBytes:=trimSplitMinimum),
+                New RescuePassDefinition(
+                    name:="TrimSweep",
+                    targetState:=RescueRangeState.Bad,
+                    chunkSizeBytes:=trimChunkSize,
+                    maxReadRetries:=trimRetries,
+                    splitOnFailure:=True,
+                    minimumSplitBytes:=trimSplitMinimum),
+                New RescuePassDefinition(
+                    name:="Scrape",
+                    targetState:=RescueRangeState.Bad,
+                    chunkSizeBytes:=scrapeChunkSize,
+                    maxReadRetries:=scrapeRetries,
+                    splitOnFailure:=True,
+                    minimumSplitBytes:=scrapeSplitMinimum),
+                New RescuePassDefinition(
+                    name:="RetryBad",
+                    targetState:=RescueRangeState.Bad,
+                    chunkSizeBytes:=retryChunkSize,
+                    maxReadRetries:=Math.Max(0, _options.MaxRetries),
+                    splitOnFailure:=False,
+                    minimumSplitBytes:=retryChunkSize)
+            }
+        End Function
+
+        Private Shared Function ResolveRescueChunkSize(configuredValue As Integer, autoValue As Integer) As Integer
+            If configuredValue <= 0 Then
+                Return NormalizeIoBufferSize(autoValue)
+            End If
+
+            Return NormalizeIoBufferSize(configuredValue)
+        End Function
+
+        Private Shared Function ResolveRescueSplitMinimum(configuredValue As Integer, fallbackValue As Integer) As Integer
+            If configuredValue <= 0 Then
+                Return NormalizeIoBufferSize(fallbackValue)
+            End If
+
+            Return NormalizeIoBufferSize(configuredValue)
+        End Function
+
+        Private Shared Function ResolveRescueRetries(configuredValue As Integer, fallbackValue As Integer) As Integer
+            If configuredValue < 0 Then
+                Return Math.Max(0, fallbackValue)
+            End If
+
+            Return configuredValue
+        End Function
+
+        Private Shared Function CapSplitMinimumForPass(splitMinimum As Integer, passChunkSize As Integer) As Integer
+            Dim halfPassChunk = Math.Max(MinimumRescueBlockSize, passChunkSize \ 2)
+            Return Math.Max(MinimumRescueBlockSize, Math.Min(splitMinimum, halfPassChunk))
+        End Function
+
+        Private Shared Function AlignToBlockSize(value As Integer, blockSize As Integer) As Integer
+            Dim normalizedBlock = Math.Max(MinimumRescueBlockSize, blockSize)
+            Dim aligned = (value \ normalizedBlock) * normalizedBlock
+            If aligned <= 0 Then
+                Return normalizedBlock
+            End If
+            Return aligned
+        End Function
+
+        Private Async Function ExecuteRescuePassAsync(
+            passDefinition As RescuePassDefinition,
+            descriptor As SourceFileDescriptor,
+            entry As JournalFileEntry,
+            destinationPath As String,
+            progress As ProgressAccumulator,
+            journal As JobJournal,
+            journalPath As String,
+            cancellationToken As CancellationToken) As Task(Of RescuePassOutcome)
+
+            Dim outcome As New RescuePassOutcome()
+            Dim targetSnapshots = SnapshotRangesByState(entry.RescueRanges, passDefinition.TargetState)
+            For Each targetRange In targetSnapshots
+                cancellationToken.ThrowIfCancellationRequested()
+                Await _executionControl.WaitIfPausedAsync(cancellationToken).ConfigureAwait(False)
+                Await WaitForMediaAvailabilityAsync(_options.SourceRoot, _options.DestinationRoot, cancellationToken).ConfigureAwait(False)
+
+                Dim work As New Stack(Of ByteRange)()
+                work.Push(New ByteRange() With {
+                    .Offset = targetRange.Offset,
+                    .Length = targetRange.Length
+                })
+
+                While work.Count > 0
+                    cancellationToken.ThrowIfCancellationRequested()
+                    Await _executionControl.WaitIfPausedAsync(cancellationToken).ConfigureAwait(False)
+                    Await WaitForMediaAvailabilityAsync(_options.SourceRoot, _options.DestinationRoot, cancellationToken).ConfigureAwait(False)
+
+                    Dim segment = work.Pop()
+                    If segment Is Nothing OrElse segment.Length <= 0 Then
+                        Continue While
+                    End If
+
+                    Dim segmentLength = segment.Length
+                    If segmentLength > passDefinition.ChunkSizeBytes Then
+                        Dim remaining = segmentLength
+                        While remaining > 0
+                            Dim chunkLength = Math.Min(passDefinition.ChunkSizeBytes, remaining)
+                            work.Push(New ByteRange() With {
+                                .Offset = segment.Offset + (remaining - chunkLength),
+                                .Length = chunkLength
+                            })
+                            remaining -= chunkLength
+                        End While
+                        Continue While
+                    End If
+
+                    outcome.AttemptedSegments += 1
+                    Dim readResult = Await ReadChunkWithRetriesAsync(
+                        descriptor.FullPath,
+                        descriptor.RelativePath,
+                        segment.Offset,
+                        segmentLength,
+                        passDefinition.ChunkSizeBytes,
+                        cancellationToken,
+                        maxRetries:=passDefinition.MaxReadRetries,
+                        allowSalvage:=False).ConfigureAwait(False)
+
+                    If readResult IsNot Nothing Then
+                        Await WriteChunkWithRetriesAsync(
+                            destinationPath,
+                            descriptor.RelativePath,
+                            segment.Offset,
+                            readResult.Buffer,
+                            readResult.Count,
+                            passDefinition.ChunkSizeBytes,
+                            cancellationToken).ConfigureAwait(False)
+                        Await ApplyThroughputThrottleAsync(readResult.Count, cancellationToken).ConfigureAwait(False)
+
+                        SetRescueRangeState(entry.RescueRanges, segment.Offset, readResult.Count, RescueRangeState.Good)
+                        progress.TotalBytesCopied += readResult.Count
+                        SyncEntryBytesCopied(entry)
+                        EmitProgress(
+                            progress,
+                            descriptor.RelativePath,
+                            entry.BytesCopied,
+                            descriptor.Length,
+                            lastChunkBytesTransferred:=readResult.Count,
+                            bufferSizeBytes:=passDefinition.ChunkSizeBytes,
+                            rescuePass:=passDefinition.Name,
+                            rescueBadRegionCount:=GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad),
+                            rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad))
+                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
+                        outcome.RecoveredBytes += readResult.Count
+                        Continue While
+                    End If
+
+                    If passDefinition.SplitOnFailure AndAlso segmentLength >= passDefinition.MinimumSplitBytes * 2 Then
+                        Dim halfLength = Math.Max(passDefinition.MinimumSplitBytes, AlignToBlockSize(segmentLength \ 2, passDefinition.MinimumSplitBytes))
+                        halfLength = Math.Min(segmentLength - passDefinition.MinimumSplitBytes, halfLength)
+                        If halfLength > 0 AndAlso halfLength < segmentLength Then
+                            Dim secondLength = segmentLength - halfLength
+                            work.Push(New ByteRange() With {
+                                .Offset = segment.Offset + halfLength,
+                                .Length = secondLength
+                            })
+                            work.Push(New ByteRange() With {
+                                .Offset = segment.Offset,
+                                .Length = halfLength
+                            })
+                            Continue While
+                        End If
+                    End If
+
+                    SetRescueRangeState(entry.RescueRanges, segment.Offset, segmentLength, RescueRangeState.Bad)
+                    SyncEntryBytesCopied(entry)
+                    EmitProgress(
+                        progress,
+                        descriptor.RelativePath,
+                        entry.BytesCopied,
+                        descriptor.Length,
+                        lastChunkBytesTransferred:=0,
+                        bufferSizeBytes:=passDefinition.ChunkSizeBytes,
+                        rescuePass:=passDefinition.Name,
+                        rescueBadRegionCount:=GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad),
+                        rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad))
+                    Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
+                    outcome.FailedSegments += 1
+                End While
+            Next
+
+            Return outcome
+        End Function
+
+        Private Shared Function ShouldLogRescuePassSummary(
+            passDefinition As RescuePassDefinition,
+            outcome As RescuePassOutcome,
+            remainingBadRegions As Integer) As Boolean
+
+            If passDefinition Is Nothing OrElse outcome Is Nothing Then
+                Return False
+            End If
+
+            If String.Equals(passDefinition.Name, "FastScan", StringComparison.OrdinalIgnoreCase) Then
+                Return outcome.FailedSegments > 0
+            End If
+
+            Return outcome.AttemptedSegments > 0 OrElse
+                outcome.RecoveredBytes > 0 OrElse
+                remainingBadRegions > 0
+        End Function
+
+        Private Async Function SalvageRemainingRangesAsync(
+            descriptor As SourceFileDescriptor,
+            entry As JournalFileEntry,
+            destinationPath As String,
+            ioBufferSize As Integer,
+            progress As ProgressAccumulator,
+            journal As JobJournal,
+            journalPath As String,
+            cancellationToken As CancellationToken) As Task(Of Boolean)
+
+            Dim recoveredAny = False
+            Dim badSnapshots = SnapshotRangesByState(entry.RescueRanges, RescueRangeState.Bad)
+            For Each badRange In badSnapshots
+                Dim offset = badRange.Offset
+                Dim remaining = badRange.Length
+                While remaining > 0
+                    cancellationToken.ThrowIfCancellationRequested()
+                    Await _executionControl.WaitIfPausedAsync(cancellationToken).ConfigureAwait(False)
+                    Await WaitForMediaAvailabilityAsync(_options.SourceRoot, _options.DestinationRoot, cancellationToken).ConfigureAwait(False)
+
+                    Dim chunkLength = Math.Min(ioBufferSize, remaining)
+                    Dim salvageBuffer = CreateSalvageBuffer(chunkLength)
+                    Await WriteChunkWithRetriesAsync(
+                        destinationPath,
+                        descriptor.RelativePath,
+                        offset,
+                        salvageBuffer,
+                        chunkLength,
+                        ioBufferSize,
+                        cancellationToken).ConfigureAwait(False)
+                    Await ApplyThroughputThrottleAsync(chunkLength, cancellationToken).ConfigureAwait(False)
+
+                    SetRescueRangeState(entry.RescueRanges, offset, chunkLength, RescueRangeState.Recovered)
+                    entry.RecoveredRanges.Add(New ByteRange() With {
+                        .Offset = offset,
+                        .Length = chunkLength
+                    })
+
+                    progress.TotalBytesCopied += chunkLength
+                    SyncEntryBytesCopied(entry)
+                    EmitProgress(
+                        progress,
+                        descriptor.RelativePath,
+                        entry.BytesCopied,
+                        descriptor.Length,
+                        lastChunkBytesTransferred:=chunkLength,
+                        bufferSizeBytes:=ioBufferSize,
+                        rescuePass:="SalvageFill",
+                        rescueBadRegionCount:=GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad),
+                        rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad))
+                    Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
+
+                    offset += chunkLength
+                    remaining -= chunkLength
+                    recoveredAny = True
+                End While
+            Next
+
+            Return recoveredAny
+        End Function
+
+        Private Shared Function MergeByteRanges(ranges As IEnumerable(Of ByteRange)) As List(Of ByteRange)
+            Dim merged As New List(Of ByteRange)()
+            If ranges Is Nothing Then
+                Return merged
+            End If
+
+            For Each item In ranges.
+                Where(Function(value) value IsNot Nothing AndAlso value.Length > 0).
+                OrderBy(Function(value) value.Offset)
+
+                Dim start = item.Offset
+                Dim [end] = start + CLng(item.Length)
+                If [end] <= start Then
+                    Continue For
+                End If
+
+                If merged.Count = 0 Then
+                    merged.Add(New ByteRange() With {.Offset = start, .Length = item.Length})
+                    Continue For
+                End If
+
+                Dim last = merged(merged.Count - 1)
+                Dim lastEnd = last.Offset + CLng(last.Length)
+                If start <= lastEnd AndAlso [end] > lastEnd Then
+                    last.Length = CInt(Math.Min(CLng(Integer.MaxValue), [end] - last.Offset))
+                ElseIf start > lastEnd Then
+                    merged.Add(New ByteRange() With {.Offset = start, .Length = item.Length})
+                End If
+            Next
+
+            Return merged
+        End Function
+
+        Private NotInheritable Class RescuePassDefinition
+            Public Sub New(
+                name As String,
+                targetState As RescueRangeState,
+                chunkSizeBytes As Integer,
+                maxReadRetries As Integer,
+                splitOnFailure As Boolean,
+                minimumSplitBytes As Integer)
+
+                Me.Name = If(String.IsNullOrWhiteSpace(name), "Pass", name.Trim())
+                Me.TargetState = NormalizeRescueRangeState(targetState)
+                Me.ChunkSizeBytes = NormalizeIoBufferSize(chunkSizeBytes)
+                Me.MaxReadRetries = Math.Max(0, maxReadRetries)
+                Me.SplitOnFailure = splitOnFailure
+                Me.MinimumSplitBytes = NormalizeIoBufferSize(Math.Max(MinimumRescueBlockSize, minimumSplitBytes))
+            End Sub
+
+            Public ReadOnly Property Name As String
+            Public ReadOnly Property TargetState As RescueRangeState
+            Public ReadOnly Property ChunkSizeBytes As Integer
+            Public ReadOnly Property MaxReadRetries As Integer
+            Public ReadOnly Property SplitOnFailure As Boolean
+            Public ReadOnly Property MinimumSplitBytes As Integer
+        End Class
+
+        Private NotInheritable Class RescuePassOutcome
+            Public Property AttemptedSegments As Integer
+            Public Property RecoveredBytes As Long
+            Public Property FailedSegments As Integer
+        End Class
 
         Private Shared Function GetExistingFileLength(path As String) As Long
             If Not File.Exists(path) Then
@@ -525,13 +1228,16 @@ Namespace Services
             offset As Long,
             length As Integer,
             ioBufferSize As Integer,
-            cancellationToken As CancellationToken) As Task(Of ChunkReadResult)
+            cancellationToken As CancellationToken,
+            Optional maxRetries As Integer = -1,
+            Optional allowSalvage As Boolean = True) As Task(Of ChunkReadResult)
 
             Dim buffer(length - 1) As Byte
             Dim attempt = 0
             Dim lastError As Exception = Nothing
+            Dim effectiveMaxRetries = If(maxRetries >= 0, maxRetries, _options.MaxRetries)
 
-            While attempt <= _options.MaxRetries
+            While attempt <= effectiveMaxRetries
                 cancellationToken.ThrowIfCancellationRequested()
 
                 Try
@@ -565,22 +1271,26 @@ Namespace Services
                 End If
 
                 attempt += 1
-                If attempt > _options.MaxRetries Then
+                If attempt > effectiveMaxRetries Then
                     Exit While
                 End If
 
-                EmitLog($"Read retry {attempt}/{_options.MaxRetries} on {relativePath} at {FormatBytes(offset)}: {lastError.Message}")
+                EmitLog($"Read retry {attempt}/{effectiveMaxRetries} on {relativePath} at {FormatBytes(offset)}: {lastError.Message}")
                 Await DelayForRetryAsync(attempt, cancellationToken).ConfigureAwait(False)
             End While
 
-            If _options.SalvageUnreadableBlocks Then
+            If IsFatalReadException(lastError) Then
+                Throw New IOException($"Read failed on {relativePath} at offset {offset}.", lastError)
+            End If
+
+            If allowSalvage AndAlso _options.SalvageUnreadableBlocks Then
                 Dim recoveredBuffer = CreateSalvageBuffer(length)
                 Dim fillDescription = DescribeSalvageFillPattern(_options.SalvageFillPattern)
                 EmitLog($"Recovered unreadable block on {relativePath} at {FormatBytes(offset)} ({length} bytes {fillDescription}-filled).")
                 Return New ChunkReadResult(recoveredBuffer, length, usedRecovery:=True)
             End If
 
-            Throw New IOException($"Read failed on {relativePath} at offset {offset}.", lastError)
+            Return Nothing
         End Function
 
         Private Async Function ReadChunkOnceAsync(
@@ -693,7 +1403,6 @@ Namespace Services
 
                 stream.Seek(offset, SeekOrigin.Begin)
                 Await stream.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(False)
-                Await stream.FlushAsync(cancellationToken).ConfigureAwait(False)
             End Using
         End Function
 
@@ -954,7 +1663,10 @@ Namespace Services
             currentFileBytes As Long,
             currentFileTotal As Long,
             lastChunkBytesTransferred As Integer,
-            bufferSizeBytes As Integer)
+            bufferSizeBytes As Integer,
+            Optional rescuePass As String = "",
+            Optional rescueBadRegionCount As Integer = 0,
+            Optional rescueRemainingBytes As Long = 0)
             Dim snapshot As New CopyProgressSnapshot() With {
                 .CurrentFile = currentFile,
                 .CurrentFileBytesCopied = currentFileBytes,
@@ -967,7 +1679,10 @@ Namespace Services
                 .FailedFiles = progress.FailedFiles,
                 .RecoveredFiles = progress.RecoveredFiles,
                 .SkippedFiles = progress.SkippedFiles,
-                .TotalFiles = progress.TotalFiles
+                .TotalFiles = progress.TotalFiles,
+                .RescuePass = If(rescuePass, String.Empty),
+                .RescueBadRegionCount = Math.Max(0, rescueBadRegionCount),
+                .RescueRemainingBytes = Math.Max(0L, rescueRemainingBytes)
             }
             RaiseEvent ProgressChanged(Me, snapshot)
         End Sub
@@ -1098,6 +1813,17 @@ Namespace Services
                 message.Contains("specified network")
         End Function
 
+        Private Shared Function IsFatalReadException(ex As Exception) As Boolean
+            If ex Is Nothing Then
+                Return False
+            End If
+
+            Return TypeOf ex Is UnauthorizedAccessException OrElse
+                TypeOf ex Is NotSupportedException OrElse
+                TypeOf ex Is System.Security.SecurityException OrElse
+                TypeOf ex Is ArgumentException
+        End Function
+
         Private Function ResolveVerificationMode() As VerificationMode
             If _options.VerificationMode <> VerificationMode.None Then
                 Return _options.VerificationMode
@@ -1180,7 +1906,7 @@ Namespace Services
         End Function
 
         Private Shared Function NormalizeIoBufferSize(value As Integer) As Integer
-            Return Math.Max(4096, value)
+            Return Math.Min(MaximumIoBufferSize, Math.Max(4096, value))
         End Function
 
         Private Sub EmitLog(message As String)

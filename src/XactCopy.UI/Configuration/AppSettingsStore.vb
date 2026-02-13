@@ -89,6 +89,22 @@ Namespace Configuration
                 SettingsValueConverter.ClampInteger(settings.DefaultPerFileTimeoutSeconds, 0, 86400, 0)
             settings.DefaultMaxThroughputMbPerSecond =
                 SettingsValueConverter.ClampInteger(settings.DefaultMaxThroughputMbPerSecond, 0, 4096, 0)
+            settings.DefaultRescueFastScanChunkKb =
+                SettingsValueConverter.ClampInteger(settings.DefaultRescueFastScanChunkKb, 0, 262144, 0)
+            settings.DefaultRescueTrimChunkKb =
+                SettingsValueConverter.ClampInteger(settings.DefaultRescueTrimChunkKb, 0, 262144, 0)
+            settings.DefaultRescueScrapeChunkKb =
+                SettingsValueConverter.ClampInteger(settings.DefaultRescueScrapeChunkKb, 0, 262144, 0)
+            settings.DefaultRescueRetryChunkKb =
+                SettingsValueConverter.ClampInteger(settings.DefaultRescueRetryChunkKb, 0, 262144, 0)
+            settings.DefaultRescueSplitMinimumKb =
+                SettingsValueConverter.ClampInteger(settings.DefaultRescueSplitMinimumKb, 0, 65536, 0)
+            settings.DefaultRescueFastScanRetries =
+                SettingsValueConverter.ClampInteger(settings.DefaultRescueFastScanRetries, 0, 1000, 0)
+            settings.DefaultRescueTrimRetries =
+                SettingsValueConverter.ClampInteger(settings.DefaultRescueTrimRetries, 0, 1000, 1)
+            settings.DefaultRescueScrapeRetries =
+                SettingsValueConverter.ClampInteger(settings.DefaultRescueScrapeRetries, 0, 1000, 2)
             settings.DefaultSampleVerificationChunkKb =
                 SettingsValueConverter.ClampInteger(settings.DefaultSampleVerificationChunkKb, 32, 4096, 128)
             settings.DefaultSampleVerificationChunkCount =
