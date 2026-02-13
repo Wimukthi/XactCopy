@@ -25,4 +25,5 @@ dotnet test XactCopy.slnx
 - Build succeeds with no errors.
 - Tests pass.
 - User-facing behavior changes are documented in `CHANGELOG.md`.
+- If a versioned release is being prepared, `README.md` `Brief Version History` is updated for that version.
 - GPLv3 license headers and terms are preserved.

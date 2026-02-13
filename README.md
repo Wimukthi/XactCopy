@@ -52,6 +52,12 @@ dotnet run --project src/XactCopy.UI/XactCopy.UI.vbproj
 - Changelog entries: `CHANGELOG.md`
 - Release process notes: `docs/RELEASE_PROCESS.md`
 
+## Brief Version History
+
+- `v1.0.0.7` Worker renamed to `XactCopyExecutive`, shared app icon applied to worker, and standalone worker startup hardened.
+- `v1.0.0.3` Default update URL now targets XactCopy latest GitHub release endpoint.
+- `v1.0.0.1` Initial public release with resilient worker, journal recovery, telemetry, settings, and Explorer integration.
+
 ## Notes
 
 - Salvage mode can keep a copy moving, but unreadable source bytes are replaced by the selected fill pattern.

@@ -16,7 +16,10 @@ The counter increments on each UI project build.
 1. Build and test:
    - `dotnet build XactCopy.slnx`
    - `dotnet test XactCopy.slnx --no-build`
-2. Confirm changelog updates in `CHANGELOG.md`.
+2. Update release documentation (required gate):
+   - Add a new version section in `CHANGELOG.md`.
+   - Add a concise one-line entry for the same version in `README.md` under `Brief Version History`.
+   - Keep both files in sync with the release tag.
 3. Commit changes and push to `main`.
 4. Create a git tag from the computed version (for example `v1.0.0.1`).
-5. Create a GitHub release using the same tag and include changelog notes.
+5. Create a GitHub release using the same tag and include notes aligned with `CHANGELOG.md`.
