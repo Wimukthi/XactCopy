@@ -6,6 +6,8 @@ Namespace Services
         Private Const ShellClassesRoot As String = "Software\Classes"
         Private Const MenuKeyName As String = "XactCopy"
 
+        ' Use "%1" as the reliable primary selection token and keep "%*" as an
+        ' optional tail for shells that still provide expanded multi-select args.
         Private Shared ReadOnly _targets As RegistrationTarget() = {
             New RegistrationTarget("Directory", "--from-explorer ""%1"" %*", supportsMultiSelect:=True),
             New RegistrationTarget("Drive", "--from-explorer ""%1"" %*", supportsMultiSelect:=True),
