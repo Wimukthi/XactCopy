@@ -17,7 +17,7 @@ GNU GPL v3.0. See `LICENSE`.
 - Job manager (saved jobs, queue, history).
 - Explorer context menu integration (`Copy with XactCopy`).
 - Dark/system/classic theme support.
-- Built-in update checker.
+- Built-in updater with download and in-place apply flow.
 
 ## Repository Layout
 
@@ -54,6 +54,7 @@ dotnet run --project src/XactCopy.UI/XactCopy.UI.vbproj
 
 ## Brief Version History
 
+- `v1.0.0.9` Updater upgraded to download/apply releases in-app with progress, replacing page-only update prompts.
 - `v1.0.0.7` Worker renamed to `XactCopyExecutive`, shared app icon applied to worker, and standalone worker startup hardened.
 - `v1.0.0.3` Default update URL now targets XactCopy latest GitHub release endpoint.
 - `v1.0.0.1` Initial public release with resilient worker, journal recovery, telemetry, settings, and Explorer integration.

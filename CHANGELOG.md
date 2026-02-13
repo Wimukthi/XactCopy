@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.0.9] - 2026-02-13
+
+### Added
+
+- In-app updater flow now supports downloading release assets and applying updates in-place (zip/exe), with progress UI.
+
+### Changed
+
+- `Check for Updates` now opens the installer dialog for available releases instead of only prompting to open the release page.
+
 ## [1.0.0.7] - 2026-02-13
 
 ### Changed

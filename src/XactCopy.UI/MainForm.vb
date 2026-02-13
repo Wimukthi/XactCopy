@@ -623,6 +623,12 @@ Public Class MainForm
     End Sub
 
     Private Async Sub CheckUpdatesMenuItem_Click(sender As Object, e As EventArgs)
+        If _latestUpdateRelease IsNot Nothing Then
+            Dim currentVersion = UpdateService.ParseVersionSafe(Application.ProductVersion)
+            ShowUpdateDialog(_latestUpdateRelease, currentVersion)
+            Return
+        End If
+
         Await CheckForUpdatesAsync(showUpToDateDialog:=True)
     End Sub
 
@@ -962,25 +968,7 @@ Public Class MainForm
             AppendLog($"Update available: {latestLabel}")
 
             If showUpToDateDialog Then
-                Dim releaseUrl As String = If(String.IsNullOrWhiteSpace(release.HtmlUrl), _settings.UpdateReleaseUrl, release.HtmlUrl)
-                Dim message As String =
-                    $"Update available.{Environment.NewLine}" &
-                    $"Current version: {currentVersion}{Environment.NewLine}" &
-                    $"Latest version: {release.Version}"
-
-                If Not String.IsNullOrWhiteSpace(releaseUrl) Then
-                    message &= Environment.NewLine & Environment.NewLine & "Open release page now?"
-                End If
-
-                Dim buttons As MessageBoxButtons = If(String.IsNullOrWhiteSpace(releaseUrl), MessageBoxButtons.OK, MessageBoxButtons.YesNo)
-                Dim result As DialogResult = MessageBox.Show(Me,
-                                                             message,
-                                                             "XactCopy Updates",
-                                                             buttons,
-                                                             MessageBoxIcon.Information)
-                If buttons = MessageBoxButtons.YesNo AndAlso result = DialogResult.Yes Then
-                    OpenUrl(releaseUrl)
-                End If
+                ShowUpdateDialog(release, currentVersion)
             End If
         Catch ex As Exception
             _latestUpdateRelease = Nothing
@@ -998,6 +986,35 @@ Public Class MainForm
             UpdateCheckMenuCaption()
         End Try
     End Function
+
+    Private Sub ShowUpdateDialog(release As UpdateReleaseInfo, currentVersion As Version)
+        If release Is Nothing Then
+            Return
+        End If
+
+        If _isRunning Then
+            MessageBox.Show(Me,
+                            "Finish or cancel the active copy job before installing updates.",
+                            "XactCopy Updates",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information)
+            Return
+        End If
+
+        Try
+            Using dialog As New UpdateForm(release, currentVersion, _settings)
+                ThemeManager.ApplyTheme(dialog, ThemeSettings.GetPreferredColorMode(_settings))
+                dialog.ShowDialog(Me)
+            End Using
+        Catch ex As Exception
+            AppendLog($"Update dialog failed: {ex.Message}")
+            MessageBox.Show(Me,
+                            "Unable to open updater: " & ex.Message,
+                            "XactCopy Updates",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning)
+        End Try
+    End Sub
 
     Private Sub UpdateCheckMenuCaption()
         If _isCheckingUpdates Then

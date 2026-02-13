@@ -3,6 +3,8 @@ Imports System.Net.Http
 Imports System.Text.Json
 Imports System.Threading
 Imports System.Threading.Tasks
+Imports System.Diagnostics
+Imports System.IO
 
 Imports XactCopy.Configuration
 
@@ -20,6 +22,31 @@ Friend Class UpdateReleaseInfo
     Public Property HtmlUrl As String = String.Empty
     Public Property Assets As List(Of UpdateAssetInfo) = New List(Of UpdateAssetInfo)()
 End Class
+
+Friend Structure DownloadProgressInfo
+    Public ReadOnly BytesReceived As Long
+    Public ReadOnly TotalBytes As Long
+    Public ReadOnly SpeedBytesPerSec As Double
+    Public ReadOnly Elapsed As TimeSpan
+
+    Public Sub New(bytesReceived As Long, totalBytes As Long, speedBytesPerSec As Double, elapsed As TimeSpan)
+        Me.BytesReceived = bytesReceived
+        Me.TotalBytes = totalBytes
+        Me.SpeedBytesPerSec = speedBytesPerSec
+        Me.Elapsed = elapsed
+    End Sub
+
+    Public ReadOnly Property Percent As Integer
+        Get
+            If TotalBytes <= 0 Then
+                Return 0
+            End If
+
+            Dim percentValue As Double = (CDbl(BytesReceived) / CDbl(TotalBytes)) * 100.0R
+            Return CInt(Math.Clamp(Math.Round(percentValue), 0.0R, 100.0R))
+        End Get
+    End Property
+End Structure
 
 Friend Module UpdateService
     Private Const DefaultTimeoutSeconds As Integer = 20
@@ -87,6 +114,115 @@ Friend Module UpdateService
         Return Await GetLatestReleaseAsync(settings, CancellationToken.None)
     End Function
 
+    Public Function SelectBestAsset(release As UpdateReleaseInfo) As UpdateAssetInfo
+        If release Is Nothing OrElse release.Assets Is Nothing OrElse release.Assets.Count = 0 Then
+            Return Nothing
+        End If
+
+        Dim architectureToken As String = If(Environment.Is64BitProcess, "x64", "x86")
+        Dim bestAsset As UpdateAssetInfo = Nothing
+        Dim bestScore As Integer = -1
+
+        For Each asset In release.Assets
+            If asset Is Nothing OrElse String.IsNullOrWhiteSpace(asset.Name) Then
+                Continue For
+            End If
+
+            Dim lowerName = asset.Name.ToLowerInvariant()
+            Dim score As Integer = 0
+
+            If lowerName.Contains("win") OrElse lowerName.Contains("windows") Then
+                score += 2
+            End If
+
+            If lowerName.Contains(architectureToken) Then
+                score += 3
+            End If
+
+            If lowerName.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) Then
+                score += 3
+            ElseIf lowerName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) Then
+                score += 2
+            End If
+
+            If score > bestScore Then
+                bestScore = score
+                bestAsset = asset
+            End If
+        Next
+
+        Return bestAsset
+    End Function
+
+    Public Async Function DownloadAssetAsync(
+        settings As AppSettings,
+        asset As UpdateAssetInfo,
+        destinationPath As String,
+        progress As IProgress(Of DownloadProgressInfo),
+        cancellationToken As CancellationToken) As Task
+
+        If settings Is Nothing Then
+            Throw New ArgumentNullException(NameOf(settings))
+        End If
+
+        If asset Is Nothing OrElse String.IsNullOrWhiteSpace(asset.DownloadUrl) Then
+            Throw New InvalidOperationException("No compatible update package is available.")
+        End If
+
+        If String.IsNullOrWhiteSpace(destinationPath) Then
+            Throw New ArgumentException("Destination path must be provided.", NameOf(destinationPath))
+        End If
+
+        Dim destinationDirectory = Path.GetDirectoryName(destinationPath)
+        If Not String.IsNullOrWhiteSpace(destinationDirectory) Then
+            Directory.CreateDirectory(destinationDirectory)
+        End If
+
+        Using client As New HttpClient()
+            client.Timeout = TimeSpan.FromMinutes(10)
+
+            Dim userAgent As String = ResolveUserAgent(settings)
+            If Not String.IsNullOrWhiteSpace(userAgent) Then
+                client.DefaultRequestHeaders.UserAgent.ParseAdd(userAgent)
+            End If
+
+            Using response As HttpResponseMessage = Await client.GetAsync(asset.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+                response.EnsureSuccessStatusCode()
+
+                Dim totalBytes As Long = If(response.Content.Headers.ContentLength, asset.Size)
+                Dim buffer(81919) As Byte
+                Dim totalRead As Long = 0
+                Dim downloadWatch As Stopwatch = Stopwatch.StartNew()
+
+                Using networkStream As Stream = Await response.Content.ReadAsStreamAsync(cancellationToken)
+                    Using fileStream As New FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None)
+                        Do
+                            Dim read = Await networkStream.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
+                            If read = 0 Then
+                                Exit Do
+                            End If
+
+                            Await fileStream.WriteAsync(buffer.AsMemory(0, read), cancellationToken)
+                            totalRead += read
+
+                            If progress IsNot Nothing Then
+                                Dim elapsed = downloadWatch.Elapsed
+                                Dim speed = If(elapsed.TotalSeconds > 0, totalRead / elapsed.TotalSeconds, 0.0R)
+                                progress.Report(New DownloadProgressInfo(totalRead, totalBytes, speed, elapsed))
+                            End If
+                        Loop
+                    End Using
+                End Using
+
+                If progress IsNot Nothing Then
+                    Dim elapsed = downloadWatch.Elapsed
+                    Dim speed = If(elapsed.TotalSeconds > 0, totalRead / elapsed.TotalSeconds, 0.0R)
+                    progress.Report(New DownloadProgressInfo(totalRead, totalBytes, speed, elapsed))
+                End If
+            End Using
+        End Using
+    End Function
+
     Public Function IsUpdateAvailable(currentVersion As Version, latestVersion As Version) As Boolean
         If currentVersion Is Nothing OrElse latestVersion Is Nothing Then
             Return False
@@ -124,6 +260,19 @@ Friend Module UpdateService
         Dim build As Integer = If(version.Build >= 0, version.Build, 0)
         Dim revision As Integer = If(version.Revision >= 0, version.Revision, 0)
         Return New Version(version.Major, version.Minor, build, revision)
+    End Function
+
+    Public Function FormatBytes(value As Long) As String
+        Dim units = {"B", "KB", "MB", "GB", "TB"}
+        Dim size As Double = value
+        Dim unitIndex As Integer = 0
+
+        While size >= 1024.0R AndAlso unitIndex < units.Length - 1
+            size /= 1024.0R
+            unitIndex += 1
+        End While
+
+        Return $"{size:F1} {units(unitIndex)}"
     End Function
 
     Private Function NormalizeVersionText(text As String) As String
