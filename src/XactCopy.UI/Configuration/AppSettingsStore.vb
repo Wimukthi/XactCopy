@@ -69,7 +69,8 @@ Namespace Configuration
 
             settings.Theme = If(String.IsNullOrWhiteSpace(settings.Theme), "dark", settings.Theme.Trim())
             settings.UserAgent = If(settings.UserAgent, String.Empty).Trim()
-            settings.UpdateReleaseUrl = If(settings.UpdateReleaseUrl, String.Empty).Trim()
+            Dim updateReleaseUrl = If(settings.UpdateReleaseUrl, String.Empty).Trim()
+            settings.UpdateReleaseUrl = If(String.IsNullOrWhiteSpace(updateReleaseUrl), AppSettings.DefaultUpdateReleaseUrl, updateReleaseUrl)
 
             settings.RecoveryTouchIntervalSeconds =
                 SettingsValueConverter.ClampInteger(settings.RecoveryTouchIntervalSeconds, 1, 60, 2)

@@ -39,8 +39,6 @@ dotnet run --project src/XactCopy.UI/XactCopy.UI.vbproj
 
 ## Versioning
 
-XactCopy uses the same auto-increment technique as OptiScalerInstaller.
-
 - A monotonic build counter is stored in `src/XactCopy.UI/BuildVersion.txt`.
 - Each build increments the counter.
 - Version is computed as `Major.Minor.Patch.Revision`:

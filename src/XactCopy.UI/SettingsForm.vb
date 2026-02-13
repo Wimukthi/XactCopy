@@ -401,7 +401,7 @@ Friend Class SettingsForm
         Dim source = CreateFieldGrid(2)
 
         ConfigureTextBoxControl(_updateUrlTextBox, stretch:=True)
-        _updateUrlTextBox.PlaceholderText = "https://api.github.com/repos/owner/repo/releases/latest"
+        _updateUrlTextBox.PlaceholderText = AppSettings.DefaultUpdateReleaseUrl
         ConfigureTextBoxControl(_userAgentTextBox, stretch:=True)
         _userAgentTextBox.PlaceholderText = "XactCopy/1.0"
 

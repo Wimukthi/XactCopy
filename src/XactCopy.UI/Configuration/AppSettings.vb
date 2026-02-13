@@ -1,9 +1,11 @@
 Namespace Configuration
     Public NotInheritable Class AppSettings
+        Public Const DefaultUpdateReleaseUrl As String = "https://api.github.com/repos/Wimukthi/XactCopy/releases/latest"
+
         Public Property Theme As String = "dark"
 
         Public Property CheckUpdatesOnLaunch As Boolean = False
-        Public Property UpdateReleaseUrl As String = String.Empty
+        Public Property UpdateReleaseUrl As String = DefaultUpdateReleaseUrl
         Public Property UserAgent As String = String.Empty
 
         Public Property EnableRecoveryAutostart As Boolean = True
