@@ -1,4 +1,5 @@
 Imports System.Diagnostics
+Imports System.Runtime.InteropServices
 Imports System.IO.Pipes
 Imports System.Threading
 Imports XactCopy.Ipc
@@ -18,15 +19,30 @@ Module Program
     Private _shutdownRequested As Boolean
 
     Sub Main(args As String())
-        RunAsync(args).GetAwaiter().GetResult()
+        Dim exitCode = MainAsync(args).GetAwaiter().GetResult()
+        Environment.ExitCode = exitCode
     End Sub
 
-    Private Async Function RunAsync(args As String()) As Task
-        Dim pipeName = ReadPipeName(args)
-        If String.IsNullOrWhiteSpace(pipeName) Then
-            Throw New InvalidOperationException("Worker requires --pipe <name>.")
-        End If
+    Private Async Function MainAsync(args As String()) As Task(Of Integer)
+        Try
+            Dim pipeName = ReadPipeName(args)
+            If String.IsNullOrWhiteSpace(pipeName) Then
+                NotifyManualLaunch()
+                Return 2
+            End If
 
+            Await RunAsync(pipeName).ConfigureAwait(False)
+            Return 0
+        Catch ex As Exception
+            Try
+                Console.Error.WriteLine($"XactCopyExecutive fatal error: {ex}")
+            Catch
+            End Try
+            Return 1
+        End Try
+    End Function
+
+    Private Async Function RunAsync(pipeName As String) As Task
         Using lifetimeCts As New CancellationTokenSource()
             Using server As New NamedPipeServerStream(
                 pipeName,
@@ -60,6 +76,22 @@ Module Program
             End Using
         End Using
     End Function
+
+    Private Sub NotifyManualLaunch()
+        Dim message = "XactCopyExecutive is a background worker and must be started by XactCopy." &
+                      Environment.NewLine &
+                      "Use XactCopy.exe to start copy jobs."
+        Try
+            Console.WriteLine(message)
+        Catch
+        End Try
+
+        Try
+            MessageBoxW(IntPtr.Zero, message, "XactCopyExecutive", &H40UI)
+        Catch
+            ' Ignore message box failures.
+        End Try
+    End Sub
 
     Private Function ReadPipeName(args As String()) As String
         For index = 0 To args.Length - 2
@@ -339,4 +371,8 @@ Module Program
 
         Dim ignoredException = task.Exception
     End Sub
+
+    <DllImport("user32.dll", CharSet:=CharSet.Unicode, SetLastError:=True)>
+    Private Function MessageBoxW(hWnd As IntPtr, lpText As String, lpCaption As String, uType As UInteger) As Integer
+    End Function
 End Module

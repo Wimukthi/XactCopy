@@ -173,9 +173,8 @@ Namespace Services
             End If
 
             Dim pipeName = $"xactcopy-{Guid.NewGuid():N}"
-            Dim workerDllPath = ResolveWorkerDllPath()
-
-            Dim startInfo As New ProcessStartInfo("dotnet", $"""{workerDllPath}"" --pipe ""{pipeName}""") With {
+            Dim launch = ResolveWorkerLaunch(pipeName)
+            Dim startInfo As New ProcessStartInfo(launch.FileName, launch.Arguments) With {
                 .UseShellExecute = False,
                 .CreateNoWindow = True,
                 .WindowStyle = ProcessWindowStyle.Hidden
@@ -427,20 +426,61 @@ Namespace Services
             End Try
         End Function
 
-        Private Shared Function ResolveWorkerDllPath() As String
-            Dim baseDirectory = AppContext.BaseDirectory
-            Dim directPath = Path.Combine(baseDirectory, "XactCopy.Worker.dll")
-            If File.Exists(directPath) Then
-                Return directPath
+        Private Shared Function ResolveWorkerLaunch(pipeName As String) As WorkerLaunch
+            Dim workerExecutablePath = ResolveWorkerExecutablePath()
+            If Not String.IsNullOrWhiteSpace(workerExecutablePath) Then
+                Return New WorkerLaunch(workerExecutablePath, $"--pipe ""{pipeName}""")
             End If
 
-            Dim anyMatch = Directory.EnumerateFiles(baseDirectory, "XactCopy.Worker.dll", SearchOption.AllDirectories).FirstOrDefault()
-            If Not String.IsNullOrWhiteSpace(anyMatch) Then
-                Return anyMatch
+            Dim workerDllPath = ResolveWorkerDllPath()
+            Return New WorkerLaunch("dotnet", $"""{workerDllPath}"" --pipe ""{pipeName}""")
+        End Function
+
+        Private Shared Function ResolveWorkerExecutablePath() As String
+            Dim baseDirectory = AppContext.BaseDirectory
+            Dim preferredPath = Path.Combine(baseDirectory, "XactCopyExecutive.exe")
+            If File.Exists(preferredPath) Then
+                Return preferredPath
+            End If
+
+            Dim legacyPath = Path.Combine(baseDirectory, "XactCopy.Worker.exe")
+            If File.Exists(legacyPath) Then
+                Return legacyPath
+            End If
+
+            Dim preferredMatch = Directory.EnumerateFiles(baseDirectory, "XactCopyExecutive.exe", SearchOption.AllDirectories).FirstOrDefault()
+            If Not String.IsNullOrWhiteSpace(preferredMatch) Then
+                Return preferredMatch
+            End If
+
+            Dim legacyMatch = Directory.EnumerateFiles(baseDirectory, "XactCopy.Worker.exe", SearchOption.AllDirectories).FirstOrDefault()
+            Return legacyMatch
+        End Function
+
+        Private Shared Function ResolveWorkerDllPath() As String
+            Dim baseDirectory = AppContext.BaseDirectory
+            Dim preferredPath = Path.Combine(baseDirectory, "XactCopyExecutive.dll")
+            If File.Exists(preferredPath) Then
+                Return preferredPath
+            End If
+
+            Dim legacyPath = Path.Combine(baseDirectory, "XactCopy.Worker.dll")
+            If File.Exists(legacyPath) Then
+                Return legacyPath
+            End If
+
+            Dim preferredMatch = Directory.EnumerateFiles(baseDirectory, "XactCopyExecutive.dll", SearchOption.AllDirectories).FirstOrDefault()
+            If Not String.IsNullOrWhiteSpace(preferredMatch) Then
+                Return preferredMatch
+            End If
+
+            Dim legacyMatch = Directory.EnumerateFiles(baseDirectory, "XactCopy.Worker.dll", SearchOption.AllDirectories).FirstOrDefault()
+            If Not String.IsNullOrWhiteSpace(legacyMatch) Then
+                Return legacyMatch
             End If
 
             Throw New FileNotFoundException(
-                "Unable to locate XactCopy.Worker.dll. Build the solution so the worker output is available.")
+                "Unable to locate worker binary (XactCopyExecutive.exe/.dll). Build the solution so the worker output is available.")
         End Function
 
         Private Shared Function CloneOptions(options As CopyJobOptions) As CopyJobOptions
@@ -501,5 +541,15 @@ Namespace Services
             _sendLock.Dispose()
             _disposeLock.Dispose()
         End Sub
+
+        Private NotInheritable Class WorkerLaunch
+            Public Sub New(fileName As String, arguments As String)
+                Me.FileName = If(fileName, String.Empty)
+                Me.Arguments = If(arguments, String.Empty)
+            End Sub
+
+            Public ReadOnly Property FileName As String
+            Public ReadOnly Property Arguments As String
+        End Class
     End Class
 End Namespace

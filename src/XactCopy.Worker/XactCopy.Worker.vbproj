@@ -7,11 +7,18 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
+    <AssemblyName>XactCopyExecutive</AssemblyName>
     <RootNamespace>XactCopy</RootNamespace>
     <TargetFramework>net10.0</TargetFramework>
+    <ApplicationIcon>..\..\Icons\xactcopy.ico</ApplicationIcon>
+    <Win32Icon>..\..\Icons\xactcopy.ico</Win32Icon>
     <OptionStrict>On</OptionStrict>
     <OptionInfer>On</OptionInfer>
     <OptionExplicit>On</OptionExplicit>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\Icons\xactcopy.ico" Link="Icons\xactcopy.ico" />
+  </ItemGroup>
 
 </Project>
