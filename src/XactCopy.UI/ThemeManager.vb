@@ -25,6 +25,11 @@ Friend Module ThemeManager
             themedProgressBar.BackColor = themedProgressBar.TrackColor
             themedProgressBar.ForeColor = themedProgressBar.FillColor
             themedProgressBar.PercentageTextColor = If(palette.IsDark, Color.Gainsboro, SystemColors.ControlText)
+        ElseIf TypeOf control Is RichTextBox Then
+            Dim richTextBox = DirectCast(control, RichTextBox)
+            richTextBox.BackColor = palette.Field
+            richTextBox.ForeColor = palette.Text
+            richTextBox.BorderStyle = If(richTextBox.BorderStyle = BorderStyle.None, BorderStyle.None, BorderStyle.FixedSingle)
         ElseIf TypeOf control Is TextBox Then
             Dim textBox = DirectCast(control, TextBox)
             EnsureBorderWrapper(textBox, palette)

@@ -4,6 +4,23 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.4.0] - 2026-02-14
+
+### Added
+
+- New dedicated About dialog (Help -> About XactCopy) with the XactCopy banner logo and themed presentation.
+- About dialog now includes author attribution (`Wimukthi Bandara`) and a live system snapshot (OS/runtime/architecture/CPU/RAM).
+
+### Changed
+
+- About dialog version string is now centered along the bottom of the logo banner.
+- About dialog content was streamlined to remove duplicated metadata text.
+
+### Fixed
+
+- Dark-mode theming now applies correctly to `RichTextBox` controls used by the About dialog.
+- `Assets/logo.png` is now packaged with app output so the About logo loads correctly in published builds.
+
 ## [1.0.3.7] - 2026-02-14
 
 ### Added

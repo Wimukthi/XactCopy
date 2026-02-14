@@ -32,6 +32,9 @@
 
   <ItemGroup>
     <None Include="..\..\Icons\xactcopy.ico" Link="Icons\xactcopy.ico" />
+    <Content Include="..\..\Assets\logo.png" Link="Assets\logo.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <None Include="BuildVersion.txt" />
   </ItemGroup>
 

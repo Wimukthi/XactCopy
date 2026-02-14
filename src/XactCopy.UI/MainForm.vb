@@ -778,13 +778,10 @@ Public Class MainForm
     End Sub
 
     Private Sub AboutMenuItem_Click(sender As Object, e As EventArgs)
-        Dim aboutText As String =
-            $"XactCopy{Environment.NewLine}" &
-            $"Version: {Application.ProductVersion}{Environment.NewLine}" &
-            $"License: GNU GPL v3.0{Environment.NewLine}" &
-            $"Resilient copy engine for unstable media with journaled recovery."
-
-        MessageBox.Show(Me, aboutText, "About XactCopy", MessageBoxButtons.OK, MessageBoxIcon.Information)
+        Using dialog As New AboutForm()
+            ThemeManager.ApplyTheme(dialog, ThemeSettings.GetPreferredColorMode(_settings), _settings)
+            dialog.ShowDialog(Me)
+        End Using
     End Sub
 
     Private Sub ShowSettingsDialog()
