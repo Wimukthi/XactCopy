@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.2.7] - 2026-02-14
+
+### Changed
+
+- Settings dialog now tracks dirty state live and keeps `Save` disabled until there are actual changes.
+- Restart-required settings are now identified during save, with a clear reason list shown to the user.
+
+### Fixed
+
+- Theme mode changes are now treated as restart-required for full startup-level color-mode consistency.
+- After saving restart-required settings, XactCopy now offers immediate relaunch (or defers safely if a run is active).
+
 ## [1.0.2.4] - 2026-02-13
 
 ### Added

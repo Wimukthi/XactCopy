@@ -680,6 +680,9 @@ Public Class MainForm
                 Return
             End If
 
+            Dim requiresRestart = dialog.RequiresApplicationRestart
+            Dim restartReasonText = dialog.RestartReasonText
+
             _settings = dialog.ResultSettings
             _settingsStore.Save(_settings)
             SyncExplorerIntegration(announceResult:=True)
@@ -689,7 +692,54 @@ Public Class MainForm
             UpdateCheckMenuCaption()
             UpdateRecoveryMenuState()
             AppendLog("Settings saved.")
+
+            If requiresRestart Then
+                OfferRestartAfterSettingsChange(restartReasonText)
+            End If
         End Using
+    End Sub
+
+    Private Sub OfferRestartAfterSettingsChange(reasonText As String)
+        Dim reasonDetails = If(String.IsNullOrWhiteSpace(reasonText), "- Startup behavior settings", reasonText)
+        Dim message = "Some settings apply only after restarting XactCopy:" & Environment.NewLine &
+            reasonDetails
+
+        If _isRunning Then
+            MessageBox.Show(
+                Me,
+                message & Environment.NewLine & Environment.NewLine &
+                "Restart after the current copy run completes.",
+                "XactCopy",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information)
+            AppendLog("Restart-required settings saved. Restart XactCopy after the current run to apply them fully.")
+            Return
+        End If
+
+        Dim response = MessageBox.Show(
+            Me,
+            message & Environment.NewLine & Environment.NewLine & "Restart now?",
+            "XactCopy",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question)
+
+        If response = DialogResult.Yes Then
+            RestartApplication()
+        End If
+    End Sub
+
+    Private Sub RestartApplication()
+        Try
+            Dim startInfo As New ProcessStartInfo(Application.ExecutablePath) With {
+                .UseShellExecute = True,
+                .WorkingDirectory = AppContext.BaseDirectory
+            }
+            Process.Start(startInfo)
+            Close()
+        Catch ex As Exception
+            AppendLog($"Restart failed: {ex.Message}")
+            MessageBox.Show(Me, $"Unable to restart automatically: {ex.Message}", "XactCopy", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+        End Try
     End Sub
 
     Private Sub SaveCurrentOptionsAsJob()

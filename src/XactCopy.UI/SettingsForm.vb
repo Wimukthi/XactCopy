@@ -71,6 +71,11 @@ Friend Class SettingsForm
     }
 
     Private ReadOnly _workingSettings As AppSettings
+    Private ReadOnly _originalSettings As AppSettings
+    Private _hasChanges As Boolean
+    Private _requiresRestart As Boolean
+    Private _restartReasonText As String = String.Empty
+    Private _suspendDirtyTracking As Boolean
 
     Public Sub New(settings As AppSettings)
         If settings Is Nothing Then
@@ -78,6 +83,7 @@ Friend Class SettingsForm
         End If
 
         _workingSettings = CloneSettings(settings)
+        _originalSettings = CloneSettings(settings)
 
         Text = "Settings"
         StartPosition = FormStartPosition.CenterParent
@@ -87,6 +93,7 @@ Friend Class SettingsForm
 
         BuildUi()
         ConfigureToolTips()
+        WireDirtyTracking(Controls)
         ApplySettingsToControls()
 
         AddHandler Shown, AddressOf SettingsForm_Shown
@@ -96,6 +103,24 @@ Friend Class SettingsForm
     Public ReadOnly Property ResultSettings As AppSettings
         Get
             Return CloneSettings(_workingSettings)
+        End Get
+    End Property
+
+    Public ReadOnly Property HasChanges As Boolean
+        Get
+            Return _hasChanges
+        End Get
+    End Property
+
+    Public ReadOnly Property RequiresApplicationRestart As Boolean
+        Get
+            Return _requiresRestart
+        End Get
+    End Property
+
+    Public ReadOnly Property RestartReasonText As String
+        Get
+            Return _restartReasonText
         End Get
     End Property
 
@@ -143,6 +168,37 @@ Friend Class SettingsForm
         Controls.Add(rootLayout)
         AcceptButton = _okButton
         CancelButton = _cancelButton
+    End Sub
+
+    Private Sub WireDirtyTracking(controlCollection As Control.ControlCollection)
+        If controlCollection Is Nothing Then
+            Return
+        End If
+
+        For Each control As Control In controlCollection
+            If TypeOf control Is CheckBox Then
+                AddHandler DirectCast(control, CheckBox).CheckedChanged, AddressOf InputControl_Changed
+            ElseIf TypeOf control Is ComboBox Then
+                AddHandler DirectCast(control, ComboBox).SelectedIndexChanged, AddressOf InputControl_Changed
+                AddHandler DirectCast(control, ComboBox).TextChanged, AddressOf InputControl_Changed
+            ElseIf TypeOf control Is TextBox Then
+                AddHandler DirectCast(control, TextBox).TextChanged, AddressOf InputControl_Changed
+            ElseIf TypeOf control Is NumericUpDown Then
+                AddHandler DirectCast(control, NumericUpDown).ValueChanged, AddressOf InputControl_Changed
+            End If
+
+            If control.HasChildren Then
+                WireDirtyTracking(control.Controls)
+            End If
+        Next
+    End Sub
+
+    Private Sub InputControl_Changed(sender As Object, e As EventArgs)
+        If _suspendDirtyTracking Then
+            Return
+        End If
+
+        UpdateDirtyState()
     End Sub
 
     Private Sub ConfigureToolTips()
@@ -708,111 +764,305 @@ Friend Class SettingsForm
     End Sub
 
     Private Sub ApplySettingsToControls()
-        _checkUpdatesOnLaunchCheckBox.Checked = _workingSettings.CheckUpdatesOnLaunch
-        _updateUrlTextBox.Text = If(_workingSettings.UpdateReleaseUrl, String.Empty)
-        _userAgentTextBox.Text = If(_workingSettings.UserAgent, String.Empty)
+        _suspendDirtyTracking = True
+        Try
+            _checkUpdatesOnLaunchCheckBox.Checked = _workingSettings.CheckUpdatesOnLaunch
+            _updateUrlTextBox.Text = If(_workingSettings.UpdateReleaseUrl, String.Empty)
+            _userAgentTextBox.Text = If(_workingSettings.UserAgent, String.Empty)
 
-        _enableRecoveryAutostartCheckBox.Checked = _workingSettings.EnableRecoveryAutostart
-        _promptResumeAfterCrashCheckBox.Checked = _workingSettings.PromptResumeAfterCrash
-        _autoResumeAfterCrashCheckBox.Checked = _workingSettings.AutoResumeAfterCrash
-        _keepResumePromptCheckBox.Checked = _workingSettings.KeepResumePromptUntilResolved
-        _autoRunQueuedOnStartupCheckBox.Checked = _workingSettings.AutoRunQueuedJobsOnStartup
-        _recoveryTouchIntervalNumeric.Value = ClampNumeric(_recoveryTouchIntervalNumeric, _workingSettings.RecoveryTouchIntervalSeconds)
+            _enableRecoveryAutostartCheckBox.Checked = _workingSettings.EnableRecoveryAutostart
+            _promptResumeAfterCrashCheckBox.Checked = _workingSettings.PromptResumeAfterCrash
+            _autoResumeAfterCrashCheckBox.Checked = _workingSettings.AutoResumeAfterCrash
+            _keepResumePromptCheckBox.Checked = _workingSettings.KeepResumePromptUntilResolved
+            _autoRunQueuedOnStartupCheckBox.Checked = _workingSettings.AutoRunQueuedJobsOnStartup
+            _recoveryTouchIntervalNumeric.Value = ClampNumeric(_recoveryTouchIntervalNumeric, _workingSettings.RecoveryTouchIntervalSeconds)
 
-        _enableExplorerContextMenuCheckBox.Checked = _workingSettings.EnableExplorerContextMenu
+            _enableExplorerContextMenuCheckBox.Checked = _workingSettings.EnableExplorerContextMenu
 
-        _defaultResumeCheckBox.Checked = _workingSettings.DefaultResumeFromJournal
-        _defaultSalvageCheckBox.Checked = _workingSettings.DefaultSalvageUnreadableBlocks
-        _defaultContinueOnErrorCheckBox.Checked = _workingSettings.DefaultContinueOnFileError
-        _defaultPreserveTimestampsCheckBox.Checked = _workingSettings.DefaultPreserveTimestamps
-        _defaultCopyEmptyDirectoriesCheckBox.Checked = _workingSettings.DefaultCopyEmptyDirectories
-        _defaultWaitForMediaCheckBox.Checked = _workingSettings.DefaultWaitForMediaAvailability
+            _defaultResumeCheckBox.Checked = _workingSettings.DefaultResumeFromJournal
+            _defaultSalvageCheckBox.Checked = _workingSettings.DefaultSalvageUnreadableBlocks
+            _defaultContinueOnErrorCheckBox.Checked = _workingSettings.DefaultContinueOnFileError
+            _defaultPreserveTimestampsCheckBox.Checked = _workingSettings.DefaultPreserveTimestamps
+            _defaultCopyEmptyDirectoriesCheckBox.Checked = _workingSettings.DefaultCopyEmptyDirectories
+            _defaultWaitForMediaCheckBox.Checked = _workingSettings.DefaultWaitForMediaAvailability
 
-        _defaultAdaptiveBufferCheckBox.Checked = _workingSettings.DefaultUseAdaptiveBuffer
-        _defaultBufferMbNumeric.Value = ClampNumeric(_defaultBufferMbNumeric, _workingSettings.DefaultBufferSizeMb)
-        _defaultRetriesNumeric.Value = ClampNumeric(_defaultRetriesNumeric, _workingSettings.DefaultMaxRetries)
-        _defaultOperationTimeoutNumeric.Value = ClampNumeric(_defaultOperationTimeoutNumeric, _workingSettings.DefaultOperationTimeoutSeconds)
-        _defaultPerFileTimeoutNumeric.Value = ClampNumeric(_defaultPerFileTimeoutNumeric, _workingSettings.DefaultPerFileTimeoutSeconds)
-        _defaultMaxThroughputNumeric.Value = ClampNumeric(_defaultMaxThroughputNumeric, _workingSettings.DefaultMaxThroughputMbPerSecond)
-        _rescueFastChunkKbNumeric.Value = ClampNumeric(_rescueFastChunkKbNumeric, _workingSettings.DefaultRescueFastScanChunkKb)
-        _rescueTrimChunkKbNumeric.Value = ClampNumeric(_rescueTrimChunkKbNumeric, _workingSettings.DefaultRescueTrimChunkKb)
-        _rescueScrapeChunkKbNumeric.Value = ClampNumeric(_rescueScrapeChunkKbNumeric, _workingSettings.DefaultRescueScrapeChunkKb)
-        _rescueRetryChunkKbNumeric.Value = ClampNumeric(_rescueRetryChunkKbNumeric, _workingSettings.DefaultRescueRetryChunkKb)
-        _rescueSplitMinimumKbNumeric.Value = ClampNumeric(_rescueSplitMinimumKbNumeric, _workingSettings.DefaultRescueSplitMinimumKb)
-        _rescueFastRetriesNumeric.Value = ClampNumeric(_rescueFastRetriesNumeric, _workingSettings.DefaultRescueFastScanRetries)
-        _rescueTrimRetriesNumeric.Value = ClampNumeric(_rescueTrimRetriesNumeric, _workingSettings.DefaultRescueTrimRetries)
-        _rescueScrapeRetriesNumeric.Value = ClampNumeric(_rescueScrapeRetriesNumeric, _workingSettings.DefaultRescueScrapeRetries)
+            _defaultAdaptiveBufferCheckBox.Checked = _workingSettings.DefaultUseAdaptiveBuffer
+            _defaultBufferMbNumeric.Value = ClampNumeric(_defaultBufferMbNumeric, _workingSettings.DefaultBufferSizeMb)
+            _defaultRetriesNumeric.Value = ClampNumeric(_defaultRetriesNumeric, _workingSettings.DefaultMaxRetries)
+            _defaultOperationTimeoutNumeric.Value = ClampNumeric(_defaultOperationTimeoutNumeric, _workingSettings.DefaultOperationTimeoutSeconds)
+            _defaultPerFileTimeoutNumeric.Value = ClampNumeric(_defaultPerFileTimeoutNumeric, _workingSettings.DefaultPerFileTimeoutSeconds)
+            _defaultMaxThroughputNumeric.Value = ClampNumeric(_defaultMaxThroughputNumeric, _workingSettings.DefaultMaxThroughputMbPerSecond)
+            _rescueFastChunkKbNumeric.Value = ClampNumeric(_rescueFastChunkKbNumeric, _workingSettings.DefaultRescueFastScanChunkKb)
+            _rescueTrimChunkKbNumeric.Value = ClampNumeric(_rescueTrimChunkKbNumeric, _workingSettings.DefaultRescueTrimChunkKb)
+            _rescueScrapeChunkKbNumeric.Value = ClampNumeric(_rescueScrapeChunkKbNumeric, _workingSettings.DefaultRescueScrapeChunkKb)
+            _rescueRetryChunkKbNumeric.Value = ClampNumeric(_rescueRetryChunkKbNumeric, _workingSettings.DefaultRescueRetryChunkKb)
+            _rescueSplitMinimumKbNumeric.Value = ClampNumeric(_rescueSplitMinimumKbNumeric, _workingSettings.DefaultRescueSplitMinimumKb)
+            _rescueFastRetriesNumeric.Value = ClampNumeric(_rescueFastRetriesNumeric, _workingSettings.DefaultRescueFastScanRetries)
+            _rescueTrimRetriesNumeric.Value = ClampNumeric(_rescueTrimRetriesNumeric, _workingSettings.DefaultRescueTrimRetries)
+            _rescueScrapeRetriesNumeric.Value = ClampNumeric(_rescueScrapeRetriesNumeric, _workingSettings.DefaultRescueScrapeRetries)
 
-        _defaultVerifyCheckBox.Checked = _workingSettings.DefaultVerifyAfterCopy
-        _sampleChunkKbNumeric.Value = ClampNumeric(_sampleChunkKbNumeric, _workingSettings.DefaultSampleVerificationChunkKb)
-        _sampleChunkCountNumeric.Value = ClampNumeric(_sampleChunkCountNumeric, _workingSettings.DefaultSampleVerificationChunkCount)
+            _defaultVerifyCheckBox.Checked = _workingSettings.DefaultVerifyAfterCopy
+            _sampleChunkKbNumeric.Value = ClampNumeric(_sampleChunkKbNumeric, _workingSettings.DefaultSampleVerificationChunkKb)
+            _sampleChunkCountNumeric.Value = ClampNumeric(_sampleChunkCountNumeric, _workingSettings.DefaultSampleVerificationChunkCount)
 
-        Select Case ThemeSettings.GetPreferredColorMode(_workingSettings)
-            Case SystemColorMode.Dark
-                _themeComboBox.SelectedItem = "Dark"
-            Case SystemColorMode.Classic
-                _themeComboBox.SelectedItem = "Classic"
+            Select Case ThemeSettings.GetPreferredColorMode(_workingSettings)
+                Case SystemColorMode.Dark
+                    _themeComboBox.SelectedItem = "Dark"
+                Case SystemColorMode.Classic
+                    _themeComboBox.SelectedItem = "Classic"
+                Case Else
+                    _themeComboBox.SelectedItem = "System"
+            End Select
+
+            Select Case SettingsValueConverter.ToOverwritePolicy(_workingSettings.DefaultOverwritePolicy)
+                Case OverwritePolicy.SkipExisting
+                    _overwritePolicyComboBox.SelectedIndex = 1
+                Case OverwritePolicy.OverwriteIfSourceNewer
+                    _overwritePolicyComboBox.SelectedIndex = 2
+                Case Else
+                    _overwritePolicyComboBox.SelectedIndex = 0
+            End Select
+
+            Select Case SettingsValueConverter.ToSymlinkHandling(_workingSettings.DefaultSymlinkHandling)
+                Case SymlinkHandlingMode.Follow
+                    _symlinkHandlingComboBox.SelectedIndex = 1
+                Case Else
+                    _symlinkHandlingComboBox.SelectedIndex = 0
+            End Select
+
+            Select Case SettingsValueConverter.ToSalvageFillPattern(_workingSettings.DefaultSalvageFillPattern)
+                Case SalvageFillPattern.Ones
+                    _salvageFillPatternComboBox.SelectedIndex = 1
+                Case SalvageFillPattern.Random
+                    _salvageFillPatternComboBox.SelectedIndex = 2
+                Case Else
+                    _salvageFillPatternComboBox.SelectedIndex = 0
+            End Select
+
+            Select Case SettingsValueConverter.ToVerificationMode(_workingSettings.DefaultVerificationMode)
+                Case VerificationMode.Sampled
+                    _defaultVerificationModeComboBox.SelectedIndex = 1
+                Case Else
+                    _defaultVerificationModeComboBox.SelectedIndex = 0
+            End Select
+
+            Select Case SettingsValueConverter.ToVerificationHashAlgorithm(_workingSettings.DefaultVerificationHashAlgorithm)
+                Case VerificationHashAlgorithm.Sha512
+                    _defaultHashAlgorithmComboBox.SelectedIndex = 1
+                Case Else
+                    _defaultHashAlgorithmComboBox.SelectedIndex = 0
+            End Select
+
+            Select Case SettingsValueConverter.ToExplorerSelectionMode(_workingSettings.ExplorerSelectionMode)
+                Case ExplorerSelectionMode.SourceFolder
+                    _explorerSelectionModeComboBox.SelectedIndex = 1
+                Case Else
+                    _explorerSelectionModeComboBox.SelectedIndex = 0
+            End Select
+
+            EnsureSelection(_themeComboBox)
+            EnsureSelection(_overwritePolicyComboBox)
+            EnsureSelection(_symlinkHandlingComboBox)
+            EnsureSelection(_salvageFillPatternComboBox)
+            EnsureSelection(_defaultVerificationModeComboBox)
+            EnsureSelection(_defaultHashAlgorithmComboBox)
+            EnsureSelection(_explorerSelectionModeComboBox)
+
+            UpdateRecoveryControlStates()
+            UpdateVerificationControlStates()
+            UpdateExplorerControlStates()
+        Finally
+            _suspendDirtyTracking = False
+        End Try
+
+        UpdateDirtyState()
+    End Sub
+
+    Private Sub UpdateDirtyState()
+        If _suspendDirtyTracking Then
+            Return
+        End If
+
+        Dim capturedSettings As AppSettings = Nothing
+        If Not TryCaptureSettingsFromControls(capturedSettings, validateInput:=False, showValidationErrors:=False) Then
+            _hasChanges = False
+            _okButton.Enabled = False
+            Return
+        End If
+
+        _hasChanges = Not AreSettingsEqual(_originalSettings, capturedSettings)
+        _okButton.Enabled = _hasChanges
+    End Sub
+
+    Private Function TryCaptureSettingsFromControls(
+        ByRef capturedSettings As AppSettings,
+        validateInput As Boolean,
+        showValidationErrors As Boolean) As Boolean
+
+        Dim updateUrl = _updateUrlTextBox.Text.Trim()
+        If validateInput AndAlso updateUrl.Length > 0 AndAlso Not IsValidHttpUrl(updateUrl) Then
+            If showValidationErrors Then
+                MessageBox.Show(Me, "Release URL must be an absolute http/https URL.", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                _updateUrlTextBox.Focus()
+            End If
+            capturedSettings = Nothing
+            Return False
+        End If
+
+        Dim overwritePolicyIndex = If(_overwritePolicyComboBox.SelectedIndex >= 0, _overwritePolicyComboBox.SelectedIndex, 0)
+        Dim symlinkHandlingIndex = If(_symlinkHandlingComboBox.SelectedIndex >= 0, _symlinkHandlingComboBox.SelectedIndex, 0)
+        Dim salvagePatternIndex = If(_salvageFillPatternComboBox.SelectedIndex >= 0, _salvageFillPatternComboBox.SelectedIndex, 0)
+        Dim verificationModeIndex = If(_defaultVerificationModeComboBox.SelectedIndex >= 0, _defaultVerificationModeComboBox.SelectedIndex, 0)
+        Dim hashAlgorithmIndex = If(_defaultHashAlgorithmComboBox.SelectedIndex >= 0, _defaultHashAlgorithmComboBox.SelectedIndex, 0)
+        Dim explorerSelectionModeIndex = If(_explorerSelectionModeComboBox.SelectedIndex >= 0, _explorerSelectionModeComboBox.SelectedIndex, 0)
+
+        capturedSettings = CloneSettings(_workingSettings)
+        capturedSettings.Theme = ThemeSettings.ModeToString(GetSelectedMode())
+        capturedSettings.CheckUpdatesOnLaunch = _checkUpdatesOnLaunchCheckBox.Checked
+        capturedSettings.UpdateReleaseUrl = updateUrl
+        capturedSettings.UserAgent = _userAgentTextBox.Text.Trim()
+
+        capturedSettings.EnableRecoveryAutostart = _enableRecoveryAutostartCheckBox.Checked
+        capturedSettings.AutoResumeAfterCrash = _autoResumeAfterCrashCheckBox.Checked
+        capturedSettings.PromptResumeAfterCrash = If(_autoResumeAfterCrashCheckBox.Checked, True, _promptResumeAfterCrashCheckBox.Checked)
+        capturedSettings.KeepResumePromptUntilResolved = If(_autoResumeAfterCrashCheckBox.Checked, False, _keepResumePromptCheckBox.Checked)
+        capturedSettings.AutoRunQueuedJobsOnStartup = _autoRunQueuedOnStartupCheckBox.Checked
+        capturedSettings.RecoveryTouchIntervalSeconds = CInt(_recoveryTouchIntervalNumeric.Value)
+
+        capturedSettings.EnableExplorerContextMenu = _enableExplorerContextMenuCheckBox.Checked
+        capturedSettings.ExplorerSelectionMode = If(explorerSelectionModeIndex = 1,
+                                                    SettingsValueConverter.ExplorerSelectionModeToString(ExplorerSelectionMode.SourceFolder),
+                                                    SettingsValueConverter.ExplorerSelectionModeToString(ExplorerSelectionMode.SelectedItems))
+
+        capturedSettings.DefaultResumeFromJournal = _defaultResumeCheckBox.Checked
+        capturedSettings.DefaultSalvageUnreadableBlocks = _defaultSalvageCheckBox.Checked
+        capturedSettings.DefaultContinueOnFileError = _defaultContinueOnErrorCheckBox.Checked
+        capturedSettings.DefaultPreserveTimestamps = _defaultPreserveTimestampsCheckBox.Checked
+        capturedSettings.DefaultCopyEmptyDirectories = _defaultCopyEmptyDirectoriesCheckBox.Checked
+        capturedSettings.DefaultWaitForMediaAvailability = _defaultWaitForMediaCheckBox.Checked
+        capturedSettings.DefaultUseAdaptiveBuffer = _defaultAdaptiveBufferCheckBox.Checked
+        capturedSettings.DefaultBufferSizeMb = CInt(_defaultBufferMbNumeric.Value)
+        capturedSettings.DefaultMaxRetries = CInt(_defaultRetriesNumeric.Value)
+        capturedSettings.DefaultOperationTimeoutSeconds = CInt(_defaultOperationTimeoutNumeric.Value)
+        capturedSettings.DefaultPerFileTimeoutSeconds = CInt(_defaultPerFileTimeoutNumeric.Value)
+        capturedSettings.DefaultMaxThroughputMbPerSecond = CInt(_defaultMaxThroughputNumeric.Value)
+        capturedSettings.DefaultRescueFastScanChunkKb = CInt(_rescueFastChunkKbNumeric.Value)
+        capturedSettings.DefaultRescueTrimChunkKb = CInt(_rescueTrimChunkKbNumeric.Value)
+        capturedSettings.DefaultRescueScrapeChunkKb = CInt(_rescueScrapeChunkKbNumeric.Value)
+        capturedSettings.DefaultRescueRetryChunkKb = CInt(_rescueRetryChunkKbNumeric.Value)
+        capturedSettings.DefaultRescueSplitMinimumKb = CInt(_rescueSplitMinimumKbNumeric.Value)
+        capturedSettings.DefaultRescueFastScanRetries = CInt(_rescueFastRetriesNumeric.Value)
+        capturedSettings.DefaultRescueTrimRetries = CInt(_rescueTrimRetriesNumeric.Value)
+        capturedSettings.DefaultRescueScrapeRetries = CInt(_rescueScrapeRetriesNumeric.Value)
+
+        Select Case overwritePolicyIndex
+            Case 1
+                capturedSettings.DefaultOverwritePolicy = SettingsValueConverter.OverwritePolicyToString(OverwritePolicy.SkipExisting)
+            Case 2
+                capturedSettings.DefaultOverwritePolicy = SettingsValueConverter.OverwritePolicyToString(OverwritePolicy.OverwriteIfSourceNewer)
             Case Else
-                _themeComboBox.SelectedItem = "System"
+                capturedSettings.DefaultOverwritePolicy = SettingsValueConverter.OverwritePolicyToString(OverwritePolicy.Overwrite)
         End Select
 
-        Select Case SettingsValueConverter.ToOverwritePolicy(_workingSettings.DefaultOverwritePolicy)
-            Case OverwritePolicy.SkipExisting
-                _overwritePolicyComboBox.SelectedIndex = 1
-            Case OverwritePolicy.OverwriteIfSourceNewer
-                _overwritePolicyComboBox.SelectedIndex = 2
+        Select Case symlinkHandlingIndex
+            Case 1
+                capturedSettings.DefaultSymlinkHandling = SettingsValueConverter.SymlinkHandlingToString(SymlinkHandlingMode.Follow)
             Case Else
-                _overwritePolicyComboBox.SelectedIndex = 0
+                capturedSettings.DefaultSymlinkHandling = SettingsValueConverter.SymlinkHandlingToString(SymlinkHandlingMode.Skip)
         End Select
 
-        Select Case SettingsValueConverter.ToSymlinkHandling(_workingSettings.DefaultSymlinkHandling)
-            Case SymlinkHandlingMode.Follow
-                _symlinkHandlingComboBox.SelectedIndex = 1
+        Select Case salvagePatternIndex
+            Case 1
+                capturedSettings.DefaultSalvageFillPattern = SettingsValueConverter.SalvageFillPatternToString(SalvageFillPattern.Ones)
+            Case 2
+                capturedSettings.DefaultSalvageFillPattern = SettingsValueConverter.SalvageFillPatternToString(SalvageFillPattern.Random)
             Case Else
-                _symlinkHandlingComboBox.SelectedIndex = 0
+                capturedSettings.DefaultSalvageFillPattern = SettingsValueConverter.SalvageFillPatternToString(SalvageFillPattern.Zero)
         End Select
 
-        Select Case SettingsValueConverter.ToSalvageFillPattern(_workingSettings.DefaultSalvageFillPattern)
-            Case SalvageFillPattern.Ones
-                _salvageFillPatternComboBox.SelectedIndex = 1
-            Case SalvageFillPattern.Random
-                _salvageFillPatternComboBox.SelectedIndex = 2
-            Case Else
-                _salvageFillPatternComboBox.SelectedIndex = 0
-        End Select
+        capturedSettings.DefaultVerifyAfterCopy = _defaultVerifyCheckBox.Checked
+        capturedSettings.DefaultVerificationMode = If(verificationModeIndex = 1,
+                                                      SettingsValueConverter.VerificationModeToString(VerificationMode.Sampled),
+                                                      SettingsValueConverter.VerificationModeToString(VerificationMode.Full))
+        capturedSettings.DefaultVerificationHashAlgorithm = If(hashAlgorithmIndex = 1,
+                                                               SettingsValueConverter.VerificationHashAlgorithmToString(VerificationHashAlgorithm.Sha512),
+                                                               SettingsValueConverter.VerificationHashAlgorithmToString(VerificationHashAlgorithm.Sha256))
+        capturedSettings.DefaultSampleVerificationChunkKb = CInt(_sampleChunkKbNumeric.Value)
+        capturedSettings.DefaultSampleVerificationChunkCount = CInt(_sampleChunkCountNumeric.Value)
+        Return True
+    End Function
 
-        Select Case SettingsValueConverter.ToVerificationMode(_workingSettings.DefaultVerificationMode)
-            Case VerificationMode.Sampled
-                _defaultVerificationModeComboBox.SelectedIndex = 1
-            Case Else
-                _defaultVerificationModeComboBox.SelectedIndex = 0
-        End Select
+    Private Shared Function BuildRestartRequirementSummary(original As AppSettings, updated As AppSettings) As String
+        If original Is Nothing OrElse updated Is Nothing Then
+            Return String.Empty
+        End If
 
-        Select Case SettingsValueConverter.ToVerificationHashAlgorithm(_workingSettings.DefaultVerificationHashAlgorithm)
-            Case VerificationHashAlgorithm.Sha512
-                _defaultHashAlgorithmComboBox.SelectedIndex = 1
-            Case Else
-                _defaultHashAlgorithmComboBox.SelectedIndex = 0
-        End Select
+        Dim reasons As New List(Of String)()
 
-        Select Case SettingsValueConverter.ToExplorerSelectionMode(_workingSettings.ExplorerSelectionMode)
-            Case ExplorerSelectionMode.SourceFolder
-                _explorerSelectionModeComboBox.SelectedIndex = 1
-            Case Else
-                _explorerSelectionModeComboBox.SelectedIndex = 0
-        End Select
+        If Not String.Equals(original.Theme, updated.Theme, StringComparison.OrdinalIgnoreCase) Then
+            reasons.Add("Application theme mode")
+        End If
 
-        EnsureSelection(_themeComboBox)
-        EnsureSelection(_overwritePolicyComboBox)
-        EnsureSelection(_symlinkHandlingComboBox)
-        EnsureSelection(_salvageFillPatternComboBox)
-        EnsureSelection(_defaultVerificationModeComboBox)
-        EnsureSelection(_defaultHashAlgorithmComboBox)
-        EnsureSelection(_explorerSelectionModeComboBox)
+        If original.CheckUpdatesOnLaunch <> updated.CheckUpdatesOnLaunch Then
+            reasons.Add("Startup update-check behavior")
+        End If
 
-        UpdateRecoveryControlStates()
-        UpdateVerificationControlStates()
-        UpdateExplorerControlStates()
+        If original.EnableRecoveryAutostart <> updated.EnableRecoveryAutostart Then
+            reasons.Add("Recovery auto-start behavior")
+        End If
+
+        If original.AutoRunQueuedJobsOnStartup <> updated.AutoRunQueuedJobsOnStartup Then
+            reasons.Add("Startup queued-jobs behavior")
+        End If
+
+        If original.PromptResumeAfterCrash <> updated.PromptResumeAfterCrash OrElse
+            original.AutoResumeAfterCrash <> updated.AutoResumeAfterCrash OrElse
+            original.KeepResumePromptUntilResolved <> updated.KeepResumePromptUntilResolved Then
+            reasons.Add("Interrupted-run startup handling")
+        End If
+
+        If reasons.Count = 0 Then
+            Return String.Empty
+        End If
+
+        Dim lines As New List(Of String)()
+        For Each reason In reasons
+            lines.Add($"- {reason}")
+        Next
+
+        Return String.Join(Environment.NewLine, lines)
+    End Function
+
+    Private Shared Function AreSettingsEqual(left As AppSettings, right As AppSettings) As Boolean
+        If left Is right Then
+            Return True
+        End If
+
+        If left Is Nothing OrElse right Is Nothing Then
+            Return False
+        End If
+
+        For Each propertyInfo In GetType(AppSettings).GetProperties(System.Reflection.BindingFlags.Public Or System.Reflection.BindingFlags.Instance)
+            Dim leftValue = propertyInfo.GetValue(left)
+            Dim rightValue = propertyInfo.GetValue(right)
+            If Not Object.Equals(leftValue, rightValue) Then
+                Return False
+            End If
+        Next
+
+        Return True
+    End Function
+
+    Private Shared Sub CopySettings(source As AppSettings, target As AppSettings)
+        If source Is Nothing OrElse target Is Nothing Then
+            Return
+        End If
+
+        For Each propertyInfo In GetType(AppSettings).GetProperties(System.Reflection.BindingFlags.Public Or System.Reflection.BindingFlags.Instance)
+            If propertyInfo.CanRead AndAlso propertyInfo.CanWrite Then
+                propertyInfo.SetValue(target, propertyInfo.GetValue(source))
+            End If
+        Next
     End Sub
     Private Shared Function ClampNumeric(control As ThemedNumericUpDown, value As Integer) As Decimal
         Dim candidate As Decimal = value
@@ -869,85 +1119,20 @@ Friend Class SettingsForm
     End Sub
 
     Private Sub OkButton_Click(sender As Object, e As EventArgs)
-        Dim updateUrl = _updateUrlTextBox.Text.Trim()
-        If updateUrl.Length > 0 AndAlso Not IsValidHttpUrl(updateUrl) Then
-            MessageBox.Show(Me, "Release URL must be an absolute http/https URL.", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Warning)
-            _updateUrlTextBox.Focus()
+        Dim capturedSettings As AppSettings = Nothing
+        If Not TryCaptureSettingsFromControls(capturedSettings, validateInput:=True, showValidationErrors:=True) Then
             Return
         End If
 
-        _workingSettings.Theme = ThemeSettings.ModeToString(GetSelectedMode())
-        _workingSettings.CheckUpdatesOnLaunch = _checkUpdatesOnLaunchCheckBox.Checked
-        _workingSettings.UpdateReleaseUrl = updateUrl
-        _workingSettings.UserAgent = _userAgentTextBox.Text.Trim()
+        _hasChanges = Not AreSettingsEqual(_originalSettings, capturedSettings)
+        If Not _hasChanges Then
+            Return
+        End If
 
-        _workingSettings.EnableRecoveryAutostart = _enableRecoveryAutostartCheckBox.Checked
-        _workingSettings.AutoResumeAfterCrash = _autoResumeAfterCrashCheckBox.Checked
-        _workingSettings.PromptResumeAfterCrash = If(_autoResumeAfterCrashCheckBox.Checked, True, _promptResumeAfterCrashCheckBox.Checked)
-        _workingSettings.KeepResumePromptUntilResolved = If(_autoResumeAfterCrashCheckBox.Checked, False, _keepResumePromptCheckBox.Checked)
-        _workingSettings.AutoRunQueuedJobsOnStartup = _autoRunQueuedOnStartupCheckBox.Checked
-        _workingSettings.RecoveryTouchIntervalSeconds = CInt(_recoveryTouchIntervalNumeric.Value)
+        _restartReasonText = BuildRestartRequirementSummary(_originalSettings, capturedSettings)
+        _requiresRestart = Not String.IsNullOrWhiteSpace(_restartReasonText)
 
-        _workingSettings.EnableExplorerContextMenu = _enableExplorerContextMenuCheckBox.Checked
-        _workingSettings.ExplorerSelectionMode = If(_explorerSelectionModeComboBox.SelectedIndex = 1,
-                                                    SettingsValueConverter.ExplorerSelectionModeToString(ExplorerSelectionMode.SourceFolder),
-                                                    SettingsValueConverter.ExplorerSelectionModeToString(ExplorerSelectionMode.SelectedItems))
-
-        _workingSettings.DefaultResumeFromJournal = _defaultResumeCheckBox.Checked
-        _workingSettings.DefaultSalvageUnreadableBlocks = _defaultSalvageCheckBox.Checked
-        _workingSettings.DefaultContinueOnFileError = _defaultContinueOnErrorCheckBox.Checked
-        _workingSettings.DefaultPreserveTimestamps = _defaultPreserveTimestampsCheckBox.Checked
-        _workingSettings.DefaultCopyEmptyDirectories = _defaultCopyEmptyDirectoriesCheckBox.Checked
-        _workingSettings.DefaultWaitForMediaAvailability = _defaultWaitForMediaCheckBox.Checked
-        _workingSettings.DefaultUseAdaptiveBuffer = _defaultAdaptiveBufferCheckBox.Checked
-        _workingSettings.DefaultBufferSizeMb = CInt(_defaultBufferMbNumeric.Value)
-        _workingSettings.DefaultMaxRetries = CInt(_defaultRetriesNumeric.Value)
-        _workingSettings.DefaultOperationTimeoutSeconds = CInt(_defaultOperationTimeoutNumeric.Value)
-        _workingSettings.DefaultPerFileTimeoutSeconds = CInt(_defaultPerFileTimeoutNumeric.Value)
-        _workingSettings.DefaultMaxThroughputMbPerSecond = CInt(_defaultMaxThroughputNumeric.Value)
-        _workingSettings.DefaultRescueFastScanChunkKb = CInt(_rescueFastChunkKbNumeric.Value)
-        _workingSettings.DefaultRescueTrimChunkKb = CInt(_rescueTrimChunkKbNumeric.Value)
-        _workingSettings.DefaultRescueScrapeChunkKb = CInt(_rescueScrapeChunkKbNumeric.Value)
-        _workingSettings.DefaultRescueRetryChunkKb = CInt(_rescueRetryChunkKbNumeric.Value)
-        _workingSettings.DefaultRescueSplitMinimumKb = CInt(_rescueSplitMinimumKbNumeric.Value)
-        _workingSettings.DefaultRescueFastScanRetries = CInt(_rescueFastRetriesNumeric.Value)
-        _workingSettings.DefaultRescueTrimRetries = CInt(_rescueTrimRetriesNumeric.Value)
-        _workingSettings.DefaultRescueScrapeRetries = CInt(_rescueScrapeRetriesNumeric.Value)
-
-        Select Case _overwritePolicyComboBox.SelectedIndex
-            Case 1
-                _workingSettings.DefaultOverwritePolicy = SettingsValueConverter.OverwritePolicyToString(OverwritePolicy.SkipExisting)
-            Case 2
-                _workingSettings.DefaultOverwritePolicy = SettingsValueConverter.OverwritePolicyToString(OverwritePolicy.OverwriteIfSourceNewer)
-            Case Else
-                _workingSettings.DefaultOverwritePolicy = SettingsValueConverter.OverwritePolicyToString(OverwritePolicy.Overwrite)
-        End Select
-
-        Select Case _symlinkHandlingComboBox.SelectedIndex
-            Case 1
-                _workingSettings.DefaultSymlinkHandling = SettingsValueConverter.SymlinkHandlingToString(SymlinkHandlingMode.Follow)
-            Case Else
-                _workingSettings.DefaultSymlinkHandling = SettingsValueConverter.SymlinkHandlingToString(SymlinkHandlingMode.Skip)
-        End Select
-
-        Select Case _salvageFillPatternComboBox.SelectedIndex
-            Case 1
-                _workingSettings.DefaultSalvageFillPattern = SettingsValueConverter.SalvageFillPatternToString(SalvageFillPattern.Ones)
-            Case 2
-                _workingSettings.DefaultSalvageFillPattern = SettingsValueConverter.SalvageFillPatternToString(SalvageFillPattern.Random)
-            Case Else
-                _workingSettings.DefaultSalvageFillPattern = SettingsValueConverter.SalvageFillPatternToString(SalvageFillPattern.Zero)
-        End Select
-
-        _workingSettings.DefaultVerifyAfterCopy = _defaultVerifyCheckBox.Checked
-        _workingSettings.DefaultVerificationMode = If(_defaultVerificationModeComboBox.SelectedIndex = 1,
-                                                      SettingsValueConverter.VerificationModeToString(VerificationMode.Sampled),
-                                                      SettingsValueConverter.VerificationModeToString(VerificationMode.Full))
-        _workingSettings.DefaultVerificationHashAlgorithm = If(_defaultHashAlgorithmComboBox.SelectedIndex = 1,
-                                                               SettingsValueConverter.VerificationHashAlgorithmToString(VerificationHashAlgorithm.Sha512),
-                                                               SettingsValueConverter.VerificationHashAlgorithmToString(VerificationHashAlgorithm.Sha256))
-        _workingSettings.DefaultSampleVerificationChunkKb = CInt(_sampleChunkKbNumeric.Value)
-        _workingSettings.DefaultSampleVerificationChunkCount = CInt(_sampleChunkCountNumeric.Value)
+        CopySettings(capturedSettings, _workingSettings)
 
         DialogResult = DialogResult.OK
         Close()

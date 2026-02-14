@@ -54,6 +54,7 @@ dotnet run --project src/XactCopy.UI/XactCopy.UI.vbproj
 
 ## Brief Version History
 
+- `v1.0.2.7` Settings now use live dirty-state save enablement, detect restart-required changes (including theme), and prompt to restart with safe defer behavior during active runs.
 - `v1.0.2.4` Added `AegisRescueCore` multi-pass rescue with range-aware journal resume, rescue telemetry/tuning, event-focused logging, and fixed high-speed UI progress rendering/finalization accuracy.
 - `v1.0.1.3` Fixed updater apply hang on `Canceling...` and improved release notes formatting in the update dialog.
 - `v1.0.0.9` Updater upgraded to download/apply releases in-app with progress, replacing page-only update prompts.
