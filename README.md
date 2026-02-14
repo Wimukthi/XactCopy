@@ -19,6 +19,16 @@ GNU GPL v3.0. See `LICENSE`.
 - Dark/system/classic theme support.
 - Built-in updater with download and in-place apply flow.
 
+## Screenshots
+
+### Main Window
+
+![XactCopy Main Window](docs/screenshots/main-window.png)
+
+### Settings (Appearance)
+
+![XactCopy Settings Appearance](docs/screenshots/settings-appearance.png)
+
 ## Repository Layout
 
 - `src/XactCopy.UI` WinForms GUI, theme, settings, shell integration.
@@ -54,6 +64,7 @@ dotnet run --project src/XactCopy.UI/XactCopy.UI.vbproj
 
 ## Brief Version History
 
+- `v1.0.3.7` Added README screenshots for main window and appearance settings, with image assets now tracked under `docs/screenshots`.
 - `v1.0.3.6` Added diagnostics + worker telemetry controls, virtualized and throttled runtime log rendering, expanded appearance customization (accent/density/scale/grid/progress/status rows/window chrome), explorer-launch destination prompt, and restart guidance for UI settings.
 - `v1.0.2.7` Settings now use live dirty-state save enablement, detect restart-required changes (including theme), and prompt to restart with safe defer behavior during active runs.
 - `v1.0.2.4` Added `AegisRescueCore` multi-pass rescue with range-aware journal resume, rescue telemetry/tuning, event-focused logging, and fixed high-speed UI progress rendering/finalization accuracy.

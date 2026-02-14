@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.3.7] - 2026-02-14
+
+### Added
+
+- README now includes a screenshots section for the main window and appearance settings page.
+- Screenshot assets were added under `docs/screenshots/` for release documentation.
+
 ## [1.0.3.6] - 2026-02-14
 
 ### Added
