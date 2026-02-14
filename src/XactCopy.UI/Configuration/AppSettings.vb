@@ -3,6 +3,20 @@ Namespace Configuration
         Public Const DefaultUpdateReleaseUrl As String = "https://api.github.com/repos/Wimukthi/XactCopy/releases/latest"
 
         Public Property Theme As String = "dark"
+        Public Property AccentColorMode As String = "auto"
+        Public Property AccentColorHex As String = "#5A78C8"
+        Public Property WindowChromeMode As String = "themed"
+        Public Property UiDensity As String = "normal"
+        Public Property UiScalePercent As Integer = 100
+        Public Property LogFontFamily As String = "Consolas"
+        Public Property LogFontSizePoints As Integer = 9
+        Public Property GridAlternatingRows As Boolean = True
+        Public Property GridRowHeight As Integer = 24
+        Public Property GridHeaderStyle As String = "default"
+        Public Property ProgressBarStyle As String = "standard"
+        Public Property ProgressBarShowPercentage As Boolean = False
+        Public Property ShowBufferStatusRow As Boolean = True
+        Public Property ShowRescueStatusRow As Boolean = True
 
         Public Property CheckUpdatesOnLaunch As Boolean = False
         Public Property UpdateReleaseUrl As String = DefaultUpdateReleaseUrl
@@ -31,6 +45,12 @@ Namespace Configuration
         Public Property DefaultMaxThroughputMbPerSecond As Integer = 0
         Public Property DefaultPreserveTimestamps As Boolean = True
         Public Property DefaultCopyEmptyDirectories As Boolean = True
+        Public Property WorkerTelemetryProfile As String = "normal"
+        Public Property WorkerProgressIntervalMs As Integer = 75
+        Public Property WorkerMaxLogsPerSecond As Integer = 100
+        Public Property UiShowDiagnostics As Boolean = True
+        Public Property UiDiagnosticsRefreshMs As Integer = 250
+        Public Property UiMaxLogLines As Integer = 50000
         Public Property DefaultOverwritePolicy As String = "overwrite"
         Public Property DefaultSymlinkHandling As String = "skip"
         Public Property DefaultRescueFastScanChunkKb As Integer = 0

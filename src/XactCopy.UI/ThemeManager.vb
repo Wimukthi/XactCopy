@@ -1,13 +1,17 @@
 Imports System.Drawing
 Imports System.Windows.Forms
+Imports XactCopy.Configuration
 
 Friend Module ThemeManager
-    Public Sub ApplyTheme(root As Control, mode As SystemColorMode)
-        Dim palette = ThemePalette.FromMode(mode)
-        ApplyToControl(root, palette)
+    Public Sub ApplyTheme(root As Control, mode As SystemColorMode, Optional settings As AppSettings = Nothing)
+        Dim safeSettings = If(settings, New AppSettings())
+        UiAppearanceManager.Apply(root, safeSettings)
+        Dim accentColor = ResolveAccentColor(mode, safeSettings)
+        Dim palette = ThemePalette.FromMode(mode, accentColor)
+        ApplyToControl(root, palette, mode, safeSettings)
     End Sub
 
-    Private Sub ApplyToControl(control As Control, palette As ThemePalette)
+    Private Sub ApplyToControl(control As Control, palette As ThemePalette, mode As SystemColorMode, settings As AppSettings)
         If control Is Nothing Then
             Return
         End If
@@ -20,6 +24,7 @@ Friend Module ThemeManager
             themedProgressBar.ShowBorder = False
             themedProgressBar.BackColor = themedProgressBar.TrackColor
             themedProgressBar.ForeColor = themedProgressBar.FillColor
+            themedProgressBar.PercentageTextColor = If(palette.IsDark, Color.Gainsboro, SystemColors.ControlText)
         ElseIf TypeOf control Is TextBox Then
             Dim textBox = DirectCast(control, TextBox)
             EnsureBorderWrapper(textBox, palette)
@@ -67,6 +72,12 @@ Friend Module ThemeManager
             listBox.BackColor = palette.Field
             listBox.ForeColor = palette.Text
             listBox.BorderStyle = BorderStyle.None
+        ElseIf TypeOf control Is ListView Then
+            Dim listView = DirectCast(control, ListView)
+            EnsureBorderWrapper(listView, palette)
+            listView.BackColor = palette.Field
+            listView.ForeColor = palette.Text
+            listView.BorderStyle = BorderStyle.None
         ElseIf TypeOf control Is ThemedGroupBox Then
             Dim themedGroup = DirectCast(control, ThemedGroupBox)
             themedGroup.BackColor = palette.Surface
@@ -104,9 +115,7 @@ Friend Module ThemeManager
                 .SelectionForeColor = If(palette.IsDark, palette.Text, SystemColors.HighlightText)
             }
             grid.DefaultCellStyle = cellStyle
-            grid.AlternatingRowsDefaultCellStyle = New DataGridViewCellStyle(cellStyle) With {
-                .BackColor = If(palette.IsDark, Color.FromArgb(40, 40, 40), palette.Field)
-            }
+            ApplyGridPresentationSettings(grid, palette, settings, cellStyle)
         ElseIf TypeOf control Is MenuStrip Then
             Dim menu = DirectCast(control, MenuStrip)
             menu.BackColor = palette.Surface
@@ -118,13 +127,74 @@ Friend Module ThemeManager
             If TypeOf control Is Form Then
                 control.BackColor = palette.Base
                 control.ForeColor = palette.Text
+                WindowChromeManager.Apply(DirectCast(control, Form), mode, settings)
             End If
         End If
 
         For Each child As Control In control.Controls
-            ApplyToControl(child, palette)
+            ApplyToControl(child, palette, mode, settings)
         Next
     End Sub
+
+    Private Sub ApplyGridPresentationSettings(grid As DataGridView, palette As ThemePalette, settings As AppSettings, baseCellStyle As DataGridViewCellStyle)
+        If grid Is Nothing Then
+            Return
+        End If
+
+        Dim safeSettings = If(settings, New AppSettings())
+        Dim alternatingEnabled = safeSettings.GridAlternatingRows
+        Dim rowHeight = Math.Max(18, Math.Min(48, safeSettings.GridRowHeight))
+        grid.RowTemplate.Height = rowHeight
+        grid.ScrollBars = ScrollBars.Both
+
+        Dim alternateBackColor = If(palette.IsDark, Color.FromArgb(40, 40, 40), palette.Field)
+        If alternatingEnabled Then
+            grid.AlternatingRowsDefaultCellStyle = New DataGridViewCellStyle(baseCellStyle) With {
+                .BackColor = alternateBackColor
+            }
+        Else
+            grid.AlternatingRowsDefaultCellStyle = New DataGridViewCellStyle(baseCellStyle) With {
+                .BackColor = baseCellStyle.BackColor
+            }
+        End If
+
+        Dim headerStyle = SettingsValueConverter.ToGridHeaderStyleChoice(safeSettings.GridHeaderStyle)
+        grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing
+
+        Select Case headerStyle
+            Case GridHeaderStyleChoice.Minimal
+                grid.ColumnHeadersHeight = Math.Max(22, rowHeight)
+                grid.ColumnHeadersDefaultCellStyle.Font = New Font(grid.Font, FontStyle.Regular)
+            Case GridHeaderStyleChoice.Prominent
+                grid.ColumnHeadersHeight = Math.Max(30, rowHeight + 8)
+                grid.ColumnHeadersDefaultCellStyle.Font = New Font(grid.Font, FontStyle.Bold)
+            Case Else
+                grid.ColumnHeadersHeight = Math.Max(26, rowHeight + 4)
+                grid.ColumnHeadersDefaultCellStyle.Font = New Font(grid.Font, FontStyle.Regular)
+        End Select
+    End Sub
+
+    Private Function ResolveAccentColor(mode As SystemColorMode, settings As AppSettings) As Color
+        Dim defaultDarkAccent = Color.FromArgb(90, 120, 200)
+        Dim systemAccent = SystemColors.Highlight
+        Dim accentMode = SettingsValueConverter.ToAccentColorModeChoice(settings.AccentColorMode)
+
+        Select Case accentMode
+            Case AccentColorModeChoice.System
+                Return systemAccent
+            Case AccentColorModeChoice.Custom
+                Dim parsed As Color = Nothing
+                If SettingsValueConverter.TryParseColorHex(settings.AccentColorHex, parsed) Then
+                    Return parsed
+                End If
+                Return defaultDarkAccent
+            Case Else
+                If mode = SystemColorMode.Dark Then
+                    Return defaultDarkAccent
+                End If
+                Return systemAccent
+        End Select
+    End Function
 
     Private Sub ApplyToolStripItemTheme(item As ToolStripItem, palette As ThemePalette)
         If item Is Nothing Then
@@ -210,7 +280,7 @@ Friend Module ThemeManager
         Public Property Text As Color
         Public Property MutedText As Color
 
-        Public Shared Function FromMode(mode As SystemColorMode) As ThemePalette
+        Public Shared Function FromMode(mode As SystemColorMode, accentColor As Color) As ThemePalette
             If mode = SystemColorMode.Dark Then
                 Return New ThemePalette() With {
                     .IsDark = True,
@@ -218,7 +288,7 @@ Friend Module ThemeManager
                     .Surface = Color.FromArgb(32, 32, 32),
                     .Field = Color.FromArgb(45, 45, 45),
                     .Border = Color.FromArgb(70, 70, 70),
-                    .FocusBorder = Color.FromArgb(90, 120, 200),
+                    .FocusBorder = accentColor,
                     .Text = Color.Gainsboro,
                     .MutedText = Color.FromArgb(140, 140, 140)
                 }
@@ -230,7 +300,7 @@ Friend Module ThemeManager
                 .Surface = SystemColors.Control,
                 .Field = SystemColors.Window,
                 .Border = SystemColors.ControlDark,
-                .FocusBorder = SystemColors.Highlight,
+                .FocusBorder = accentColor,
                 .Text = SystemColors.ControlText,
                 .MutedText = SystemColors.GrayText
             }

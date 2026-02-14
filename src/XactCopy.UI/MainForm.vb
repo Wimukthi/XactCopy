@@ -13,12 +13,24 @@ Imports XactCopy.Services
 Public Class MainForm
     Inherits Form
 
+    Private Shared ReadOnly DoubleBufferedProperty As System.Reflection.PropertyInfo = GetType(Control).GetProperty(
+        "DoubleBuffered",
+        System.Reflection.BindingFlags.Instance Or System.Reflection.BindingFlags.NonPublic)
+
     Private Const AppTitle As String = "XactCopy"
     Private Const LayoutWindowKey As String = "MainForm"
     Private Const TaskbarProgressScale As ULong = 1000UL
-    Private Const MaxLogCharacters As Integer = 400000
-    Private Const LogTrimTargetCharacters As Integer = 280000
     Private Const ProgressRenderIntervalMs As Integer = 50
+    Private Const LogRenderIntervalMs As Integer = 80
+    Private Const MaxQueuedLogLines As Integer = 20000
+    Private Const MaxLogLinesPerRender As Integer = 240
+    Private Const DefaultMaxLogLines As Integer = 50000
+    Private Const MinimumMaxLogLines As Integer = 1000
+    Private Const DefaultDiagnosticsRefreshIntervalMs As Integer = 250
+    Private Const MinimumDiagnosticsRefreshIntervalMs As Integer = 100
+    Private Const ThinProgressBarHeight As Integer = 10
+    Private Const StandardProgressBarHeight As Integer = 17
+    Private Const ThickProgressBarHeight As Integer = 24
 
     Private Shared ReadOnly AppDataRoot As String = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -58,10 +70,13 @@ Public Class MainForm
     Private ReadOnly _etaLabel As New Label()
     Private ReadOnly _bufferUsageLabel As New Label()
     Private ReadOnly _rescueTelemetryLabel As New Label()
+    Private ReadOnly _diagnosticsLabel As New Label()
     Private ReadOnly _jobSummaryLabel As New Label()
     Private ReadOnly _journalLabel As New Label()
 
-    Private ReadOnly _logTextBox As New TextBox()
+    Private ReadOnly _logListView As New ListView()
+    Private ReadOnly _logListColumn As New ColumnHeader()
+    Private ReadOnly _logEntries As New List(Of String)()
 
     Private ReadOnly _menuStrip As New MenuStrip()
     Private ReadOnly _fileMenu As New ToolStripMenuItem("&File")
@@ -126,6 +141,23 @@ Public Class MainForm
     Private _pendingProgressSnapshot As CopyProgressSnapshot
     Private _progressDispatchQueued As Integer
     Private _lastProgressRenderTick As Long
+    Private ReadOnly _logDispatchLock As New Object()
+    Private ReadOnly _pendingLogLines As New Queue(Of String)()
+    Private _logDispatchQueued As Integer
+    Private _droppedLogLines As Integer
+    Private _recoveryTouchInFlight As Integer
+    Private _maxLogLines As Integer = DefaultMaxLogLines
+    Private _logTrimTargetLines As Integer = CInt(DefaultMaxLogLines * 0.7R)
+    Private _showUiDiagnostics As Boolean = True
+    Private _diagnosticsRefreshIntervalMs As Integer = DefaultDiagnosticsRefreshIntervalMs
+    Private _lastDiagnosticsRenderTick As Long
+    Private _uiProgressEventsReceived As Long
+    Private _uiProgressEventsRendered As Long
+    Private _uiProgressEventsCoalesced As Long
+    Private _uiProgressRenderAverageMs As Double
+    Private _uiLogLinesRendered As Long
+    Private _uiLogLinesDropped As Long
+    Private _uiWorkerSuppressedLogLines As Long
 
     Public Sub New(Optional launchOptions As LaunchOptions = Nothing)
         Text = AppTitle
@@ -133,6 +165,8 @@ Public Class MainForm
         MinimumSize = New Size(940, 640)
         Size = New Size(1100, 760)
         WindowIconHelper.Apply(Me)
+        SetStyle(ControlStyles.AllPaintingInWmPaint Or ControlStyles.OptimizedDoubleBuffer, True)
+        UpdateStyles()
 
         _supervisor = New WorkerSupervisor()
         AddHandler _supervisor.LogMessage, AddressOf Supervisor_LogMessage
@@ -154,6 +188,8 @@ Public Class MainForm
         End If
 
         BuildUi()
+        EnableDoubleBufferingForContainers(Me)
+        ApplyUiResponsivenessSettings()
         ConfigureToolTips()
         ApplyDefaultSettingsToUi()
         ApplyTheme()
@@ -329,37 +365,41 @@ Public Class MainForm
         _currentProgressBar.Style = ProgressBarStyle.Continuous
         _currentProgressBar.ShowBorder = False
 
-        _overallStatsLabel.AutoSize = True
+        ConfigureStatusLabel(_overallStatsLabel)
         _overallStatsLabel.Text = "Files: 0/0  Failed: 0  Recovered: 0  Skipped: 0"
 
-        _currentFileLabel.AutoSize = True
+        ConfigureStatusLabel(_currentFileLabel)
         _currentFileLabel.Text = "Current: -"
         _currentFileLabel.AutoEllipsis = True
 
-        _bytesLabel.AutoSize = True
+        ConfigureStatusLabel(_bytesLabel)
         _bytesLabel.Text = "Bytes: 0 B / 0 B"
 
-        _throughputLabel.AutoSize = True
+        ConfigureStatusLabel(_throughputLabel)
         _throughputLabel.Text = "Speed: 0 B/s (avg 0 B/s)"
 
-        _etaLabel.AutoSize = True
+        ConfigureStatusLabel(_etaLabel)
         _etaLabel.Text = "ETA: -"
 
-        _bufferUsageLabel.AutoSize = True
+        ConfigureStatusLabel(_bufferUsageLabel)
         _bufferUsageLabel.Text = "Buffer Use: last - / -  avg -"
 
-        _rescueTelemetryLabel.AutoSize = True
+        ConfigureStatusLabel(_rescueTelemetryLabel)
         _rescueTelemetryLabel.Text = "Rescue: -"
 
-        _journalLabel.AutoSize = True
+        ConfigureStatusLabel(_diagnosticsLabel)
+        _diagnosticsLabel.Text = "Diagnostics: -"
+
+        ConfigureStatusLabel(_journalLabel)
         _journalLabel.Text = "Journal: -"
 
         Dim progressLayout As New TableLayoutPanel() With {
             .Dock = DockStyle.Fill,
             .ColumnCount = 1,
-            .RowCount = 10,
+            .RowCount = 11,
             .AutoSize = True
         }
+        progressLayout.RowStyles.Add(New RowStyle(SizeType.AutoSize))
         progressLayout.RowStyles.Add(New RowStyle(SizeType.AutoSize))
         progressLayout.RowStyles.Add(New RowStyle(SizeType.AutoSize))
         progressLayout.RowStyles.Add(New RowStyle(SizeType.AutoSize))
@@ -379,16 +419,27 @@ Public Class MainForm
         progressLayout.Controls.Add(_etaLabel, 0, 6)
         progressLayout.Controls.Add(_bufferUsageLabel, 0, 7)
         progressLayout.Controls.Add(_rescueTelemetryLabel, 0, 8)
-        progressLayout.Controls.Add(_journalLabel, 0, 9)
+        progressLayout.Controls.Add(_diagnosticsLabel, 0, 9)
+        progressLayout.Controls.Add(_journalLabel, 0, 10)
         rootLayout.Controls.Add(progressLayout, 0, 4)
 
-        _logTextBox.Dock = DockStyle.Fill
-        _logTextBox.Multiline = True
-        _logTextBox.ScrollBars = ScrollBars.Both
-        _logTextBox.ReadOnly = True
-        _logTextBox.WordWrap = False
-        _logTextBox.Font = New Font("Consolas", 9.0F, FontStyle.Regular, GraphicsUnit.Point)
-        rootLayout.Controls.Add(_logTextBox, 0, 5)
+        _logListView.Dock = DockStyle.Fill
+        _logListView.View = View.Details
+        _logListView.FullRowSelect = False
+        _logListView.GridLines = False
+        _logListView.HideSelection = False
+        _logListView.MultiSelect = False
+        _logListView.LabelWrap = False
+        _logListView.Scrollable = True
+        _logListView.VirtualMode = True
+        _logListView.HeaderStyle = ColumnHeaderStyle.None
+        _logListView.Font = New Font("Consolas", 9.0F, FontStyle.Regular, GraphicsUnit.Point)
+        _logListView.Columns.Add(_logListColumn)
+        _logListView.VirtualListSize = 0
+        AddHandler _logListView.RetrieveVirtualItem, AddressOf LogListView_RetrieveVirtualItem
+        AddHandler _logListView.Resize, AddressOf LogListView_Resize
+        ResizeLogColumn()
+        rootLayout.Controls.Add(_logListView, 0, 5)
 
         Dim shellLayout As New TableLayoutPanel() With {
             .Dock = DockStyle.Fill,
@@ -401,6 +452,69 @@ Public Class MainForm
         shellLayout.Controls.Add(rootLayout, 0, 1)
 
         Controls.Add(shellLayout)
+    End Sub
+
+    Private Sub ConfigureStatusLabel(label As Label)
+        If label Is Nothing Then
+            Return
+        End If
+
+        label.AutoSize = False
+        label.Dock = DockStyle.Fill
+        label.Height = 20
+        label.TextAlign = ContentAlignment.MiddleLeft
+        label.Margin = New Padding(0, 1, 0, 1)
+    End Sub
+
+    Private Sub LogListView_RetrieveVirtualItem(sender As Object, e As RetrieveVirtualItemEventArgs)
+        If e Is Nothing Then
+            Return
+        End If
+
+        If e.ItemIndex < 0 OrElse e.ItemIndex >= _logEntries.Count Then
+            e.Item = New ListViewItem(String.Empty)
+            Return
+        End If
+
+        e.Item = New ListViewItem(_logEntries(e.ItemIndex))
+    End Sub
+
+    Private Sub LogListView_Resize(sender As Object, e As EventArgs)
+        ResizeLogColumn()
+    End Sub
+
+    Private Sub ResizeLogColumn()
+        If _logListColumn Is Nothing OrElse _logListView Is Nothing Then
+            Return
+        End If
+
+        Dim targetWidth = Math.Max(_logListView.ClientSize.Width + 600, 2400)
+        _logListColumn.Width = targetWidth
+    End Sub
+
+    Private Sub EnableDoubleBufferingForContainers(root As Control)
+        If root Is Nothing Then
+            Return
+        End If
+
+        If TypeOf root Is Panel OrElse
+            TypeOf root Is TableLayoutPanel OrElse
+            TypeOf root Is FlowLayoutPanel OrElse
+            TypeOf root Is SplitContainer OrElse
+            TypeOf root Is DataGridView OrElse
+            TypeOf root Is ListView Then
+            Try
+                If DoubleBufferedProperty IsNot Nothing Then
+                    DoubleBufferedProperty.SetValue(root, True, Nothing)
+                End If
+            Catch
+                ' Ignore controls that do not expose the backing property.
+            End Try
+        End If
+
+        For Each child As Control In root.Controls
+            EnableDoubleBufferingForContainers(child)
+        Next
     End Sub
 
     Private Sub ConfigureMenu()
@@ -576,8 +690,9 @@ Public Class MainForm
         _toolTip.SetToolTip(_etaLabel, "Estimated remaining time based on current average speed.")
         _toolTip.SetToolTip(_bufferUsageLabel, "Recent and average buffer utilization.")
         _toolTip.SetToolTip(_rescueTelemetryLabel, "AegisRescueCore pass status, unreadable region count, and remaining unrecovered bytes.")
+        _toolTip.SetToolTip(_diagnosticsLabel, "UI diagnostics: render latency, event counts, queue depth, and dropped/suppressed logs.")
         _toolTip.SetToolTip(_journalLabel, "Active journal file used for resume/recovery.")
-        _toolTip.SetToolTip(_logTextBox, "Event-focused operation log (errors, retries, rescue pass summaries). Horizontal and vertical scrolling are enabled.")
+        _toolTip.SetToolTip(_logListView, "Operations log")
     End Sub
 
     Private Sub SourceTextBox_TextChanged(sender As Object, e As EventArgs)
@@ -674,7 +789,7 @@ Public Class MainForm
 
     Private Sub ShowSettingsDialog()
         Using dialog As New SettingsForm(_settings)
-            ThemeManager.ApplyTheme(dialog, ThemeSettings.GetPreferredColorMode(_settings))
+            ThemeManager.ApplyTheme(dialog, ThemeSettings.GetPreferredColorMode(_settings), _settings)
 
             If dialog.ShowDialog(Me) <> DialogResult.OK Then
                 Return
@@ -688,6 +803,7 @@ Public Class MainForm
             SyncExplorerIntegration(announceResult:=True)
 
             ApplyDefaultSettingsToUi()
+            ApplyUiResponsivenessSettings()
             ApplyTheme()
             UpdateCheckMenuCaption()
             UpdateRecoveryMenuState()
@@ -772,7 +888,7 @@ Public Class MainForm
 
     Private Async Function OpenJobManagerAsync() As Task
         Using dialog As New JobManagerForm(_jobManager)
-            ThemeManager.ApplyTheme(dialog, ThemeSettings.GetPreferredColorMode(_settings))
+            ThemeManager.ApplyTheme(dialog, ThemeSettings.GetPreferredColorMode(_settings), _settings)
             Dim result = dialog.ShowDialog(Me)
             If result <> DialogResult.OK Then
                 UpdateRecoveryMenuState()
@@ -887,7 +1003,7 @@ Public Class MainForm
         Dim reason = If(_startupRecovery?.InterruptionReason, "The previous copy session ended unexpectedly.")
 
         Using dialog As New RecoveryPromptForm(_interruptedRun, reason)
-            ThemeManager.ApplyTheme(dialog, ThemeSettings.GetPreferredColorMode(_settings))
+            ThemeManager.ApplyTheme(dialog, ThemeSettings.GetPreferredColorMode(_settings), _settings)
             Dim result = dialog.ShowDialog(Me)
 
             If result = DialogResult.OK Then
@@ -953,7 +1069,10 @@ Public Class MainForm
         End If
 
         SyncExplorerIntegration(announceResult:=False)
-        ApplyExplorerLaunchOptions()
+        Dim explorerSourceApplied = ApplyExplorerLaunchOptions()
+        If explorerSourceApplied Then
+            PromptForDestinationFromExplorerLaunch()
+        End If
 
         If _launchOptions IsNot Nothing AndAlso _launchOptions.IsRecoveryAutostart Then
             AppendLog("Launched automatically after logon for recovery.")
@@ -1067,7 +1186,7 @@ Public Class MainForm
 
         Try
             Using dialog As New UpdateForm(release, currentVersion, _settings)
-                ThemeManager.ApplyTheme(dialog, ThemeSettings.GetPreferredColorMode(_settings))
+                ThemeManager.ApplyTheme(dialog, ThemeSettings.GetPreferredColorMode(_settings), _settings)
                 dialog.ShowDialog(Me)
             End Using
         Catch ex As Exception
@@ -1121,29 +1240,28 @@ Public Class MainForm
         End Try
     End Sub
 
-    Private Sub ApplyExplorerLaunchOptions()
+    Private Function ApplyExplorerLaunchOptions() As Boolean
         If _launchOptions Is Nothing Then
-            Return
+            Return False
         End If
 
         If Not String.IsNullOrWhiteSpace(_launchOptions.ExplorerFolderPath) Then
             Dim resolvedFolder As String = String.Empty
             If Not TryResolveExplorerPath(_launchOptions.ExplorerFolderPath, resolvedFolder) Then
                 AppendLog($"Explorer folder path is invalid: {_launchOptions.ExplorerFolderPath}")
-                Return
+                Return False
             End If
 
             If Not Directory.Exists(resolvedFolder) Then
                 AppendLog($"Explorer folder path was not found: {resolvedFolder}")
-                Return
+                Return False
             End If
 
-            ApplyExplorerSourceFolder(resolvedFolder, "Explorer background folder")
-            Return
+            Return ApplyExplorerSourceFolder(resolvedFolder, "Explorer background folder")
         End If
 
         If _launchOptions.ExplorerSourcePaths Is Nothing OrElse _launchOptions.ExplorerSourcePaths.Count = 0 Then
-            Return
+            Return False
         End If
 
         Dim resolvedSelections As New List(Of String)()
@@ -1167,7 +1285,7 @@ Public Class MainForm
         Next
 
         If resolvedSelections.Count = 0 Then
-            Return
+            Return False
         End If
 
         Dim selectionMode = SettingsValueConverter.ToExplorerSelectionMode(_settings.ExplorerSelectionMode)
@@ -1176,38 +1294,38 @@ Public Class MainForm
             Dim sourceFolder = If(File.Exists(firstSelection), Path.GetDirectoryName(firstSelection), firstSelection)
             If String.IsNullOrWhiteSpace(sourceFolder) Then
                 AppendLog($"Explorer source path has no parent directory: {firstSelection}")
-                Return
+                Return False
             End If
 
-            ApplyExplorerSourceFolder(sourceFolder, "Explorer selection")
-            Return
+            Return ApplyExplorerSourceFolder(sourceFolder, "Explorer selection")
         End If
 
-        ApplyExplorerSelectedItems(resolvedSelections)
-    End Sub
+        Return ApplyExplorerSelectedItems(resolvedSelections)
+    End Function
 
-    Private Sub ApplyExplorerSourceFolder(sourceFolder As String, context As String)
+    Private Function ApplyExplorerSourceFolder(sourceFolder As String, context As String) As Boolean
         ClearExplorerSelectionContext(announce:=False)
         If String.IsNullOrWhiteSpace(sourceFolder) Then
-            Return
+            Return False
         End If
 
         _suspendSourceTextChanged = True
         _sourceTextBox.Text = sourceFolder
         _suspendSourceTextChanged = False
         AppendLog($"Source set from {context}: {sourceFolder}")
-    End Sub
+        Return True
+    End Function
 
-    Private Sub ApplyExplorerSelectedItems(resolvedSelections As IReadOnlyList(Of String))
+    Private Function ApplyExplorerSelectedItems(resolvedSelections As IReadOnlyList(Of String)) As Boolean
         Dim sourceRoot = DetermineExplorerSelectionRoot(resolvedSelections)
         If String.IsNullOrWhiteSpace(sourceRoot) Then
             AppendLog("Explorer selected items do not share a common source root.")
-            Return
+            Return False
         End If
 
         If Not Directory.Exists(sourceRoot) Then
             AppendLog($"Explorer source root was not found: {sourceRoot}")
-            Return
+            Return False
         End If
 
         Dim relativeSelections As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
@@ -1221,8 +1339,7 @@ Public Class MainForm
         Next
 
         If relativeSelections.Count = 0 Then
-            ApplyExplorerSourceFolder(sourceRoot, "Explorer selection")
-            Return
+            Return ApplyExplorerSourceFolder(sourceRoot, "Explorer selection")
         End If
 
         _explorerSelectionSourceRoot = NormalizePathKey(sourceRoot)
@@ -1235,6 +1352,30 @@ Public Class MainForm
 
         AppendLog($"Source set from Explorer selection: {sourceRoot}")
         AppendLog($"Explorer selected-items mode active ({_explorerSelectedRelativePaths.Count} item(s) queued).")
+        Return True
+    End Function
+
+    Private Sub PromptForDestinationFromExplorerLaunch()
+        If _isRunning Then
+            Return
+        End If
+
+        Dim previousDestination = _destinationTextBox.Text.Trim()
+        AppendLog("Explorer launch detected. Choose a destination folder (Cancel keeps current value).")
+        BrowseFolder(_destinationTextBox)
+
+        Dim currentDestination = _destinationTextBox.Text.Trim()
+        If String.Equals(previousDestination, currentDestination, StringComparison.OrdinalIgnoreCase) Then
+            AppendLog("Destination picker canceled.")
+            Return
+        End If
+
+        If String.IsNullOrWhiteSpace(currentDestination) Then
+            AppendLog("Destination remains empty after Explorer launch.")
+            Return
+        End If
+
+        AppendLog($"Destination set from Explorer launch: {currentDestination}")
     End Sub
 
     Private Shared Function DetermineExplorerSelectionRoot(paths As IReadOnlyList(Of String)) As String
@@ -1353,7 +1494,106 @@ Public Class MainForm
 
     Private Sub ApplyTheme()
         Dim mode As SystemColorMode = ThemeSettings.GetPreferredColorMode(_settings)
-        ThemeManager.ApplyTheme(Me, mode)
+        ThemeManager.ApplyTheme(Me, mode, _settings)
+        ApplyAppearanceSettings()
+    End Sub
+
+    Private Sub ApplyUiResponsivenessSettings()
+        Dim safeSettings = If(_settings, New AppSettings())
+
+        _maxLogLines = Math.Max(MinimumMaxLogLines, Math.Min(1000000, safeSettings.UiMaxLogLines))
+        _logTrimTargetLines = Math.Max(MinimumMaxLogLines, CInt(Math.Round(_maxLogLines * 0.7R)))
+        _showUiDiagnostics = safeSettings.UiShowDiagnostics
+        _diagnosticsRefreshIntervalMs = Math.Max(MinimumDiagnosticsRefreshIntervalMs, safeSettings.UiDiagnosticsRefreshMs)
+
+        TrimLogBufferIfNeeded()
+        _logListView.VirtualListSize = _logEntries.Count
+        ApplyStatusRowVisibility(safeSettings)
+        If _showUiDiagnostics Then
+            RefreshDiagnosticsLabel(force:=True)
+        End If
+    End Sub
+
+    Private Sub ApplyAppearanceSettings()
+        Dim safeSettings = If(_settings, New AppSettings())
+        ApplyStatusRowVisibility(safeSettings)
+        ApplyProgressBarPresentation(safeSettings)
+        ApplyLogFontSettings(safeSettings)
+    End Sub
+
+    Private Sub ApplyStatusRowVisibility(settings As AppSettings)
+        Dim safeSettings = If(settings, New AppSettings())
+        _bufferUsageLabel.Visible = safeSettings.ShowBufferStatusRow
+        _rescueTelemetryLabel.Visible = safeSettings.ShowRescueStatusRow
+        _diagnosticsLabel.Visible = _showUiDiagnostics
+    End Sub
+
+    Private Sub ApplyProgressBarPresentation(settings As AppSettings)
+        Dim safeSettings = If(settings, New AppSettings())
+        Dim barHeight As Integer = StandardProgressBarHeight
+
+        Select Case SettingsValueConverter.ToProgressBarStyleChoice(safeSettings.ProgressBarStyle)
+            Case ProgressBarStyleChoice.Thin
+                barHeight = ThinProgressBarHeight
+            Case ProgressBarStyleChoice.Thick
+                barHeight = ThickProgressBarHeight
+            Case Else
+                barHeight = StandardProgressBarHeight
+        End Select
+
+        For Each bar As ThemedProgressBar In New ThemedProgressBar() {_overallProgressBar, _currentProgressBar}
+            bar.MinimumSize = New Size(0, barHeight)
+            bar.Height = barHeight
+            bar.ShowPercentageText = safeSettings.ProgressBarShowPercentage
+        Next
+    End Sub
+
+    Private Sub ApplyLogFontSettings(settings As AppSettings)
+        If _logListView Is Nothing Then
+            Return
+        End If
+
+        Dim safeSettings = If(settings, New AppSettings())
+        Dim requestedFamily = If(safeSettings.LogFontFamily, String.Empty).Trim()
+        If requestedFamily.Length = 0 Then
+            requestedFamily = "Consolas"
+        End If
+
+        Dim targetSize = CSng(Math.Max(7, Math.Min(20, safeSettings.LogFontSizePoints)))
+        Dim targetFont As Font = Nothing
+
+        Try
+            targetFont = New Font(requestedFamily, targetSize, FontStyle.Regular, GraphicsUnit.Point)
+        Catch
+            targetFont = New Font("Consolas", targetSize, FontStyle.Regular, GraphicsUnit.Point)
+        End Try
+
+        _logListView.Font = targetFont
+        ResizeLogColumn()
+    End Sub
+
+    Private Sub RefreshDiagnosticsLabel(Optional force As Boolean = False)
+        If Not _showUiDiagnostics OrElse _diagnosticsLabel Is Nothing Then
+            Return
+        End If
+
+        Dim nowTick = Environment.TickCount64
+        If Not force AndAlso _lastDiagnosticsRenderTick > 0 Then
+            Dim elapsed = nowTick - _lastDiagnosticsRenderTick
+            If elapsed < _diagnosticsRefreshIntervalMs Then
+                Return
+            End If
+        End If
+
+        _lastDiagnosticsRenderTick = nowTick
+
+        Dim pendingLogQueueCount As Integer
+        SyncLock _logDispatchLock
+            pendingLogQueueCount = _pendingLogLines.Count
+        End SyncLock
+
+        _diagnosticsLabel.Text =
+            $"Diagnostics: UI render {_uiProgressRenderAverageMs:0.00} ms | Progress recv/render {_uiProgressEventsReceived}/{_uiProgressEventsRendered} (coalesced {_uiProgressEventsCoalesced}) | Log queued {pendingLogQueueCount} shown {_uiLogLinesRendered} dropped {_uiLogLinesDropped} worker-suppressed {_uiWorkerSuppressedLogLines}"
     End Sub
 
     Private Sub BrowseFolder(targetTextBox As TextBox)
@@ -1510,7 +1750,7 @@ Public Class MainForm
         ApplyOptionsToUi(options)
 
         If clearLog Then
-            _logTextBox.Clear()
+            ClearLogView()
         End If
 
         ResetPendingProgressState()
@@ -1524,6 +1764,7 @@ Public Class MainForm
         _etaLabel.Text = "ETA: -"
         _bufferUsageLabel.Text = $"Buffer Use: last - / {FormatBytes(CLng(_bufferMbNumeric.Value) * 1024L * 1024L)}  avg -"
         _rescueTelemetryLabel.Text = "Rescue: -"
+        _diagnosticsLabel.Text = "Diagnostics: -"
         _journalLabel.Text = "Journal: -"
         ResetCopyTelemetry()
         _lastProgressSnapshot = Nothing
@@ -1587,6 +1828,9 @@ Public Class MainForm
             .ContinueOnFileError = safeSettings.DefaultContinueOnFileError,
             .PreserveTimestamps = safeSettings.DefaultPreserveTimestamps,
             .WorkerProcessPriorityClass = "Normal",
+            .WorkerTelemetryProfile = SettingsValueConverter.ToWorkerTelemetryProfile(safeSettings.WorkerTelemetryProfile),
+            .WorkerProgressEmitIntervalMs = Math.Max(20, safeSettings.WorkerProgressIntervalMs),
+            .WorkerMaxLogsPerSecond = Math.Max(0, safeSettings.WorkerMaxLogsPerSecond),
             .RescueFastScanChunkBytes = Math.Max(0, safeSettings.DefaultRescueFastScanChunkKb) * 1024,
             .RescueTrimChunkBytes = Math.Max(0, safeSettings.DefaultRescueTrimChunkKb) * 1024,
             .RescueScrapeChunkBytes = Math.Max(0, safeSettings.DefaultRescueScrapeChunkKb) * 1024,
@@ -1832,6 +2076,9 @@ Public Class MainForm
             .ContinueOnFileError = options.ContinueOnFileError,
             .PreserveTimestamps = options.PreserveTimestamps,
             .WorkerProcessPriorityClass = If(options.WorkerProcessPriorityClass, "Normal"),
+            .WorkerTelemetryProfile = options.WorkerTelemetryProfile,
+            .WorkerProgressEmitIntervalMs = Math.Max(20, Math.Min(1000, options.WorkerProgressEmitIntervalMs)),
+            .WorkerMaxLogsPerSecond = Math.Max(0, Math.Min(5000, options.WorkerMaxLogsPerSecond)),
             .RescueFastScanChunkBytes = ClampRescueChunkBytes(options.RescueFastScanChunkBytes),
             .RescueTrimChunkBytes = ClampRescueChunkBytes(options.RescueTrimChunkBytes),
             .RescueScrapeChunkBytes = ClampRescueChunkBytes(options.RescueScrapeChunkBytes),
@@ -1855,7 +2102,12 @@ Public Class MainForm
             Return
         End If
 
+        _uiProgressEventsReceived += 1
+
         SyncLock _progressDispatchLock
+            If _pendingProgressSnapshot IsNot Nothing Then
+                _uiProgressEventsCoalesced += 1
+            End If
             _pendingProgressSnapshot = progress
         End SyncLock
 
@@ -1922,6 +2174,8 @@ Public Class MainForm
             SyncLock _progressDispatchLock
                 If _pendingProgressSnapshot Is Nothing Then
                     _pendingProgressSnapshot = deferredSnapshot
+                Else
+                    _uiProgressEventsCoalesced += 1
                 End If
             End SyncLock
         End If
@@ -1969,6 +2223,8 @@ Public Class MainForm
             Return
         End If
 
+        Dim renderStopwatch = Stopwatch.StartNew()
+
         _lastProgressSnapshot = progress
         _overallProgressBar.Value = ToProgressBarValue(progress.OverallProgress)
         _currentProgressBar.Value = ToProgressBarValue(progress.CurrentFileProgress)
@@ -1985,18 +2241,45 @@ Public Class MainForm
             Dim touchIntervalSeconds = If(_settings Is Nothing, 2, Math.Max(1, _settings.RecoveryTouchIntervalSeconds))
             If _lastRecoveryTouchUtc = DateTimeOffset.MinValue OrElse (nowUtc - _lastRecoveryTouchUtc) >= TimeSpan.FromSeconds(touchIntervalSeconds) Then
                 _lastRecoveryTouchUtc = nowUtc
-                _recoveryService.TouchActiveRun(_activeRun.RunId)
+                QueueRecoveryTouch(_activeRun.RunId)
             End If
         End If
+
+        renderStopwatch.Stop()
+        _uiProgressEventsRendered += 1
+        Dim renderMs = renderStopwatch.Elapsed.TotalMilliseconds
+        If _uiProgressRenderAverageMs <= 0 Then
+            _uiProgressRenderAverageMs = renderMs
+        Else
+            _uiProgressRenderAverageMs = (_uiProgressRenderAverageMs * 0.82R) + (renderMs * 0.18R)
+        End If
+        RefreshDiagnosticsLabel()
     End Sub
 
-    Private Sub Supervisor_LogMessage(sender As Object, message As String)
-        If InvokeRequired Then
-            BeginInvoke(New Action(Of String)(AddressOf AppendLog), message)
+    Private Sub QueueRecoveryTouch(runId As String)
+        If String.IsNullOrWhiteSpace(runId) Then
             Return
         End If
 
-        AppendLog(message)
+        If Interlocked.Exchange(_recoveryTouchInFlight, 1) = 1 Then
+            Return
+        End If
+
+        Dim touchTask = Task.Run(
+            Sub()
+                Try
+                    _recoveryService.TouchActiveRun(runId)
+                Catch
+                    ' Ignore touch failures and keep UI thread responsive.
+                Finally
+                    Interlocked.Exchange(_recoveryTouchInFlight, 0)
+                End Try
+            End Sub)
+        Dim ignoredTouchTask = touchTask
+    End Sub
+
+    Private Sub Supervisor_LogMessage(sender As Object, message As String)
+        QueueLogLine(message)
     End Sub
 
     Private Sub Supervisor_WorkerStateChanged(sender As Object, stateText As String)
@@ -2097,6 +2380,7 @@ Public Class MainForm
         End If
 
         AppendLog($"Journal saved at: {result.JournalPath}")
+        RefreshDiagnosticsLabel(force:=True)
 
         Dim queuedTask = RunNextQueuedJobAsync(manualTrigger:=False)
         Dim ignoredQueuedTask = queuedTask
@@ -2193,31 +2477,201 @@ Public Class MainForm
             Return
         End If
 
-        _logTextBox.AppendText(message)
-        _logTextBox.AppendText(Environment.NewLine)
+        AppendLogLines(New List(Of String) From {message})
+    End Sub
+
+    Private Sub QueueLogLine(message As String)
+        If String.IsNullOrWhiteSpace(message) Then
+            Return
+        End If
+
+        SyncLock _logDispatchLock
+            If _pendingLogLines.Count >= MaxQueuedLogLines Then
+                _pendingLogLines.Dequeue()
+                _droppedLogLines += 1
+                _uiLogLinesDropped += 1
+            End If
+            _pendingLogLines.Enqueue(message)
+        End SyncLock
+
+        If Interlocked.CompareExchange(_logDispatchQueued, 1, 0) <> 0 Then
+            Return
+        End If
+
+        PostLogDrain()
+        RefreshDiagnosticsLabel()
+    End Sub
+
+    Private Sub PostLogDrain()
+        If IsDisposed OrElse Disposing Then
+            Interlocked.Exchange(_logDispatchQueued, 0)
+            Return
+        End If
+
+        If InvokeRequired Then
+            Try
+                BeginInvoke(New MethodInvoker(AddressOf DrainPendingLogLines))
+            Catch
+                Interlocked.Exchange(_logDispatchQueued, 0)
+            End Try
+            Return
+        End If
+
+        DrainPendingLogLines()
+    End Sub
+
+    Private Sub DrainPendingLogLines()
+        If IsDisposed OrElse Disposing Then
+            Interlocked.Exchange(_logDispatchQueued, 0)
+            Return
+        End If
+
+        Dim linesToAppend As New List(Of String)()
+
+        SyncLock _logDispatchLock
+            If _droppedLogLines > 0 Then
+                linesToAppend.Add($"[Log] Dropped {_droppedLogLines} queued message(s) to keep UI responsive.")
+                _droppedLogLines = 0
+            End If
+
+            While _pendingLogLines.Count > 0 AndAlso linesToAppend.Count < MaxLogLinesPerRender
+                linesToAppend.Add(_pendingLogLines.Dequeue())
+            End While
+        End SyncLock
+
+        If linesToAppend.Count > 0 Then
+            AppendLogLines(linesToAppend)
+        End If
+
+        Interlocked.Exchange(_logDispatchQueued, 0)
+
+        Dim hasPending As Boolean
+        SyncLock _logDispatchLock
+            hasPending = _pendingLogLines.Count > 0 OrElse _droppedLogLines > 0
+        End SyncLock
+
+        If hasPending AndAlso Interlocked.CompareExchange(_logDispatchQueued, 1, 0) = 0 Then
+            ScheduleLogDrain(LogRenderIntervalMs)
+        End If
+    End Sub
+
+    Private Sub ScheduleLogDrain(delayMs As Integer)
+        Dim safeDelayMs = Math.Max(1, delayMs)
+        Dim drainTask = Task.Run(
+            Async Function() As Task
+                Try
+                    Await Task.Delay(safeDelayMs).ConfigureAwait(False)
+                    PostLogDrain()
+                Catch
+                    Interlocked.Exchange(_logDispatchQueued, 0)
+                End Try
+            End Function)
+        Dim ignoredDrainTask = drainTask
+    End Sub
+
+    Private Sub AppendLogLines(lines As IEnumerable(Of String))
+        If lines Is Nothing Then
+            Return
+        End If
+
+        Dim shouldAutoScroll = ShouldAutoScrollLogView()
+        Dim appendedCount = 0
+        For Each line In lines
+            If String.IsNullOrWhiteSpace(line) Then
+                Continue For
+            End If
+
+            _logEntries.Add(line)
+            appendedCount += 1
+            _uiLogLinesRendered += 1
+            CaptureWorkerSuppressedLogTelemetry(line)
+        Next
+
+        If appendedCount = 0 Then
+            Return
+        End If
+
         TrimLogBufferIfNeeded()
-        _logTextBox.SelectionStart = _logTextBox.TextLength
-        _logTextBox.ScrollToCaret()
+        _logListView.VirtualListSize = _logEntries.Count
+        If shouldAutoScroll Then
+            EnsureLogTailVisible()
+        End If
+
+        RefreshDiagnosticsLabel()
     End Sub
 
     Private Sub TrimLogBufferIfNeeded()
-        If _logTextBox.TextLength <= MaxLogCharacters Then
+        If _logEntries.Count <= _maxLogLines Then
             Return
         End If
 
-        Dim cutIndex = Math.Max(0, _logTextBox.TextLength - LogTrimTargetCharacters)
-        If cutIndex > 0 Then
-            Dim newlineIndex = _logTextBox.Text.IndexOf(Environment.NewLine, cutIndex, StringComparison.Ordinal)
-            If newlineIndex >= 0 Then
-                cutIndex = newlineIndex + Environment.NewLine.Length
+        Dim removeCount = _logEntries.Count - _logTrimTargetLines
+        If removeCount <= 0 Then
+            removeCount = _logEntries.Count - _maxLogLines
+        End If
+        If removeCount <= 0 Then
+            Return
+        End If
+
+        _logEntries.RemoveRange(0, removeCount)
+        _logEntries.Insert(0, $"[Log trimmed] Removed {removeCount} older lines to keep UI responsive.")
+    End Sub
+
+    Private Function ShouldAutoScrollLogView() As Boolean
+        If _logEntries.Count = 0 OrElse _logListView.VirtualListSize = 0 Then
+            Return True
+        End If
+
+        Try
+            Dim topItem = _logListView.TopItem
+            If topItem Is Nothing Then
+                Return True
             End If
-        End If
 
-        If cutIndex <= 0 OrElse cutIndex >= _logTextBox.TextLength Then
+            Return topItem.Index >= Math.Max(0, _logListView.VirtualListSize - 25)
+        Catch
+            Return True
+        End Try
+    End Function
+
+    Private Sub EnsureLogTailVisible()
+        If _logListView.VirtualListSize <= 0 Then
             Return
         End If
 
-        _logTextBox.Text = "[Log trimmed to recent events]" & Environment.NewLine & _logTextBox.Text.Substring(cutIndex)
+        Try
+            _logListView.EnsureVisible(_logListView.VirtualListSize - 1)
+        Catch
+        End Try
+    End Sub
+
+    Private Sub ClearLogView()
+        _logEntries.Clear()
+        _logListView.VirtualListSize = 0
+    End Sub
+
+    Private Sub CaptureWorkerSuppressedLogTelemetry(line As String)
+        If String.IsNullOrWhiteSpace(line) Then
+            Return
+        End If
+
+        Dim marker = "Suppressed "
+        Dim markerIndex = line.IndexOf(marker, StringComparison.OrdinalIgnoreCase)
+        If markerIndex < 0 Then
+            Return
+        End If
+
+        markerIndex += marker.Length
+        Dim endIndex = line.IndexOf(" log message", markerIndex, StringComparison.OrdinalIgnoreCase)
+        If endIndex <= markerIndex Then
+            Return
+        End If
+
+        Dim numberText = line.Substring(markerIndex, endIndex - markerIndex).Trim()
+        Dim suppressedCount = 0
+        If Integer.TryParse(numberText, suppressedCount) AndAlso suppressedCount > 0 Then
+            _uiWorkerSuppressedLogLines += suppressedCount
+        End If
     End Sub
 
     Private Sub SetRunningState(isRunning As Boolean)
@@ -2282,6 +2736,14 @@ Public Class MainForm
         _bufferSampleBytesTotal = 0
         _lastChunkUtilization = 0
         _lastProgressSnapshot = Nothing
+        _uiProgressEventsReceived = 0
+        _uiProgressEventsRendered = 0
+        _uiProgressEventsCoalesced = 0
+        _uiProgressRenderAverageMs = 0
+        _uiLogLinesRendered = 0
+        _uiLogLinesDropped = 0
+        _uiWorkerSuppressedLogLines = 0
+        _lastDiagnosticsRenderTick = 0
     End Sub
 
     Private Sub UpdateTransferTelemetry(progress As CopyProgressSnapshot)

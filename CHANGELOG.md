@@ -4,6 +4,39 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.3.6] - 2026-02-14
+
+### Added
+
+- New Diagnostics settings category for worker telemetry policy and UI responsiveness tuning.
+- Worker telemetry profiles (`Normal`, `Verbose`, `Debug`) with per-run effective progress/log throttling.
+- Main-window live diagnostics strip (render latency, event coalescing, log queue depth, dropped/suppressed counts).
+- Appearance settings expansion:
+  - Accent source (`Auto`, `System`, `Custom`) and custom accent color picker.
+  - UI density (`Compact`, `Normal`, `Comfortable`) and UI scale (`90%`, `100%`, `110%`, `125%`).
+  - Operations log font family/size.
+  - Grid appearance controls (alternating rows, row height, header style).
+  - Main status-row visibility controls (Buffer, Rescue, Diagnostics).
+  - Progress-bar style (`Thin`, `Standard`, `Thick`) and optional percentage overlay.
+  - Window chrome mode (`Themed` vs `Standard`) with DWM fallback handling.
+
+### Changed
+
+- Main UI now batches worker log rendering in timed chunks to avoid flooding the UI thread during high-event copy sessions.
+- Dynamic transfer status labels were switched to fixed-layout rendering to reduce repeated autosize/layout churn under fast progress updates.
+- Runtime log view on main form is now virtualized (ListView virtual mode) for smoother scrolling and lower UI memory pressure on very large runs.
+- Worker now emits telemetry summaries for progress/log suppression behavior at run end.
+- Theme application now consumes appearance profile settings (accent + grid presentation + density/scale pass).
+
+### Fixed
+
+- Recovery heartbeat persistence is now queued off the UI thread, removing synchronous state writes from the progress repaint path.
+- Container double-buffering is now applied across core layouts/grids to reduce resize and repaint jitter.
+- Explorer shell-launch flow now opens destination folder picker automatically after source is populated from `Copy with XactCopy` (cancel keeps current destination).
+- Main operations-log tooltip now uses concise wording (`Operations log`).
+- Settings page host now scrolls correctly when appearance page content exceeds the visible area, preventing clipped controls.
+- Restart prompt reasons now include key UI settings (`Window chrome mode`, `UI scale`, `UI density`) in addition to theme/startup behaviors.
+
 ## [1.0.2.7] - 2026-02-14
 
 ### Changed

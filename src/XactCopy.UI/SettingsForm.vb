@@ -15,6 +15,22 @@ Friend Class SettingsForm
     Private ReadOnly _mainSplit As New SplitContainer()
 
     Private ReadOnly _themeComboBox As New ComboBox()
+    Private ReadOnly _accentModeComboBox As New ComboBox()
+    Private ReadOnly _accentColorTextBox As New TextBox()
+    Private ReadOnly _accentColorPickButton As New Button()
+    Private ReadOnly _windowChromeModeComboBox As New ComboBox()
+    Private ReadOnly _uiDensityComboBox As New ComboBox()
+    Private ReadOnly _uiScaleComboBox As New ComboBox()
+    Private ReadOnly _logFontFamilyComboBox As New ComboBox()
+    Private ReadOnly _logFontSizeNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _gridAlternatingRowsCheckBox As New CheckBox()
+    Private ReadOnly _gridRowHeightNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _gridHeaderStyleComboBox As New ComboBox()
+    Private ReadOnly _showBufferStatusRowCheckBox As New CheckBox()
+    Private ReadOnly _showRescueStatusRowCheckBox As New CheckBox()
+    Private ReadOnly _showDiagnosticsStatusRowCheckBox As New CheckBox()
+    Private ReadOnly _progressBarStyleComboBox As New ComboBox()
+    Private ReadOnly _progressBarShowPercentageCheckBox As New CheckBox()
 
     Private ReadOnly _defaultResumeCheckBox As New CheckBox()
     Private ReadOnly _defaultSalvageCheckBox As New CheckBox()
@@ -40,6 +56,12 @@ Friend Class SettingsForm
     Private ReadOnly _rescueFastRetriesNumeric As New ThemedNumericUpDown()
     Private ReadOnly _rescueTrimRetriesNumeric As New ThemedNumericUpDown()
     Private ReadOnly _rescueScrapeRetriesNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _workerTelemetryProfileComboBox As New ComboBox()
+    Private ReadOnly _workerProgressIntervalNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _workerMaxLogsPerSecondNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _uiShowDiagnosticsCheckBox As New CheckBox()
+    Private ReadOnly _uiDiagnosticsRefreshNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _uiMaxLogLinesNumeric As New ThemedNumericUpDown()
 
     Private ReadOnly _defaultVerifyCheckBox As New CheckBox()
     Private ReadOnly _defaultVerificationModeComboBox As New ComboBox()
@@ -204,6 +226,22 @@ Friend Class SettingsForm
     Private Sub ConfigureToolTips()
         _toolTip.SetToolTip(_categoryTreeView, "Select a category to edit related settings.")
         _toolTip.SetToolTip(_themeComboBox, "Choose the color mode used by XactCopy windows.")
+        _toolTip.SetToolTip(_accentModeComboBox, "Accent source used for focus highlights and progress fills.")
+        _toolTip.SetToolTip(_accentColorTextBox, "Custom accent color in #RRGGBB format.")
+        _toolTip.SetToolTip(_accentColorPickButton, "Pick a custom accent color.")
+        _toolTip.SetToolTip(_windowChromeModeComboBox, "Choose themed or standard Windows title bar behavior.")
+        _toolTip.SetToolTip(_uiDensityComboBox, "Control density preset for spacing and compactness.")
+        _toolTip.SetToolTip(_uiScaleComboBox, "Global UI text/control scale.")
+        _toolTip.SetToolTip(_logFontFamilyComboBox, "Font family used by the operations log.")
+        _toolTip.SetToolTip(_logFontSizeNumeric, "Font size for the operations log in points.")
+        _toolTip.SetToolTip(_gridAlternatingRowsCheckBox, "Use alternating row colors in data grids.")
+        _toolTip.SetToolTip(_gridRowHeightNumeric, "Default data-grid row height.")
+        _toolTip.SetToolTip(_gridHeaderStyleComboBox, "Header style used by data grids.")
+        _toolTip.SetToolTip(_showBufferStatusRowCheckBox, "Show or hide the Buffer Use status row on main window.")
+        _toolTip.SetToolTip(_showRescueStatusRowCheckBox, "Show or hide the Rescue telemetry status row on main window.")
+        _toolTip.SetToolTip(_showDiagnosticsStatusRowCheckBox, "Show or hide the diagnostics status strip on main window.")
+        _toolTip.SetToolTip(_progressBarStyleComboBox, "Progress bar thickness style.")
+        _toolTip.SetToolTip(_progressBarShowPercentageCheckBox, "Overlay percentage text inside progress bars.")
 
         _toolTip.SetToolTip(_defaultResumeCheckBox, "Enable journal-based resume for new runs by default.")
         _toolTip.SetToolTip(_defaultSalvageCheckBox, "Enable salvage mode for unreadable source regions by default.")
@@ -230,6 +268,12 @@ Friend Class SettingsForm
         _toolTip.SetToolTip(_rescueFastRetriesNumeric, "Read retries used by FastScan pass.")
         _toolTip.SetToolTip(_rescueTrimRetriesNumeric, "Read retries used by TrimSweep pass.")
         _toolTip.SetToolTip(_rescueScrapeRetriesNumeric, "Read retries used by Scrape pass.")
+        _toolTip.SetToolTip(_workerTelemetryProfileComboBox, "Worker telemetry profile: Normal, Verbose, or Debug.")
+        _toolTip.SetToolTip(_workerProgressIntervalNumeric, "Minimum milliseconds between worker progress events.")
+        _toolTip.SetToolTip(_workerMaxLogsPerSecondNumeric, "Maximum worker log events per second (0 means unlimited).")
+        _toolTip.SetToolTip(_uiShowDiagnosticsCheckBox, "Show live UI diagnostics counters on the main window.")
+        _toolTip.SetToolTip(_uiDiagnosticsRefreshNumeric, "Main-window diagnostics refresh interval in milliseconds.")
+        _toolTip.SetToolTip(_uiMaxLogLinesNumeric, "Maximum runtime log lines kept in memory before trimming.")
 
         _toolTip.SetToolTip(_defaultVerifyCheckBox, "Enable post-copy verification by default.")
         _toolTip.SetToolTip(_defaultVerificationModeComboBox, "Verification strategy for new runs.")
@@ -285,6 +329,7 @@ Friend Class SettingsForm
         _categoryTreeView.Nodes.Add(New TreeNode("Appearance") With {.Name = "appearance"})
         _categoryTreeView.Nodes.Add(New TreeNode("Copy Defaults") With {.Name = "copy"})
         _categoryTreeView.Nodes.Add(New TreeNode("Performance") With {.Name = "performance"})
+        _categoryTreeView.Nodes.Add(New TreeNode("Diagnostics") With {.Name = "diagnostics"})
         _categoryTreeView.Nodes.Add(New TreeNode("Verification") With {.Name = "verification"})
         _categoryTreeView.Nodes.Add(New TreeNode("Updates") With {.Name = "updates"})
         _categoryTreeView.Nodes.Add(New TreeNode("Recovery & Startup") With {.Name = "recovery"})
@@ -317,13 +362,15 @@ Friend Class SettingsForm
         _pageLookup("appearance") = BuildAppearancePage()
         _pageLookup("copy") = BuildCopyDefaultsPage()
         _pageLookup("performance") = BuildPerformancePage()
+        _pageLookup("diagnostics") = BuildDiagnosticsPage()
         _pageLookup("verification") = BuildVerificationPage()
         _pageLookup("updates") = BuildUpdatesPage()
         _pageLookup("recovery") = BuildRecoveryPage()
         _pageLookup("explorer") = BuildExplorerPage()
 
         For Each pageControl In _pageLookup.Values
-            pageControl.Dock = DockStyle.Fill
+            pageControl.Dock = DockStyle.Top
+            pageControl.AutoSize = True
             pageControl.Visible = False
             _pageHostPanel.Controls.Add(pageControl)
         Next
@@ -334,18 +381,133 @@ Friend Class SettingsForm
     End Function
 
     Private Function BuildAppearancePage() As Control
-        Dim page = CreatePageContainer(1)
+        Dim page = CreatePageContainer(5)
 
-        Dim body = CreateFieldGrid(1)
+        Dim theme = CreateFieldGrid(4)
 
         _themeComboBox.DropDownStyle = ComboBoxStyle.DropDownList
         _themeComboBox.Items.AddRange(New Object() {"Dark", "System", "Classic"})
         ConfigureComboBoxControl(_themeComboBox, width:=220)
 
-        body.Controls.Add(CreateFieldLabel("Mode"), 0, 0)
-        body.Controls.Add(_themeComboBox, 1, 0)
+        _accentModeComboBox.DropDownStyle = ComboBoxStyle.DropDownList
+        _accentModeComboBox.Items.AddRange(New Object() {"Auto", "System", "Custom"})
+        ConfigureComboBoxControl(_accentModeComboBox, width:=220)
+        AddHandler _accentModeComboBox.SelectedIndexChanged, AddressOf AppearanceControl_Changed
 
-        page.Controls.Add(CreateSection("Theme", body), 0, 0)
+        ConfigureTextBoxControl(_accentColorTextBox, stretch:=False)
+        _accentColorTextBox.Width = 120
+        _accentColorTextBox.CharacterCasing = CharacterCasing.Upper
+
+        _accentColorPickButton.Text = "Pick..."
+        _accentColorPickButton.AutoSize = True
+        AddHandler _accentColorPickButton.Click, AddressOf AccentColorPickButton_Click
+
+        _windowChromeModeComboBox.DropDownStyle = ComboBoxStyle.DropDownList
+        _windowChromeModeComboBox.Items.AddRange(New Object() {"Themed title bar (if supported)", "Standard title bar"})
+        ConfigureComboBoxControl(_windowChromeModeComboBox, width:=280)
+
+        Dim accentColorPane As New FlowLayoutPanel() With {
+            .AutoSize = True,
+            .AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            .FlowDirection = FlowDirection.LeftToRight,
+            .WrapContents = False,
+            .Margin = New Padding(0)
+        }
+        accentColorPane.Controls.Add(_accentColorTextBox)
+        accentColorPane.Controls.Add(_accentColorPickButton)
+
+        theme.Controls.Add(CreateFieldLabel("Mode"), 0, 0)
+        theme.Controls.Add(_themeComboBox, 1, 0)
+        theme.Controls.Add(CreateFieldLabel("Accent source"), 0, 1)
+        theme.Controls.Add(_accentModeComboBox, 1, 1)
+        theme.Controls.Add(CreateFieldLabel("Custom accent color"), 0, 2)
+        theme.Controls.Add(accentColorPane, 1, 2)
+        theme.Controls.Add(CreateFieldLabel("Window chrome"), 0, 3)
+        theme.Controls.Add(_windowChromeModeComboBox, 1, 3)
+
+        Dim layout = CreateFieldGrid(2)
+
+        _uiDensityComboBox.DropDownStyle = ComboBoxStyle.DropDownList
+        _uiDensityComboBox.Items.AddRange(New Object() {"Compact", "Normal", "Comfortable"})
+        ConfigureComboBoxControl(_uiDensityComboBox, width:=220)
+
+        _uiScaleComboBox.DropDownStyle = ComboBoxStyle.DropDownList
+        _uiScaleComboBox.Items.AddRange(New Object() {"90%", "100%", "110%", "125%"})
+        ConfigureComboBoxControl(_uiScaleComboBox, width:=160)
+
+        layout.Controls.Add(CreateFieldLabel("UI density"), 0, 0)
+        layout.Controls.Add(_uiDensityComboBox, 1, 0)
+        layout.Controls.Add(CreateFieldLabel("UI scale"), 0, 1)
+        layout.Controls.Add(_uiScaleComboBox, 1, 1)
+
+        Dim log = CreateFieldGrid(2)
+
+        _logFontFamilyComboBox.DropDownStyle = ComboBoxStyle.DropDownList
+        ConfigureComboBoxControl(_logFontFamilyComboBox, width:=320)
+        PopulateLogFontFamilyComboBox()
+
+        ConfigureNumeric(_logFontSizeNumeric, 7D, 20D, 9D)
+
+        log.Controls.Add(CreateFieldLabel("Operations log font"), 0, 0)
+        log.Controls.Add(_logFontFamilyComboBox, 1, 0)
+        log.Controls.Add(CreateFieldLabel("Operations log size (pt)"), 0, 1)
+        log.Controls.Add(_logFontSizeNumeric, 1, 1)
+
+        Dim grid = CreateFieldGrid(3)
+
+        _gridAlternatingRowsCheckBox.Text = "Use alternating grid rows"
+        ConfigureCheckBox(_gridAlternatingRowsCheckBox)
+        ConfigureNumeric(_gridRowHeightNumeric, 18D, 48D, 24D)
+
+        _gridHeaderStyleComboBox.DropDownStyle = ComboBoxStyle.DropDownList
+        _gridHeaderStyleComboBox.Items.AddRange(New Object() {"Default", "Minimal", "Prominent"})
+        ConfigureComboBoxControl(_gridHeaderStyleComboBox, width:=220)
+
+        grid.Controls.Add(_gridAlternatingRowsCheckBox, 0, 0)
+        grid.SetColumnSpan(_gridAlternatingRowsCheckBox, 3)
+        grid.Controls.Add(CreateFieldLabel("Grid row height"), 0, 1)
+        grid.Controls.Add(_gridRowHeightNumeric, 1, 1)
+        grid.Controls.Add(CreateFieldLabel("Grid header style"), 0, 2)
+        grid.Controls.Add(_gridHeaderStyleComboBox, 1, 2)
+
+        Dim statusAndProgress = CreateFieldGrid(5)
+
+        _showBufferStatusRowCheckBox.Text = "Show buffer status row"
+        _showRescueStatusRowCheckBox.Text = "Show rescue status row"
+        _showDiagnosticsStatusRowCheckBox.Text = "Show diagnostics status row"
+        _progressBarShowPercentageCheckBox.Text = "Show percentage overlay on progress bars"
+
+        For Each box As CheckBox In New CheckBox() {
+            _showBufferStatusRowCheckBox,
+            _showRescueStatusRowCheckBox,
+            _showDiagnosticsStatusRowCheckBox,
+            _progressBarShowPercentageCheckBox
+        }
+            ConfigureCheckBox(box)
+        Next
+
+        AddHandler _showDiagnosticsStatusRowCheckBox.CheckedChanged, AddressOf AppearanceDiagnosticsVisibilityCheckBox_CheckedChanged
+
+        _progressBarStyleComboBox.DropDownStyle = ComboBoxStyle.DropDownList
+        _progressBarStyleComboBox.Items.AddRange(New Object() {"Thin", "Standard", "Thick"})
+        ConfigureComboBoxControl(_progressBarStyleComboBox, width:=180)
+
+        statusAndProgress.Controls.Add(_showBufferStatusRowCheckBox, 0, 0)
+        statusAndProgress.SetColumnSpan(_showBufferStatusRowCheckBox, 3)
+        statusAndProgress.Controls.Add(_showRescueStatusRowCheckBox, 0, 1)
+        statusAndProgress.SetColumnSpan(_showRescueStatusRowCheckBox, 3)
+        statusAndProgress.Controls.Add(_showDiagnosticsStatusRowCheckBox, 0, 2)
+        statusAndProgress.SetColumnSpan(_showDiagnosticsStatusRowCheckBox, 3)
+        statusAndProgress.Controls.Add(CreateFieldLabel("Progress bar style"), 0, 3)
+        statusAndProgress.Controls.Add(_progressBarStyleComboBox, 1, 3)
+        statusAndProgress.Controls.Add(_progressBarShowPercentageCheckBox, 0, 4)
+        statusAndProgress.SetColumnSpan(_progressBarShowPercentageCheckBox, 3)
+
+        page.Controls.Add(CreateSection("Theme & Accent", theme), 0, 0)
+        page.Controls.Add(CreateSection("Layout", layout), 0, 1)
+        page.Controls.Add(CreateSection("Operations Log", log), 0, 2)
+        page.Controls.Add(CreateSection("Grid Appearance", grid), 0, 3)
+        page.Controls.Add(CreateSection("Status & Progress", statusAndProgress), 0, 4)
         Return page
     End Function
     Private Function BuildCopyDefaultsPage() As Control
@@ -448,6 +610,47 @@ Friend Class SettingsForm
 
         page.Controls.Add(CreateSection("Transfer Tuning", body), 0, 0)
         page.Controls.Add(CreateSection("AegisRescueCore Tuning", rescue), 0, 1)
+        Return page
+    End Function
+
+    Private Function BuildDiagnosticsPage() As Control
+        Dim page = CreatePageContainer(2)
+
+        Dim workerTelemetry = CreateFieldGrid(3)
+
+        _workerTelemetryProfileComboBox.DropDownStyle = ComboBoxStyle.DropDownList
+        _workerTelemetryProfileComboBox.Items.AddRange(New Object() {"Normal", "Verbose", "Debug"})
+        ConfigureComboBoxControl(_workerTelemetryProfileComboBox, width:=240)
+
+        ConfigureNumeric(_workerProgressIntervalNumeric, 20D, 1000D, 75D)
+        ConfigureNumeric(_workerMaxLogsPerSecondNumeric, 0D, 5000D, 100D)
+
+        workerTelemetry.Controls.Add(CreateFieldLabel("Worker telemetry profile"), 0, 0)
+        workerTelemetry.Controls.Add(_workerTelemetryProfileComboBox, 1, 0)
+        workerTelemetry.Controls.Add(CreateFieldLabel("Progress interval (ms)"), 0, 1)
+        workerTelemetry.Controls.Add(_workerProgressIntervalNumeric, 1, 1)
+        workerTelemetry.Controls.Add(CreateFieldLabel("Log rate cap (events/sec, 0=unlimited)"), 0, 2)
+        workerTelemetry.Controls.Add(_workerMaxLogsPerSecondNumeric, 1, 2)
+
+        Dim uiDiagnostics = CreateFieldGrid(3)
+
+        _uiShowDiagnosticsCheckBox.Text = "Show UI diagnostics strip on main window"
+        ConfigureCheckBox(_uiShowDiagnosticsCheckBox)
+        AddHandler _uiShowDiagnosticsCheckBox.CheckedChanged, AddressOf DiagnosticsControl_CheckedChanged
+
+        ConfigureNumeric(_uiDiagnosticsRefreshNumeric, 100D, 5000D, 250D)
+        ConfigureNumeric(_uiMaxLogLinesNumeric, 1000D, 1000000D, 50000D)
+        _uiMaxLogLinesNumeric.Increment = 1000D
+
+        uiDiagnostics.Controls.Add(_uiShowDiagnosticsCheckBox, 0, 0)
+        uiDiagnostics.SetColumnSpan(_uiShowDiagnosticsCheckBox, 3)
+        uiDiagnostics.Controls.Add(CreateFieldLabel("Diagnostics refresh interval (ms)"), 0, 1)
+        uiDiagnostics.Controls.Add(_uiDiagnosticsRefreshNumeric, 1, 1)
+        uiDiagnostics.Controls.Add(CreateFieldLabel("Virtual log max lines"), 0, 2)
+        uiDiagnostics.Controls.Add(_uiMaxLogLinesNumeric, 1, 2)
+
+        page.Controls.Add(CreateSection("Worker Telemetry", workerTelemetry), 0, 0)
+        page.Controls.Add(CreateSection("UI Diagnostics", uiDiagnostics), 0, 1)
         Return page
     End Function
 
@@ -633,6 +836,31 @@ Friend Class SettingsForm
         control.Padding = New Padding(0)
     End Sub
 
+    Private Sub PopulateLogFontFamilyComboBox()
+        If _logFontFamilyComboBox.Items.Count > 0 Then
+            Return
+        End If
+
+        Dim preferredFonts = New String() {"Consolas", "Cascadia Mono", "Lucida Console", "Courier New", "Segoe UI"}
+        Dim fontNames As New SortedSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each fontName As String In preferredFonts
+            fontNames.Add(fontName)
+        Next
+
+        Try
+            For Each family As FontFamily In FontFamily.Families
+                fontNames.Add(family.Name)
+            Next
+        Catch
+            ' Ignore font-enumeration failures and keep fallback list.
+        End Try
+
+        For Each fontName As String In fontNames
+            _logFontFamilyComboBox.Items.Add(fontName)
+        Next
+    End Sub
+
     Private Shared Function CreateFieldGrid(rowCount As Integer) As TableLayoutPanel
         Dim grid As New TableLayoutPanel() With {
             .Dock = DockStyle.Top,
@@ -681,16 +909,18 @@ Friend Class SettingsForm
 
     Private Function CreatePageContainer(sectionCount As Integer) As TableLayoutPanel
         Dim page As New TableLayoutPanel() With {
-            .Dock = DockStyle.Fill,
+            .Dock = DockStyle.Top,
+            .AutoSize = True,
+            .AutoSizeMode = AutoSizeMode.GrowAndShrink,
             .ColumnCount = 1,
-            .RowCount = sectionCount + 1,
-            .Padding = New Padding(2)
+            .RowCount = sectionCount,
+            .Padding = New Padding(2),
+            .Margin = New Padding(0)
         }
         page.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100.0F))
         For index = 0 To sectionCount - 1
             page.RowStyles.Add(New RowStyle(SizeType.AutoSize))
         Next
-        page.RowStyles.Add(New RowStyle(SizeType.Percent, 100.0F))
         Return page
     End Function
 
@@ -741,15 +971,28 @@ Friend Class SettingsForm
     End Sub
 
     Private Sub ShowPage(pageKey As String)
+        Dim selectedPage As Control = Nothing
         For Each entry In _pageLookup
-            entry.Value.Visible = String.Equals(entry.Key, pageKey, StringComparison.OrdinalIgnoreCase)
+            Dim isMatch = String.Equals(entry.Key, pageKey, StringComparison.OrdinalIgnoreCase)
+            entry.Value.Visible = isMatch
+            If isMatch Then
+                selectedPage = entry.Value
+            End If
         Next
+
+        If selectedPage IsNot Nothing Then
+            selectedPage.BringToFront()
+            _pageHostPanel.ScrollControlIntoView(selectedPage)
+            _pageHostPanel.AutoScrollPosition = New Point(0, 0)
+        End If
 
         Select Case pageKey
             Case "copy"
                 _pageTitleLabel.Text = "Copy Defaults"
             Case "performance"
                 _pageTitleLabel.Text = "Performance"
+            Case "diagnostics"
+                _pageTitleLabel.Text = "Diagnostics"
             Case "verification"
                 _pageTitleLabel.Text = "Verification"
             Case "updates"
@@ -766,6 +1009,20 @@ Friend Class SettingsForm
     Private Sub ApplySettingsToControls()
         _suspendDirtyTracking = True
         Try
+            _accentColorTextBox.Text = SettingsValueConverter.NormalizeColorHex(_workingSettings.AccentColorHex, "#5A78C8")
+            _windowChromeModeComboBox.SelectedIndex = If(
+                SettingsValueConverter.ToWindowChromeModeChoice(_workingSettings.WindowChromeMode) = WindowChromeModeChoice.Standard,
+                1,
+                0)
+            _uiScaleComboBox.SelectedItem = $"{Math.Max(90, Math.Min(125, _workingSettings.UiScalePercent))}%"
+            _logFontSizeNumeric.Value = ClampNumeric(_logFontSizeNumeric, _workingSettings.LogFontSizePoints)
+            _gridAlternatingRowsCheckBox.Checked = _workingSettings.GridAlternatingRows
+            _gridRowHeightNumeric.Value = ClampNumeric(_gridRowHeightNumeric, _workingSettings.GridRowHeight)
+            _showBufferStatusRowCheckBox.Checked = _workingSettings.ShowBufferStatusRow
+            _showRescueStatusRowCheckBox.Checked = _workingSettings.ShowRescueStatusRow
+            _showDiagnosticsStatusRowCheckBox.Checked = _workingSettings.UiShowDiagnostics
+            _progressBarShowPercentageCheckBox.Checked = _workingSettings.ProgressBarShowPercentage
+
             _checkUpdatesOnLaunchCheckBox.Checked = _workingSettings.CheckUpdatesOnLaunch
             _updateUrlTextBox.Text = If(_workingSettings.UpdateReleaseUrl, String.Empty)
             _userAgentTextBox.Text = If(_workingSettings.UserAgent, String.Empty)
@@ -800,6 +1057,11 @@ Friend Class SettingsForm
             _rescueFastRetriesNumeric.Value = ClampNumeric(_rescueFastRetriesNumeric, _workingSettings.DefaultRescueFastScanRetries)
             _rescueTrimRetriesNumeric.Value = ClampNumeric(_rescueTrimRetriesNumeric, _workingSettings.DefaultRescueTrimRetries)
             _rescueScrapeRetriesNumeric.Value = ClampNumeric(_rescueScrapeRetriesNumeric, _workingSettings.DefaultRescueScrapeRetries)
+            _workerProgressIntervalNumeric.Value = ClampNumeric(_workerProgressIntervalNumeric, _workingSettings.WorkerProgressIntervalMs)
+            _workerMaxLogsPerSecondNumeric.Value = ClampNumeric(_workerMaxLogsPerSecondNumeric, _workingSettings.WorkerMaxLogsPerSecond)
+            _uiDiagnosticsRefreshNumeric.Value = ClampNumeric(_uiDiagnosticsRefreshNumeric, _workingSettings.UiDiagnosticsRefreshMs)
+            _uiMaxLogLinesNumeric.Value = ClampNumeric(_uiMaxLogLinesNumeric, _workingSettings.UiMaxLogLines)
+            _uiShowDiagnosticsCheckBox.Checked = _workingSettings.UiShowDiagnostics
 
             _defaultVerifyCheckBox.Checked = _workingSettings.DefaultVerifyAfterCopy
             _sampleChunkKbNumeric.Value = ClampNumeric(_sampleChunkKbNumeric, _workingSettings.DefaultSampleVerificationChunkKb)
@@ -812,6 +1074,42 @@ Friend Class SettingsForm
                     _themeComboBox.SelectedItem = "Classic"
                 Case Else
                     _themeComboBox.SelectedItem = "System"
+            End Select
+
+            Select Case SettingsValueConverter.ToAccentColorModeChoice(_workingSettings.AccentColorMode)
+                Case AccentColorModeChoice.System
+                    _accentModeComboBox.SelectedIndex = 1
+                Case AccentColorModeChoice.Custom
+                    _accentModeComboBox.SelectedIndex = 2
+                Case Else
+                    _accentModeComboBox.SelectedIndex = 0
+            End Select
+
+            Select Case SettingsValueConverter.ToUiDensityChoice(_workingSettings.UiDensity)
+                Case UiDensityChoice.Compact
+                    _uiDensityComboBox.SelectedIndex = 0
+                Case UiDensityChoice.Comfortable
+                    _uiDensityComboBox.SelectedIndex = 2
+                Case Else
+                    _uiDensityComboBox.SelectedIndex = 1
+            End Select
+
+            Select Case SettingsValueConverter.ToGridHeaderStyleChoice(_workingSettings.GridHeaderStyle)
+                Case GridHeaderStyleChoice.Minimal
+                    _gridHeaderStyleComboBox.SelectedIndex = 1
+                Case GridHeaderStyleChoice.Prominent
+                    _gridHeaderStyleComboBox.SelectedIndex = 2
+                Case Else
+                    _gridHeaderStyleComboBox.SelectedIndex = 0
+            End Select
+
+            Select Case SettingsValueConverter.ToProgressBarStyleChoice(_workingSettings.ProgressBarStyle)
+                Case ProgressBarStyleChoice.Thin
+                    _progressBarStyleComboBox.SelectedIndex = 0
+                Case ProgressBarStyleChoice.Thick
+                    _progressBarStyleComboBox.SelectedIndex = 2
+                Case Else
+                    _progressBarStyleComboBox.SelectedIndex = 1
             End Select
 
             Select Case SettingsValueConverter.ToOverwritePolicy(_workingSettings.DefaultOverwritePolicy)
@@ -860,17 +1158,49 @@ Friend Class SettingsForm
                     _explorerSelectionModeComboBox.SelectedIndex = 0
             End Select
 
+            Select Case SettingsValueConverter.ToWorkerTelemetryProfile(_workingSettings.WorkerTelemetryProfile)
+                Case WorkerTelemetryProfile.Verbose
+                    _workerTelemetryProfileComboBox.SelectedIndex = 1
+                Case WorkerTelemetryProfile.Debug
+                    _workerTelemetryProfileComboBox.SelectedIndex = 2
+                Case Else
+                    _workerTelemetryProfileComboBox.SelectedIndex = 0
+            End Select
+
             EnsureSelection(_themeComboBox)
+            EnsureSelection(_accentModeComboBox)
+            EnsureSelection(_windowChromeModeComboBox)
+            EnsureSelection(_uiDensityComboBox)
+            EnsureSelection(_uiScaleComboBox)
+            EnsureSelection(_gridHeaderStyleComboBox)
+            EnsureSelection(_progressBarStyleComboBox)
             EnsureSelection(_overwritePolicyComboBox)
             EnsureSelection(_symlinkHandlingComboBox)
             EnsureSelection(_salvageFillPatternComboBox)
             EnsureSelection(_defaultVerificationModeComboBox)
             EnsureSelection(_defaultHashAlgorithmComboBox)
             EnsureSelection(_explorerSelectionModeComboBox)
+            EnsureSelection(_workerTelemetryProfileComboBox)
+
+            Dim requestedLogFont = If(_workingSettings.LogFontFamily, String.Empty).Trim()
+            If requestedLogFont.Length = 0 Then
+                requestedLogFont = "Consolas"
+            End If
+            Dim requestedFontIndex = _logFontFamilyComboBox.FindStringExact(requestedLogFont)
+            If requestedFontIndex < 0 Then
+                _logFontFamilyComboBox.Items.Add(requestedLogFont)
+                requestedFontIndex = _logFontFamilyComboBox.Items.Count - 1
+            End If
+            _logFontFamilyComboBox.SelectedIndex = requestedFontIndex
 
             UpdateRecoveryControlStates()
             UpdateVerificationControlStates()
             UpdateExplorerControlStates()
+            If _showDiagnosticsStatusRowCheckBox.Checked <> _uiShowDiagnosticsCheckBox.Checked Then
+                _showDiagnosticsStatusRowCheckBox.Checked = _uiShowDiagnosticsCheckBox.Checked
+            End If
+            UpdateAppearanceControlStates()
+            UpdateDiagnosticsControlStates()
         Finally
             _suspendDirtyTracking = False
         End Try
@@ -900,6 +1230,7 @@ Friend Class SettingsForm
         showValidationErrors As Boolean) As Boolean
 
         Dim updateUrl = _updateUrlTextBox.Text.Trim()
+        Dim accentColor = _accentColorTextBox.Text.Trim()
         If validateInput AndAlso updateUrl.Length > 0 AndAlso Not IsValidHttpUrl(updateUrl) Then
             If showValidationErrors Then
                 MessageBox.Show(Me, "Release URL must be an absolute http/https URL.", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Warning)
@@ -909,15 +1240,74 @@ Friend Class SettingsForm
             Return False
         End If
 
+        If validateInput AndAlso _accentModeComboBox.SelectedIndex = 2 Then
+            Dim parsedAccentColor As Color = Nothing
+            If Not SettingsValueConverter.TryParseColorHex(accentColor, parsedAccentColor) Then
+                If showValidationErrors Then
+                    MessageBox.Show(Me, "Custom accent color must use #RRGGBB format.", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                    _accentColorTextBox.Focus()
+                End If
+                capturedSettings = Nothing
+                Return False
+            End If
+        End If
+
         Dim overwritePolicyIndex = If(_overwritePolicyComboBox.SelectedIndex >= 0, _overwritePolicyComboBox.SelectedIndex, 0)
         Dim symlinkHandlingIndex = If(_symlinkHandlingComboBox.SelectedIndex >= 0, _symlinkHandlingComboBox.SelectedIndex, 0)
         Dim salvagePatternIndex = If(_salvageFillPatternComboBox.SelectedIndex >= 0, _salvageFillPatternComboBox.SelectedIndex, 0)
         Dim verificationModeIndex = If(_defaultVerificationModeComboBox.SelectedIndex >= 0, _defaultVerificationModeComboBox.SelectedIndex, 0)
         Dim hashAlgorithmIndex = If(_defaultHashAlgorithmComboBox.SelectedIndex >= 0, _defaultHashAlgorithmComboBox.SelectedIndex, 0)
         Dim explorerSelectionModeIndex = If(_explorerSelectionModeComboBox.SelectedIndex >= 0, _explorerSelectionModeComboBox.SelectedIndex, 0)
+        Dim telemetryProfileIndex = If(_workerTelemetryProfileComboBox.SelectedIndex >= 0, _workerTelemetryProfileComboBox.SelectedIndex, 0)
+        Dim accentModeIndex = If(_accentModeComboBox.SelectedIndex >= 0, _accentModeComboBox.SelectedIndex, 0)
+        Dim windowChromeIndex = If(_windowChromeModeComboBox.SelectedIndex >= 0, _windowChromeModeComboBox.SelectedIndex, 0)
+        Dim uiDensityIndex = If(_uiDensityComboBox.SelectedIndex >= 0, _uiDensityComboBox.SelectedIndex, 1)
+        Dim gridHeaderStyleIndex = If(_gridHeaderStyleComboBox.SelectedIndex >= 0, _gridHeaderStyleComboBox.SelectedIndex, 0)
+        Dim progressBarStyleIndex = If(_progressBarStyleComboBox.SelectedIndex >= 0, _progressBarStyleComboBox.SelectedIndex, 1)
+        Dim uiScalePercent = ParseScalePercent(_uiScaleComboBox)
 
         capturedSettings = CloneSettings(_workingSettings)
         capturedSettings.Theme = ThemeSettings.ModeToString(GetSelectedMode())
+        capturedSettings.AccentColorMode = If(
+            accentModeIndex = 1,
+            SettingsValueConverter.AccentColorModeChoiceToString(AccentColorModeChoice.System),
+            If(accentModeIndex = 2,
+               SettingsValueConverter.AccentColorModeChoiceToString(AccentColorModeChoice.Custom),
+               SettingsValueConverter.AccentColorModeChoiceToString(AccentColorModeChoice.Auto)))
+        capturedSettings.AccentColorHex = SettingsValueConverter.NormalizeColorHex(accentColor, "#5A78C8")
+        capturedSettings.WindowChromeMode = If(
+            windowChromeIndex = 1,
+            SettingsValueConverter.WindowChromeModeChoiceToString(WindowChromeModeChoice.Standard),
+            SettingsValueConverter.WindowChromeModeChoiceToString(WindowChromeModeChoice.Themed))
+        capturedSettings.UiDensity = If(
+            uiDensityIndex = 0,
+            SettingsValueConverter.UiDensityChoiceToString(UiDensityChoice.Compact),
+            If(uiDensityIndex = 2,
+               SettingsValueConverter.UiDensityChoiceToString(UiDensityChoice.Comfortable),
+               SettingsValueConverter.UiDensityChoiceToString(UiDensityChoice.Normal)))
+        capturedSettings.UiScalePercent = uiScalePercent
+        capturedSettings.LogFontFamily = _logFontFamilyComboBox.Text.Trim()
+        If capturedSettings.LogFontFamily.Length = 0 Then
+            capturedSettings.LogFontFamily = "Consolas"
+        End If
+        capturedSettings.LogFontSizePoints = CInt(_logFontSizeNumeric.Value)
+        capturedSettings.GridAlternatingRows = _gridAlternatingRowsCheckBox.Checked
+        capturedSettings.GridRowHeight = CInt(_gridRowHeightNumeric.Value)
+        capturedSettings.GridHeaderStyle = If(
+            gridHeaderStyleIndex = 1,
+            SettingsValueConverter.GridHeaderStyleChoiceToString(GridHeaderStyleChoice.Minimal),
+            If(gridHeaderStyleIndex = 2,
+               SettingsValueConverter.GridHeaderStyleChoiceToString(GridHeaderStyleChoice.Prominent),
+               SettingsValueConverter.GridHeaderStyleChoiceToString(GridHeaderStyleChoice.Default)))
+        capturedSettings.ProgressBarStyle = If(
+            progressBarStyleIndex = 0,
+            SettingsValueConverter.ProgressBarStyleChoiceToString(ProgressBarStyleChoice.Thin),
+            If(progressBarStyleIndex = 2,
+               SettingsValueConverter.ProgressBarStyleChoiceToString(ProgressBarStyleChoice.Thick),
+               SettingsValueConverter.ProgressBarStyleChoiceToString(ProgressBarStyleChoice.Standard)))
+        capturedSettings.ProgressBarShowPercentage = _progressBarShowPercentageCheckBox.Checked
+        capturedSettings.ShowBufferStatusRow = _showBufferStatusRowCheckBox.Checked
+        capturedSettings.ShowRescueStatusRow = _showRescueStatusRowCheckBox.Checked
         capturedSettings.CheckUpdatesOnLaunch = _checkUpdatesOnLaunchCheckBox.Checked
         capturedSettings.UpdateReleaseUrl = updateUrl
         capturedSettings.UserAgent = _userAgentTextBox.Text.Trim()
@@ -954,6 +1344,11 @@ Friend Class SettingsForm
         capturedSettings.DefaultRescueFastScanRetries = CInt(_rescueFastRetriesNumeric.Value)
         capturedSettings.DefaultRescueTrimRetries = CInt(_rescueTrimRetriesNumeric.Value)
         capturedSettings.DefaultRescueScrapeRetries = CInt(_rescueScrapeRetriesNumeric.Value)
+        capturedSettings.WorkerProgressIntervalMs = CInt(_workerProgressIntervalNumeric.Value)
+        capturedSettings.WorkerMaxLogsPerSecond = CInt(_workerMaxLogsPerSecondNumeric.Value)
+        capturedSettings.UiShowDiagnostics = _uiShowDiagnosticsCheckBox.Checked
+        capturedSettings.UiDiagnosticsRefreshMs = CInt(_uiDiagnosticsRefreshNumeric.Value)
+        capturedSettings.UiMaxLogLines = CInt(_uiMaxLogLinesNumeric.Value)
 
         Select Case overwritePolicyIndex
             Case 1
@@ -989,6 +1384,16 @@ Friend Class SettingsForm
                                                                SettingsValueConverter.VerificationHashAlgorithmToString(VerificationHashAlgorithm.Sha256))
         capturedSettings.DefaultSampleVerificationChunkKb = CInt(_sampleChunkKbNumeric.Value)
         capturedSettings.DefaultSampleVerificationChunkCount = CInt(_sampleChunkCountNumeric.Value)
+
+        Select Case telemetryProfileIndex
+            Case 1
+                capturedSettings.WorkerTelemetryProfile = SettingsValueConverter.WorkerTelemetryProfileToString(WorkerTelemetryProfile.Verbose)
+            Case 2
+                capturedSettings.WorkerTelemetryProfile = SettingsValueConverter.WorkerTelemetryProfileToString(WorkerTelemetryProfile.Debug)
+            Case Else
+                capturedSettings.WorkerTelemetryProfile = SettingsValueConverter.WorkerTelemetryProfileToString(WorkerTelemetryProfile.Normal)
+        End Select
+
         Return True
     End Function
 
@@ -1001,6 +1406,18 @@ Friend Class SettingsForm
 
         If Not String.Equals(original.Theme, updated.Theme, StringComparison.OrdinalIgnoreCase) Then
             reasons.Add("Application theme mode")
+        End If
+
+        If Not String.Equals(original.WindowChromeMode, updated.WindowChromeMode, StringComparison.OrdinalIgnoreCase) Then
+            reasons.Add("Window chrome mode")
+        End If
+
+        If original.UiScalePercent <> updated.UiScalePercent Then
+            reasons.Add("UI scale")
+        End If
+
+        If Not String.Equals(original.UiDensity, updated.UiDensity, StringComparison.OrdinalIgnoreCase) Then
+            reasons.Add("UI density")
         End If
 
         If original.CheckUpdatesOnLaunch <> updated.CheckUpdatesOnLaunch Then
@@ -1093,6 +1510,45 @@ Friend Class SettingsForm
         UpdateExplorerControlStates()
     End Sub
 
+    Private Sub DiagnosticsControl_CheckedChanged(sender As Object, e As EventArgs)
+        If _showDiagnosticsStatusRowCheckBox.Checked <> _uiShowDiagnosticsCheckBox.Checked Then
+            _showDiagnosticsStatusRowCheckBox.Checked = _uiShowDiagnosticsCheckBox.Checked
+        End If
+        UpdateDiagnosticsControlStates()
+    End Sub
+
+    Private Sub AppearanceControl_Changed(sender As Object, e As EventArgs)
+        UpdateAppearanceControlStates()
+    End Sub
+
+    Private Sub AppearanceDiagnosticsVisibilityCheckBox_CheckedChanged(sender As Object, e As EventArgs)
+        If _uiShowDiagnosticsCheckBox.Checked <> _showDiagnosticsStatusRowCheckBox.Checked Then
+            _uiShowDiagnosticsCheckBox.Checked = _showDiagnosticsStatusRowCheckBox.Checked
+        End If
+        UpdateDiagnosticsControlStates()
+    End Sub
+
+    Private Sub AccentColorPickButton_Click(sender As Object, e As EventArgs)
+        Using colorDialog As New ColorDialog()
+            colorDialog.FullOpen = True
+            colorDialog.AnyColor = True
+
+            Dim parsedColor As Color = Nothing
+            If SettingsValueConverter.TryParseColorHex(_accentColorTextBox.Text, parsedColor) Then
+                colorDialog.Color = parsedColor
+            End If
+
+            If colorDialog.ShowDialog(Me) <> DialogResult.OK Then
+                Return
+            End If
+
+            _accentColorTextBox.Text = SettingsValueConverter.ColorToHex(colorDialog.Color)
+            _accentModeComboBox.SelectedIndex = 2
+            UpdateAppearanceControlStates()
+            UpdateDirtyState()
+        End Using
+    End Sub
+
     Private Sub UpdateRecoveryControlStates()
         Dim autoResumeEnabled = _autoResumeAfterCrashCheckBox.Checked
         _promptResumeAfterCrashCheckBox.Enabled = Not autoResumeEnabled
@@ -1117,6 +1573,30 @@ Friend Class SettingsForm
     Private Sub UpdateExplorerControlStates()
         _explorerSelectionModeComboBox.Enabled = _enableExplorerContextMenuCheckBox.Checked
     End Sub
+
+    Private Sub UpdateDiagnosticsControlStates()
+        _uiDiagnosticsRefreshNumeric.Enabled = _uiShowDiagnosticsCheckBox.Checked
+    End Sub
+
+    Private Sub UpdateAppearanceControlStates()
+        Dim customAccent = _accentModeComboBox.SelectedIndex = 2
+        _accentColorTextBox.Enabled = customAccent
+        _accentColorPickButton.Enabled = customAccent
+    End Sub
+
+    Private Shared Function ParseScalePercent(scaleComboBox As ComboBox) As Integer
+        If scaleComboBox Is Nothing Then
+            Return 100
+        End If
+
+        Dim valueText = If(scaleComboBox.Text, String.Empty).Trim().TrimEnd("%"c)
+        Dim parsedValue As Integer
+        If Not Integer.TryParse(valueText, parsedValue) Then
+            Return 100
+        End If
+
+        Return Math.Max(90, Math.Min(125, parsedValue))
+    End Function
 
     Private Sub OkButton_Click(sender As Object, e As EventArgs)
         Dim capturedSettings As AppSettings = Nothing
@@ -1158,47 +1638,17 @@ Friend Class SettingsForm
     End Function
 
     Private Shared Function CloneSettings(source As AppSettings) As AppSettings
-        Return New AppSettings() With {
-            .Theme = source.Theme,
-            .CheckUpdatesOnLaunch = source.CheckUpdatesOnLaunch,
-            .UpdateReleaseUrl = source.UpdateReleaseUrl,
-            .UserAgent = source.UserAgent,
-            .EnableRecoveryAutostart = source.EnableRecoveryAutostart,
-            .PromptResumeAfterCrash = source.PromptResumeAfterCrash,
-            .AutoResumeAfterCrash = source.AutoResumeAfterCrash,
-            .KeepResumePromptUntilResolved = source.KeepResumePromptUntilResolved,
-            .AutoRunQueuedJobsOnStartup = source.AutoRunQueuedJobsOnStartup,
-            .RecoveryTouchIntervalSeconds = source.RecoveryTouchIntervalSeconds,
-            .EnableExplorerContextMenu = source.EnableExplorerContextMenu,
-            .ExplorerSelectionMode = source.ExplorerSelectionMode,
-            .DefaultResumeFromJournal = source.DefaultResumeFromJournal,
-            .DefaultSalvageUnreadableBlocks = source.DefaultSalvageUnreadableBlocks,
-            .DefaultContinueOnFileError = source.DefaultContinueOnFileError,
-            .DefaultVerifyAfterCopy = source.DefaultVerifyAfterCopy,
-            .DefaultUseAdaptiveBuffer = source.DefaultUseAdaptiveBuffer,
-            .DefaultWaitForMediaAvailability = source.DefaultWaitForMediaAvailability,
-            .DefaultBufferSizeMb = source.DefaultBufferSizeMb,
-            .DefaultMaxRetries = source.DefaultMaxRetries,
-            .DefaultOperationTimeoutSeconds = source.DefaultOperationTimeoutSeconds,
-            .DefaultPerFileTimeoutSeconds = source.DefaultPerFileTimeoutSeconds,
-            .DefaultMaxThroughputMbPerSecond = source.DefaultMaxThroughputMbPerSecond,
-            .DefaultRescueFastScanChunkKb = source.DefaultRescueFastScanChunkKb,
-            .DefaultRescueTrimChunkKb = source.DefaultRescueTrimChunkKb,
-            .DefaultRescueScrapeChunkKb = source.DefaultRescueScrapeChunkKb,
-            .DefaultRescueRetryChunkKb = source.DefaultRescueRetryChunkKb,
-            .DefaultRescueSplitMinimumKb = source.DefaultRescueSplitMinimumKb,
-            .DefaultRescueFastScanRetries = source.DefaultRescueFastScanRetries,
-            .DefaultRescueTrimRetries = source.DefaultRescueTrimRetries,
-            .DefaultRescueScrapeRetries = source.DefaultRescueScrapeRetries,
-            .DefaultPreserveTimestamps = source.DefaultPreserveTimestamps,
-            .DefaultCopyEmptyDirectories = source.DefaultCopyEmptyDirectories,
-            .DefaultOverwritePolicy = source.DefaultOverwritePolicy,
-            .DefaultSymlinkHandling = source.DefaultSymlinkHandling,
-            .DefaultVerificationMode = source.DefaultVerificationMode,
-            .DefaultVerificationHashAlgorithm = source.DefaultVerificationHashAlgorithm,
-            .DefaultSampleVerificationChunkKb = source.DefaultSampleVerificationChunkKb,
-            .DefaultSampleVerificationChunkCount = source.DefaultSampleVerificationChunkCount,
-            .DefaultSalvageFillPattern = source.DefaultSalvageFillPattern
-        }
+        Dim clone As New AppSettings()
+        If source Is Nothing Then
+            Return clone
+        End If
+
+        For Each propertyInfo In GetType(AppSettings).GetProperties(System.Reflection.BindingFlags.Public Or System.Reflection.BindingFlags.Instance)
+            If propertyInfo.CanRead AndAlso propertyInfo.CanWrite Then
+                propertyInfo.SetValue(clone, propertyInfo.GetValue(source))
+            End If
+        Next
+
+        Return clone
     End Function
 End Class

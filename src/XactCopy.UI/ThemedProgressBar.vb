@@ -16,6 +16,8 @@ Friend Class ThemedProgressBar
     Private _fillColor As Color = Color.FromArgb(90, 120, 200)
     Private _borderColor As Color = Color.FromArgb(70, 70, 70)
     Private _showBorder As Boolean = False
+    Private _showPercentageText As Boolean = False
+    Private _percentageTextColor As Color = Color.Gainsboro
 
     Public Sub New()
         SetStyle(ControlStyles.UserPaint Or
@@ -161,6 +163,36 @@ Friend Class ThemedProgressBar
         End Set
     End Property
 
+    <DefaultValue(False)>
+    Public Property ShowPercentageText As Boolean
+        Get
+            Return _showPercentageText
+        End Get
+        Set(value As Boolean)
+            If _showPercentageText = value Then
+                Return
+            End If
+
+            _showPercentageText = value
+            Invalidate()
+        End Set
+    End Property
+
+    <DefaultValue(GetType(Color), "220, 220, 220")>
+    Public Property PercentageTextColor As Color
+        Get
+            Return _percentageTextColor
+        End Get
+        Set(value As Color)
+            If _percentageTextColor = value Then
+                Return
+            End If
+
+            _percentageTextColor = value
+            Invalidate()
+        End Set
+    End Property
+
     Protected Overrides Sub OnPaint(e As PaintEventArgs)
         Dim rect As Rectangle = ClientRectangle
         If rect.Width <= 0 OrElse rect.Height <= 0 Then
@@ -190,6 +222,20 @@ Friend Class ThemedProgressBar
             Using borderPen As New Pen(_borderColor)
                 e.Graphics.DrawRectangle(borderPen, New Rectangle(0, 0, rect.Width - 1, rect.Height - 1))
             End Using
+        End If
+
+        If _showPercentageText AndAlso _style <> ProgressBarStyle.Marquee Then
+            Dim range As Integer = Math.Max(1, _maximum - _minimum)
+            Dim progress As Double = CDbl(_value - _minimum) / range
+            progress = Math.Max(0.0R, Math.Min(1.0R, progress))
+            Dim text = $"{progress * 100.0R:0.0}%"
+            TextRenderer.DrawText(
+                e.Graphics,
+                text,
+                Font,
+                contentRect,
+                _percentageTextColor,
+                TextFormatFlags.HorizontalCenter Or TextFormatFlags.VerticalCenter Or TextFormatFlags.NoPrefix)
         End If
     End Sub
 

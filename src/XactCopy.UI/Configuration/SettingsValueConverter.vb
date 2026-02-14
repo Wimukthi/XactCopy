@@ -1,6 +1,36 @@
+Imports System.Drawing
 Imports XactCopy.Models
 
 Namespace Configuration
+    Friend Enum AccentColorModeChoice
+        Auto = 0
+        System = 1
+        Custom = 2
+    End Enum
+
+    Friend Enum UiDensityChoice
+        Compact = 0
+        Normal = 1
+        Comfortable = 2
+    End Enum
+
+    Friend Enum GridHeaderStyleChoice
+        [Default] = 0
+        Minimal = 1
+        Prominent = 2
+    End Enum
+
+    Friend Enum ProgressBarStyleChoice
+        Thin = 0
+        Standard = 1
+        Thick = 2
+    End Enum
+
+    Friend Enum WindowChromeModeChoice
+        Themed = 0
+        Standard = 1
+    End Enum
+
     Friend Enum ExplorerSelectionMode
         SourceFolder = 0
         SelectedItems = 1
@@ -28,6 +58,162 @@ Namespace Configuration
             End If
 
             Return value
+        End Function
+
+        Public Function ToAccentColorModeChoice(value As String) As AccentColorModeChoice
+            Select Case NormalizeChoice(value, "auto", "auto", "system", "custom")
+                Case "system"
+                    Return AccentColorModeChoice.System
+                Case "custom"
+                    Return AccentColorModeChoice.Custom
+                Case Else
+                    Return AccentColorModeChoice.Auto
+            End Select
+        End Function
+
+        Public Function AccentColorModeChoiceToString(value As AccentColorModeChoice) As String
+            Select Case value
+                Case AccentColorModeChoice.System
+                    Return "system"
+                Case AccentColorModeChoice.Custom
+                    Return "custom"
+                Case Else
+                    Return "auto"
+            End Select
+        End Function
+
+        Public Function ToUiDensityChoice(value As String) As UiDensityChoice
+            Select Case NormalizeChoice(value, "normal", "compact", "normal", "comfortable")
+                Case "compact"
+                    Return UiDensityChoice.Compact
+                Case "comfortable"
+                    Return UiDensityChoice.Comfortable
+                Case Else
+                    Return UiDensityChoice.Normal
+            End Select
+        End Function
+
+        Public Function UiDensityChoiceToString(value As UiDensityChoice) As String
+            Select Case value
+                Case UiDensityChoice.Compact
+                    Return "compact"
+                Case UiDensityChoice.Comfortable
+                    Return "comfortable"
+                Case Else
+                    Return "normal"
+            End Select
+        End Function
+
+        Public Function ToGridHeaderStyleChoice(value As String) As GridHeaderStyleChoice
+            Select Case NormalizeChoice(value, "default", "default", "minimal", "prominent")
+                Case "minimal"
+                    Return GridHeaderStyleChoice.Minimal
+                Case "prominent"
+                    Return GridHeaderStyleChoice.Prominent
+                Case Else
+                    Return GridHeaderStyleChoice.Default
+            End Select
+        End Function
+
+        Public Function GridHeaderStyleChoiceToString(value As GridHeaderStyleChoice) As String
+            Select Case value
+                Case GridHeaderStyleChoice.Minimal
+                    Return "minimal"
+                Case GridHeaderStyleChoice.Prominent
+                    Return "prominent"
+                Case Else
+                    Return "default"
+            End Select
+        End Function
+
+        Public Function ToProgressBarStyleChoice(value As String) As ProgressBarStyleChoice
+            Select Case NormalizeChoice(value, "standard", "thin", "standard", "thick")
+                Case "thin"
+                    Return ProgressBarStyleChoice.Thin
+                Case "thick"
+                    Return ProgressBarStyleChoice.Thick
+                Case Else
+                    Return ProgressBarStyleChoice.Standard
+            End Select
+        End Function
+
+        Public Function ProgressBarStyleChoiceToString(value As ProgressBarStyleChoice) As String
+            Select Case value
+                Case ProgressBarStyleChoice.Thin
+                    Return "thin"
+                Case ProgressBarStyleChoice.Thick
+                    Return "thick"
+                Case Else
+                    Return "standard"
+            End Select
+        End Function
+
+        Public Function ToWindowChromeModeChoice(value As String) As WindowChromeModeChoice
+            Select Case NormalizeChoice(value, "themed", "themed", "standard")
+                Case "standard"
+                    Return WindowChromeModeChoice.Standard
+                Case Else
+                    Return WindowChromeModeChoice.Themed
+            End Select
+        End Function
+
+        Public Function WindowChromeModeChoiceToString(value As WindowChromeModeChoice) As String
+            If value = WindowChromeModeChoice.Standard Then
+                Return "standard"
+            End If
+
+            Return "themed"
+        End Function
+
+        Public Function NormalizeColorHex(value As String, defaultValue As String) As String
+            Dim candidate = If(value, String.Empty).Trim()
+            Dim parsed As Color = Nothing
+            If TryParseColorHex(candidate, parsed) Then
+                Return ColorToHex(parsed)
+            End If
+
+            If TryParseColorHex(defaultValue, parsed) Then
+                Return ColorToHex(parsed)
+            End If
+
+            Return "#5A78C8"
+        End Function
+
+        Public Function TryParseColorHex(value As String, ByRef parsedColor As Color) As Boolean
+            parsedColor = Color.Empty
+            Dim candidate = If(value, String.Empty).Trim()
+            If candidate.Length = 0 Then
+                Return False
+            End If
+
+            If candidate.StartsWith("#", StringComparison.Ordinal) Then
+                candidate = candidate.Substring(1)
+            End If
+
+            If candidate.Length <> 6 Then
+                Return False
+            End If
+
+            Dim red As Integer
+            Dim green As Integer
+            Dim blue As Integer
+
+            If Not Integer.TryParse(candidate.Substring(0, 2), Globalization.NumberStyles.HexNumber, Globalization.CultureInfo.InvariantCulture, red) Then
+                Return False
+            End If
+            If Not Integer.TryParse(candidate.Substring(2, 2), Globalization.NumberStyles.HexNumber, Globalization.CultureInfo.InvariantCulture, green) Then
+                Return False
+            End If
+            If Not Integer.TryParse(candidate.Substring(4, 2), Globalization.NumberStyles.HexNumber, Globalization.CultureInfo.InvariantCulture, blue) Then
+                Return False
+            End If
+
+            parsedColor = Color.FromArgb(red, green, blue)
+            Return True
+        End Function
+
+        Public Function ColorToHex(value As Color) As String
+            Return $"#{value.R:X2}{value.G:X2}{value.B:X2}"
         End Function
 
         Public Function ToOverwritePolicy(value As String) As OverwritePolicy
@@ -145,6 +331,28 @@ Namespace Configuration
             End If
 
             Return "selected-items"
+        End Function
+
+        Public Function ToWorkerTelemetryProfile(value As String) As WorkerTelemetryProfile
+            Select Case NormalizeChoice(value, "normal", "normal", "verbose", "debug")
+                Case "verbose"
+                    Return WorkerTelemetryProfile.Verbose
+                Case "debug"
+                    Return WorkerTelemetryProfile.Debug
+                Case Else
+                    Return WorkerTelemetryProfile.Normal
+            End Select
+        End Function
+
+        Public Function WorkerTelemetryProfileToString(value As WorkerTelemetryProfile) As String
+            Select Case value
+                Case WorkerTelemetryProfile.Verbose
+                    Return "verbose"
+                Case WorkerTelemetryProfile.Debug
+                    Return "debug"
+                Case Else
+                    Return "normal"
+            End Select
         End Function
     End Module
 End Namespace

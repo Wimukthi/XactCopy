@@ -28,6 +28,9 @@ Namespace Models
         Public Property ContinueOnFileError As Boolean = True
         Public Property PreserveTimestamps As Boolean = True
         Public Property WorkerProcessPriorityClass As String = "Normal"
+        Public Property WorkerTelemetryProfile As WorkerTelemetryProfile = WorkerTelemetryProfile.Normal
+        Public Property WorkerProgressEmitIntervalMs As Integer = 75
+        Public Property WorkerMaxLogsPerSecond As Integer = 100
         Public Property RescueFastScanChunkBytes As Integer = 0
         Public Property RescueTrimChunkBytes As Integer = 0
         Public Property RescueScrapeChunkBytes As Integer = 0
