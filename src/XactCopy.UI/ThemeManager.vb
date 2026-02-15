@@ -4,11 +4,20 @@ Imports XactCopy.Configuration
 
 Friend Module ThemeManager
     Public Sub ApplyTheme(root As Control, mode As SystemColorMode, Optional settings As AppSettings = Nothing)
+        If root Is Nothing Then
+            Return
+        End If
+
+        root.SuspendLayout()
         Dim safeSettings = If(settings, New AppSettings())
-        UiAppearanceManager.Apply(root, safeSettings)
-        Dim accentColor = ResolveAccentColor(mode, safeSettings)
-        Dim palette = ThemePalette.FromMode(mode, accentColor)
-        ApplyToControl(root, palette, mode, safeSettings)
+        Try
+            UiAppearanceManager.Apply(root, safeSettings)
+            Dim accentColor = ResolveAccentColor(mode, safeSettings)
+            Dim palette = ThemePalette.FromMode(mode, accentColor)
+            ApplyToControl(root, palette, mode, safeSettings)
+        Finally
+            root.ResumeLayout(performLayout:=True)
+        End Try
     End Sub
 
     Private Sub ApplyToControl(control As Control, palette As ThemePalette, mode As SystemColorMode, settings As AppSettings)

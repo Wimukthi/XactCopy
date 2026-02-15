@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.4.8] - 2026-02-15
+
+### Changed
+
+- Settings dialog open/render path was optimized to reduce first-frame layout churn (cached property reflection, debounced dirty-state recompute, faster page switching, and broader double-buffer usage).
+- Job Manager grid pipeline was reworked for scale and responsiveness:
+  - Switched to `DataGridView` virtual mode with a cached row model (`CellValueNeeded`) instead of row-by-row `Rows.Add` rebuilds.
+  - Added debounced filter/search refresh and batched row-count swaps.
+  - Added O(1) ID lookups for selected-item details and journal actions.
+
+### Fixed
+
+- Settings window no longer flashes a light frame while opening in dark mode.
+- Job Manager refresh, filtering, and selection-detail updates are now significantly faster on large history datasets.
+
 ## [1.0.4.7] - 2026-02-15
 
 ### Added

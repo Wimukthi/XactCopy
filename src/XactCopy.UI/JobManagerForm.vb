@@ -2,6 +2,8 @@ Imports System.Diagnostics
 Imports System.Drawing
 Imports System.IO
 Imports System.Linq
+Imports System.Reflection
+Imports System.Runtime.InteropServices
 Imports XactCopy.Models
 Imports XactCopy.Services
 
@@ -17,6 +19,9 @@ Friend Class JobManagerForm
     Private Const LayoutWindowKey As String = "JobManagerForm.V3"
     Private Const GridLayoutKey As String = "JobManagerForm.V3.Grid"
     Private Const SplitterKey As String = "JobManagerForm.V3.Split"
+    Private Const WmSetRedraw As Integer = &HB
+    Private Shared ReadOnly _doubleBufferedProperty As PropertyInfo =
+        GetType(Control).GetProperty("DoubleBuffered", BindingFlags.Instance Or BindingFlags.NonPublic)
 
     Private ReadOnly _jobManager As JobManagerService
 
@@ -59,6 +64,23 @@ Friend Class JobManagerForm
     Private _savedJobs As IReadOnlyList(Of ManagedJob) = Array.Empty(Of ManagedJob)()
     Private _queueEntries As IReadOnlyList(Of JobQueueEntryView) = Array.Empty(Of JobQueueEntryView)()
     Private _runs As IReadOnlyList(Of ManagedJobRun) = Array.Empty(Of ManagedJobRun)()
+    Private _savedJobsById As IReadOnlyDictionary(Of String, ManagedJob) =
+        New Dictionary(Of String, ManagedJob)(StringComparer.OrdinalIgnoreCase)
+    Private _queueEntriesById As IReadOnlyDictionary(Of String, JobQueueEntryView) =
+        New Dictionary(Of String, JobQueueEntryView)(StringComparer.OrdinalIgnoreCase)
+    Private _runsById As IReadOnlyDictionary(Of String, ManagedJobRun) =
+        New Dictionary(Of String, ManagedJobRun)(StringComparer.OrdinalIgnoreCase)
+    Private _visibleRows As List(Of GridRowModel) = New List(Of GridRowModel)()
+    Private ReadOnly _filterDebounceTimer As New Timer() With {.Interval = 150}
+    Private _isPopulatingGrid As Boolean
+
+    <DllImport("user32.dll", CharSet:=CharSet.Auto)>
+    Private Shared Function SendMessage(
+        hWnd As IntPtr,
+        msg As Integer,
+        wParam As IntPtr,
+        lParam As IntPtr) As IntPtr
+    End Function
 
     Public Sub New(jobManager As JobManagerService)
         If jobManager Is Nothing Then
@@ -72,9 +94,13 @@ Friend Class JobManagerForm
         MinimumSize = New Size(1080, 700)
         Size = New Size(1320, 820)
         WindowIconHelper.Apply(Me)
+        SetStyle(ControlStyles.AllPaintingInWmPaint Or ControlStyles.OptimizedDoubleBuffer, True)
+        UpdateStyles()
 
         BuildUi()
+        EnableDoubleBufferingForContainers(Me)
         ConfigureToolTips()
+        AddHandler _filterDebounceTimer.Tick, AddressOf FilterDebounceTimer_Tick
 
         AddHandler Shown, AddressOf JobManagerForm_Shown
         AddHandler FormClosing, AddressOf JobManagerForm_FormClosing
@@ -359,6 +385,9 @@ Friend Class JobManagerForm
         _mainGrid.MultiSelect = False
         _mainGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect
         _mainGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None
+        _mainGrid.VirtualMode = True
+        _mainGrid.EditMode = DataGridViewEditMode.EditProgrammatically
+        _mainGrid.AutoGenerateColumns = False
         _mainGrid.RowHeadersVisible = False
         _mainGrid.DefaultCellStyle.WrapMode = DataGridViewTriState.False
         _mainGrid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing
@@ -388,6 +417,7 @@ Friend Class JobManagerForm
         _mainGrid.Columns("Destination").Width = 320
         _mainGrid.Columns("Summary").Width = 380
 
+        AddHandler _mainGrid.CellValueNeeded, AddressOf MainGrid_CellValueNeeded
         AddHandler _mainGrid.SelectionChanged, AddressOf MainGrid_SelectionChanged
         AddHandler _mainGrid.CellDoubleClick, AddressOf MainGrid_CellDoubleClick
     End Sub
@@ -418,6 +448,7 @@ Friend Class JobManagerForm
 
         _viewComboBox.SelectedIndex = 0
         _statusComboBox.SelectedIndex = 0
+        _filterDebounceTimer.Stop()
 
         RefreshData()
 
@@ -434,19 +465,30 @@ Friend Class JobManagerForm
     End Sub
 
     Private Sub JobManagerForm_FormClosing(sender As Object, e As FormClosingEventArgs)
+        _filterDebounceTimer.Stop()
         UiLayoutManager.CaptureGridLayout(_mainGrid, GridLayoutKey)
         UiLayoutManager.CaptureSplitter(_contentSplit, SplitterKey)
         UiLayoutManager.CaptureWindow(Me, LayoutWindowKey)
     End Sub
 
     Private Sub FilterChanged(sender As Object, e As EventArgs)
+        _filterDebounceTimer.Stop()
+        _filterDebounceTimer.Start()
+    End Sub
+
+    Private Sub FilterDebounceTimer_Tick(sender As Object, e As EventArgs)
+        _filterDebounceTimer.Stop()
         PopulateGrid(keepSelection:=True)
     End Sub
 
     Private Sub RefreshData()
+        _filterDebounceTimer.Stop()
         _savedJobs = _jobManager.GetJobs()
         _queueEntries = _jobManager.GetQueueEntries()
         _runs = _jobManager.GetRecentRuns(500)
+        _savedJobsById = BuildDictionary(_savedJobs, Function(job) job?.JobId)
+        _queueEntriesById = BuildDictionary(_queueEntries, Function(entry) entry?.QueueEntryId)
+        _runsById = BuildDictionary(_runs, Function(run) run?.RunId)
 
         _summaryLabel.Text = $"Saved: {_savedJobs.Count} | Queued: {_queueEntries.Count} | Runs: {_runs.Count}"
 
@@ -458,9 +500,7 @@ Friend Class JobManagerForm
         Dim view = GetSelectedViewFilter()
         Dim runStatusFilter = GetSelectedRunStatusFilter()
         Dim searchText = If(_searchTextBox.Text, String.Empty).Trim()
-
-        _mainGrid.SuspendLayout()
-        _mainGrid.Rows.Clear()
+        Dim newRows As New List(Of GridRowModel)(Math.Max(64, _savedJobs.Count + _queueEntries.Count + _runs.Count))
 
         If view = JobManagerViewFilter.AllItems OrElse view = JobManagerViewFilter.SavedJobs Then
             For Each job In _savedJobs
@@ -469,7 +509,7 @@ Friend Class JobManagerForm
                     Continue For
                 End If
 
-                Dim rowIndex = _mainGrid.Rows.Add(
+                newRows.Add(New GridRowModel(
                     "Saved",
                     job.Name,
                     "Ready",
@@ -479,9 +519,8 @@ Friend Class JobManagerForm
                     job.UpdatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
                     job.Options.SourceRoot,
                     job.Options.DestinationRoot,
-                    summary)
-
-                _mainGrid.Rows(rowIndex).Tag = New GridRowTag(RowKind.SavedJob, job.JobId, job.JobId)
+                    summary,
+                    New GridRowTag(RowKind.SavedJob, job.JobId, job.JobId)))
             Next
         End If
 
@@ -493,7 +532,7 @@ Friend Class JobManagerForm
                     Continue For
                 End If
 
-                Dim rowIndex = _mainGrid.Rows.Add(
+                newRows.Add(New GridRowModel(
                     "Queue",
                     entry.JobName,
                     state,
@@ -503,9 +542,8 @@ Friend Class JobManagerForm
                     entry.LastUpdatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
                     entry.SourceRoot,
                     entry.DestinationRoot,
-                    summary)
-
-                _mainGrid.Rows(rowIndex).Tag = New GridRowTag(RowKind.QueueEntry, entry.QueueEntryId, entry.JobId)
+                    summary,
+                    New GridRowTag(RowKind.QueueEntry, entry.QueueEntryId, entry.JobId)))
             Next
         End If
 
@@ -521,7 +559,7 @@ Friend Class JobManagerForm
                 End If
 
                 Dim queueDisplay = If(run.QueueAttempt > 0, run.QueueAttempt.ToString(), "-")
-                Dim rowIndex = _mainGrid.Rows.Add(
+                newRows.Add(New GridRowModel(
                     "Run",
                     run.DisplayName,
                     run.Status.ToString(),
@@ -531,15 +569,24 @@ Friend Class JobManagerForm
                     run.LastUpdatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
                     run.SourceRoot,
                     run.DestinationRoot,
-                    summary)
-
-                _mainGrid.Rows(rowIndex).Tag = New GridRowTag(RowKind.RunHistory, run.RunId, run.JobId)
+                    summary,
+                    New GridRowTag(RowKind.RunHistory, run.RunId, run.JobId)))
             Next
         End If
 
-        _mainGrid.ResumeLayout()
+        _isPopulatingGrid = True
+        SuspendDrawing(_mainGrid)
+        _mainGrid.SuspendLayout()
+        Try
+            _visibleRows = newRows
+            _mainGrid.RowCount = _visibleRows.Count
+            RestoreSelection(previousTag)
+        Finally
+            _mainGrid.ResumeLayout(performLayout:=False)
+            ResumeDrawing(_mainGrid)
+            _isPopulatingGrid = False
+        End Try
 
-        RestoreSelection(previousTag)
         UpdateActionStates()
         RenderSelectedItemDetails()
     End Sub
@@ -586,34 +633,74 @@ Friend Class JobManagerForm
     End Function
 
     Private Sub RestoreSelection(previousTag As GridRowTag)
-        If previousTag Is Nothing Then
-            If _mainGrid.Rows.Count > 0 Then
-                _mainGrid.Rows(0).Selected = True
-                _mainGrid.CurrentCell = _mainGrid.Rows(0).Cells(0)
-            End If
+        Dim targetIndex As Integer = -1
+
+        If previousTag IsNot Nothing Then
+            For index = 0 To _visibleRows.Count - 1
+                Dim tag = _visibleRows(index).Tag
+                If tag Is Nothing Then
+                    Continue For
+                End If
+
+                If tag.Kind = previousTag.Kind AndAlso
+                    String.Equals(tag.PrimaryId, previousTag.PrimaryId, StringComparison.OrdinalIgnoreCase) Then
+                    targetIndex = index
+                    Exit For
+                End If
+            Next
+        End If
+
+        If targetIndex < 0 AndAlso _visibleRows.Count > 0 Then
+            targetIndex = 0
+        End If
+
+        _mainGrid.ClearSelection()
+        If targetIndex < 0 OrElse targetIndex >= _visibleRows.Count Then
+            _mainGrid.CurrentCell = Nothing
             Return
         End If
 
-        For Each row As DataGridViewRow In _mainGrid.Rows
-            Dim tag = TryCast(row.Tag, GridRowTag)
-            If tag Is Nothing Then
-                Continue For
-            End If
+        _mainGrid.CurrentCell = _mainGrid.Rows(targetIndex).Cells(0)
+        _mainGrid.Rows(targetIndex).Selected = True
+    End Sub
 
-            If tag.Kind = previousTag.Kind AndAlso String.Equals(tag.PrimaryId, previousTag.PrimaryId, StringComparison.OrdinalIgnoreCase) Then
-                row.Selected = True
-                _mainGrid.CurrentCell = row.Cells(0)
-                Return
-            End If
-        Next
-
-        If _mainGrid.Rows.Count > 0 Then
-            _mainGrid.Rows(0).Selected = True
-            _mainGrid.CurrentCell = _mainGrid.Rows(0).Cells(0)
+    Private Sub MainGrid_CellValueNeeded(sender As Object, e As DataGridViewCellValueEventArgs)
+        If e.RowIndex < 0 OrElse e.RowIndex >= _visibleRows.Count Then
+            Return
         End If
+
+        Dim row = _visibleRows(e.RowIndex)
+        Select Case e.ColumnIndex
+            Case 0
+                e.Value = row.TypeText
+            Case 1
+                e.Value = row.NameText
+            Case 2
+                e.Value = row.StateText
+            Case 3
+                e.Value = row.QueueText
+            Case 4
+                e.Value = row.TriggerText
+            Case 5
+                e.Value = row.StartedText
+            Case 6
+                e.Value = row.UpdatedText
+            Case 7
+                e.Value = row.SourceText
+            Case 8
+                e.Value = row.DestinationText
+            Case 9
+                e.Value = row.SummaryText
+            Case Else
+                e.Value = String.Empty
+        End Select
     End Sub
 
     Private Sub MainGrid_SelectionChanged(sender As Object, e As EventArgs)
+        If _isPopulatingGrid Then
+            Return
+        End If
+
         UpdateActionStates()
         RenderSelectedItemDetails()
     End Sub
@@ -797,8 +884,8 @@ Friend Class JobManagerForm
             Return
         End If
 
-        Dim runEntry = _runs.FirstOrDefault(
-            Function(run) run IsNot Nothing AndAlso String.Equals(run.RunId, selectedTag.PrimaryId, StringComparison.OrdinalIgnoreCase))
+        Dim runEntry As ManagedJobRun = Nothing
+        _runsById.TryGetValue(selectedTag.PrimaryId, runEntry)
         If runEntry Is Nothing OrElse String.IsNullOrWhiteSpace(runEntry.JournalPath) Then
             MessageBox.Show(Me,
                             "Selected run does not have a journal path.",
@@ -903,18 +990,18 @@ Friend Class JobManagerForm
 
         Select Case selectedTag.Kind
             Case RowKind.SavedJob
-                Dim job = _savedJobs.FirstOrDefault(
-                    Function(candidate) candidate IsNot Nothing AndAlso String.Equals(candidate.JobId, selectedTag.JobId, StringComparison.OrdinalIgnoreCase))
+                Dim job As ManagedJob = Nothing
+                _savedJobsById.TryGetValue(selectedTag.JobId, job)
                 _detailsTextBox.Text = BuildSavedJobDetails(job)
 
             Case RowKind.QueueEntry
-                Dim entry = _queueEntries.FirstOrDefault(
-                    Function(candidate) candidate IsNot Nothing AndAlso String.Equals(candidate.QueueEntryId, selectedTag.PrimaryId, StringComparison.OrdinalIgnoreCase))
+                Dim entry As JobQueueEntryView = Nothing
+                _queueEntriesById.TryGetValue(selectedTag.PrimaryId, entry)
                 _detailsTextBox.Text = BuildQueueEntryDetails(entry)
 
             Case RowKind.RunHistory
-                Dim run = _runs.FirstOrDefault(
-                    Function(candidate) candidate IsNot Nothing AndAlso String.Equals(candidate.RunId, selectedTag.PrimaryId, StringComparison.OrdinalIgnoreCase))
+                Dim run As ManagedJobRun = Nothing
+                _runsById.TryGetValue(selectedTag.PrimaryId, run)
                 _detailsTextBox.Text = BuildRunDetails(run)
 
             Case Else
@@ -997,12 +1084,87 @@ Friend Class JobManagerForm
     End Function
 
     Private Function GetSelectedTag() As GridRowTag
-        If _mainGrid.SelectedRows.Count = 0 Then
+        Dim rowIndex = GetSelectedRowIndex()
+        If rowIndex < 0 OrElse rowIndex >= _visibleRows.Count Then
             Return Nothing
         End If
 
-        Return TryCast(_mainGrid.SelectedRows(0).Tag, GridRowTag)
+        Return _visibleRows(rowIndex).Tag
     End Function
+
+    Private Function GetSelectedRowIndex() As Integer
+        If _mainGrid.CurrentCell IsNot Nothing Then
+            Return _mainGrid.CurrentCell.RowIndex
+        End If
+
+        If _mainGrid.SelectedCells.Count > 0 Then
+            Return _mainGrid.SelectedCells(0).RowIndex
+        End If
+
+        If _mainGrid.SelectedRows.Count > 0 Then
+            Return _mainGrid.SelectedRows(0).Index
+        End If
+
+        Return -1
+    End Function
+
+    Private Shared Function BuildDictionary(Of TItem)(
+        items As IEnumerable(Of TItem),
+        keySelector As Func(Of TItem, String)) As IReadOnlyDictionary(Of String, TItem)
+
+        Dim dictionary As New Dictionary(Of String, TItem)(StringComparer.OrdinalIgnoreCase)
+        If items Is Nothing OrElse keySelector Is Nothing Then
+            Return dictionary
+        End If
+
+        For Each item In items
+            If item Is Nothing Then
+                Continue For
+            End If
+
+            Dim key = keySelector(item)
+            If String.IsNullOrWhiteSpace(key) Then
+                Continue For
+            End If
+
+            dictionary(key) = item
+        Next
+
+        Return dictionary
+    End Function
+
+    Private Shared Sub EnableDoubleBufferingForContainers(root As Control)
+        If root Is Nothing OrElse _doubleBufferedProperty Is Nothing Then
+            Return
+        End If
+
+        Try
+            _doubleBufferedProperty.SetValue(root, True, Nothing)
+        Catch
+        End Try
+
+        For Each child As Control In root.Controls
+            EnableDoubleBufferingForContainers(child)
+        Next
+    End Sub
+
+    Private Shared Sub SuspendDrawing(target As Control)
+        If target Is Nothing OrElse Not target.IsHandleCreated Then
+            Return
+        End If
+
+        SendMessage(target.Handle, WmSetRedraw, IntPtr.Zero, IntPtr.Zero)
+    End Sub
+
+    Private Shared Sub ResumeDrawing(target As Control)
+        If target Is Nothing OrElse Not target.IsHandleCreated Then
+            Return
+        End If
+
+        SendMessage(target.Handle, WmSetRedraw, New IntPtr(1), IntPtr.Zero)
+        target.Invalidate(invalidateChildren:=True)
+        target.Update()
+    End Sub
 
     Private Function GetSelectedViewFilter() As JobManagerViewFilter
         Dim selected = TryCast(_viewComboBox.SelectedItem, EnumChoice(Of JobManagerViewFilter))
@@ -1062,6 +1224,46 @@ Friend Class JobManagerForm
         QueueEntry = 1
         RunHistory = 2
     End Enum
+
+    Private NotInheritable Class GridRowModel
+        Public Sub New(
+            typeText As String,
+            nameText As String,
+            stateText As String,
+            queueText As String,
+            triggerText As String,
+            startedText As String,
+            updatedText As String,
+            sourceText As String,
+            destinationText As String,
+            summaryText As String,
+            tag As GridRowTag)
+
+            Me.TypeText = If(typeText, String.Empty)
+            Me.NameText = If(nameText, String.Empty)
+            Me.StateText = If(stateText, String.Empty)
+            Me.QueueText = If(queueText, String.Empty)
+            Me.TriggerText = If(triggerText, String.Empty)
+            Me.StartedText = If(startedText, String.Empty)
+            Me.UpdatedText = If(updatedText, String.Empty)
+            Me.SourceText = If(sourceText, String.Empty)
+            Me.DestinationText = If(destinationText, String.Empty)
+            Me.SummaryText = If(summaryText, String.Empty)
+            Me.Tag = tag
+        End Sub
+
+        Public ReadOnly Property TypeText As String
+        Public ReadOnly Property NameText As String
+        Public ReadOnly Property StateText As String
+        Public ReadOnly Property QueueText As String
+        Public ReadOnly Property TriggerText As String
+        Public ReadOnly Property StartedText As String
+        Public ReadOnly Property UpdatedText As String
+        Public ReadOnly Property SourceText As String
+        Public ReadOnly Property DestinationText As String
+        Public ReadOnly Property SummaryText As String
+        Public ReadOnly Property Tag As GridRowTag
+    End Class
 
     Private NotInheritable Class GridRowTag
         Public Sub New(kind As RowKind, primaryId As String, jobId As String)

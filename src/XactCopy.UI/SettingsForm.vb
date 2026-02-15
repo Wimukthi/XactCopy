@@ -1,4 +1,6 @@
 Imports System.Drawing
+Imports System.Linq
+Imports System.Reflection
 Imports XactCopy.Configuration
 Imports XactCopy.Models
 
@@ -7,6 +9,15 @@ Friend Class SettingsForm
 
     Private Const LayoutWindowKey As String = "SettingsForm"
     Private Const LayoutSplitterKey As String = "SettingsForm.MainSplit"
+    Private Shared ReadOnly _fontCacheSyncRoot As New Object()
+    Private Shared _cachedLogFontNames As IReadOnlyList(Of String)
+    Private Shared ReadOnly _settingsProperties As PropertyInfo() =
+        GetType(AppSettings).
+            GetProperties(BindingFlags.Public Or BindingFlags.Instance).
+            Where(Function(propertyInfo) propertyInfo.CanRead AndAlso propertyInfo.CanWrite).
+            ToArray()
+    Private Shared ReadOnly _doubleBufferedProperty As PropertyInfo =
+        GetType(Control).GetProperty("DoubleBuffered", BindingFlags.Instance Or BindingFlags.NonPublic)
 
     Private ReadOnly _categoryTreeView As New TreeView()
     Private ReadOnly _pageHostPanel As New Panel()
@@ -94,16 +105,20 @@ Friend Class SettingsForm
 
     Private ReadOnly _workingSettings As AppSettings
     Private ReadOnly _originalSettings As AppSettings
+    Private ReadOnly _dirtyStateTimer As New Timer() With {.Interval = 120}
     Private _hasChanges As Boolean
     Private _requiresRestart As Boolean
     Private _restartReasonText As String = String.Empty
     Private _suspendDirtyTracking As Boolean
+    Private _activePageKey As String = String.Empty
+    Private _activePageControl As Control
 
     Public Sub New(settings As AppSettings)
         If settings Is Nothing Then
             Throw New ArgumentNullException(NameOf(settings))
         End If
 
+        SuspendLayout()
         _workingSettings = CloneSettings(settings)
         _originalSettings = CloneSettings(settings)
 
@@ -112,14 +127,23 @@ Friend Class SettingsForm
         MinimumSize = New Size(960, 620)
         Size = New Size(1080, 720)
         WindowIconHelper.Apply(Me)
+        SetStyle(ControlStyles.AllPaintingInWmPaint Or ControlStyles.OptimizedDoubleBuffer, True)
+        UpdateStyles()
 
         BuildUi()
+        EnableDoubleBufferingForContainers(Me)
         ConfigureToolTips()
         WireDirtyTracking(Controls)
         ApplySettingsToControls()
 
-        AddHandler Shown, AddressOf SettingsForm_Shown
+        AddHandler _dirtyStateTimer.Tick, AddressOf DirtyStateTimer_Tick
+        AddHandler Load, AddressOf SettingsForm_Load
         AddHandler FormClosing, AddressOf SettingsForm_FormClosing
+        If _categoryTreeView.Nodes.Count > 0 Then
+            _categoryTreeView.SelectedNode = _categoryTreeView.Nodes(0)
+            ShowPage(If(_categoryTreeView.Nodes(0).Name, "appearance"))
+        End If
+        ResumeLayout(performLayout:=True)
     End Sub
 
     Public ReadOnly Property ResultSettings As AppSettings
@@ -147,6 +171,7 @@ Friend Class SettingsForm
     End Property
 
     Private Sub BuildUi()
+        SuspendLayout()
         Dim rootLayout As New TableLayoutPanel() With {
             .Dock = DockStyle.Fill,
             .ColumnCount = 1,
@@ -190,6 +215,7 @@ Friend Class SettingsForm
         Controls.Add(rootLayout)
         AcceptButton = _okButton
         CancelButton = _cancelButton
+        ResumeLayout(performLayout:=True)
     End Sub
 
     Private Sub WireDirtyTracking(controlCollection As Control.ControlCollection)
@@ -220,6 +246,12 @@ Friend Class SettingsForm
             Return
         End If
 
+        _dirtyStateTimer.Stop()
+        _dirtyStateTimer.Start()
+    End Sub
+
+    Private Sub DirtyStateTimer_Tick(sender As Object, e As EventArgs)
+        _dirtyStateTimer.Stop()
         UpdateDirtyState()
     End Sub
 
@@ -326,6 +358,7 @@ Friend Class SettingsForm
         _categoryTreeView.ItemHeight = 22
         _categoryTreeView.Indent = 16
 
+        _categoryTreeView.BeginUpdate()
         _categoryTreeView.Nodes.Add(New TreeNode("Appearance") With {.Name = "appearance"})
         _categoryTreeView.Nodes.Add(New TreeNode("Copy Defaults") With {.Name = "copy"})
         _categoryTreeView.Nodes.Add(New TreeNode("Performance") With {.Name = "performance"})
@@ -334,6 +367,7 @@ Friend Class SettingsForm
         _categoryTreeView.Nodes.Add(New TreeNode("Updates") With {.Name = "updates"})
         _categoryTreeView.Nodes.Add(New TreeNode("Recovery & Startup") With {.Name = "recovery"})
         _categoryTreeView.Nodes.Add(New TreeNode("Explorer Integration") With {.Name = "explorer"})
+        _categoryTreeView.EndUpdate()
         AddHandler _categoryTreeView.AfterSelect, AddressOf CategoryTreeView_AfterSelect
 
         layout.Controls.Add(headerLabel, 0, 0)
@@ -841,25 +875,42 @@ Friend Class SettingsForm
             Return
         End If
 
-        Dim preferredFonts = New String() {"Consolas", "Cascadia Mono", "Lucida Console", "Courier New", "Segoe UI"}
-        Dim fontNames As New SortedSet(Of String)(StringComparer.OrdinalIgnoreCase)
-
-        For Each fontName As String In preferredFonts
-            fontNames.Add(fontName)
-        Next
-
-        Try
-            For Each family As FontFamily In FontFamily.Families
-                fontNames.Add(family.Name)
-            Next
-        Catch
-            ' Ignore font-enumeration failures and keep fallback list.
-        End Try
-
-        For Each fontName As String In fontNames
+        For Each fontName In GetLogFontNameCache()
             _logFontFamilyComboBox.Items.Add(fontName)
         Next
     End Sub
+
+    Private Shared Function GetLogFontNameCache() As IReadOnlyList(Of String)
+        Dim cached = _cachedLogFontNames
+        If cached IsNot Nothing Then
+            Return cached
+        End If
+
+        SyncLock _fontCacheSyncRoot
+            cached = _cachedLogFontNames
+            If cached IsNot Nothing Then
+                Return cached
+            End If
+
+            Dim preferredFonts = New String() {"Consolas", "Cascadia Mono", "Lucida Console", "Courier New", "Segoe UI"}
+            Dim fontNames As New SortedSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+            For Each fontName As String In preferredFonts
+                fontNames.Add(fontName)
+            Next
+
+            Try
+                For Each family As FontFamily In FontFamily.Families
+                    fontNames.Add(family.Name)
+                Next
+            Catch
+                ' Ignore font-enumeration failures and keep fallback list.
+            End Try
+
+            _cachedLogFontNames = fontNames.ToList()
+            Return _cachedLogFontNames
+        End SyncLock
+    End Function
 
     Private Shared Function CreateFieldGrid(rowCount As Integer) As TableLayoutPanel
         Dim grid As New TableLayoutPanel() With {
@@ -953,15 +1004,41 @@ Friend Class SettingsForm
         Return section
     End Function
 
-    Private Sub SettingsForm_Shown(sender As Object, e As EventArgs)
-        UiLayoutManager.ApplyWindow(Me, LayoutWindowKey)
-        UiLayoutManager.ApplySplitter(_mainSplit, LayoutSplitterKey, defaultDistance:=210, panel1Min:=170, panel2Min:=500)
-        If _categoryTreeView.Nodes.Count > 0 Then
-            _categoryTreeView.SelectedNode = _categoryTreeView.Nodes(0)
+    Private Sub SettingsForm_Load(sender As Object, e As EventArgs)
+        SuspendLayout()
+        Try
+            UiLayoutManager.ApplyWindow(Me, LayoutWindowKey)
+            UiLayoutManager.ApplySplitter(_mainSplit, LayoutSplitterKey, defaultDistance:=210, panel1Min:=170, panel2Min:=500)
+            _categoryTreeView.BeginUpdate()
+            If _categoryTreeView.Nodes.Count > 0 AndAlso _categoryTreeView.SelectedNode Is Nothing Then
+                _categoryTreeView.SelectedNode = _categoryTreeView.Nodes(0)
+            End If
+            If _activePageControl Is Nothing Then
+                ShowPage(If(_categoryTreeView.SelectedNode?.Name, "appearance"))
+            End If
+        Finally
+            _categoryTreeView.EndUpdate()
+            ResumeLayout(performLayout:=True)
+        End Try
+    End Sub
+
+    Private Shared Sub EnableDoubleBufferingForContainers(root As Control)
+        If root Is Nothing OrElse _doubleBufferedProperty Is Nothing Then
+            Return
         End If
+
+        Try
+            _doubleBufferedProperty.SetValue(root, True, Nothing)
+        Catch
+        End Try
+
+        For Each child As Control In root.Controls
+            EnableDoubleBufferingForContainers(child)
+        Next
     End Sub
 
     Private Sub SettingsForm_FormClosing(sender As Object, e As FormClosingEventArgs)
+        _dirtyStateTimer.Stop()
         UiLayoutManager.CaptureSplitter(_mainSplit, LayoutSplitterKey)
         UiLayoutManager.CaptureWindow(Me, LayoutWindowKey)
     End Sub
@@ -971,22 +1048,50 @@ Friend Class SettingsForm
     End Sub
 
     Private Sub ShowPage(pageKey As String)
-        Dim selectedPage As Control = Nothing
-        For Each entry In _pageLookup
-            Dim isMatch = String.Equals(entry.Key, pageKey, StringComparison.OrdinalIgnoreCase)
-            entry.Value.Visible = isMatch
-            If isMatch Then
-                selectedPage = entry.Value
-            End If
-        Next
-
-        If selectedPage IsNot Nothing Then
-            selectedPage.BringToFront()
-            _pageHostPanel.ScrollControlIntoView(selectedPage)
-            _pageHostPanel.AutoScrollPosition = New Point(0, 0)
+        Dim normalizedPageKey = NormalizePageKey(pageKey)
+        If _activePageControl IsNot Nothing AndAlso
+            String.Equals(_activePageKey, normalizedPageKey, StringComparison.OrdinalIgnoreCase) Then
+            UpdatePageTitle(normalizedPageKey)
+            Return
         End If
 
-        Select Case pageKey
+        _pageHostPanel.SuspendLayout()
+        Try
+            Dim selectedPage As Control = Nothing
+            If Not _pageLookup.TryGetValue(normalizedPageKey, selectedPage) OrElse selectedPage Is Nothing Then
+                normalizedPageKey = "appearance"
+                _pageLookup.TryGetValue(normalizedPageKey, selectedPage)
+            End If
+
+            If _activePageControl IsNot Nothing AndAlso Not Object.ReferenceEquals(_activePageControl, selectedPage) Then
+                _activePageControl.Visible = False
+            End If
+
+            If selectedPage IsNot Nothing Then
+                selectedPage.Visible = True
+                selectedPage.BringToFront()
+                _pageHostPanel.AutoScrollPosition = New Point(0, 0)
+                _activePageControl = selectedPage
+                _activePageKey = normalizedPageKey
+            End If
+        Finally
+            _pageHostPanel.ResumeLayout(performLayout:=True)
+        End Try
+
+        UpdatePageTitle(normalizedPageKey)
+    End Sub
+
+    Private Shared Function NormalizePageKey(pageKey As String) As String
+        If String.IsNullOrWhiteSpace(pageKey) Then
+            Return "appearance"
+        End If
+
+        Return pageKey.Trim().ToLowerInvariant()
+    End Function
+
+    Private Sub UpdatePageTitle(pageKey As String)
+        Dim normalizedPageKey = NormalizePageKey(pageKey)
+        Select Case normalizedPageKey
             Case "copy"
                 _pageTitleLabel.Text = "Copy Defaults"
             Case "performance"
@@ -1007,6 +1112,9 @@ Friend Class SettingsForm
     End Sub
 
     Private Sub ApplySettingsToControls()
+        SuspendLayout()
+        _mainSplit.SuspendLayout()
+        _pageHostPanel.SuspendLayout()
         _suspendDirtyTracking = True
         Try
             _accentColorTextBox.Text = SettingsValueConverter.NormalizeColorHex(_workingSettings.AccentColorHex, "#5A78C8")
@@ -1205,8 +1313,12 @@ Friend Class SettingsForm
             UpdateDiagnosticsControlStates()
         Finally
             _suspendDirtyTracking = False
+            _pageHostPanel.ResumeLayout(performLayout:=True)
+            _mainSplit.ResumeLayout(performLayout:=True)
+            ResumeLayout(performLayout:=True)
         End Try
 
+        _dirtyStateTimer.Stop()
         UpdateDirtyState()
     End Sub
 
@@ -1463,7 +1575,7 @@ Friend Class SettingsForm
             Return False
         End If
 
-        For Each propertyInfo In GetType(AppSettings).GetProperties(System.Reflection.BindingFlags.Public Or System.Reflection.BindingFlags.Instance)
+        For Each propertyInfo In _settingsProperties
             Dim leftValue = propertyInfo.GetValue(left)
             Dim rightValue = propertyInfo.GetValue(right)
             If Not Object.Equals(leftValue, rightValue) Then
@@ -1479,10 +1591,8 @@ Friend Class SettingsForm
             Return
         End If
 
-        For Each propertyInfo In GetType(AppSettings).GetProperties(System.Reflection.BindingFlags.Public Or System.Reflection.BindingFlags.Instance)
-            If propertyInfo.CanRead AndAlso propertyInfo.CanWrite Then
-                propertyInfo.SetValue(target, propertyInfo.GetValue(source))
-            End If
+        For Each propertyInfo In _settingsProperties
+            propertyInfo.SetValue(target, propertyInfo.GetValue(source))
         Next
     End Sub
     Private Shared Function ClampNumeric(control As ThemedNumericUpDown, value As Integer) As Decimal
@@ -1647,12 +1757,11 @@ Friend Class SettingsForm
             Return clone
         End If
 
-        For Each propertyInfo In GetType(AppSettings).GetProperties(System.Reflection.BindingFlags.Public Or System.Reflection.BindingFlags.Instance)
-            If propertyInfo.CanRead AndAlso propertyInfo.CanWrite Then
-                propertyInfo.SetValue(clone, propertyInfo.GetValue(source))
-            End If
+        For Each propertyInfo In _settingsProperties
+            propertyInfo.SetValue(clone, propertyInfo.GetValue(source))
         Next
 
         Return clone
     End Function
+
 End Class
