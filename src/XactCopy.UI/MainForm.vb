@@ -606,7 +606,11 @@ Public Class MainForm
             .Margin = New Padding(0, 8, 10, 0)
         }
 
+        ' Keep single-line text boxes from vertically stretching in the themed border wrapper.
+        targetTextBox.Dock = DockStyle.None
+        targetTextBox.Anchor = AnchorStyles.Left Or AnchorStyles.Right
         targetTextBox.Margin = New Padding(0, 4, 8, 4)
+        browseButton.Anchor = AnchorStyles.Left
         browseButton.Margin = New Padding(0, 3, 0, 3)
 
         panel.Controls.Add(labelControl, 0, 0)
@@ -1228,9 +1232,15 @@ Public Class MainForm
 
     Private Sub SyncExplorerIntegration(announceResult As Boolean)
         Try
-            _explorerIntegration.Sync(_settings.EnableExplorerContextMenu, Application.ExecutablePath)
+            Dim desiredState = _settings.EnableExplorerContextMenu
+            Dim currentState = _explorerIntegration.IsRegistered()
+            If currentState = desiredState Then
+                Return
+            End If
+
+            _explorerIntegration.Sync(desiredState, Application.ExecutablePath)
             If announceResult Then
-                AppendLog($"Explorer context menu integration {If(_settings.EnableExplorerContextMenu, "enabled", "disabled")}.")
+                AppendLog($"Explorer context menu integration {If(desiredState, "enabled", "disabled")}.")
             End If
         Catch ex As Exception
             AppendLog($"Explorer integration update failed: {ex.Message}")
@@ -1688,6 +1698,12 @@ Public Class MainForm
             Return
         End If
 
+        Dim resolvedOptions = Await ResolveAskOverwritePolicyAsync(normalizedOptions)
+        If resolvedOptions Is Nothing Then
+            Return
+        End If
+        normalizedOptions = resolvedOptions
+
         If run Is Nothing Then
             run = _jobManager.CreateAdHocRun(normalizedOptions, "Manual Copy", "manual")
         End If
@@ -1910,6 +1926,118 @@ Public Class MainForm
         End If
 
         Return NormalizeAndValidateOptions(candidate, showDialogs:=True)
+    End Function
+
+    Private Async Function ResolveAskOverwritePolicyAsync(options As CopyJobOptions) As Task(Of CopyJobOptions)
+        If options Is Nothing Then
+            Return Nothing
+        End If
+
+        If options.OverwritePolicy <> OverwritePolicy.Ask Then
+            Return options
+        End If
+
+        Dim sourceFiles As IReadOnlyList(Of SourceFileDescriptor) = Nothing
+        Try
+            sourceFiles = Await Task.Run(
+                Function()
+                    Dim scan = DirectoryScanner.ScanSource(
+                        options.SourceRoot,
+                        options.SelectedRelativePaths,
+                        options.SymlinkHandling,
+                        copyEmptyDirectories:=False,
+                        log:=Nothing)
+                    Return CType(scan.Files, IReadOnlyList(Of SourceFileDescriptor))
+                End Function)
+        Catch ex As Exception
+            Dim message = "Unable to prepare overwrite prompts: " & ex.Message
+            AppendLog(message)
+            MessageBox.Show(Me, message, "XactCopy", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+            Return Nothing
+        End Try
+
+        If sourceFiles Is Nothing OrElse sourceFiles.Count = 0 Then
+            options.OverwritePolicy = OverwritePolicy.Overwrite
+            Return options
+        End If
+
+        Dim includedPaths As New List(Of String)(sourceFiles.Count)
+        Dim includedSet As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+        Dim conflictCount = 0
+        Dim overwriteCount = 0
+        Dim skipCount = 0
+
+        For Each descriptor In sourceFiles
+            If descriptor Is Nothing Then
+                Continue For
+            End If
+
+            Dim relativePath = NormalizeRelativePath(descriptor.RelativePath)
+            If relativePath.Length = 0 Then
+                Continue For
+            End If
+
+            Dim destinationPath = Path.Combine(options.DestinationRoot, relativePath)
+            Dim includeFile = True
+
+            If File.Exists(destinationPath) Then
+                conflictCount += 1
+                Dim response = PromptOverwriteConflict(relativePath, conflictCount)
+                Select Case response
+                    Case DialogResult.Yes
+                        overwriteCount += 1
+                    Case DialogResult.No
+                        includeFile = False
+                        skipCount += 1
+                    Case Else
+                        AppendLog("Copy start canceled by user during overwrite conflict prompts.")
+                        Return Nothing
+                End Select
+            End If
+
+            If includeFile AndAlso includedSet.Add(relativePath) Then
+                includedPaths.Add(relativePath)
+            End If
+        Next
+
+        If conflictCount = 0 Then
+            options.OverwritePolicy = OverwritePolicy.Overwrite
+            Return options
+        End If
+
+        If includedPaths.Count = 0 Then
+            AppendLog("All source files were skipped by overwrite prompts; copy start canceled.")
+            MessageBox.Show(
+                Me,
+                "All source files were skipped by overwrite prompts." & Environment.NewLine &
+                "No copy run was started.",
+                "XactCopy",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information)
+            Return Nothing
+        End If
+
+        options.SelectedRelativePaths = includedPaths
+        options.OverwritePolicy = OverwritePolicy.Overwrite
+        AppendLog($"Overwrite prompts resolved: {conflictCount} conflict(s), {overwriteCount} overwrite, {skipCount} skip.")
+        Return options
+    End Function
+
+    Private Function PromptOverwriteConflict(relativePath As String, conflictIndex As Integer) As DialogResult
+        Dim message =
+            $"Conflict #{conflictIndex}: destination file already exists." & Environment.NewLine & Environment.NewLine &
+            relativePath & Environment.NewLine & Environment.NewLine &
+            "Yes = overwrite this file" & Environment.NewLine &
+            "No = skip this file" & Environment.NewLine &
+            "Cancel = stop copy start"
+
+        Return MessageBox.Show(
+            Me,
+            message,
+            "XactCopy - Overwrite Conflict",
+            MessageBoxButtons.YesNoCancel,
+            MessageBoxIcon.Question,
+            MessageBoxDefaultButton.Button1)
     End Function
 
     Private Sub SetActiveSalvageFillPattern(pattern As SalvageFillPattern)

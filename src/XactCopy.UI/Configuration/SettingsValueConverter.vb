@@ -217,11 +217,13 @@ Namespace Configuration
         End Function
 
         Public Function ToOverwritePolicy(value As String) As OverwritePolicy
-            Select Case NormalizeChoice(value, "overwrite", "overwrite", "skip-existing", "overwrite-if-newer")
+            Select Case NormalizeChoice(value, "overwrite", "overwrite", "skip-existing", "overwrite-if-newer", "ask")
                 Case "skip-existing"
                     Return OverwritePolicy.SkipExisting
                 Case "overwrite-if-newer"
                     Return OverwritePolicy.OverwriteIfSourceNewer
+                Case "ask"
+                    Return OverwritePolicy.Ask
                 Case Else
                     Return OverwritePolicy.Overwrite
             End Select
@@ -233,6 +235,8 @@ Namespace Configuration
                     Return "skip-existing"
                 Case OverwritePolicy.OverwriteIfSourceNewer
                     Return "overwrite-if-newer"
+                Case OverwritePolicy.Ask
+                    Return "ask"
                 Case Else
                     Return "overwrite"
             End Select

@@ -398,6 +398,9 @@ Namespace Services
                         Return False
                     End Try
 
+                Case OverwritePolicy.Ask
+                    Return False
+
                 Case Else
                     Return False
             End Select

@@ -64,6 +64,7 @@ dotnet run --project src/XactCopy.UI/XactCopy.UI.vbproj
 
 ## Brief Version History
 
+- `v1.0.4.1` Added `Always ask for each conflict` overwrite policy with per-file prompts, fixed repeated Explorer context-menu enable logs on settings save, and corrected source/destination textbox wrapper rendering.
 - `v1.0.4.0` Added a new ClawHammer-style About dialog with updated XactCopy branding/logo, author attribution, centered version banner text, and a live system info snapshot.
 - `v1.0.3.7` Added README screenshots for main window and appearance settings, with image assets now tracked under `docs/screenshots`.
 - `v1.0.3.6` Added diagnostics + worker telemetry controls, virtualized and throttled runtime log rendering, expanded appearance customization (accent/density/scale/grid/progress/status rows/window chrome), explorer-launch destination prompt, and restart guidance for UI settings.

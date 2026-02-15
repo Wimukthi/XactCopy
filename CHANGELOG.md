@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.4.1] - 2026-02-15
+
+### Added
+
+- New overwrite policy option: `Always ask for each conflict` in Copy Defaults.
+- Conflict prompt flow for `Ask` policy now prompts per destination collision (`Yes` overwrite, `No` skip, `Cancel` abort start).
+
+### Changed
+
+- Source and destination text input rows were adjusted to avoid vertical wrapper stretch artifacts in dark mode.
+
+### Fixed
+
+- Explorer context menu sync now only applies and logs when the registration state actually changes, preventing repeated `enabled` log lines on unrelated settings saves.
+
 ## [1.0.4.0] - 2026-02-14
 
 ### Added

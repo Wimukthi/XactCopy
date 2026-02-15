@@ -250,7 +250,7 @@ Friend Class SettingsForm
         _toolTip.SetToolTip(_defaultCopyEmptyDirectoriesCheckBox, "Create empty directories in destination even when they contain no files.")
         _toolTip.SetToolTip(_defaultWaitForMediaCheckBox, "Wait indefinitely for source/destination media to become available.")
 
-        _toolTip.SetToolTip(_overwritePolicyComboBox, "Default conflict behavior when destination files already exist.")
+        _toolTip.SetToolTip(_overwritePolicyComboBox, "Default conflict behavior when destination files already exist. 'Always ask' prompts Yes/No/Cancel for each conflict.")
         _toolTip.SetToolTip(_symlinkHandlingComboBox, "Choose whether symbolic links are skipped or followed during scans.")
         _toolTip.SetToolTip(_salvageFillPatternComboBox, "Fill pattern used for unreadable blocks when salvage mode is enabled.")
 
@@ -530,7 +530,7 @@ Friend Class SettingsForm
         Dim policy = CreateFieldGrid(3)
 
         _overwritePolicyComboBox.DropDownStyle = ComboBoxStyle.DropDownList
-        _overwritePolicyComboBox.Items.AddRange(New Object() {"Overwrite existing files", "Skip existing files", "Overwrite only if source is newer"})
+        _overwritePolicyComboBox.Items.AddRange(New Object() {"Overwrite existing files", "Skip existing files", "Overwrite only if source is newer", "Always ask for each conflict"})
         ConfigureComboBoxControl(_overwritePolicyComboBox, width:=360)
 
         _symlinkHandlingComboBox.DropDownStyle = ComboBoxStyle.DropDownList
@@ -1117,6 +1117,8 @@ Friend Class SettingsForm
                     _overwritePolicyComboBox.SelectedIndex = 1
                 Case OverwritePolicy.OverwriteIfSourceNewer
                     _overwritePolicyComboBox.SelectedIndex = 2
+                Case OverwritePolicy.Ask
+                    _overwritePolicyComboBox.SelectedIndex = 3
                 Case Else
                     _overwritePolicyComboBox.SelectedIndex = 0
             End Select
@@ -1355,6 +1357,8 @@ Friend Class SettingsForm
                 capturedSettings.DefaultOverwritePolicy = SettingsValueConverter.OverwritePolicyToString(OverwritePolicy.SkipExisting)
             Case 2
                 capturedSettings.DefaultOverwritePolicy = SettingsValueConverter.OverwritePolicyToString(OverwritePolicy.OverwriteIfSourceNewer)
+            Case 3
+                capturedSettings.DefaultOverwritePolicy = SettingsValueConverter.OverwritePolicyToString(OverwritePolicy.Ask)
             Case Else
                 capturedSettings.DefaultOverwritePolicy = SettingsValueConverter.OverwritePolicyToString(OverwritePolicy.Overwrite)
         End Select
