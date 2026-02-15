@@ -1,11 +1,43 @@
-Imports System.Linq
 Imports System.Collections.Generic
+Imports System.Linq
 Imports XactCopy.Infrastructure
 Imports XactCopy.Models
 
 Namespace Services
+    Friend Enum QueueMoveDirection
+        Up = 0
+        Down = 1
+        Top = 2
+        Bottom = 3
+    End Enum
+
+    Friend NotInheritable Class JobQueueEntryView
+        Public Property QueueEntryId As String = String.Empty
+        Public Property JobId As String = String.Empty
+        Public Property Position As Integer
+        Public Property JobName As String = String.Empty
+        Public Property SourceRoot As String = String.Empty
+        Public Property DestinationRoot As String = String.Empty
+        Public Property EnqueuedUtc As DateTimeOffset = DateTimeOffset.MinValue
+        Public Property LastUpdatedUtc As DateTimeOffset = DateTimeOffset.MinValue
+        Public Property Trigger As String = String.Empty
+        Public Property EnqueuedBy As String = String.Empty
+        Public Property AttemptCount As Integer
+        Public Property LastAttemptUtc As DateTimeOffset?
+        Public Property LastErrorMessage As String = String.Empty
+    End Class
+
+    Friend NotInheritable Class QueuedJobWorkItem
+        Public Property QueueEntryId As String = String.Empty
+        Public Property Trigger As String = "queued"
+        Public Property EnqueuedBy As String = String.Empty
+        Public Property EnqueuedUtc As DateTimeOffset = DateTimeOffset.MinValue
+        Public Property Attempt As Integer
+        Public Property Job As ManagedJob
+    End Class
+
     Friend Class JobManagerService
-        Private Const MaximumRunHistory As Integer = 500
+        Private Const MaximumRunHistory As Integer = 1000
 
         Private ReadOnly _syncRoot As New Object()
         Private ReadOnly _catalogStore As JobCatalogStore
@@ -38,14 +70,50 @@ Namespace Services
         Public Function GetQueuedJobs() As IReadOnlyList(Of ManagedJob)
             SyncLock _syncRoot
                 Dim queued As New List(Of ManagedJob)()
-                For Each jobId In _catalog.QueuedJobIds
-                    Dim job = FindJobByIdLocked(jobId)
+                Dim sanitizedQueue = BuildSanitizedQueueLocked()
+
+                For Each queueEntry In sanitizedQueue
+                    Dim job = FindJobByIdLocked(queueEntry.JobId)
                     If job IsNot Nothing Then
                         queued.Add(CloneJob(job))
                     End If
                 Next
 
                 Return queued
+            End SyncLock
+        End Function
+
+        Public Function GetQueueEntries() As IReadOnlyList(Of JobQueueEntryView)
+            SyncLock _syncRoot
+                Dim queueEntries = BuildSanitizedQueueLocked()
+                Dim results As New List(Of JobQueueEntryView)()
+                Dim position = 1
+
+                For Each queueEntry In queueEntries
+                    Dim job = FindJobByIdLocked(queueEntry.JobId)
+                    If job Is Nothing Then
+                        Continue For
+                    End If
+
+                    results.Add(New JobQueueEntryView() With {
+                        .QueueEntryId = queueEntry.QueueEntryId,
+                        .JobId = job.JobId,
+                        .Position = position,
+                        .JobName = job.Name,
+                        .SourceRoot = job.Options.SourceRoot,
+                        .DestinationRoot = job.Options.DestinationRoot,
+                        .EnqueuedUtc = queueEntry.EnqueuedUtc,
+                        .LastUpdatedUtc = queueEntry.LastUpdatedUtc,
+                        .Trigger = queueEntry.Trigger,
+                        .EnqueuedBy = queueEntry.EnqueuedBy,
+                        .AttemptCount = queueEntry.AttemptCount,
+                        .LastAttemptUtc = queueEntry.LastAttemptUtc,
+                        .LastErrorMessage = queueEntry.LastErrorMessage
+                    })
+                    position += 1
+                Next
+
+                Return results
             End SyncLock
         End Function
 
@@ -101,44 +169,83 @@ Namespace Services
             End If
 
             SyncLock _syncRoot
-                Dim removed = _catalog.Jobs.RemoveAll(Function(job) job IsNot Nothing AndAlso String.Equals(job.JobId, jobId, StringComparison.OrdinalIgnoreCase)) > 0
+                Dim removed = _catalog.Jobs.RemoveAll(
+                    Function(job) job IsNot Nothing AndAlso String.Equals(job.JobId, jobId, StringComparison.OrdinalIgnoreCase)) > 0
                 If Not removed Then
                     Return False
                 End If
 
-                _catalog.QueuedJobIds.RemoveAll(Function(queuedId) String.Equals(queuedId, jobId, StringComparison.OrdinalIgnoreCase))
+                _catalog.QueueEntries.RemoveAll(
+                    Function(queueEntry) queueEntry IsNot Nothing AndAlso
+                        String.Equals(queueEntry.JobId, jobId, StringComparison.OrdinalIgnoreCase))
+
+                _catalog.QueuedJobIds.RemoveAll(
+                    Function(queuedId) String.Equals(queuedId, jobId, StringComparison.OrdinalIgnoreCase))
+
                 SaveCatalogLocked()
                 Return True
             End SyncLock
         End Function
 
-        Public Function QueueJob(jobId As String) As Boolean
+        Public Function QueueJob(jobId As String, Optional allowDuplicate As Boolean = False, Optional trigger As String = "manual", Optional enqueuedBy As String = "") As Boolean
             If String.IsNullOrWhiteSpace(jobId) Then
                 Return False
             End If
 
             SyncLock _syncRoot
-                If FindJobByIdLocked(jobId) Is Nothing Then
+                Dim job = FindJobByIdLocked(jobId)
+                If job Is Nothing Then
                     Return False
                 End If
 
-                If _catalog.QueuedJobIds.Any(Function(existing) String.Equals(existing, jobId, StringComparison.OrdinalIgnoreCase)) Then
-                    Return False
+                BuildSanitizedQueueLocked()
+
+                If Not allowDuplicate Then
+                    Dim alreadyQueued = _catalog.QueueEntries.Any(
+                        Function(existing) existing IsNot Nothing AndAlso
+                            String.Equals(existing.JobId, jobId, StringComparison.OrdinalIgnoreCase))
+                    If alreadyQueued Then
+                        Return False
+                    End If
                 End If
 
-                _catalog.QueuedJobIds.Add(jobId)
+                Dim nowUtc = DateTimeOffset.UtcNow
+                Dim entry As New ManagedJobQueueEntry() With {
+                    .QueueEntryId = Guid.NewGuid().ToString("N"),
+                    .JobId = job.JobId,
+                    .EnqueuedUtc = nowUtc,
+                    .LastUpdatedUtc = nowUtc,
+                    .Trigger = If(String.IsNullOrWhiteSpace(trigger), "manual", trigger.Trim()),
+                    .EnqueuedBy = If(enqueuedBy, String.Empty),
+                    .AttemptCount = 0,
+                    .LastAttemptUtc = Nothing,
+                    .LastErrorMessage = String.Empty
+                }
+
+                _catalog.QueueEntries.Add(entry)
                 SaveCatalogLocked()
                 Return True
             End SyncLock
         End Function
 
-        Public Function RemoveQueuedJob(jobId As String) As Boolean
-            If String.IsNullOrWhiteSpace(jobId) Then
+        Public Function RemoveQueuedJob(queueEntryIdOrJobId As String) As Boolean
+            If String.IsNullOrWhiteSpace(queueEntryIdOrJobId) Then
                 Return False
             End If
 
             SyncLock _syncRoot
-                Dim removed = _catalog.QueuedJobIds.RemoveAll(Function(existing) String.Equals(existing, jobId, StringComparison.OrdinalIgnoreCase)) > 0
+                Dim key = queueEntryIdOrJobId.Trim()
+
+                Dim removed = _catalog.QueueEntries.RemoveAll(
+                    Function(existing) existing IsNot Nothing AndAlso
+                        String.Equals(existing.QueueEntryId, key, StringComparison.OrdinalIgnoreCase)) > 0
+
+                If Not removed Then
+                    removed = _catalog.QueueEntries.RemoveAll(
+                        Function(existing) existing IsNot Nothing AndAlso
+                            String.Equals(existing.JobId, key, StringComparison.OrdinalIgnoreCase)) > 0
+                End If
+
                 If removed Then
                     SaveCatalogLocked()
                 End If
@@ -147,34 +254,83 @@ Namespace Services
             End SyncLock
         End Function
 
-        Public Function TryDequeueNextJob(ByRef job As ManagedJob) As Boolean
+        Public Function MoveQueueEntry(queueEntryId As String, direction As QueueMoveDirection) As Boolean
+            If String.IsNullOrWhiteSpace(queueEntryId) Then
+                Return False
+            End If
+
             SyncLock _syncRoot
-                Dim mutated = False
-                While _catalog.QueuedJobIds.Count > 0
-                    Dim nextJobId = _catalog.QueuedJobIds(0)
-                    _catalog.QueuedJobIds.RemoveAt(0)
-                    mutated = True
-
-                    Dim nextJob = FindJobByIdLocked(nextJobId)
-                    If nextJob Is Nothing Then
-                        Continue While
-                    End If
-
-                    SaveCatalogLocked()
-                    job = CloneJob(nextJob)
-                    Return True
-                End While
-
-                If mutated Then
-                    SaveCatalogLocked()
+                BuildSanitizedQueueLocked()
+                If _catalog.QueueEntries.Count <= 1 Then
+                    Return False
                 End If
 
-                job = Nothing
-                Return False
+                Dim currentIndex = _catalog.QueueEntries.FindIndex(
+                    Function(queueEntryCandidate) queueEntryCandidate IsNot Nothing AndAlso
+                        String.Equals(queueEntryCandidate.QueueEntryId, queueEntryId, StringComparison.OrdinalIgnoreCase))
+                If currentIndex < 0 Then
+                    Return False
+                End If
+
+                Dim targetIndex = currentIndex
+                Select Case direction
+                    Case QueueMoveDirection.Up
+                        targetIndex = Math.Max(0, currentIndex - 1)
+                    Case QueueMoveDirection.Down
+                        targetIndex = Math.Min(_catalog.QueueEntries.Count - 1, currentIndex + 1)
+                    Case QueueMoveDirection.Top
+                        targetIndex = 0
+                    Case QueueMoveDirection.Bottom
+                        targetIndex = _catalog.QueueEntries.Count - 1
+                End Select
+
+                If targetIndex = currentIndex Then
+                    Return False
+                End If
+
+                Dim entry = _catalog.QueueEntries(currentIndex)
+                _catalog.QueueEntries.RemoveAt(currentIndex)
+                _catalog.QueueEntries.Insert(targetIndex, entry)
+                entry.LastUpdatedUtc = DateTimeOffset.UtcNow
+                SaveCatalogLocked()
+                Return True
             End SyncLock
         End Function
 
-        Public Function CreateRunForJob(jobId As String, trigger As String) As ManagedJobRun
+        Public Function ClearQueue() As Integer
+            SyncLock _syncRoot
+                Dim removedCount = _catalog.QueueEntries.Count
+                If removedCount = 0 Then
+                    Return 0
+                End If
+
+                _catalog.QueueEntries.Clear()
+                SaveCatalogLocked()
+                Return removedCount
+            End SyncLock
+        End Function
+
+        Public Function TryDequeueNextJob(ByRef job As ManagedJob) As Boolean
+            Dim workItem As QueuedJobWorkItem = Nothing
+            Dim dequeued = TryDequeueNextJob(workItem)
+            job = If(workItem IsNot Nothing, CloneJob(workItem.Job), Nothing)
+            Return dequeued
+        End Function
+
+        Public Function TryDequeueNextJob(ByRef workItem As QueuedJobWorkItem) As Boolean
+            Return TryDequeueInternal(queueEntryId:=Nothing, workItem:=workItem)
+        End Function
+
+        Public Function TryDequeueQueuedEntry(queueEntryId As String, ByRef workItem As QueuedJobWorkItem) As Boolean
+            If String.IsNullOrWhiteSpace(queueEntryId) Then
+                workItem = Nothing
+                Return False
+            End If
+
+            Return TryDequeueInternal(queueEntryId.Trim(), workItem)
+        End Function
+
+        Public Function CreateRunForJob(jobId As String, trigger As String, Optional queueEntryId As String = Nothing, Optional queueAttempt As Integer = 0) As ManagedJobRun
             If String.IsNullOrWhiteSpace(jobId) Then
                 Throw New ArgumentException("Job ID is required.", NameOf(jobId))
             End If
@@ -189,7 +345,9 @@ Namespace Services
                     sourceJobId:=job.JobId,
                     displayName:=If(String.IsNullOrWhiteSpace(job.Name), "Saved Job", job.Name),
                     options:=job.Options,
-                    trigger:=trigger)
+                    trigger:=trigger,
+                    queueEntryId:=queueEntryId,
+                    queueAttempt:=queueAttempt)
 
                 SaveCatalogLocked()
                 Return CloneRun(run)
@@ -211,7 +369,9 @@ Namespace Services
                     sourceJobId:=String.Empty,
                     displayName:=resolvedName,
                     options:=options,
-                    trigger:=trigger)
+                    trigger:=trigger,
+                    queueEntryId:=String.Empty,
+                    queueAttempt:=0)
 
                 SaveCatalogLocked()
                 Return CloneRun(run)
@@ -337,6 +497,94 @@ Namespace Services
             End SyncLock
         End Function
 
+        Public Function DeleteRun(runId As String) As Boolean
+            If String.IsNullOrWhiteSpace(runId) Then
+                Return False
+            End If
+
+            SyncLock _syncRoot
+                Dim removed = _catalog.Runs.RemoveAll(
+                    Function(run) run IsNot Nothing AndAlso String.Equals(run.RunId, runId, StringComparison.OrdinalIgnoreCase)) > 0
+                If removed Then
+                    SaveCatalogLocked()
+                End If
+
+                Return removed
+            End SyncLock
+        End Function
+
+        Public Function ClearRunHistory(Optional keepLatest As Integer = 0) As Integer
+            SyncLock _syncRoot
+                Dim safeKeep = Math.Max(0, keepLatest)
+                If _catalog.Runs.Count <= safeKeep Then
+                    Return 0
+                End If
+
+                Dim beforeCount = _catalog.Runs.Count
+                _catalog.Runs = _catalog.Runs.Take(safeKeep).ToList()
+                Dim removed = beforeCount - _catalog.Runs.Count
+                SaveCatalogLocked()
+                Return removed
+            End SyncLock
+        End Function
+
+        Private Function TryDequeueInternal(queueEntryId As String, ByRef workItem As QueuedJobWorkItem) As Boolean
+            SyncLock _syncRoot
+                Dim nowUtc = DateTimeOffset.UtcNow
+                Dim mutated = False
+                Dim entryIndex = 0
+                Dim specificEntryRequested = Not String.IsNullOrWhiteSpace(queueEntryId)
+
+                While entryIndex < _catalog.QueueEntries.Count
+                    Dim entry = _catalog.QueueEntries(entryIndex)
+                    If entry Is Nothing OrElse String.IsNullOrWhiteSpace(entry.JobId) Then
+                        _catalog.QueueEntries.RemoveAt(entryIndex)
+                        mutated = True
+                        Continue While
+                    End If
+
+                    If specificEntryRequested AndAlso
+                        Not String.Equals(entry.QueueEntryId, queueEntryId, StringComparison.OrdinalIgnoreCase) Then
+                        entryIndex += 1
+                        Continue While
+                    End If
+
+                    Dim job = FindJobByIdLocked(entry.JobId)
+                    If job Is Nothing Then
+                        _catalog.QueueEntries.RemoveAt(entryIndex)
+                        mutated = True
+                        Continue While
+                    End If
+
+                    _catalog.QueueEntries.RemoveAt(entryIndex)
+                    mutated = True
+
+                    entry.AttemptCount = Math.Max(0, entry.AttemptCount) + 1
+                    entry.LastAttemptUtc = nowUtc
+                    entry.LastUpdatedUtc = nowUtc
+
+                    SaveCatalogLocked()
+
+                    workItem = New QueuedJobWorkItem() With {
+                        .QueueEntryId = entry.QueueEntryId,
+                        .Trigger = If(String.IsNullOrWhiteSpace(entry.Trigger), "queued", entry.Trigger),
+                        .EnqueuedBy = If(entry.EnqueuedBy, String.Empty),
+                        .EnqueuedUtc = entry.EnqueuedUtc,
+                        .Attempt = entry.AttemptCount,
+                        .Job = CloneJob(job)
+                    }
+                    Return True
+                End While
+
+                If mutated Then
+                    SaveCatalogLocked()
+                End If
+
+                workItem = Nothing
+                Return False
+            End SyncLock
+        End Function
+
         Private Sub UpdateRunStatus(runId As String, status As ManagedJobRunStatus)
             If String.IsNullOrWhiteSpace(runId) Then
                 Return
@@ -354,7 +602,7 @@ Namespace Services
             End SyncLock
         End Sub
 
-        Private Function CreateRunLocked(sourceJobId As String, displayName As String, options As CopyJobOptions, trigger As String) As ManagedJobRun
+        Private Function CreateRunLocked(sourceJobId As String, displayName As String, options As CopyJobOptions, trigger As String, queueEntryId As String, queueAttempt As Integer) As ManagedJobRun
             Dim safeOptions = CloneOptions(options)
             Dim nowUtc = DateTimeOffset.UtcNow
             Dim run As New ManagedJobRun() With {
@@ -364,6 +612,8 @@ Namespace Services
                 .SourceRoot = safeOptions.SourceRoot,
                 .DestinationRoot = safeOptions.DestinationRoot,
                 .Trigger = If(trigger, String.Empty),
+                .QueueEntryId = If(queueEntryId, String.Empty),
+                .QueueAttempt = Math.Max(0, queueAttempt),
                 .Status = ManagedJobRunStatus.Queued,
                 .StartedUtc = nowUtc,
                 .LastUpdatedUtc = nowUtc,
@@ -392,6 +642,44 @@ Namespace Services
         Private Function FindRunByIdLocked(runId As String) As ManagedJobRun
             Return _catalog.Runs.FirstOrDefault(
                 Function(run) run IsNot Nothing AndAlso String.Equals(run.RunId, runId, StringComparison.OrdinalIgnoreCase))
+        End Function
+
+        Private Function BuildSanitizedQueueLocked() As List(Of ManagedJobQueueEntry)
+            Dim sanitized As New List(Of ManagedJobQueueEntry)()
+            Dim seenEntryIds As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+            For Each queueEntry In _catalog.QueueEntries
+                If queueEntry Is Nothing Then
+                    Continue For
+                End If
+
+                Dim entryId = If(queueEntry.QueueEntryId, String.Empty).Trim()
+                If entryId.Length = 0 Then
+                    queueEntry.QueueEntryId = Guid.NewGuid().ToString("N")
+                    entryId = queueEntry.QueueEntryId
+                End If
+
+                If Not seenEntryIds.Add(entryId) Then
+                    Continue For
+                End If
+
+                If String.IsNullOrWhiteSpace(queueEntry.JobId) Then
+                    Continue For
+                End If
+
+                If FindJobByIdLocked(queueEntry.JobId) Is Nothing Then
+                    Continue For
+                End If
+
+                sanitized.Add(queueEntry)
+            Next
+
+            If _catalog.QueueEntries.Count <> sanitized.Count Then
+                _catalog.QueueEntries = sanitized
+                SaveCatalogLocked()
+            End If
+
+            Return sanitized
         End Function
 
         Private Sub SaveCatalogLocked()
@@ -424,6 +712,8 @@ Namespace Services
                 .SourceRoot = run.SourceRoot,
                 .DestinationRoot = run.DestinationRoot,
                 .Trigger = run.Trigger,
+                .QueueEntryId = run.QueueEntryId,
+                .QueueAttempt = run.QueueAttempt,
                 .Status = run.Status,
                 .StartedUtc = run.StartedUtc,
                 .LastUpdatedUtc = run.LastUpdatedUtc,

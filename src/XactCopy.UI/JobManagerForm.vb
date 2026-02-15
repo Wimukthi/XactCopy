@@ -1,30 +1,50 @@
+Imports System.Diagnostics
 Imports System.Drawing
+Imports System.IO
+Imports System.Linq
 Imports XactCopy.Models
 Imports XactCopy.Services
+
+Friend Enum JobManagerRequestAction
+    None = 0
+    RunSavedJob = 1
+    RunQueuedEntry = 2
+End Enum
 
 Friend Class JobManagerForm
     Inherits Form
 
-    Private Const LayoutWindowKey As String = "JobManagerForm"
-    Private Const GridLayoutSavedKey As String = "JobManagerForm.SingleGrid.SavedJobs"
-    Private Const GridLayoutQueueKey As String = "JobManagerForm.SingleGrid.Queue"
-    Private Const GridLayoutHistoryKey As String = "JobManagerForm.SingleGrid.RunHistory"
+    Private Const LayoutWindowKey As String = "JobManagerForm.V3"
+    Private Const GridLayoutKey As String = "JobManagerForm.V3.Grid"
+    Private Const SplitterKey As String = "JobManagerForm.V3.Split"
 
     Private ReadOnly _jobManager As JobManagerService
 
     Private ReadOnly _summaryLabel As New Label()
-    Private ReadOnly _hintLabel As New Label()
-
     Private ReadOnly _viewLabel As New Label()
     Private ReadOnly _viewComboBox As New ComboBox()
-    Private ReadOnly _runSelectedButton As New Button()
-    Private ReadOnly _queueSelectedButton As New Button()
-    Private ReadOnly _removeFromQueueButton As New Button()
-    Private ReadOnly _deleteSelectedButton As New Button()
+    Private ReadOnly _statusLabel As New Label()
+    Private ReadOnly _statusComboBox As New ComboBox()
+    Private ReadOnly _searchLabel As New Label()
+    Private ReadOnly _searchTextBox As New TextBox()
     Private ReadOnly _refreshButton As New Button()
-    Private ReadOnly _closeButton As New Button()
 
     Private ReadOnly _mainGrid As New DataGridView()
+    Private ReadOnly _detailsTextBox As New TextBox()
+    Private ReadOnly _contentSplit As New SplitContainer()
+
+    Private ReadOnly _runNowButton As New Button()
+    Private ReadOnly _queueButton As New Button()
+    Private ReadOnly _removeQueueButton As New Button()
+    Private ReadOnly _moveQueueUpButton As New Button()
+    Private ReadOnly _moveQueueDownButton As New Button()
+    Private ReadOnly _deleteJobButton As New Button()
+    Private ReadOnly _deleteRunButton As New Button()
+    Private ReadOnly _openJournalButton As New Button()
+    Private ReadOnly _clearQueueButton As New Button()
+    Private ReadOnly _clearHistoryButton As New Button()
+    Private ReadOnly _closeButton As New Button()
+
     Private ReadOnly _toolTip As New ToolTip() With {
         .ShowAlways = True,
         .InitialDelay = 350,
@@ -32,8 +52,13 @@ Friend Class JobManagerForm
         .AutoPopDelay = 24000
     }
 
+    Private _requestedAction As JobManagerRequestAction = JobManagerRequestAction.None
     Private _requestedRunJobId As String = String.Empty
-    Private _currentView As JobManagerView = JobManagerView.SavedJobs
+    Private _requestedQueueEntryId As String = String.Empty
+
+    Private _savedJobs As IReadOnlyList(Of ManagedJob) = Array.Empty(Of ManagedJob)()
+    Private _queueEntries As IReadOnlyList(Of JobQueueEntryView) = Array.Empty(Of JobQueueEntryView)()
+    Private _runs As IReadOnlyList(Of ManagedJobRun) = Array.Empty(Of ManagedJobRun)()
 
     Public Sub New(jobManager As JobManagerService)
         If jobManager Is Nothing Then
@@ -44,8 +69,8 @@ Friend Class JobManagerForm
 
         Text = "Job Manager"
         StartPosition = FormStartPosition.CenterParent
-        MinimumSize = New Size(980, 640)
-        Size = New Size(1180, 760)
+        MinimumSize = New Size(1080, 700)
+        Size = New Size(1320, 820)
         WindowIconHelper.Apply(Me)
 
         BuildUi()
@@ -55,46 +80,46 @@ Friend Class JobManagerForm
         AddHandler FormClosing, AddressOf JobManagerForm_FormClosing
     End Sub
 
+    Public ReadOnly Property RequestedAction As JobManagerRequestAction
+        Get
+            Return _requestedAction
+        End Get
+    End Property
+
     Public ReadOnly Property RequestedRunJobId As String
         Get
             Return _requestedRunJobId
         End Get
     End Property
 
+    Public ReadOnly Property RequestedQueueEntryId As String
+        Get
+            Return _requestedQueueEntryId
+        End Get
+    End Property
+
     Private Sub BuildUi()
         ConfigureGrid()
+        ConfigureSplitContainer()
 
         Dim rootLayout As New TableLayoutPanel() With {
             .Dock = DockStyle.Fill,
             .ColumnCount = 1,
             .RowCount = 4,
-            .Padding = New Padding(10)
+            .Padding = New Padding(8)
         }
         rootLayout.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100.0F))
         rootLayout.RowStyles.Add(New RowStyle(SizeType.AutoSize))
         rootLayout.RowStyles.Add(New RowStyle(SizeType.AutoSize))
         rootLayout.RowStyles.Add(New RowStyle(SizeType.Percent, 100.0F))
-        rootLayout.RowStyles.Add(New RowStyle(SizeType.AutoSize))
+        rootLayout.RowStyles.Add(New RowStyle(SizeType.Absolute, 48.0F))
 
         rootLayout.Controls.Add(BuildHeaderPane(), 0, 0)
-        rootLayout.Controls.Add(BuildCommandPane(), 0, 1)
-        rootLayout.Controls.Add(_mainGrid, 0, 2)
+        rootLayout.Controls.Add(BuildFilterPane(), 0, 1)
+        rootLayout.Controls.Add(_contentSplit, 0, 2)
         rootLayout.Controls.Add(BuildFooterPane(), 0, 3)
 
         Controls.Add(rootLayout)
-    End Sub
-
-    Private Sub ConfigureToolTips()
-        _toolTip.SetToolTip(_viewComboBox, "Choose which dataset to display in the grid: Saved Jobs, Queue, or Run History.")
-        _toolTip.SetToolTip(_runSelectedButton, "Run the selected saved job immediately.")
-        _toolTip.SetToolTip(_queueSelectedButton, "Queue the selected saved job for later execution.")
-        _toolTip.SetToolTip(_removeFromQueueButton, "Remove the selected queue entry.")
-        _toolTip.SetToolTip(_deleteSelectedButton, "Delete the selected saved job definition.")
-        _toolTip.SetToolTip(_refreshButton, "Reload jobs, queue, and run history.")
-        _toolTip.SetToolTip(_mainGrid, "Main list view. Double-click a saved job row to run it.")
-        _toolTip.SetToolTip(_summaryLabel, "Counts of saved jobs, queued jobs, and recorded runs.")
-        _toolTip.SetToolTip(_hintLabel, "Quick usage hint for this dialog.")
-        _toolTip.SetToolTip(_closeButton, "Close Job Manager.")
     End Sub
 
     Private Function BuildHeaderPane() As Control
@@ -102,7 +127,9 @@ Friend Class JobManagerForm
             .Dock = DockStyle.Fill,
             .ColumnCount = 2,
             .RowCount = 1,
-            .Margin = New Padding(0, 0, 0, 8)
+            .Margin = New Padding(0, 0, 0, 6),
+            .AutoSize = True,
+            .AutoSizeMode = AutoSizeMode.GrowAndShrink
         }
         layout.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100.0F))
         layout.ColumnStyles.Add(New ColumnStyle(SizeType.AutoSize))
@@ -110,7 +137,10 @@ Friend Class JobManagerForm
         Dim titleLayout As New TableLayoutPanel() With {
             .Dock = DockStyle.Fill,
             .ColumnCount = 1,
-            .RowCount = 2
+            .RowCount = 2,
+            .Margin = New Padding(0),
+            .AutoSize = True,
+            .AutoSizeMode = AutoSizeMode.GrowAndShrink
         }
         titleLayout.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100.0F))
         titleLayout.RowStyles.Add(New RowStyle(SizeType.AutoSize))
@@ -119,19 +149,18 @@ Friend Class JobManagerForm
         Dim titleLabel As New Label() With {
             .AutoSize = True,
             .Font = New Font(Font, FontStyle.Bold),
-            .Text = "Job Manager",
+            .Text = "Jobs Console",
             .Margin = New Padding(0, 0, 0, 2)
         }
 
         Dim subtitleLabel As New Label() With {
             .AutoSize = True,
-            .Text = "One-grid view for saved jobs, queue, and run history.",
+            .Text = "Manage saved jobs, queue order, and execution history from one grid.",
             .Margin = New Padding(0)
         }
 
         _summaryLabel.AutoSize = True
         _summaryLabel.Anchor = AnchorStyles.Right Or AnchorStyles.Top
-        _summaryLabel.Margin = New Padding(10, 2, 0, 0)
         _summaryLabel.Text = "Saved: 0 | Queued: 0 | Runs: 0"
 
         titleLayout.Controls.Add(titleLabel, 0, 0)
@@ -143,84 +172,182 @@ Friend Class JobManagerForm
         Return layout
     End Function
 
-    Private Function BuildCommandPane() As Control
-        Dim pane As New FlowLayoutPanel() With {
+    Private Function BuildFilterPane() As Control
+        Dim layout As New TableLayoutPanel() With {
             .Dock = DockStyle.Fill,
-            .FlowDirection = FlowDirection.LeftToRight,
-            .WrapContents = True,
+            .ColumnCount = 8,
+            .RowCount = 1,
+            .Margin = New Padding(0, 0, 0, 6),
             .AutoSize = True,
-            .Margin = New Padding(0, 0, 0, 8)
+            .AutoSizeMode = AutoSizeMode.GrowAndShrink
         }
+        layout.RowStyles.Add(New RowStyle(SizeType.Absolute, 32.0F))
+        layout.ColumnStyles.Add(New ColumnStyle(SizeType.AutoSize))
+        layout.ColumnStyles.Add(New ColumnStyle(SizeType.Absolute, 180.0F))
+        layout.ColumnStyles.Add(New ColumnStyle(SizeType.AutoSize))
+        layout.ColumnStyles.Add(New ColumnStyle(SizeType.Absolute, 180.0F))
+        layout.ColumnStyles.Add(New ColumnStyle(SizeType.AutoSize))
+        layout.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100.0F))
+        layout.ColumnStyles.Add(New ColumnStyle(SizeType.AutoSize))
+        layout.ColumnStyles.Add(New ColumnStyle(SizeType.AutoSize))
 
-        _viewLabel.Text = "View:"
+        _viewLabel.Text = "View"
         _viewLabel.AutoSize = True
-        _viewLabel.Margin = New Padding(0, 8, 6, 0)
+        _viewLabel.Anchor = AnchorStyles.Left
+        _viewLabel.Margin = New Padding(0, 0, 8, 0)
 
         _viewComboBox.DropDownStyle = ComboBoxStyle.DropDownList
-        _viewComboBox.Width = 200
-        _viewComboBox.Items.Add(New ViewItem(JobManagerView.SavedJobs, "Saved Jobs"))
-        _viewComboBox.Items.Add(New ViewItem(JobManagerView.Queue, "Queue"))
-        _viewComboBox.Items.Add(New ViewItem(JobManagerView.RunHistory, "Run History"))
-        AddHandler _viewComboBox.SelectedIndexChanged, AddressOf ViewComboBox_SelectedIndexChanged
+        _viewComboBox.Anchor = AnchorStyles.Left Or AnchorStyles.Right
+        _viewComboBox.Margin = New Padding(0, 0, 8, 0)
+        _viewComboBox.Items.Add(New EnumChoice(Of JobManagerViewFilter)(JobManagerViewFilter.AllItems, "All Items"))
+        _viewComboBox.Items.Add(New EnumChoice(Of JobManagerViewFilter)(JobManagerViewFilter.SavedJobs, "Saved Jobs"))
+        _viewComboBox.Items.Add(New EnumChoice(Of JobManagerViewFilter)(JobManagerViewFilter.Queue, "Queue"))
+        _viewComboBox.Items.Add(New EnumChoice(Of JobManagerViewFilter)(JobManagerViewFilter.RunHistory, "Run History"))
+        AddHandler _viewComboBox.SelectedIndexChanged, AddressOf FilterChanged
 
-        _runSelectedButton.Text = "Run Selected"
-        _runSelectedButton.AutoSize = True
-        AddHandler _runSelectedButton.Click, AddressOf RunSelectedButton_Click
+        _statusLabel.Text = "Run Status"
+        _statusLabel.AutoSize = True
+        _statusLabel.Anchor = AnchorStyles.Left
+        _statusLabel.Margin = New Padding(0, 0, 8, 0)
 
-        _queueSelectedButton.Text = "Queue Selected"
-        _queueSelectedButton.AutoSize = True
-        AddHandler _queueSelectedButton.Click, AddressOf QueueSelectedButton_Click
+        _statusComboBox.DropDownStyle = ComboBoxStyle.DropDownList
+        _statusComboBox.Anchor = AnchorStyles.Left Or AnchorStyles.Right
+        _statusComboBox.Margin = New Padding(0, 0, 8, 0)
+        _statusComboBox.Items.Add(New EnumChoice(Of RunStatusFilter)(RunStatusFilter.Any, "Any"))
+        _statusComboBox.Items.Add(New EnumChoice(Of RunStatusFilter)(RunStatusFilter.Queued, "Queued"))
+        _statusComboBox.Items.Add(New EnumChoice(Of RunStatusFilter)(RunStatusFilter.Running, "Running"))
+        _statusComboBox.Items.Add(New EnumChoice(Of RunStatusFilter)(RunStatusFilter.Paused, "Paused"))
+        _statusComboBox.Items.Add(New EnumChoice(Of RunStatusFilter)(RunStatusFilter.Completed, "Completed"))
+        _statusComboBox.Items.Add(New EnumChoice(Of RunStatusFilter)(RunStatusFilter.Failed, "Failed"))
+        _statusComboBox.Items.Add(New EnumChoice(Of RunStatusFilter)(RunStatusFilter.Cancelled, "Cancelled"))
+        _statusComboBox.Items.Add(New EnumChoice(Of RunStatusFilter)(RunStatusFilter.Interrupted, "Interrupted"))
+        AddHandler _statusComboBox.SelectedIndexChanged, AddressOf FilterChanged
 
-        _removeFromQueueButton.Text = "Remove From Queue"
-        _removeFromQueueButton.AutoSize = True
-        AddHandler _removeFromQueueButton.Click, AddressOf RemoveFromQueueButton_Click
+        _searchLabel.Text = "Search"
+        _searchLabel.AutoSize = True
+        _searchLabel.Anchor = AnchorStyles.Left
+        _searchLabel.Margin = New Padding(0, 0, 8, 0)
 
-        _deleteSelectedButton.Text = "Delete Selected Job"
-        _deleteSelectedButton.AutoSize = True
-        AddHandler _deleteSelectedButton.Click, AddressOf DeleteSelectedButton_Click
+        _searchTextBox.Anchor = AnchorStyles.Left Or AnchorStyles.Right
+        _searchTextBox.Margin = New Padding(0, 0, 8, 0)
+        AddHandler _searchTextBox.TextChanged, AddressOf FilterChanged
 
         _refreshButton.Text = "Refresh"
         _refreshButton.AutoSize = True
-        AddHandler _refreshButton.Click, AddressOf RefreshButton_Click
+        _refreshButton.Anchor = AnchorStyles.Left Or AnchorStyles.Top
+        _refreshButton.Margin = New Padding(0, 1, 0, 0)
+        AddHandler _refreshButton.Click,
+            Sub(sender, e)
+                RefreshData()
+            End Sub
 
-        pane.Controls.Add(_viewLabel)
-        pane.Controls.Add(_viewComboBox)
-        pane.Controls.Add(_runSelectedButton)
-        pane.Controls.Add(_queueSelectedButton)
-        pane.Controls.Add(_removeFromQueueButton)
-        pane.Controls.Add(_deleteSelectedButton)
-        pane.Controls.Add(_refreshButton)
+        layout.Controls.Add(_viewLabel, 0, 0)
+        layout.Controls.Add(_viewComboBox, 1, 0)
+        layout.Controls.Add(_statusLabel, 2, 0)
+        layout.Controls.Add(_statusComboBox, 3, 0)
+        layout.Controls.Add(_searchLabel, 4, 0)
+        layout.Controls.Add(_searchTextBox, 5, 0)
+        layout.Controls.Add(_refreshButton, 6, 0)
 
-        Return pane
+        Return layout
     End Function
+
+    Private Sub ConfigureSplitContainer()
+        _contentSplit.Dock = DockStyle.Fill
+        _contentSplit.Orientation = Orientation.Horizontal
+        _contentSplit.SplitterWidth = 6
+        _contentSplit.Panel1.Controls.Add(_mainGrid)
+
+        Dim detailsLayout As New TableLayoutPanel() With {
+            .Dock = DockStyle.Fill,
+            .ColumnCount = 1,
+            .RowCount = 2,
+            .Padding = New Padding(0)
+        }
+        detailsLayout.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100.0F))
+        detailsLayout.RowStyles.Add(New RowStyle(SizeType.AutoSize))
+        detailsLayout.RowStyles.Add(New RowStyle(SizeType.Percent, 100.0F))
+
+        Dim detailsTitle As New Label() With {
+            .Text = "Selected Item Details",
+            .AutoSize = True,
+            .Font = New Font(Font, FontStyle.Bold),
+            .Margin = New Padding(0, 0, 0, 4)
+        }
+
+        _detailsTextBox.Dock = DockStyle.Fill
+        _detailsTextBox.Multiline = True
+        _detailsTextBox.ReadOnly = True
+        _detailsTextBox.ScrollBars = ScrollBars.Both
+        _detailsTextBox.WordWrap = False
+
+        detailsLayout.Controls.Add(detailsTitle, 0, 0)
+        detailsLayout.Controls.Add(_detailsTextBox, 0, 1)
+        _contentSplit.Panel2.Controls.Add(detailsLayout)
+    End Sub
 
     Private Function BuildFooterPane() As Control
         Dim footer As New TableLayoutPanel() With {
             .Dock = DockStyle.Fill,
             .ColumnCount = 2,
             .RowCount = 1,
-            .Margin = New Padding(0, 8, 0, 0)
+            .Margin = New Padding(0, 4, 0, 0),
+            .AutoSize = False
         }
+        footer.RowStyles.Add(New RowStyle(SizeType.Percent, 100.0F))
         footer.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100.0F))
         footer.ColumnStyles.Add(New ColumnStyle(SizeType.AutoSize))
 
-        _hintLabel.AutoSize = True
-        _hintLabel.Text = "Tip: double-click a saved job row to run immediately."
-        _hintLabel.Anchor = AnchorStyles.Left Or AnchorStyles.Top
+        Dim actionsPanel As New FlowLayoutPanel() With {
+            .Dock = DockStyle.Fill,
+            .FlowDirection = FlowDirection.LeftToRight,
+            .WrapContents = True,
+            .AutoSize = False,
+            .Margin = New Padding(0)
+        }
+
+        ConfigureActionButton(_runNowButton, "Run Now", AddressOf RunNowButton_Click)
+        ConfigureActionButton(_queueButton, "Queue", AddressOf QueueButton_Click)
+        ConfigureActionButton(_removeQueueButton, "Remove Queue", AddressOf RemoveQueueButton_Click)
+        ConfigureActionButton(_moveQueueUpButton, "Move Up", AddressOf MoveQueueUpButton_Click)
+        ConfigureActionButton(_moveQueueDownButton, "Move Down", AddressOf MoveQueueDownButton_Click)
+        ConfigureActionButton(_deleteJobButton, "Delete Job", AddressOf DeleteJobButton_Click)
+        ConfigureActionButton(_deleteRunButton, "Delete Run", AddressOf DeleteRunButton_Click)
+        ConfigureActionButton(_openJournalButton, "Open Journal", AddressOf OpenJournalButton_Click)
+        ConfigureActionButton(_clearQueueButton, "Clear Queue", AddressOf ClearQueueButton_Click)
+        ConfigureActionButton(_clearHistoryButton, "Clear History", AddressOf ClearHistoryButton_Click)
+
+        actionsPanel.Controls.Add(_runNowButton)
+        actionsPanel.Controls.Add(_queueButton)
+        actionsPanel.Controls.Add(_removeQueueButton)
+        actionsPanel.Controls.Add(_moveQueueUpButton)
+        actionsPanel.Controls.Add(_moveQueueDownButton)
+        actionsPanel.Controls.Add(_deleteJobButton)
+        actionsPanel.Controls.Add(_deleteRunButton)
+        actionsPanel.Controls.Add(_openJournalButton)
+        actionsPanel.Controls.Add(_clearQueueButton)
+        actionsPanel.Controls.Add(_clearHistoryButton)
 
         _closeButton.Text = "Close"
         _closeButton.AutoSize = True
+        _closeButton.Anchor = AnchorStyles.Right Or AnchorStyles.Top
+        _closeButton.Margin = New Padding(8, 0, 0, 0)
         AddHandler _closeButton.Click,
             Sub(sender, e)
                 DialogResult = DialogResult.Cancel
                 Close()
             End Sub
 
-        footer.Controls.Add(_hintLabel, 0, 0)
+        footer.Controls.Add(actionsPanel, 0, 0)
         footer.Controls.Add(_closeButton, 1, 0)
-
         Return footer
     End Function
+
+    Private Sub ConfigureActionButton(button As Button, text As String, handler As EventHandler)
+        button.Text = text
+        button.AutoSize = True
+        AddHandler button.Click, handler
+    End Sub
 
     Private Sub ConfigureGrid()
         _mainGrid.Dock = DockStyle.Fill
@@ -239,211 +366,256 @@ Friend Class JobManagerForm
         _mainGrid.RowTemplate.Height = 24
         _mainGrid.ScrollBars = ScrollBars.Both
 
+        _mainGrid.Columns.Add("Type", "Type")
+        _mainGrid.Columns.Add("Name", "Name")
+        _mainGrid.Columns.Add("State", "State")
+        _mainGrid.Columns.Add("QueuePos", "Queue")
+        _mainGrid.Columns.Add("Trigger", "Trigger")
+        _mainGrid.Columns.Add("Started", "Started")
+        _mainGrid.Columns.Add("Updated", "Updated")
+        _mainGrid.Columns.Add("Source", "Source")
+        _mainGrid.Columns.Add("Destination", "Destination")
+        _mainGrid.Columns.Add("Summary", "Summary")
+
+        _mainGrid.Columns("Type").Width = 85
+        _mainGrid.Columns("Name").Width = 220
+        _mainGrid.Columns("State").Width = 120
+        _mainGrid.Columns("QueuePos").Width = 75
+        _mainGrid.Columns("Trigger").Width = 130
+        _mainGrid.Columns("Started").Width = 160
+        _mainGrid.Columns("Updated").Width = 160
+        _mainGrid.Columns("Source").Width = 320
+        _mainGrid.Columns("Destination").Width = 320
+        _mainGrid.Columns("Summary").Width = 380
+
         AddHandler _mainGrid.SelectionChanged, AddressOf MainGrid_SelectionChanged
         AddHandler _mainGrid.CellDoubleClick, AddressOf MainGrid_CellDoubleClick
     End Sub
 
+    Private Sub ConfigureToolTips()
+        _toolTip.SetToolTip(_summaryLabel, "Live counts for saved jobs, queue entries, and run history entries.")
+        _toolTip.SetToolTip(_viewComboBox, "Choose which records are shown in the grid.")
+        _toolTip.SetToolTip(_statusComboBox, "Optional run-status filter when viewing run history.")
+        _toolTip.SetToolTip(_searchTextBox, "Filter grid rows by job name, paths, trigger, or summary text.")
+        _toolTip.SetToolTip(_refreshButton, "Reload records from disk.")
+
+        _toolTip.SetToolTip(_runNowButton, "Run the selected saved job now, or run a selected queue entry immediately.")
+        _toolTip.SetToolTip(_queueButton, "Queue the selected saved job.")
+        _toolTip.SetToolTip(_removeQueueButton, "Remove selected queue entry.")
+        _toolTip.SetToolTip(_moveQueueUpButton, "Move selected queue entry one position up.")
+        _toolTip.SetToolTip(_moveQueueDownButton, "Move selected queue entry one position down.")
+        _toolTip.SetToolTip(_deleteJobButton, "Delete selected saved job.")
+        _toolTip.SetToolTip(_deleteRunButton, "Delete selected run history entry.")
+        _toolTip.SetToolTip(_openJournalButton, "Open the journal file for the selected run.")
+        _toolTip.SetToolTip(_clearQueueButton, "Clear all queued entries.")
+        _toolTip.SetToolTip(_clearHistoryButton, "Clear all run-history entries.")
+        _toolTip.SetToolTip(_detailsTextBox, "Detailed metadata for the currently selected row.")
+    End Sub
+
     Private Sub JobManagerForm_Shown(sender As Object, e As EventArgs)
         UiLayoutManager.ApplyWindow(Me, LayoutWindowKey)
+        UiLayoutManager.ApplyGridLayout(_mainGrid, GridLayoutKey)
 
         _viewComboBox.SelectedIndex = 0
+        _statusComboBox.SelectedIndex = 0
+
         RefreshData()
+
+        ' Apply splitter after initial layout pass so persisted distance/min sizes are honored.
+        BeginInvoke(New Action(
+            Sub()
+                UiLayoutManager.ApplySplitter(
+                    _contentSplit,
+                    SplitterKey,
+                    defaultDistance:=CInt(Math.Max(260, _contentSplit.Height * 0.68R)),
+                    panel1Min:=320,
+                    panel2Min:=160)
+            End Sub))
     End Sub
 
     Private Sub JobManagerForm_FormClosing(sender As Object, e As FormClosingEventArgs)
-        CaptureGridLayoutForCurrentView()
+        UiLayoutManager.CaptureGridLayout(_mainGrid, GridLayoutKey)
+        UiLayoutManager.CaptureSplitter(_contentSplit, SplitterKey)
         UiLayoutManager.CaptureWindow(Me, LayoutWindowKey)
     End Sub
 
-    Private Sub ViewComboBox_SelectedIndexChanged(sender As Object, e As EventArgs)
-        Dim selectedView = GetSelectedView()
-        If selectedView = _currentView AndAlso _mainGrid.Columns.Count > 0 Then
-            Return
-        End If
-
-        SwitchView(selectedView)
-        RefreshData()
-    End Sub
-
-    Private Sub RefreshButton_Click(sender As Object, e As EventArgs)
-        RefreshData()
+    Private Sub FilterChanged(sender As Object, e As EventArgs)
+        PopulateGrid(keepSelection:=True)
     End Sub
 
     Private Sub RefreshData()
-        Dim savedJobs = _jobManager.GetJobs()
-        Dim queuedJobs = _jobManager.GetQueuedJobs()
-        Dim runs = _jobManager.GetRecentRuns(250)
+        _savedJobs = _jobManager.GetJobs()
+        _queueEntries = _jobManager.GetQueueEntries()
+        _runs = _jobManager.GetRecentRuns(500)
 
-        _summaryLabel.Text = $"Saved: {savedJobs.Count} | Queued: {queuedJobs.Count} | Runs: {runs.Count}"
+        _summaryLabel.Text = $"Saved: {_savedJobs.Count} | Queued: {_queueEntries.Count} | Runs: {_runs.Count}"
 
-        Select Case _currentView
-            Case JobManagerView.SavedJobs
-                PopulateSavedJobs(savedJobs)
-            Case JobManagerView.Queue
-                PopulateQueue(queuedJobs)
-            Case Else
-                PopulateRunHistory(runs)
-        End Select
+        PopulateGrid(keepSelection:=True)
+    End Sub
 
+    Private Sub PopulateGrid(keepSelection As Boolean)
+        Dim previousTag = If(keepSelection, GetSelectedTag(), Nothing)
+        Dim view = GetSelectedViewFilter()
+        Dim runStatusFilter = GetSelectedRunStatusFilter()
+        Dim searchText = If(_searchTextBox.Text, String.Empty).Trim()
+
+        _mainGrid.SuspendLayout()
+        _mainGrid.Rows.Clear()
+
+        If view = JobManagerViewFilter.AllItems OrElse view = JobManagerViewFilter.SavedJobs Then
+            For Each job In _savedJobs
+                Dim summary = BuildSavedJobSummary(job)
+                If Not MatchesSearch(searchText, "saved", job.Name, "ready", job.Options.SourceRoot, job.Options.DestinationRoot, summary) Then
+                    Continue For
+                End If
+
+                Dim rowIndex = _mainGrid.Rows.Add(
+                    "Saved",
+                    job.Name,
+                    "Ready",
+                    "-",
+                    "manual",
+                    job.CreatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
+                    job.UpdatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
+                    job.Options.SourceRoot,
+                    job.Options.DestinationRoot,
+                    summary)
+
+                _mainGrid.Rows(rowIndex).Tag = New GridRowTag(RowKind.SavedJob, job.JobId, job.JobId)
+            Next
+        End If
+
+        If view = JobManagerViewFilter.AllItems OrElse view = JobManagerViewFilter.Queue Then
+            For Each entry In _queueEntries
+                Dim state = If(entry.AttemptCount > 0, "Retry queued", "Queued")
+                Dim summary = BuildQueueSummary(entry)
+                If Not MatchesSearch(searchText, "queue", entry.JobName, state, entry.SourceRoot, entry.DestinationRoot, summary, entry.Trigger) Then
+                    Continue For
+                End If
+
+                Dim rowIndex = _mainGrid.Rows.Add(
+                    "Queue",
+                    entry.JobName,
+                    state,
+                    entry.Position.ToString(),
+                    entry.Trigger,
+                    entry.EnqueuedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
+                    entry.LastUpdatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
+                    entry.SourceRoot,
+                    entry.DestinationRoot,
+                    summary)
+
+                _mainGrid.Rows(rowIndex).Tag = New GridRowTag(RowKind.QueueEntry, entry.QueueEntryId, entry.JobId)
+            Next
+        End If
+
+        If view = JobManagerViewFilter.AllItems OrElse view = JobManagerViewFilter.RunHistory Then
+            For Each run In _runs
+                If runStatusFilter.HasValue AndAlso run.Status <> runStatusFilter.Value Then
+                    Continue For
+                End If
+
+                Dim summary = If(String.IsNullOrWhiteSpace(run.Summary), "-", run.Summary)
+                If Not MatchesSearch(searchText, "run", run.DisplayName, run.Status.ToString(), run.SourceRoot, run.DestinationRoot, summary, run.Trigger) Then
+                    Continue For
+                End If
+
+                Dim queueDisplay = If(run.QueueAttempt > 0, run.QueueAttempt.ToString(), "-")
+                Dim rowIndex = _mainGrid.Rows.Add(
+                    "Run",
+                    run.DisplayName,
+                    run.Status.ToString(),
+                    queueDisplay,
+                    run.Trigger,
+                    run.StartedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
+                    run.LastUpdatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
+                    run.SourceRoot,
+                    run.DestinationRoot,
+                    summary)
+
+                _mainGrid.Rows(rowIndex).Tag = New GridRowTag(RowKind.RunHistory, run.RunId, run.JobId)
+            Next
+        End If
+
+        _mainGrid.ResumeLayout()
+
+        RestoreSelection(previousTag)
         UpdateActionStates()
+        RenderSelectedItemDetails()
     End Sub
 
-    Private Sub SwitchView(view As JobManagerView)
-        CaptureGridLayoutForCurrentView()
-        _currentView = view
+    Private Function BuildSavedJobSummary(job As ManagedJob) As String
+        If job Is Nothing OrElse job.Options Is Nothing Then
+            Return "Saved job definition"
+        End If
 
-        ConfigureColumnsForCurrentView()
-        UiLayoutManager.ApplyGridLayout(_mainGrid, GetLayoutKeyForCurrentView())
-        UpdateActionStates()
-    End Sub
+        Dim mode = If(job.Options.UseAdaptiveBufferSizing, "Adaptive buffer", "Fixed buffer")
+        Dim verify = If(job.Options.VerifyAfterCopy, "Verify", "No verify")
+        Return $"{mode}; retries {Math.Max(0, job.Options.MaxRetries)}; {verify}."
+    End Function
 
-    Private Sub ConfigureColumnsForCurrentView()
-        _mainGrid.Columns.Clear()
-        _mainGrid.Rows.Clear()
+    Private Function BuildQueueSummary(entry As JobQueueEntryView) As String
+        If entry Is Nothing Then
+            Return "Queued"
+        End If
 
-        Select Case _currentView
-            Case JobManagerView.SavedJobs
-                Dim nameColumn = _mainGrid.Columns.Add("Name", "Name")
-                Dim sourceColumn = _mainGrid.Columns.Add("Source", "Source")
-                Dim destinationColumn = _mainGrid.Columns.Add("Destination", "Destination")
-                Dim updatedColumn = _mainGrid.Columns.Add("Updated", "Updated")
+        Dim baseText = If(String.IsNullOrWhiteSpace(entry.EnqueuedBy), "Queued", $"Queued by {entry.EnqueuedBy}")
+        If String.IsNullOrWhiteSpace(entry.LastErrorMessage) Then
+            Return baseText
+        End If
 
-                _mainGrid.Columns(nameColumn).Width = 240
-                _mainGrid.Columns(sourceColumn).Width = 380
-                _mainGrid.Columns(destinationColumn).Width = 380
-                _mainGrid.Columns(updatedColumn).Width = 170
+        Return $"{baseText}; last error: {entry.LastErrorMessage}"
+    End Function
 
-            Case JobManagerView.Queue
-                Dim positionColumn = _mainGrid.Columns.Add("Position", "#")
-                Dim nameColumn = _mainGrid.Columns.Add("Name", "Job")
-                Dim sourceColumn = _mainGrid.Columns.Add("Source", "Source")
-                Dim destinationColumn = _mainGrid.Columns.Add("Destination", "Destination")
+    Private Function MatchesSearch(searchText As String, ParamArray fields() As String) As Boolean
+        If String.IsNullOrWhiteSpace(searchText) Then
+            Return True
+        End If
 
-                _mainGrid.Columns(positionColumn).Width = 50
-                _mainGrid.Columns(nameColumn).Width = 260
-                _mainGrid.Columns(sourceColumn).Width = 410
-                _mainGrid.Columns(destinationColumn).Width = 410
+        For Each field In fields
+            If field Is Nothing Then
+                Continue For
+            End If
 
-            Case Else
-                Dim startedColumn = _mainGrid.Columns.Add("Started", "Started")
-                Dim runColumn = _mainGrid.Columns.Add("DisplayName", "Run")
-                Dim statusColumn = _mainGrid.Columns.Add("Status", "Status")
-                Dim sourceColumn = _mainGrid.Columns.Add("Source", "Source")
-                Dim destinationColumn = _mainGrid.Columns.Add("Destination", "Destination")
-                Dim summaryColumn = _mainGrid.Columns.Add("Summary", "Summary")
-
-                _mainGrid.Columns(startedColumn).Width = 160
-                _mainGrid.Columns(runColumn).Width = 240
-                _mainGrid.Columns(statusColumn).Width = 120
-                _mainGrid.Columns(sourceColumn).Width = 330
-                _mainGrid.Columns(destinationColumn).Width = 330
-                _mainGrid.Columns(summaryColumn).Width = 360
-        End Select
-    End Sub
-
-    Private Sub PopulateSavedJobs(jobs As IReadOnlyList(Of ManagedJob))
-        _mainGrid.Rows.Clear()
-
-        For Each job In jobs
-            Dim rowIndex = _mainGrid.Rows.Add(
-                job.Name,
-                job.Options.SourceRoot,
-                job.Options.DestinationRoot,
-                job.UpdatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"))
-
-            _mainGrid.Rows(rowIndex).Tag = New GridRowTag(RowKind.SavedJob, job.JobId)
+            If field.IndexOf(searchText, StringComparison.OrdinalIgnoreCase) >= 0 Then
+                Return True
+            End If
         Next
-    End Sub
 
-    Private Sub PopulateQueue(queue As IReadOnlyList(Of ManagedJob))
-        _mainGrid.Rows.Clear()
+        Return False
+    End Function
 
-        Dim position = 1
-        For Each job In queue
-            Dim rowIndex = _mainGrid.Rows.Add(
-                position.ToString(),
-                job.Name,
-                job.Options.SourceRoot,
-                job.Options.DestinationRoot)
+    Private Sub RestoreSelection(previousTag As GridRowTag)
+        If previousTag Is Nothing Then
+            If _mainGrid.Rows.Count > 0 Then
+                _mainGrid.Rows(0).Selected = True
+                _mainGrid.CurrentCell = _mainGrid.Rows(0).Cells(0)
+            End If
+            Return
+        End If
 
-            _mainGrid.Rows(rowIndex).Tag = New GridRowTag(RowKind.QueuedJob, job.JobId)
-            position += 1
+        For Each row As DataGridViewRow In _mainGrid.Rows
+            Dim tag = TryCast(row.Tag, GridRowTag)
+            If tag Is Nothing Then
+                Continue For
+            End If
+
+            If tag.Kind = previousTag.Kind AndAlso String.Equals(tag.PrimaryId, previousTag.PrimaryId, StringComparison.OrdinalIgnoreCase) Then
+                row.Selected = True
+                _mainGrid.CurrentCell = row.Cells(0)
+                Return
+            End If
         Next
-    End Sub
 
-    Private Sub PopulateRunHistory(runs As IReadOnlyList(Of ManagedJobRun))
-        _mainGrid.Rows.Clear()
-
-        For Each run In runs
-            Dim summaryText = If(String.IsNullOrWhiteSpace(run.Summary), "-", run.Summary)
-            Dim rowIndex = _mainGrid.Rows.Add(
-                run.StartedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
-                run.DisplayName,
-                run.Status.ToString(),
-                run.SourceRoot,
-                run.DestinationRoot,
-                summaryText)
-
-            _mainGrid.Rows(rowIndex).Tag = New GridRowTag(RowKind.RunHistoryEntry, run.RunId)
-        Next
-    End Sub
-
-    Private Sub RunSelectedButton_Click(sender As Object, e As EventArgs)
-        RunSelectedSavedJob()
-    End Sub
-
-    Private Sub QueueSelectedButton_Click(sender As Object, e As EventArgs)
-        Dim selectedTag = GetSelectedTag()
-        If selectedTag Is Nothing OrElse selectedTag.Kind <> RowKind.SavedJob Then
-            MessageBox.Show(Me, "Select a saved job row first.", "Job Manager", MessageBoxButtons.OK, MessageBoxIcon.Information)
-            Return
+        If _mainGrid.Rows.Count > 0 Then
+            _mainGrid.Rows(0).Selected = True
+            _mainGrid.CurrentCell = _mainGrid.Rows(0).Cells(0)
         End If
-
-        If Not _jobManager.QueueJob(selectedTag.Id) Then
-            MessageBox.Show(Me,
-                            "Unable to queue that job. It may already be queued.",
-                            "Job Manager",
-                            MessageBoxButtons.OK,
-                            MessageBoxIcon.Information)
-            Return
-        End If
-
-        RefreshData()
-    End Sub
-
-    Private Sub RemoveFromQueueButton_Click(sender As Object, e As EventArgs)
-        Dim selectedTag = GetSelectedTag()
-        If selectedTag Is Nothing OrElse selectedTag.Kind <> RowKind.QueuedJob Then
-            MessageBox.Show(Me, "Select a queued job row first.", "Job Manager", MessageBoxButtons.OK, MessageBoxIcon.Information)
-            Return
-        End If
-
-        _jobManager.RemoveQueuedJob(selectedTag.Id)
-        RefreshData()
-    End Sub
-
-    Private Sub DeleteSelectedButton_Click(sender As Object, e As EventArgs)
-        Dim selectedTag = GetSelectedTag()
-        If selectedTag Is Nothing OrElse selectedTag.Kind <> RowKind.SavedJob Then
-            MessageBox.Show(Me, "Select a saved job row first.", "Job Manager", MessageBoxButtons.OK, MessageBoxIcon.Information)
-            Return
-        End If
-
-        Dim response = MessageBox.Show(Me,
-                                       "Delete selected job?",
-                                       "Job Manager",
-                                       MessageBoxButtons.YesNo,
-                                       MessageBoxIcon.Warning)
-        If response <> DialogResult.Yes Then
-            Return
-        End If
-
-        _jobManager.DeleteJob(selectedTag.Id)
-        RefreshData()
     End Sub
 
     Private Sub MainGrid_SelectionChanged(sender As Object, e As EventArgs)
         UpdateActionStates()
+        RenderSelectedItemDetails()
     End Sub
 
     Private Sub MainGrid_CellDoubleClick(sender As Object, e As DataGridViewCellEventArgs)
@@ -451,47 +623,378 @@ Friend Class JobManagerForm
             Return
         End If
 
-        If _currentView = JobManagerView.SavedJobs Then
-            RunSelectedSavedJob()
-        End If
+        RunNowSelected()
     End Sub
 
-    Private Sub RunSelectedSavedJob()
+    Private Sub RunNowButton_Click(sender As Object, e As EventArgs)
+        RunNowSelected()
+    End Sub
+
+    Private Sub RunNowSelected()
         Dim selectedTag = GetSelectedTag()
-        If selectedTag Is Nothing OrElse selectedTag.Kind <> RowKind.SavedJob Then
-            MessageBox.Show(Me, "Select a saved job row first.", "Job Manager", MessageBoxButtons.OK, MessageBoxIcon.Information)
+        If selectedTag Is Nothing Then
             Return
         End If
 
-        _requestedRunJobId = selectedTag.Id
-        DialogResult = DialogResult.OK
-        Close()
+        Select Case selectedTag.Kind
+            Case RowKind.SavedJob
+                _requestedAction = JobManagerRequestAction.RunSavedJob
+                _requestedRunJobId = selectedTag.JobId
+                _requestedQueueEntryId = String.Empty
+                DialogResult = DialogResult.OK
+                Close()
+
+            Case RowKind.QueueEntry
+                _requestedAction = JobManagerRequestAction.RunQueuedEntry
+                _requestedQueueEntryId = selectedTag.PrimaryId
+                _requestedRunJobId = selectedTag.JobId
+                DialogResult = DialogResult.OK
+                Close()
+
+            Case Else
+                MessageBox.Show(Me,
+                                "Select a saved job or queue entry to run.",
+                                "Job Manager",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Information)
+        End Select
+    End Sub
+
+    Private Sub QueueButton_Click(sender As Object, e As EventArgs)
+        Dim selectedTag = GetSelectedTag()
+        If selectedTag Is Nothing Then
+            Return
+        End If
+
+        Dim queued As Boolean
+        Select Case selectedTag.Kind
+            Case RowKind.SavedJob
+                queued = _jobManager.QueueJob(selectedTag.JobId, trigger:="job-manager")
+            Case RowKind.RunHistory
+                If String.IsNullOrWhiteSpace(selectedTag.JobId) Then
+                    MessageBox.Show(Me,
+                                    "This run is not linked to a saved job, so it cannot be queued.",
+                                    "Job Manager",
+                                    MessageBoxButtons.OK,
+                                    MessageBoxIcon.Information)
+                    Return
+                End If
+                queued = _jobManager.QueueJob(selectedTag.JobId, trigger:="rerun-history")
+            Case Else
+                MessageBox.Show(Me,
+                                "Queue action applies to saved jobs and saved-job run entries.",
+                                "Job Manager",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Information)
+                Return
+        End Select
+
+        If Not queued Then
+            MessageBox.Show(Me,
+                            "Unable to queue this item. It may already be queued.",
+                            "Job Manager",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information)
+        End If
+
+        RefreshData()
+    End Sub
+
+    Private Sub RemoveQueueButton_Click(sender As Object, e As EventArgs)
+        Dim selectedTag = GetSelectedTag()
+        If selectedTag Is Nothing OrElse selectedTag.Kind <> RowKind.QueueEntry Then
+            MessageBox.Show(Me,
+                            "Select a queue entry first.",
+                            "Job Manager",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information)
+            Return
+        End If
+
+        _jobManager.RemoveQueuedJob(selectedTag.PrimaryId)
+        RefreshData()
+    End Sub
+
+    Private Sub MoveQueueUpButton_Click(sender As Object, e As EventArgs)
+        MoveQueueEntry(QueueMoveDirection.Up)
+    End Sub
+
+    Private Sub MoveQueueDownButton_Click(sender As Object, e As EventArgs)
+        MoveQueueEntry(QueueMoveDirection.Down)
+    End Sub
+
+    Private Sub MoveQueueEntry(direction As QueueMoveDirection)
+        Dim selectedTag = GetSelectedTag()
+        If selectedTag Is Nothing OrElse selectedTag.Kind <> RowKind.QueueEntry Then
+            MessageBox.Show(Me,
+                            "Select a queue entry first.",
+                            "Job Manager",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information)
+            Return
+        End If
+
+        _jobManager.MoveQueueEntry(selectedTag.PrimaryId, direction)
+        RefreshData()
+    End Sub
+
+    Private Sub DeleteJobButton_Click(sender As Object, e As EventArgs)
+        Dim selectedTag = GetSelectedTag()
+        If selectedTag Is Nothing OrElse selectedTag.Kind <> RowKind.SavedJob Then
+            MessageBox.Show(Me,
+                            "Select a saved job first.",
+                            "Job Manager",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information)
+            Return
+        End If
+
+        Dim response = MessageBox.Show(Me,
+                                       "Delete selected saved job?",
+                                       "Job Manager",
+                                       MessageBoxButtons.YesNo,
+                                       MessageBoxIcon.Warning)
+        If response <> DialogResult.Yes Then
+            Return
+        End If
+
+        _jobManager.DeleteJob(selectedTag.JobId)
+        RefreshData()
+    End Sub
+
+    Private Sub DeleteRunButton_Click(sender As Object, e As EventArgs)
+        Dim selectedTag = GetSelectedTag()
+        If selectedTag Is Nothing OrElse selectedTag.Kind <> RowKind.RunHistory Then
+            MessageBox.Show(Me,
+                            "Select a run history row first.",
+                            "Job Manager",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information)
+            Return
+        End If
+
+        Dim response = MessageBox.Show(Me,
+                                       "Delete selected run history entry?",
+                                       "Job Manager",
+                                       MessageBoxButtons.YesNo,
+                                       MessageBoxIcon.Warning)
+        If response <> DialogResult.Yes Then
+            Return
+        End If
+
+        _jobManager.DeleteRun(selectedTag.PrimaryId)
+        RefreshData()
+    End Sub
+
+    Private Sub OpenJournalButton_Click(sender As Object, e As EventArgs)
+        Dim selectedTag = GetSelectedTag()
+        If selectedTag Is Nothing OrElse selectedTag.Kind <> RowKind.RunHistory Then
+            MessageBox.Show(Me,
+                            "Select a run history row first.",
+                            "Job Manager",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information)
+            Return
+        End If
+
+        Dim runEntry = _runs.FirstOrDefault(
+            Function(run) run IsNot Nothing AndAlso String.Equals(run.RunId, selectedTag.PrimaryId, StringComparison.OrdinalIgnoreCase))
+        If runEntry Is Nothing OrElse String.IsNullOrWhiteSpace(runEntry.JournalPath) Then
+            MessageBox.Show(Me,
+                            "Selected run does not have a journal path.",
+                            "Job Manager",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information)
+            Return
+        End If
+
+        Dim journalPath = runEntry.JournalPath
+        If Not File.Exists(journalPath) Then
+            MessageBox.Show(Me,
+                            "Journal file no longer exists.",
+                            "Job Manager",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information)
+            Return
+        End If
+
+        Try
+            Process.Start(New ProcessStartInfo() With {
+                .FileName = journalPath,
+                .UseShellExecute = True
+            })
+        Catch ex As Exception
+            MessageBox.Show(Me,
+                            ex.Message,
+                            "Job Manager",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Error)
+        End Try
+    End Sub
+
+    Private Sub ClearQueueButton_Click(sender As Object, e As EventArgs)
+        If _queueEntries.Count = 0 Then
+            Return
+        End If
+
+        Dim response = MessageBox.Show(Me,
+                                       "Clear all queued jobs?",
+                                       "Job Manager",
+                                       MessageBoxButtons.YesNo,
+                                       MessageBoxIcon.Warning)
+        If response <> DialogResult.Yes Then
+            Return
+        End If
+
+        _jobManager.ClearQueue()
+        RefreshData()
+    End Sub
+
+    Private Sub ClearHistoryButton_Click(sender As Object, e As EventArgs)
+        If _runs.Count = 0 Then
+            Return
+        End If
+
+        Dim response = MessageBox.Show(Me,
+                                       "Clear all run history entries?",
+                                       "Job Manager",
+                                       MessageBoxButtons.YesNo,
+                                       MessageBoxIcon.Warning)
+        If response <> DialogResult.Yes Then
+            Return
+        End If
+
+        _jobManager.ClearRunHistory(keepLatest:=0)
+        RefreshData()
     End Sub
 
     Private Sub UpdateActionStates()
-        Dim hasSelection = _mainGrid.SelectedRows.Count > 0
-        Dim inSavedView = _currentView = JobManagerView.SavedJobs
-        Dim inQueueView = _currentView = JobManagerView.Queue
+        Dim selectedTag = GetSelectedTag()
+        Dim hasSelection = selectedTag IsNot Nothing
 
-        _runSelectedButton.Visible = inSavedView
-        _queueSelectedButton.Visible = inSavedView
-        _deleteSelectedButton.Visible = inSavedView
-        _removeFromQueueButton.Visible = inQueueView
+        Dim isSaved = hasSelection AndAlso selectedTag.Kind = RowKind.SavedJob
+        Dim isQueue = hasSelection AndAlso selectedTag.Kind = RowKind.QueueEntry
+        Dim isRun = hasSelection AndAlso selectedTag.Kind = RowKind.RunHistory
+        Dim isRunWithSavedJob = isRun AndAlso Not String.IsNullOrWhiteSpace(selectedTag.JobId)
 
-        _runSelectedButton.Enabled = inSavedView AndAlso hasSelection
-        _queueSelectedButton.Enabled = inSavedView AndAlso hasSelection
-        _deleteSelectedButton.Enabled = inSavedView AndAlso hasSelection
-        _removeFromQueueButton.Enabled = inQueueView AndAlso hasSelection
+        _runNowButton.Enabled = isSaved OrElse isQueue
+        _queueButton.Enabled = isSaved OrElse isRunWithSavedJob
+        _removeQueueButton.Enabled = isQueue
+        _moveQueueUpButton.Enabled = isQueue
+        _moveQueueDownButton.Enabled = isQueue
+        _deleteJobButton.Enabled = isSaved
+        _deleteRunButton.Enabled = isRun
+        _openJournalButton.Enabled = isRun
+        _clearQueueButton.Enabled = _queueEntries.Count > 0
+        _clearHistoryButton.Enabled = _runs.Count > 0
 
-        Select Case _currentView
-            Case JobManagerView.SavedJobs
-                _hintLabel.Text = "Tip: double-click a saved job row to run immediately."
-            Case JobManagerView.Queue
-                _hintLabel.Text = "Queue order is top-to-bottom and runs in that sequence."
+        Dim view = GetSelectedViewFilter()
+        Dim supportsRunFilter = (view = JobManagerViewFilter.AllItems OrElse view = JobManagerViewFilter.RunHistory)
+        _statusLabel.Enabled = supportsRunFilter
+        _statusComboBox.Enabled = supportsRunFilter
+    End Sub
+
+    Private Sub RenderSelectedItemDetails()
+        Dim selectedTag = GetSelectedTag()
+        If selectedTag Is Nothing Then
+            _detailsTextBox.Text = "Select an item to view details."
+            Return
+        End If
+
+        Select Case selectedTag.Kind
+            Case RowKind.SavedJob
+                Dim job = _savedJobs.FirstOrDefault(
+                    Function(candidate) candidate IsNot Nothing AndAlso String.Equals(candidate.JobId, selectedTag.JobId, StringComparison.OrdinalIgnoreCase))
+                _detailsTextBox.Text = BuildSavedJobDetails(job)
+
+            Case RowKind.QueueEntry
+                Dim entry = _queueEntries.FirstOrDefault(
+                    Function(candidate) candidate IsNot Nothing AndAlso String.Equals(candidate.QueueEntryId, selectedTag.PrimaryId, StringComparison.OrdinalIgnoreCase))
+                _detailsTextBox.Text = BuildQueueEntryDetails(entry)
+
+            Case RowKind.RunHistory
+                Dim run = _runs.FirstOrDefault(
+                    Function(candidate) candidate IsNot Nothing AndAlso String.Equals(candidate.RunId, selectedTag.PrimaryId, StringComparison.OrdinalIgnoreCase))
+                _detailsTextBox.Text = BuildRunDetails(run)
+
             Case Else
-                _hintLabel.Text = "Run history is read-only."
+                _detailsTextBox.Text = String.Empty
         End Select
     End Sub
+
+    Private Function BuildSavedJobDetails(job As ManagedJob) As String
+        If job Is Nothing Then
+            Return "Saved job details unavailable."
+        End If
+
+        Dim options = If(job.Options, New CopyJobOptions())
+        Dim lines As New List(Of String)()
+        lines.Add("Type: Saved Job")
+        lines.Add($"Name: {job.Name}")
+        lines.Add($"Job ID: {job.JobId}")
+        lines.Add($"Created: {job.CreatedUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}")
+        lines.Add($"Updated: {job.UpdatedUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}")
+        lines.Add($"Source: {options.SourceRoot}")
+        lines.Add($"Destination: {options.DestinationRoot}")
+        lines.Add($"Overwrite: {options.OverwritePolicy}")
+        lines.Add($"Verify: {options.VerifyAfterCopy}")
+        lines.Add($"Adaptive Buffer: {options.UseAdaptiveBufferSizing}")
+        lines.Add($"Buffer MB: {Math.Max(1, CInt(Math.Round(options.BufferSizeBytes / 1024.0R / 1024.0R)))}")
+        lines.Add($"Retries: {Math.Max(0, options.MaxRetries)}")
+        lines.Add($"Timeout: {Math.Max(0, CInt(options.OperationTimeout.TotalSeconds))} sec")
+        Return String.Join(Environment.NewLine, lines)
+    End Function
+
+    Private Function BuildQueueEntryDetails(entry As JobQueueEntryView) As String
+        If entry Is Nothing Then
+            Return "Queue entry details unavailable."
+        End If
+
+        Dim lines As New List(Of String)()
+        lines.Add("Type: Queue Entry")
+        lines.Add($"Queue Entry ID: {entry.QueueEntryId}")
+        lines.Add($"Position: {entry.Position}")
+        lines.Add($"Job: {entry.JobName}")
+        lines.Add($"Job ID: {entry.JobId}")
+        lines.Add($"Trigger: {entry.Trigger}")
+        lines.Add($"Enqueued: {entry.EnqueuedUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}")
+        lines.Add($"Updated: {entry.LastUpdatedUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}")
+        lines.Add($"Attempts: {entry.AttemptCount}")
+        lines.Add($"Source: {entry.SourceRoot}")
+        lines.Add($"Destination: {entry.DestinationRoot}")
+        If Not String.IsNullOrWhiteSpace(entry.LastErrorMessage) Then
+            lines.Add($"Last Error: {entry.LastErrorMessage}")
+        End If
+        Return String.Join(Environment.NewLine, lines)
+    End Function
+
+    Private Function BuildRunDetails(run As ManagedJobRun) As String
+        If run Is Nothing Then
+            Return "Run details unavailable."
+        End If
+
+        Dim lines As New List(Of String)()
+        lines.Add("Type: Run")
+        lines.Add($"Run ID: {run.RunId}")
+        lines.Add($"Display Name: {run.DisplayName}")
+        lines.Add($"Status: {run.Status}")
+        lines.Add($"Trigger: {run.Trigger}")
+        lines.Add($"Started: {run.StartedUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}")
+        lines.Add($"Updated: {run.LastUpdatedUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}")
+        If run.FinishedUtc.HasValue Then
+            lines.Add($"Finished: {run.FinishedUtc.Value.ToLocalTime():yyyy-MM-dd HH:mm:ss}")
+        End If
+        lines.Add($"Source: {run.SourceRoot}")
+        lines.Add($"Destination: {run.DestinationRoot}")
+        lines.Add($"Queue Entry ID: {If(String.IsNullOrWhiteSpace(run.QueueEntryId), "-", run.QueueEntryId)}")
+        lines.Add($"Queue Attempt: {run.QueueAttempt}")
+        lines.Add($"Journal: {If(String.IsNullOrWhiteSpace(run.JournalPath), "-", run.JournalPath)}")
+        lines.Add($"Summary: {If(String.IsNullOrWhiteSpace(run.Summary), "-", run.Summary)}")
+        If Not String.IsNullOrWhiteSpace(run.ErrorMessage) Then
+            lines.Add($"Error: {run.ErrorMessage}")
+        End If
+        Return String.Join(Environment.NewLine, lines)
+    End Function
 
     Private Function GetSelectedTag() As GridRowTag
         If _mainGrid.SelectedRows.Count = 0 Then
@@ -501,63 +1004,84 @@ Friend Class JobManagerForm
         Return TryCast(_mainGrid.SelectedRows(0).Tag, GridRowTag)
     End Function
 
-    Private Function GetSelectedView() As JobManagerView
-        Dim selectedItem = TryCast(_viewComboBox.SelectedItem, ViewItem)
-        If selectedItem Is Nothing Then
-            Return JobManagerView.SavedJobs
+    Private Function GetSelectedViewFilter() As JobManagerViewFilter
+        Dim selected = TryCast(_viewComboBox.SelectedItem, EnumChoice(Of JobManagerViewFilter))
+        If selected Is Nothing Then
+            Return JobManagerViewFilter.AllItems
         End If
 
-        Return selectedItem.View
+        Return selected.Value
     End Function
 
-    Private Function GetLayoutKeyForCurrentView() As String
-        Select Case _currentView
-            Case JobManagerView.Queue
-                Return GridLayoutQueueKey
-            Case JobManagerView.RunHistory
-                Return GridLayoutHistoryKey
+    Private Function GetSelectedRunStatusFilter() As ManagedJobRunStatus?
+        Dim selected = TryCast(_statusComboBox.SelectedItem, EnumChoice(Of RunStatusFilter))
+        If selected Is Nothing OrElse selected.Value = RunStatusFilter.Any Then
+            Return Nothing
+        End If
+
+        Select Case selected.Value
+            Case RunStatusFilter.Queued
+                Return ManagedJobRunStatus.Queued
+            Case RunStatusFilter.Running
+                Return ManagedJobRunStatus.Running
+            Case RunStatusFilter.Paused
+                Return ManagedJobRunStatus.Paused
+            Case RunStatusFilter.Completed
+                Return ManagedJobRunStatus.Completed
+            Case RunStatusFilter.Failed
+                Return ManagedJobRunStatus.Failed
+            Case RunStatusFilter.Cancelled
+                Return ManagedJobRunStatus.Cancelled
+            Case RunStatusFilter.Interrupted
+                Return ManagedJobRunStatus.Interrupted
             Case Else
-                Return GridLayoutSavedKey
+                Return Nothing
         End Select
     End Function
 
-    Private Sub CaptureGridLayoutForCurrentView()
-        If _mainGrid.Columns.Count = 0 Then
-            Return
-        End If
+    Private Enum JobManagerViewFilter
+        AllItems = 0
+        SavedJobs = 1
+        Queue = 2
+        RunHistory = 3
+    End Enum
 
-        UiLayoutManager.CaptureGridLayout(_mainGrid, GetLayoutKeyForCurrentView())
-    End Sub
-
-    Private Enum JobManagerView
-        SavedJobs = 0
-        Queue = 1
-        RunHistory = 2
+    Private Enum RunStatusFilter
+        Any = 0
+        Queued = 1
+        Running = 2
+        Paused = 3
+        Completed = 4
+        Failed = 5
+        Cancelled = 6
+        Interrupted = 7
     End Enum
 
     Private Enum RowKind
         SavedJob = 0
-        QueuedJob = 1
-        RunHistoryEntry = 2
+        QueueEntry = 1
+        RunHistory = 2
     End Enum
 
     Private NotInheritable Class GridRowTag
-        Public Sub New(kind As RowKind, id As String)
+        Public Sub New(kind As RowKind, primaryId As String, jobId As String)
             Me.Kind = kind
-            Me.Id = If(id, String.Empty)
+            Me.PrimaryId = If(primaryId, String.Empty)
+            Me.JobId = If(jobId, String.Empty)
         End Sub
 
         Public ReadOnly Property Kind As RowKind
-        Public ReadOnly Property Id As String
+        Public ReadOnly Property PrimaryId As String
+        Public ReadOnly Property JobId As String
     End Class
 
-    Private NotInheritable Class ViewItem
-        Public Sub New(view As JobManagerView, caption As String)
-            Me.View = view
+    Private NotInheritable Class EnumChoice(Of T)
+        Public Sub New(value As T, caption As String)
+            Me.Value = value
             Me.Caption = If(caption, String.Empty)
         End Sub
 
-        Public ReadOnly Property View As JobManagerView
+        Public ReadOnly Property Value As T
         Public ReadOnly Property Caption As String
 
         Public Overrides Function ToString() As String

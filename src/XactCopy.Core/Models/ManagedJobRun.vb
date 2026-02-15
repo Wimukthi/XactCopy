@@ -6,6 +6,8 @@ Namespace Models
         Public Property SourceRoot As String = String.Empty
         Public Property DestinationRoot As String = String.Empty
         Public Property Trigger As String = "manual"
+        Public Property QueueEntryId As String = String.Empty
+        Public Property QueueAttempt As Integer = 0
         Public Property Status As ManagedJobRunStatus = ManagedJobRunStatus.Queued
         Public Property StartedUtc As DateTimeOffset = DateTimeOffset.UtcNow
         Public Property LastUpdatedUtc As DateTimeOffset = DateTimeOffset.UtcNow

@@ -896,13 +896,16 @@ Public Class MainForm
                 Return
             End If
 
-            Dim selectedJobId = dialog.RequestedRunJobId
-            If String.IsNullOrWhiteSpace(selectedJobId) Then
-                UpdateRecoveryMenuState()
-                Return
-            End If
-
-            Await RunJobByIdAsync(selectedJobId, "job-manager")
+            Select Case dialog.RequestedAction
+                Case JobManagerRequestAction.RunSavedJob
+                    If Not String.IsNullOrWhiteSpace(dialog.RequestedRunJobId) Then
+                        Await RunJobByIdAsync(dialog.RequestedRunJobId, "job-manager")
+                    End If
+                Case JobManagerRequestAction.RunQueuedEntry
+                    If Not String.IsNullOrWhiteSpace(dialog.RequestedQueueEntryId) Then
+                        Await RunQueuedEntryByIdAsync(dialog.RequestedQueueEntryId, manualTrigger:=True)
+                    End If
+            End Select
         End Using
     End Function
 
@@ -928,40 +931,70 @@ Public Class MainForm
     End Function
 
     Private Async Function RunNextQueuedJobAsync(manualTrigger As Boolean) As Task
+        Await RunQueuedEntryByIdAsync(queueEntryId:=Nothing, manualTrigger:=manualTrigger)
+    End Function
+
+    Private Async Function RunQueuedEntryByIdAsync(queueEntryId As String, manualTrigger As Boolean) As Task
         If _isRunning Then
             Return
         End If
 
         Dim showEmptyQueueDialog = manualTrigger
         Do
-            Dim nextJob As ManagedJob = Nothing
-            If Not _jobManager.TryDequeueNextJob(nextJob) OrElse nextJob Is Nothing Then
+            Dim queuedWorkItem As QueuedJobWorkItem = Nothing
+            Dim dequeued As Boolean
+
+            If String.IsNullOrWhiteSpace(queueEntryId) Then
+                dequeued = _jobManager.TryDequeueNextJob(queuedWorkItem)
+            Else
+                dequeued = _jobManager.TryDequeueQueuedEntry(queueEntryId, queuedWorkItem)
+            End If
+
+            If Not dequeued OrElse queuedWorkItem Is Nothing OrElse queuedWorkItem.Job Is Nothing Then
                 If showEmptyQueueDialog Then
-                    MessageBox.Show(Me, "No queued jobs are waiting to run.", "XactCopy", MessageBoxButtons.OK, MessageBoxIcon.Information)
+                    Dim emptyMessage = If(String.IsNullOrWhiteSpace(queueEntryId),
+                                          "No queued jobs are waiting to run.",
+                                          "Selected queue entry no longer exists.")
+                    MessageBox.Show(Me, emptyMessage, "XactCopy", MessageBoxButtons.OK, MessageBoxIcon.Information)
                 End If
                 Return
             End If
 
-            Dim normalized = NormalizeAndValidateOptions(nextJob.Options, showDialogs:=manualTrigger)
-            Dim queuedRun = _jobManager.CreateRunForJob(nextJob.JobId, If(manualTrigger, "queued-manual", "queued-auto"))
-
-            If normalized Is Nothing Then
-                Dim failure As New CopyJobResult() With {
-                    .Succeeded = False,
-                    .Cancelled = False,
-                    .JournalPath = ComputeJournalPath(nextJob.Options),
-                    .ErrorMessage = "Queued job skipped due invalid configuration."
-                }
-                _jobManager.MarkRunCompleted(queuedRun.RunId, failure)
-                AppendLog($"Skipped queued job '{nextJob.Name}' because configuration is invalid.")
-                showEmptyQueueDialog = False
-                Continue Do
+            Dim handled = Await RunDequeuedWorkItemAsync(queuedWorkItem, manualTrigger)
+            If handled Then
+                Return
             End If
 
-            AppendLog($"Dequeued job '{nextJob.Name}'.")
-            Await StartCopyAsync(normalized, queuedRun, clearLog:=True)
-            Return
+            showEmptyQueueDialog = False
+            queueEntryId = Nothing
         Loop
+    End Function
+
+    Private Async Function RunDequeuedWorkItemAsync(queuedWorkItem As QueuedJobWorkItem, manualTrigger As Boolean) As Task(Of Boolean)
+        If queuedWorkItem Is Nothing OrElse queuedWorkItem.Job Is Nothing Then
+            Return False
+        End If
+
+        Dim nextJob = queuedWorkItem.Job
+        Dim normalized = NormalizeAndValidateOptions(nextJob.Options, showDialogs:=manualTrigger)
+        Dim trigger = If(manualTrigger, "queued-manual", "queued-auto")
+        Dim queuedRun = _jobManager.CreateRunForJob(nextJob.JobId, trigger, queuedWorkItem.QueueEntryId, queuedWorkItem.Attempt)
+
+        If normalized Is Nothing Then
+            Dim failure As New CopyJobResult() With {
+                .Succeeded = False,
+                .Cancelled = False,
+                .JournalPath = ComputeJournalPath(nextJob.Options),
+                .ErrorMessage = "Queued job skipped due invalid configuration."
+            }
+            _jobManager.MarkRunCompleted(queuedRun.RunId, failure)
+            AppendLog($"Skipped queued job '{nextJob.Name}' because configuration is invalid.")
+            Return False
+        End If
+
+        AppendLog($"Dequeued job '{nextJob.Name}'.")
+        Await StartCopyAsync(normalized, queuedRun, clearLog:=True)
+        Return True
     End Function
 
     Private Async Function ResumeInterruptedRunAsync() As Task

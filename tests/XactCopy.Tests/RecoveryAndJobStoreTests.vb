@@ -42,10 +42,49 @@ Public Class RecoveryAndJobStoreTests
 
             Assert.Single(loaded.Jobs)
             Assert.Single(loaded.Runs)
-            Assert.Single(loaded.QueuedJobIds)
+            Assert.Single(loaded.QueueEntries)
             Assert.Equal("job-alpha", loaded.Jobs(0).JobId)
             Assert.Equal(ManagedJobRunStatus.Completed, loaded.Runs(0).Status)
-            Assert.Equal("job-alpha", loaded.QueuedJobIds(0))
+            Assert.Equal("job-alpha", loaded.QueueEntries(0).JobId)
+            Assert.Equal(2, loaded.SchemaVersion)
+        Finally
+            If Directory.Exists(tempDirectory) Then
+                Directory.Delete(tempDirectory, recursive:=True)
+            End If
+        End Try
+    End Sub
+
+    <Fact>
+    Public Sub JobCatalogStore_Load_MigratesLegacyQueuedJobIdsToQueueEntries()
+        Dim tempDirectory = Path.Combine(Path.GetTempPath(), "xactcopy-tests-" & Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(tempDirectory)
+
+        Try
+            Dim catalogPath = Path.Combine(tempDirectory, "catalog.json")
+            Dim legacyJson =
+"{
+  ""Jobs"": [
+    {
+      ""JobId"": ""job-legacy"",
+      ""Name"": ""Legacy Job"",
+      ""Options"": {
+        ""SourceRoot"": ""C:\\legacy-src"",
+        ""DestinationRoot"": ""D:\\legacy-dst""
+      }
+    }
+  ],
+  ""Runs"": [],
+  ""QueuedJobIds"": [ ""job-legacy"" ]
+}"
+
+            File.WriteAllText(catalogPath, legacyJson)
+            Dim store As New JobCatalogStore(catalogPath)
+            Dim loaded = store.Load()
+
+            Assert.Single(loaded.QueueEntries)
+            Assert.Equal("job-legacy", loaded.QueueEntries(0).JobId)
+            Assert.Equal("legacy-migration", loaded.QueueEntries(0).Trigger)
+            Assert.Equal(2, loaded.SchemaVersion)
         Finally
             If Directory.Exists(tempDirectory) Then
                 Directory.Delete(tempDirectory, recursive:=True)

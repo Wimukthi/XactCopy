@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.4.7] - 2026-02-15
+
+### Added
+
+- Advanced jobs data model with schema versioning (`SchemaVersion = 2`) and explicit queue entry records (`QueueEntries`) including enqueue metadata.
+- Legacy catalog migration path from `QueuedJobIds` to new queue-entry records.
+- Job service APIs for queue entry inspection, queue reordering, targeted dequeue, queue clearing, run deletion, and history clearing.
+- New Job Manager UI redesign (`Jobs Console`) with:
+  - Single-grid unified view (`All Items`, `Saved Jobs`, `Queue`, `Run History`)
+  - Search and run-status filtering
+  - Queue controls (run now, remove, move up/down, clear)
+  - Run-history actions (delete run, open journal, clear history)
+  - Details pane for selected item metadata
+  - Persisted window/grid/splitter layout
+
+### Changed
+
+- Main-form queue execution now dequeues queue-entry work items (not just raw job IDs), preserving queue-entry metadata in created runs.
+- Runs now record queue linkage (`QueueEntryId`) and queue-attempt index (`QueueAttempt`) for better traceability in history.
+
+### Fixed
+
+- Job-catalog load/save tests now validate queue-entry persistence and legacy queue migration behavior.
+- Job Manager layout spacing was tightened and splitter restore timing corrected so details panel visibility and footer alignment remain stable.
+- Filter-row alignment was refined, including `Refresh` button positioning.
+
 ## [1.0.4.1] - 2026-02-15
 
 ### Added

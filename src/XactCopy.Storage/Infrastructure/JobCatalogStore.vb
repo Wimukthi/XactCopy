@@ -1,10 +1,13 @@
 Imports System.IO
+Imports System.Linq
 Imports System.Text.Json
 Imports System.Text.Json.Serialization
 Imports XactCopy.Models
 
 Namespace Infrastructure
     Public Class JobCatalogStore
+        Private Const CurrentSchemaVersion As Integer = 2
+
         Private ReadOnly _catalogPath As String
         Private ReadOnly _serializerOptions As JsonSerializerOptions
 
@@ -68,12 +71,18 @@ Namespace Infrastructure
                 Return New JobCatalog()
             End If
 
+            catalog.SchemaVersion = Math.Max(1, catalog.SchemaVersion)
+
             If catalog.Jobs Is Nothing Then
                 catalog.Jobs = New List(Of ManagedJob)()
             End If
 
             If catalog.Runs Is Nothing Then
                 catalog.Runs = New List(Of ManagedJobRun)()
+            End If
+
+            If catalog.QueueEntries Is Nothing Then
+                catalog.QueueEntries = New List(Of ManagedJobQueueEntry)()
             End If
 
             If catalog.QueuedJobIds Is Nothing Then
@@ -103,12 +112,92 @@ Namespace Infrastructure
                     run.RunId = Guid.NewGuid().ToString("N")
                 End If
 
+                If String.IsNullOrWhiteSpace(run.QueueEntryId) Then
+                    run.QueueEntryId = String.Empty
+                End If
+
+                If run.QueueAttempt < 0 Then
+                    run.QueueAttempt = 0
+                End If
+
                 If run.Result Is Nothing Then
                     run.Result = Nothing
                 End If
             Next
 
+            For Each queueEntry In catalog.QueueEntries
+                If queueEntry Is Nothing Then
+                    Continue For
+                End If
+
+                If String.IsNullOrWhiteSpace(queueEntry.QueueEntryId) Then
+                    queueEntry.QueueEntryId = Guid.NewGuid().ToString("N")
+                End If
+
+                If queueEntry.EnqueuedUtc = DateTimeOffset.MinValue Then
+                    queueEntry.EnqueuedUtc = DateTimeOffset.UtcNow
+                End If
+
+                If queueEntry.LastUpdatedUtc = DateTimeOffset.MinValue Then
+                    queueEntry.LastUpdatedUtc = queueEntry.EnqueuedUtc
+                End If
+
+                If String.IsNullOrWhiteSpace(queueEntry.Trigger) Then
+                    queueEntry.Trigger = "queued"
+                End If
+
+                If queueEntry.AttemptCount < 0 Then
+                    queueEntry.AttemptCount = 0
+                End If
+            Next
+
+            MigrateLegacyQueue(catalog)
+            RemoveDuplicateQueueEntries(catalog)
+            catalog.SchemaVersion = CurrentSchemaVersion
+
             Return catalog
         End Function
+
+        Private Shared Sub MigrateLegacyQueue(catalog As JobCatalog)
+            If catalog Is Nothing Then
+                Return
+            End If
+
+            If catalog.QueueEntries.Count > 0 Then
+                Return
+            End If
+
+            If catalog.QueuedJobIds Is Nothing OrElse catalog.QueuedJobIds.Count = 0 Then
+                Return
+            End If
+
+            Dim nowUtc = DateTimeOffset.UtcNow
+            For Each queuedJobId In catalog.QueuedJobIds
+                If String.IsNullOrWhiteSpace(queuedJobId) Then
+                    Continue For
+                End If
+
+                catalog.QueueEntries.Add(New ManagedJobQueueEntry() With {
+                    .QueueEntryId = Guid.NewGuid().ToString("N"),
+                    .JobId = queuedJobId.Trim(),
+                    .EnqueuedUtc = nowUtc,
+                    .LastUpdatedUtc = nowUtc,
+                    .Trigger = "legacy-migration",
+                    .EnqueuedBy = "migration"
+                })
+            Next
+        End Sub
+
+        Private Shared Sub RemoveDuplicateQueueEntries(catalog As JobCatalog)
+            If catalog Is Nothing OrElse catalog.QueueEntries Is Nothing OrElse catalog.QueueEntries.Count = 0 Then
+                Return
+            End If
+
+            catalog.QueueEntries = catalog.QueueEntries.
+                Where(Function(entry) entry IsNot Nothing AndAlso Not String.IsNullOrWhiteSpace(entry.JobId)).
+                GroupBy(Function(entry) entry.QueueEntryId, StringComparer.OrdinalIgnoreCase).
+                Select(Function(group) group.First()).
+                ToList()
+        End Sub
     End Class
 End Namespace
