@@ -1,4 +1,5 @@
 Imports System.Collections.Generic
+Imports System.Buffers
 Imports System.IO
 Imports System.Linq
 Imports System.Security.Cryptography
@@ -444,98 +445,109 @@ Namespace Services
             destinationLength = GetExistingFileLength(destinationPath)
 
             Dim activeBufferSize = ResolveBufferSizeForFile(descriptor.Length)
+            Dim ioBuffer = ArrayPool(Of Byte).Shared.Rent(Math.Max(activeBufferSize, MinimumRescueBlockSize))
 
-            entry.RescueRanges = BuildRescueRanges(entry, descriptor.Length, destinationLength)
-            entry.LastRescuePass = "Init"
+            Try
+                Using transferSession As New FileTransferSession(descriptor.FullPath, destinationPath, activeBufferSize)
+                    entry.RescueRanges = BuildRescueRanges(entry, descriptor.Length, destinationLength)
+                    entry.LastRescuePass = "Init"
 
-            Dim alreadySatisfiedBytes = GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Good, RescueRangeState.Recovered)
-            entry.BytesCopied = alreadySatisfiedBytes
+                    Dim alreadySatisfiedBytes = GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Good, RescueRangeState.Recovered)
+                    entry.BytesCopied = alreadySatisfiedBytes
 
-            progress.TotalBytesCopied += alreadySatisfiedBytes
-            EmitProgress(
-                progress,
-                descriptor.RelativePath,
-                alreadySatisfiedBytes,
-                descriptor.Length,
-                lastChunkBytesTransferred:=0,
-                bufferSizeBytes:=activeBufferSize,
-                rescuePass:=entry.LastRescuePass,
-                rescueBadRegionCount:=GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad),
-                rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad))
-
-            Dim passPlan = BuildRescuePassPlan(activeBufferSize)
-            For Each passDefinition In passPlan
-                Dim targetCount = GetRescueRegionCount(entry.RescueRanges, passDefinition.TargetState)
-                If targetCount <= 0 Then
-                    Continue For
-                End If
-
-                entry.LastRescuePass = passDefinition.Name
-
-                Dim passOutcome = Await ExecuteRescuePassAsync(
-                    passDefinition,
-                    descriptor,
-                    entry,
-                    destinationPath,
-                    progress,
-                    journal,
-                    journalPath,
-                    cancellationToken).ConfigureAwait(False)
-
-                Dim remainingBadRegions = GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad)
-                Dim passRemainingBadBytes = GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Bad)
-                If ShouldLogRescuePassSummary(passDefinition, passOutcome, remainingBadRegions) Then
-                    EmitLog(
-                        $"[{RescueCoreName}] {passDefinition.Name} {descriptor.RelativePath}: attempts {passOutcome.AttemptedSegments}, recovered {FormatBytes(passOutcome.RecoveredBytes)}, failed {passOutcome.FailedSegments}, remaining bad {remainingBadRegions} ({FormatBytes(passRemainingBadBytes)}).")
-                End If
-
-                SyncEntryBytesCopied(entry)
-                Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
-            Next
-
-            Dim recoveredAny = GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Recovered) > 0
-            Dim remainingBadBytes = GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Bad)
-            If remainingBadBytes > 0 Then
-                If Not _options.SalvageUnreadableBlocks Then
-                    Throw New IOException(
-                        $"[{RescueCoreName}] Unrecoverable regions remain on {descriptor.RelativePath}: {FormatBytes(remainingBadBytes)} in {GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad)} block(s).")
-                End If
-
-                entry.LastRescuePass = "SalvageFill"
-                EmitLog($"[{RescueCoreName}] Salvaging remaining unreadable regions on {descriptor.RelativePath}.")
-                recoveredAny = Await SalvageRemainingRangesAsync(
-                    descriptor,
-                    entry,
-                    destinationPath,
-                    activeBufferSize,
-                    progress,
-                    journal,
-                    journalPath,
-                    cancellationToken).ConfigureAwait(False) OrElse recoveredAny
-                SyncEntryBytesCopied(entry)
-                entry.RecoveredRanges = MergeByteRanges(entry.RecoveredRanges)
-                Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
-            End If
-
-            If _options.PreserveTimestamps Then
-                File.SetLastWriteTimeUtc(destinationPath, descriptor.LastWriteTimeUtc)
-            End If
-
-            Dim verificationMode = ResolveVerificationMode()
-            If verificationMode <> VerificationMode.None Then
-                If recoveredAny Then
-                    EmitLog($"Verification skipped for recovered file: {descriptor.RelativePath}")
-                Else
-                    Await VerifyFileWithRetriesAsync(
-                        descriptor.FullPath,
-                        destinationPath,
+                    progress.TotalBytesCopied += alreadySatisfiedBytes
+                    EmitProgress(
+                        progress,
                         descriptor.RelativePath,
-                        verificationMode,
-                        cancellationToken).ConfigureAwait(False)
-                End If
-            End If
+                        alreadySatisfiedBytes,
+                        descriptor.Length,
+                        lastChunkBytesTransferred:=0,
+                        bufferSizeBytes:=activeBufferSize,
+                        rescuePass:=entry.LastRescuePass,
+                        rescueBadRegionCount:=GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad),
+                        rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad))
 
-            Return recoveredAny
+                    Dim passPlan = BuildRescuePassPlan(activeBufferSize)
+                    For Each passDefinition In passPlan
+                        Dim targetCount = GetRescueRegionCount(entry.RescueRanges, passDefinition.TargetState)
+                        If targetCount <= 0 Then
+                            Continue For
+                        End If
+
+                        entry.LastRescuePass = passDefinition.Name
+
+                        Dim passOutcome = Await ExecuteRescuePassAsync(
+                            passDefinition,
+                            descriptor,
+                            entry,
+                            destinationPath,
+                            transferSession,
+                            ioBuffer,
+                            progress,
+                            journal,
+                            journalPath,
+                            cancellationToken).ConfigureAwait(False)
+
+                        Dim remainingBadRegions = GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad)
+                        Dim passRemainingBadBytes = GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Bad)
+                        If ShouldLogRescuePassSummary(passDefinition, passOutcome, remainingBadRegions) Then
+                            EmitLog(
+                                $"[{RescueCoreName}] {passDefinition.Name} {descriptor.RelativePath}: attempts {passOutcome.AttemptedSegments}, recovered {FormatBytes(passOutcome.RecoveredBytes)}, failed {passOutcome.FailedSegments}, remaining bad {remainingBadRegions} ({FormatBytes(passRemainingBadBytes)}).")
+                        End If
+
+                        SyncEntryBytesCopied(entry)
+                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+                    Next
+
+                    Dim recoveredAny = GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Recovered) > 0
+                    Dim remainingBadBytes = GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Bad)
+                    If remainingBadBytes > 0 Then
+                        If Not _options.SalvageUnreadableBlocks Then
+                            Throw New IOException(
+                                $"[{RescueCoreName}] Unrecoverable regions remain on {descriptor.RelativePath}: {FormatBytes(remainingBadBytes)} in {GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad)} block(s).")
+                        End If
+
+                        entry.LastRescuePass = "SalvageFill"
+                        EmitLog($"[{RescueCoreName}] Salvaging remaining unreadable regions on {descriptor.RelativePath}.")
+                        recoveredAny = Await SalvageRemainingRangesAsync(
+                            descriptor,
+                            entry,
+                            destinationPath,
+                            transferSession,
+                            ioBuffer,
+                            activeBufferSize,
+                            progress,
+                            journal,
+                            journalPath,
+                            cancellationToken).ConfigureAwait(False) OrElse recoveredAny
+                        SyncEntryBytesCopied(entry)
+                        entry.RecoveredRanges = MergeByteRanges(entry.RecoveredRanges)
+                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+                    End If
+
+                    If _options.PreserveTimestamps Then
+                        File.SetLastWriteTimeUtc(destinationPath, descriptor.LastWriteTimeUtc)
+                    End If
+
+                    Dim verificationMode = ResolveVerificationMode()
+                    If verificationMode <> VerificationMode.None Then
+                        If recoveredAny Then
+                            EmitLog($"Verification skipped for recovered file: {descriptor.RelativePath}")
+                        Else
+                            Await VerifyFileWithRetriesAsync(
+                                descriptor.FullPath,
+                                destinationPath,
+                                descriptor.RelativePath,
+                                verificationMode,
+                                cancellationToken).ConfigureAwait(False)
+                        End If
+                    End If
+
+                    Return recoveredAny
+                End Using
+            Finally
+                ArrayPool(Of Byte).Shared.Return(ioBuffer, clearArray:=False)
+            End Try
         End Function
 
         Private Shared Sub PrepareDestinationFile(
@@ -950,6 +962,8 @@ Namespace Services
             descriptor As SourceFileDescriptor,
             entry As JournalFileEntry,
             destinationPath As String,
+            transferSession As FileTransferSession,
+            ioBuffer As Byte(),
             progress As ProgressAccumulator,
             journal As JobJournal,
             journalPath As String,
@@ -993,42 +1007,45 @@ Namespace Services
                     End If
 
                     outcome.AttemptedSegments += 1
-                    Dim readResult = Await ReadChunkWithRetriesAsync(
+                    Dim bytesRead = Await ReadChunkWithRetriesAsync(
                         descriptor.FullPath,
                         descriptor.RelativePath,
                         segment.Offset,
                         segmentLength,
                         passDefinition.ChunkSizeBytes,
+                        transferSession,
+                        ioBuffer,
                         cancellationToken,
                         maxRetries:=passDefinition.MaxReadRetries,
                         allowSalvage:=False).ConfigureAwait(False)
 
-                    If readResult IsNot Nothing Then
+                    If bytesRead > 0 Then
                         Await WriteChunkWithRetriesAsync(
                             destinationPath,
                             descriptor.RelativePath,
                             segment.Offset,
-                            readResult.Buffer,
-                            readResult.Count,
+                            ioBuffer,
+                            bytesRead,
                             passDefinition.ChunkSizeBytes,
+                            transferSession,
                             cancellationToken).ConfigureAwait(False)
-                        Await ApplyThroughputThrottleAsync(readResult.Count, cancellationToken).ConfigureAwait(False)
+                        Await ApplyThroughputThrottleAsync(bytesRead, cancellationToken).ConfigureAwait(False)
 
-                        SetRescueRangeState(entry.RescueRanges, segment.Offset, readResult.Count, RescueRangeState.Good)
-                        progress.TotalBytesCopied += readResult.Count
+                        SetRescueRangeState(entry.RescueRanges, segment.Offset, bytesRead, RescueRangeState.Good)
+                        progress.TotalBytesCopied += bytesRead
                         SyncEntryBytesCopied(entry)
                         EmitProgress(
                             progress,
                             descriptor.RelativePath,
                             entry.BytesCopied,
                             descriptor.Length,
-                            lastChunkBytesTransferred:=readResult.Count,
+                            lastChunkBytesTransferred:=bytesRead,
                             bufferSizeBytes:=passDefinition.ChunkSizeBytes,
                             rescuePass:=passDefinition.Name,
                             rescueBadRegionCount:=GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad),
                             rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad))
                         Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
-                        outcome.RecoveredBytes += readResult.Count
+                        outcome.RecoveredBytes += bytesRead
                         Continue While
                     End If
 
@@ -1091,6 +1108,8 @@ Namespace Services
             descriptor As SourceFileDescriptor,
             entry As JournalFileEntry,
             destinationPath As String,
+            transferSession As FileTransferSession,
+            ioBuffer As Byte(),
             ioBufferSize As Integer,
             progress As ProgressAccumulator,
             journal As JobJournal,
@@ -1108,14 +1127,15 @@ Namespace Services
                     Await WaitForMediaAvailabilityAsync(_options.SourceRoot, _options.DestinationRoot, cancellationToken).ConfigureAwait(False)
 
                     Dim chunkLength = Math.Min(ioBufferSize, remaining)
-                    Dim salvageBuffer = CreateSalvageBuffer(chunkLength)
+                    FillSalvageBuffer(ioBuffer, chunkLength)
                     Await WriteChunkWithRetriesAsync(
                         destinationPath,
                         descriptor.RelativePath,
                         offset,
-                        salvageBuffer,
+                        ioBuffer,
                         chunkLength,
                         ioBufferSize,
+                        transferSession,
                         cancellationToken).ConfigureAwait(False)
                     Await ApplyThroughputThrottleAsync(chunkLength, cancellationToken).ConfigureAwait(False)
 
@@ -1231,11 +1251,20 @@ Namespace Services
             offset As Long,
             length As Integer,
             ioBufferSize As Integer,
+            transferSession As FileTransferSession,
+            buffer As Byte(),
             cancellationToken As CancellationToken,
             Optional maxRetries As Integer = -1,
-            Optional allowSalvage As Boolean = True) As Task(Of ChunkReadResult)
+            Optional allowSalvage As Boolean = True) As Task(Of Integer)
 
-            Dim buffer(length - 1) As Byte
+            If buffer Is Nothing Then
+                Throw New ArgumentNullException(NameOf(buffer))
+            End If
+
+            If length <= 0 OrElse length > buffer.Length Then
+                Throw New ArgumentOutOfRangeException(NameOf(length))
+            End If
+
             Dim attempt = 0
             Dim lastError As Exception = Nothing
             Dim effectiveMaxRetries = If(maxRetries >= 0, maxRetries, _options.MaxRetries)
@@ -1252,13 +1281,14 @@ Namespace Services
                             buffer,
                             length,
                             ioBufferSize,
+                            transferSession,
                             linkedCts.Token).ConfigureAwait(False)
 
                         If bytesRead <> length Then
                             Throw New IOException($"Short read at offset {offset}. Expected {length}, got {bytesRead}.")
                         End If
 
-                        Return New ChunkReadResult(buffer, bytesRead, usedRecovery:=False)
+                        Return bytesRead
                     End Using
                 Catch ex As OperationCanceledException When Not cancellationToken.IsCancellationRequested
                     lastError = New TimeoutException($"Read timeout at offset {offset}.", ex)
@@ -1267,11 +1297,14 @@ Namespace Services
                 End Try
 
                 If _options.WaitForMediaAvailability AndAlso IsAvailabilityRelatedException(lastError) Then
+                    transferSession?.InvalidateSource()
                     EmitLog($"Source unavailable during read of {relativePath}. Waiting for media to return.")
                     Await WaitForSourceFileAsync(sourcePath, cancellationToken).ConfigureAwait(False)
                     attempt = 0
                     Continue While
                 End If
+
+                transferSession?.InvalidateSource()
 
                 attempt += 1
                 If attempt > effectiveMaxRetries Then
@@ -1287,13 +1320,13 @@ Namespace Services
             End If
 
             If allowSalvage AndAlso _options.SalvageUnreadableBlocks Then
-                Dim recoveredBuffer = CreateSalvageBuffer(length)
+                FillSalvageBuffer(buffer, length)
                 Dim fillDescription = DescribeSalvageFillPattern(_options.SalvageFillPattern)
                 EmitLog($"Recovered unreadable block on {relativePath} at {FormatBytes(offset)} ({length} bytes {fillDescription}-filled).")
-                Return New ChunkReadResult(recoveredBuffer, length, usedRecovery:=True)
+                Return length
             End If
 
-            Return Nothing
+            Return -1
         End Function
 
         Private Async Function ReadChunkOnceAsync(
@@ -1302,19 +1335,29 @@ Namespace Services
             buffer As Byte(),
             count As Integer,
             ioBufferSize As Integer,
+            transferSession As FileTransferSession,
             cancellationToken As CancellationToken) As Task(Of Integer)
 
-            Using stream = New FileStream(
-                sourcePath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite Or FileShare.Delete,
-                NormalizeIoBufferSize(ioBufferSize),
-                FileOptions.Asynchronous Or FileOptions.SequentialScan)
+            If transferSession Is Nothing Then
+                Using stream = New FileStream(
+                    sourcePath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite Or FileShare.Delete,
+                    NormalizeIoBufferSize(ioBufferSize),
+                    FileOptions.Asynchronous Or FileOptions.SequentialScan)
 
-                stream.Seek(offset, SeekOrigin.Begin)
-                Return Await ReadExactlyAsync(stream, buffer, count, cancellationToken).ConfigureAwait(False)
-            End Using
+                    stream.Seek(offset, SeekOrigin.Begin)
+                    Return Await ReadExactlyAsync(stream, buffer, count, cancellationToken).ConfigureAwait(False)
+                End Using
+            End If
+
+            Dim sessionStream = transferSession.GetSourceStream()
+            If sessionStream.Position <> offset Then
+                sessionStream.Seek(offset, SeekOrigin.Begin)
+            End If
+
+            Return Await ReadExactlyAsync(sessionStream, buffer, count, cancellationToken).ConfigureAwait(False)
         End Function
 
         Private Shared Async Function ReadExactlyAsync(
@@ -1343,6 +1386,7 @@ Namespace Services
             buffer As Byte(),
             count As Integer,
             ioBufferSize As Integer,
+            transferSession As FileTransferSession,
             cancellationToken As CancellationToken) As Task
 
             Dim attempt = 0
@@ -1360,6 +1404,7 @@ Namespace Services
                             buffer,
                             count,
                             ioBufferSize,
+                            transferSession,
                             linkedCts.Token).ConfigureAwait(False)
                         Return
                     End Using
@@ -1370,11 +1415,14 @@ Namespace Services
                 End Try
 
                 If _options.WaitForMediaAvailability AndAlso IsAvailabilityRelatedException(lastError) Then
+                    transferSession?.InvalidateDestination()
                     EmitLog($"Destination unavailable during write of {relativePath}. Waiting for media to return.")
                     Await WaitForDestinationPathAsync(destinationPath, cancellationToken).ConfigureAwait(False)
                     attempt = 0
                     Continue While
                 End If
+
+                transferSession?.InvalidateDestination()
 
                 attempt += 1
                 If attempt > _options.MaxRetries Then
@@ -1394,19 +1442,30 @@ Namespace Services
             buffer As Byte(),
             count As Integer,
             ioBufferSize As Integer,
+            transferSession As FileTransferSession,
             cancellationToken As CancellationToken) As Task
 
-            Using stream = New FileStream(
-                destinationPath,
-                FileMode.OpenOrCreate,
-                FileAccess.Write,
-                FileShare.Read,
-                NormalizeIoBufferSize(ioBufferSize),
-                FileOptions.Asynchronous Or FileOptions.SequentialScan)
+            If transferSession Is Nothing Then
+                Using stream = New FileStream(
+                    destinationPath,
+                    FileMode.OpenOrCreate,
+                    FileAccess.Write,
+                    FileShare.Read,
+                    NormalizeIoBufferSize(ioBufferSize),
+                    FileOptions.Asynchronous Or FileOptions.SequentialScan)
 
-                stream.Seek(offset, SeekOrigin.Begin)
-                Await stream.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(False)
-            End Using
+                    stream.Seek(offset, SeekOrigin.Begin)
+                    Await stream.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(False)
+                End Using
+                Return
+            End If
+
+            Dim sessionStream = transferSession.GetDestinationStream()
+            If sessionStream.Position <> offset Then
+                sessionStream.Seek(offset, SeekOrigin.Begin)
+            End If
+
+            Await sessionStream.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(False)
         End Function
 
         Private Async Function VerifyFileWithRetriesAsync(
@@ -1506,43 +1565,48 @@ Namespace Services
 
             Dim attempt = 0
             Dim lastError As Exception = Nothing
+            Dim rentedBuffer = ArrayPool(Of Byte).Shared.Rent(Math.Max(count, MinimumRescueBlockSize))
 
-            While attempt <= _options.MaxRetries
-                cancellationToken.ThrowIfCancellationRequested()
+            Try
+                While attempt <= _options.MaxRetries
+                    cancellationToken.ThrowIfCancellationRequested()
 
-                Try
-                    Using linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-                        linkedCts.CancelAfter(_options.OperationTimeout)
+                    Try
+                        Using linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+                            linkedCts.CancelAfter(_options.OperationTimeout)
 
-                        Dim buffer(count - 1) As Byte
-                        Dim bytesRead = Await ReadChunkOnceAsync(
-                            filePath,
-                            offset,
-                            buffer,
-                            count,
-                            _options.BufferSizeBytes,
-                            linkedCts.Token).ConfigureAwait(False)
+                            Dim bytesRead = Await ReadChunkOnceAsync(
+                                filePath,
+                                offset,
+                                rentedBuffer,
+                                count,
+                                _options.BufferSizeBytes,
+                                Nothing,
+                                linkedCts.Token).ConfigureAwait(False)
 
-                        If bytesRead <> count Then
-                            Throw New IOException($"Short read while sampling {context}. Expected {count}, got {bytesRead}.")
-                        End If
+                            If bytesRead <> count Then
+                                Throw New IOException($"Short read while sampling {context}. Expected {count}, got {bytesRead}.")
+                            End If
 
-                        Return ComputeHash(buffer, bytesRead)
-                    End Using
-                Catch ex As OperationCanceledException When Not cancellationToken.IsCancellationRequested
-                    lastError = New TimeoutException($"Verification timeout for {context}.", ex)
-                Catch ex As Exception
-                    lastError = ex
-                End Try
+                            Return ComputeHash(rentedBuffer, bytesRead)
+                        End Using
+                    Catch ex As OperationCanceledException When Not cancellationToken.IsCancellationRequested
+                        lastError = New TimeoutException($"Verification timeout for {context}.", ex)
+                    Catch ex As Exception
+                        lastError = ex
+                    End Try
 
-                attempt += 1
-                If attempt > _options.MaxRetries Then
-                    Exit While
-                End If
+                    attempt += 1
+                    If attempt > _options.MaxRetries Then
+                        Exit While
+                    End If
 
-                EmitLog($"Verification retry {attempt}/{_options.MaxRetries} on {context}: {lastError.Message}")
-                Await DelayForRetryAsync(attempt, cancellationToken).ConfigureAwait(False)
-            End While
+                    EmitLog($"Verification retry {attempt}/{_options.MaxRetries} on {context}: {lastError.Message}")
+                    Await DelayForRetryAsync(attempt, cancellationToken).ConfigureAwait(False)
+                End While
+            Finally
+                ArrayPool(Of Byte).Shared.Return(rentedBuffer, clearArray:=False)
+            End Try
 
             Throw New IOException($"Unable to verify sampled chunk for {context}.", lastError)
         End Function
@@ -1868,21 +1932,24 @@ Namespace Services
             End If
         End Function
 
-        Private Function CreateSalvageBuffer(length As Integer) As Byte()
-            Dim buffer(length - 1) As Byte
+        Private Sub FillSalvageBuffer(buffer As Byte(), count As Integer)
+            If buffer Is Nothing Then
+                Throw New ArgumentNullException(NameOf(buffer))
+            End If
+
+            If count <= 0 OrElse count > buffer.Length Then
+                Throw New ArgumentOutOfRangeException(NameOf(count))
+            End If
+
             Select Case _options.SalvageFillPattern
                 Case SalvageFillPattern.Ones
-                    For index = 0 To buffer.Length - 1
-                        buffer(index) = &HFF
-                    Next
+                    buffer.AsSpan(0, count).Fill(&HFF)
                 Case SalvageFillPattern.Random
-                    RandomNumberGenerator.Fill(buffer)
+                    RandomNumberGenerator.Fill(buffer.AsSpan(0, count))
                 Case Else
-                    ' Zero is default byte state.
+                    Array.Clear(buffer, 0, count)
             End Select
-
-            Return buffer
-        End Function
+        End Sub
 
         Private Shared Function DescribeSalvageFillPattern(pattern As SalvageFillPattern) As String
             Select Case pattern
@@ -1955,16 +2022,93 @@ Namespace Services
             }
         End Function
 
-        Private NotInheritable Class ChunkReadResult
-            Public Sub New(buffer As Byte(), count As Integer, usedRecovery As Boolean)
-                Me.Buffer = buffer
-                Me.Count = count
-                Me.UsedRecovery = usedRecovery
+        Private NotInheritable Class FileTransferSession
+            Implements IDisposable
+
+            Private ReadOnly _sourcePath As String
+            Private ReadOnly _destinationPath As String
+            Private ReadOnly _ioBufferSize As Integer
+            Private _sourceStream As FileStream
+            Private _destinationStream As FileStream
+            Private _disposed As Boolean
+
+            Public Sub New(sourcePath As String, destinationPath As String, ioBufferSize As Integer)
+                _sourcePath = sourcePath
+                _destinationPath = destinationPath
+                _ioBufferSize = NormalizeIoBufferSize(ioBufferSize)
             End Sub
 
-            Public ReadOnly Property Buffer As Byte()
-            Public ReadOnly Property Count As Integer
-            Public ReadOnly Property UsedRecovery As Boolean
+            Public Function GetSourceStream() As FileStream
+                ThrowIfDisposed()
+                If _sourceStream Is Nothing Then
+                    _sourceStream = New FileStream(
+                        _sourcePath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.ReadWrite Or FileShare.Delete,
+                        _ioBufferSize,
+                        FileOptions.Asynchronous Or FileOptions.SequentialScan)
+                End If
+
+                Return _sourceStream
+            End Function
+
+            Public Function GetDestinationStream() As FileStream
+                ThrowIfDisposed()
+                If _destinationStream Is Nothing Then
+                    _destinationStream = New FileStream(
+                        _destinationPath,
+                        FileMode.OpenOrCreate,
+                        FileAccess.Write,
+                        FileShare.Read,
+                        _ioBufferSize,
+                        FileOptions.Asynchronous Or FileOptions.SequentialScan)
+                End If
+
+                Return _destinationStream
+            End Function
+
+            Public Sub InvalidateSource()
+                If _sourceStream Is Nothing Then
+                    Return
+                End If
+
+                Try
+                    _sourceStream.Dispose()
+                Catch
+                Finally
+                    _sourceStream = Nothing
+                End Try
+            End Sub
+
+            Public Sub InvalidateDestination()
+                If _destinationStream Is Nothing Then
+                    Return
+                End If
+
+                Try
+                    _destinationStream.Dispose()
+                Catch
+                Finally
+                    _destinationStream = Nothing
+                End Try
+            End Sub
+
+            Public Sub Dispose() Implements IDisposable.Dispose
+                If _disposed Then
+                    Return
+                End If
+
+                _disposed = True
+                InvalidateSource()
+                InvalidateDestination()
+            End Sub
+
+            Private Sub ThrowIfDisposed()
+                If _disposed Then
+                    Throw New ObjectDisposedException(NameOf(FileTransferSession))
+                End If
+            End Sub
         End Class
 
         Private NotInheritable Class ProgressAccumulator
