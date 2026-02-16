@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.4.9] - 2026-02-16
+
+### Changed
+
+- Worker copy pipeline hot path was optimized to reduce allocation and stream-open overhead:
+  - Added pooled I/O buffers (`ArrayPool`) for rescue/salvage/verification read paths.
+  - Added per-file transfer sessions to reuse source and destination `FileStream` instances across chunk operations.
+  - Refactored chunk read/write retry paths to reuse shared buffers and invalidate/reopen streams only on media/retry failures.
+
+### Performance
+
+- Improved sustained throughput consistency and reduced GC pressure during long-running copy jobs, especially for large datasets and rescue passes.
+
 ## [1.0.4.8] - 2026-02-15
 
 ### Changed

@@ -64,6 +64,7 @@ dotnet run --project src/XactCopy.UI/XactCopy.UI.vbproj
 
 ## Brief Version History
 
+- `v1.0.4.9` Optimized worker copy throughput by pooling hot-path buffers, reusing per-file transfer streams, and reducing retry-path allocation/stream churn for smoother sustained transfers.
 - `v1.0.4.8` Optimized UI responsiveness with faster Settings rendering (no dark-mode opening flash) and a virtualized high-performance Job Manager grid with debounced filtering and faster details lookup.
 - `v1.0.4.7` Introduced the advanced jobs-system revamp (schema-based queue entries, migration from legacy queue IDs, richer queue/run APIs), shipped a redesigned single-grid Jobs Console with filtering/details/actions, and fixed Job Manager spacing/splitter/button alignment issues.
 - `v1.0.4.1` Added `Always ask for each conflict` overwrite policy with per-file prompts, fixed repeated Explorer context-menu enable logs on settings save, and corrected source/destination textbox wrapper rendering.
