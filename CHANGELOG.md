@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.5.0] - 2026-02-16
+
+### Changed
+
+- Worker data path now uses handle-based `RandomAccess` for chunk reads and writes, reducing hot-path seek overhead and stream-position churn.
+- Added adaptive rescue pass tuning that adjusts chunk size and retry aggressiveness by observed bad-region density.
+- Added reverse-direction rescue sweeps (`TrimSweepReverse` and descending `RetryBad`) to improve recovery behavior on fragmented/borderline media.
+- Added a dedicated small-file fast path that lowers per-file overhead while preserving retry, salvage, progress, and journal guarantees.
+
+### Performance
+
+- Improved throughput consistency and lower CPU/GC overhead during both high-speed healthy copies and recovery-heavy rescue scenarios.
+
 ## [1.0.4.9] - 2026-02-16
 
 ### Changed
