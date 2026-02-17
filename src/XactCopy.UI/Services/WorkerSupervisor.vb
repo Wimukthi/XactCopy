@@ -506,10 +506,15 @@ Namespace Services
             End If
 
             Return New CopyJobOptions() With {
+                .OperationMode = options.OperationMode,
                 .SourceRoot = options.SourceRoot,
                 .DestinationRoot = options.DestinationRoot,
                 .ExpectedSourceIdentity = options.ExpectedSourceIdentity,
                 .ExpectedDestinationIdentity = options.ExpectedDestinationIdentity,
+                .UseBadRangeMap = options.UseBadRangeMap,
+                .SkipKnownBadRanges = options.SkipKnownBadRanges,
+                .UpdateBadRangeMapFromRun = options.UpdateBadRangeMapFromRun,
+                .BadRangeMapMaxAgeDays = options.BadRangeMapMaxAgeDays,
                 .ResumeJournalPathHint = options.ResumeJournalPathHint,
                 .AllowJournalRootRemap = options.AllowJournalRootRemap,
                 .SelectedRelativePaths = New List(Of String)(If(options.SelectedRelativePaths, New List(Of String)())),

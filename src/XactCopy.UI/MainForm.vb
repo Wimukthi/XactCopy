@@ -60,6 +60,7 @@ Public Class MainForm
     Private ReadOnly _browseSourceButton As New Button()
     Private ReadOnly _browseDestinationButton As New Button()
     Private ReadOnly _startButton As New Button()
+    Private ReadOnly _scanBadBlocksButton As New Button()
     Private ReadOnly _pauseButton As New Button()
     Private ReadOnly _resumeButton As New Button()
     Private ReadOnly _cancelButton As New Button()
@@ -69,6 +70,8 @@ Public Class MainForm
     Private ReadOnly _continueCheckBox As New CheckBox()
     Private ReadOnly _verifyCheckBox As New CheckBox()
     Private ReadOnly _adaptiveBufferCheckBox As New CheckBox()
+    Private ReadOnly _useBadRangeMapCheckBox As New CheckBox()
+    Private ReadOnly _skipKnownBadRangesCheckBox As New CheckBox()
     Private ReadOnly _waitForMediaCheckBox As New CheckBox()
 
     Private ReadOnly _bufferMbNumeric As New ThemedNumericUpDown()
@@ -104,6 +107,7 @@ Public Class MainForm
     Private ReadOnly _exitMenuItem As New ToolStripMenuItem("E&xit")
 
     Private ReadOnly _toolsMenu As New ToolStripMenuItem("&Tools")
+    Private ReadOnly _scanBadBlocksMenuItem As New ToolStripMenuItem("Scan for &Bad Blocks...")
     Private ReadOnly _settingsMenuItem As New ToolStripMenuItem("&Settings...")
     Private ReadOnly _checkUpdatesMenuItem As New ToolStripMenuItem("Check for &Updates...")
 
@@ -214,6 +218,7 @@ Public Class MainForm
         UpdateCheckMenuCaption()
         ResetCopyTelemetry()
         SetRunningState(isRunning:=False)
+        UpdateBadRangeMapOptionStates()
 
         AddHandler Shown, AddressOf MainForm_Shown
     End Sub
@@ -317,6 +322,15 @@ Public Class MainForm
         _adaptiveBufferCheckBox.AutoSize = True
         _adaptiveBufferCheckBox.Checked = False
 
+        _useBadRangeMapCheckBox.Text = "Use bad-range map"
+        _useBadRangeMapCheckBox.AutoSize = True
+        _useBadRangeMapCheckBox.Checked = True
+        AddHandler _useBadRangeMapCheckBox.CheckedChanged, AddressOf BadRangeMapOptionCheckBox_CheckedChanged
+
+        _skipKnownBadRangesCheckBox.Text = "Skip known bad ranges"
+        _skipKnownBadRangesCheckBox.AutoSize = True
+        _skipKnownBadRangesCheckBox.Checked = True
+
         _waitForMediaCheckBox.Text = "Wait Forever for Source/Destination"
         _waitForMediaCheckBox.AutoSize = True
         _waitForMediaCheckBox.Checked = False
@@ -342,6 +356,10 @@ Public Class MainForm
         _startButton.AutoSize = True
         AddHandler _startButton.Click, AddressOf StartButton_Click
 
+        _scanBadBlocksButton.Text = "Scan Bad Blocks"
+        _scanBadBlocksButton.AutoSize = True
+        AddHandler _scanBadBlocksButton.Click, AddressOf ScanBadBlocksButton_Click
+
         _pauseButton.Text = "Pause"
         _pauseButton.AutoSize = True
         AddHandler _pauseButton.Click, AddressOf PauseButton_Click
@@ -365,6 +383,7 @@ Public Class MainForm
             .FlowDirection = FlowDirection.LeftToRight
         }
         actionsPanel.Controls.Add(_startButton)
+        actionsPanel.Controls.Add(_scanBadBlocksButton)
         actionsPanel.Controls.Add(_pauseButton)
         actionsPanel.Controls.Add(_resumeButton)
         actionsPanel.Controls.Add(_cancelButton)
@@ -545,6 +564,7 @@ Public Class MainForm
         _cancelMenuItem.ShortcutKeys = Keys.Shift Or Keys.F5
         _exitMenuItem.ShortcutKeys = Keys.Alt Or Keys.F4
         _openJobManagerMenuItem.ShortcutKeys = Keys.Control Or Keys.J
+        _scanBadBlocksMenuItem.ShortcutKeys = Keys.Control Or Keys.Shift Or Keys.B
         _startMenuItem.ToolTipText = "Start a copy run with the current options."
         _pauseMenuItem.ToolTipText = "Pause the active copy run."
         _resumeMenuItem.ToolTipText = "Resume a paused copy run."
@@ -552,6 +572,7 @@ Public Class MainForm
         _openJournalsMenuItem.ToolTipText = "Open the journal folder used for resume/recovery data."
         _openCrashMenuItem.ToolTipText = "Open captured crash logs."
         _exitMenuItem.ToolTipText = "Close XactCopy."
+        _scanBadBlocksMenuItem.ToolTipText = "Run a read-only bad-block scan and update the bad-range map."
         _settingsMenuItem.ToolTipText = "Open application settings."
         _checkUpdatesMenuItem.ToolTipText = "Check online for a newer release."
         _saveCurrentAsJobMenuItem.ToolTipText = "Save source, destination, and options as a reusable job."
@@ -568,6 +589,7 @@ Public Class MainForm
         AddHandler _openCrashMenuItem.Click, AddressOf OpenCrashMenuItem_Click
         AddHandler _exitMenuItem.Click, Sub(sender, e) Close()
 
+        AddHandler _scanBadBlocksMenuItem.Click, AddressOf ScanBadBlocksMenuItem_Click
         AddHandler _settingsMenuItem.Click, AddressOf SettingsMenuItem_Click
         AddHandler _checkUpdatesMenuItem.Click, AddressOf CheckUpdatesMenuItem_Click
         AddHandler _saveCurrentAsJobMenuItem.Click, AddressOf SaveCurrentAsJobMenuItem_Click
@@ -587,6 +609,8 @@ Public Class MainForm
         _fileMenu.DropDownItems.Add(New ToolStripSeparator())
         _fileMenu.DropDownItems.Add(_exitMenuItem)
 
+        _toolsMenu.DropDownItems.Add(_scanBadBlocksMenuItem)
+        _toolsMenu.DropDownItems.Add(New ToolStripSeparator())
         _toolsMenu.DropDownItems.Add(_settingsMenuItem)
         _toolsMenu.DropDownItems.Add(_checkUpdatesMenuItem)
 
@@ -649,7 +673,15 @@ Public Class MainForm
             .Margin = New Padding(0)
         }
 
-        For Each checkBox In New CheckBox() {_resumeCheckBox, _salvageCheckBox, _continueCheckBox, _verifyCheckBox, _adaptiveBufferCheckBox, _waitForMediaCheckBox}
+        For Each checkBox In New CheckBox() {
+            _resumeCheckBox,
+            _salvageCheckBox,
+            _continueCheckBox,
+            _verifyCheckBox,
+            _adaptiveBufferCheckBox,
+            _useBadRangeMapCheckBox,
+            _skipKnownBadRangesCheckBox,
+            _waitForMediaCheckBox}
             checkBox.Anchor = AnchorStyles.Left
             checkBox.Margin = New Padding(0, 4, 12, 0)
         Next
@@ -666,6 +698,8 @@ Public Class MainForm
         optionsPanel.Controls.Add(_continueCheckBox)
         optionsPanel.Controls.Add(_verifyCheckBox)
         optionsPanel.Controls.Add(_adaptiveBufferCheckBox)
+        optionsPanel.Controls.Add(_useBadRangeMapCheckBox)
+        optionsPanel.Controls.Add(_skipKnownBadRangesCheckBox)
         optionsPanel.Controls.Add(_waitForMediaCheckBox)
 
         optionsPanel.Controls.Add(New Label() With {.Text = "Buffer MB (max):", .AutoSize = True, .Margin = New Padding(12, 7, 4, 0)})
@@ -691,6 +725,8 @@ Public Class MainForm
         _toolTip.SetToolTip(_continueCheckBox, "Continue with remaining files when a file copy fails.")
         _toolTip.SetToolTip(_verifyCheckBox, "Verify copied output after each file.")
         _toolTip.SetToolTip(_adaptiveBufferCheckBox, "Dynamically adjust transfer buffer size by file profile and I/O behavior.")
+        _toolTip.SetToolTip(_useBadRangeMapCheckBox, "Use saved unreadable-range map metadata for this source when available.")
+        _toolTip.SetToolTip(_skipKnownBadRangesCheckBox, "Skip read attempts for ranges already known unreadable in the bad-range map.")
         _toolTip.SetToolTip(_waitForMediaCheckBox, "Wait indefinitely if source or destination becomes unavailable.")
 
         _toolTip.SetToolTip(_bufferMbNumeric, "Maximum transfer buffer in MB (1-256).")
@@ -698,6 +734,7 @@ Public Class MainForm
         _toolTip.SetToolTip(_timeoutSecondsNumeric, "I/O timeout per operation in seconds (1-3600).")
 
         _toolTip.SetToolTip(_startButton, "Start copying with current options.")
+        _toolTip.SetToolTip(_scanBadBlocksButton, "Run a read-only bad-block scan and update the bad-range map.")
         _toolTip.SetToolTip(_pauseButton, "Pause the active copy run.")
         _toolTip.SetToolTip(_resumeButton, "Resume a paused copy run.")
         _toolTip.SetToolTip(_cancelButton, "Cancel the active copy run.")
@@ -737,6 +774,14 @@ Public Class MainForm
         End If
     End Sub
 
+    Private Sub BadRangeMapOptionCheckBox_CheckedChanged(sender As Object, e As EventArgs)
+        UpdateBadRangeMapOptionStates()
+    End Sub
+
+    Private Sub UpdateBadRangeMapOptionStates()
+        _skipKnownBadRangesCheckBox.Enabled = _useBadRangeMapCheckBox.Checked AndAlso Not _isRunning
+    End Sub
+
     Private Async Sub StartMenuItem_Click(sender As Object, e As EventArgs)
         If _isRunning Then
             Return
@@ -771,6 +816,22 @@ Public Class MainForm
 
     Private Sub SettingsMenuItem_Click(sender As Object, e As EventArgs)
         ShowSettingsDialog()
+    End Sub
+
+    Private Async Sub ScanBadBlocksMenuItem_Click(sender As Object, e As EventArgs)
+        If _isRunning Then
+            Return
+        End If
+
+        Await StartBadBlockScanAsync()
+    End Sub
+
+    Private Async Sub ScanBadBlocksButton_Click(sender As Object, e As EventArgs)
+        If _isRunning Then
+            Return
+        End If
+
+        Await StartBadBlockScanAsync()
     End Sub
 
     Private Async Sub CheckUpdatesMenuItem_Click(sender As Object, e As EventArgs)
@@ -1107,8 +1168,8 @@ Public Class MainForm
     End Sub
 
     Private Shared Function BuildDefaultJobName(options As CopyJobOptions) As String
-        Dim sourceName = Path.GetFileName(options.SourceRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
-        Dim destinationName = Path.GetFileName(options.DestinationRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+        Dim sourceName = Path.GetFileName(TrimTrailingSeparatorsPreservingRoot(options.SourceRoot))
+        Dim destinationName = Path.GetFileName(TrimTrailingSeparatorsPreservingRoot(options.DestinationRoot))
 
         If String.IsNullOrWhiteSpace(sourceName) Then
             sourceName = options.SourceRoot
@@ -1116,6 +1177,10 @@ Public Class MainForm
 
         If String.IsNullOrWhiteSpace(destinationName) Then
             destinationName = options.DestinationRoot
+        End If
+
+        If options.OperationMode = JobOperationMode.ScanOnly Then
+            Return $"{sourceName} (Bad Block Scan)"
         End If
 
         Return $"{sourceName} -> {destinationName}"
@@ -1126,11 +1191,16 @@ Public Class MainForm
             Return String.Empty
         End If
 
-        If String.IsNullOrWhiteSpace(options.SourceRoot) OrElse String.IsNullOrWhiteSpace(options.DestinationRoot) Then
+        Dim destinationRoot = options.DestinationRoot
+        If options.OperationMode = JobOperationMode.ScanOnly AndAlso String.IsNullOrWhiteSpace(destinationRoot) Then
+            destinationRoot = options.SourceRoot
+        End If
+
+        If String.IsNullOrWhiteSpace(options.SourceRoot) OrElse String.IsNullOrWhiteSpace(destinationRoot) Then
             Return String.Empty
         End If
 
-        Dim jobId = JobJournalStore.BuildJobId(options.SourceRoot, options.DestinationRoot)
+        Dim jobId = JobJournalStore.BuildJobId(options.SourceRoot, destinationRoot)
         Return JobJournalStore.GetDefaultJournalPath(jobId)
     End Function
 
@@ -1519,12 +1589,7 @@ Public Class MainForm
     End Function
 
     Private Shared Function NormalizeComparablePath(pathValue As String) As String
-        Dim fullPath = Path.GetFullPath(pathValue)
-        If fullPath.Length <= 3 Then
-            Return fullPath
-        End If
-
-        Return fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+        Return NormalizeFullPathPreservingRoot(pathValue)
     End Function
 
     Private Shared Function TryResolveExplorerPath(inputPath As String, ByRef resolvedPath As String) As Boolean
@@ -1557,10 +1622,42 @@ Public Class MainForm
         End If
 
         Try
-            Return Path.GetFullPath(pathValue).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            Return NormalizeFullPathPreservingRoot(pathValue)
         Catch
             Return String.Empty
         End Try
+    End Function
+
+    Private Shared Function NormalizeFullPathPreservingRoot(pathValue As String) As String
+        Dim fullPath = Path.GetFullPath(pathValue)
+        Return TrimTrailingSeparatorsPreservingRoot(fullPath)
+    End Function
+
+    Private Shared Function TrimTrailingSeparatorsPreservingRoot(pathValue As String) As String
+        If String.IsNullOrWhiteSpace(pathValue) Then
+            Return String.Empty
+        End If
+
+        Dim trimmed = pathValue.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+        If trimmed.Length = 0 Then
+            Return pathValue
+        End If
+
+        Dim root = Path.GetPathRoot(pathValue)
+        If String.IsNullOrWhiteSpace(root) Then
+            Return trimmed
+        End If
+
+        Dim normalizedRoot = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+        If normalizedRoot.Length = 0 Then
+            normalizedRoot = root
+        End If
+
+        If String.Equals(trimmed, normalizedRoot, StringComparison.OrdinalIgnoreCase) Then
+            Return root
+        End If
+
+        Return trimmed
     End Function
 
     Private Sub ClearExplorerSelectionContext(announce As Boolean)
@@ -1761,6 +1858,16 @@ Public Class MainForm
         Await StartCopyAsync(options, run, clearLog:=True)
     End Function
 
+    Private Async Function StartBadBlockScanAsync() As Task
+        Dim options = BuildScanOptions()
+        If options Is Nothing Then
+            Return
+        End If
+
+        Dim run = _jobManager.CreateAdHocRun(options, "Bad Block Scan", "scan")
+        Await StartCopyAsync(options, run, clearLog:=True)
+    End Function
+
     Private Async Function StartCopyAsync(options As CopyJobOptions, run As ManagedJobRun, clearLog As Boolean) As Task
         If options Is Nothing Then
             Return
@@ -1771,7 +1878,10 @@ Public Class MainForm
             Return
         End If
 
-        Dim resolvedOptions = Await ResolveAskOverwritePolicyAsync(normalizedOptions)
+        Dim resolvedOptions As CopyJobOptions = normalizedOptions
+        If normalizedOptions.OperationMode <> JobOperationMode.ScanOnly Then
+            resolvedOptions = Await ResolveAskOverwritePolicyAsync(normalizedOptions)
+        End If
         If resolvedOptions Is Nothing Then
             Return
         End If
@@ -1800,12 +1910,18 @@ Public Class MainForm
         UpdateRecoveryMenuState()
 
         Try
+            Dim scanOnly = normalizedOptions.OperationMode = JobOperationMode.ScanOnly
             AppendLog($"Starting run: {_activeRun.DisplayName}")
-            AppendLog("Starting copy job through supervisor.")
+            AppendLog(If(scanOnly, "Starting bad-block scan through supervisor.", "Starting copy job through supervisor."))
             AppendLog($"Buffer mode: {If(normalizedOptions.UseAdaptiveBufferSizing, "Adaptive (max " & CInt(_bufferMbNumeric.Value) & " MB)", "Fixed (" & CInt(_bufferMbNumeric.Value) & " MB)")}.")
             AppendLog($"Media wait mode: {If(normalizedOptions.WaitForMediaAvailability, "Enabled (wait forever)", "Disabled")}.")
+            If normalizedOptions.UseBadRangeMap Then
+                AppendLog($"Bad-range map: Enabled ({If(normalizedOptions.SkipKnownBadRanges, "skip known bad ranges", "read all ranges")}).")
+            Else
+                AppendLog("Bad-range map: Disabled.")
+            End If
             If normalizedOptions.SelectedRelativePaths IsNot Nothing AndAlso normalizedOptions.SelectedRelativePaths.Count > 0 Then
-                AppendLog($"Selection mode: copying {normalizedOptions.SelectedRelativePaths.Count} selected item(s) from source root.")
+                AppendLog($"Selection mode: processing {normalizedOptions.SelectedRelativePaths.Count} selected item(s) from source root.")
             End If
             Await _supervisor.StartJobAsync(normalizedOptions, CancellationToken.None)
             _jobSummaryLabel.Text = "Status: Running"
@@ -1837,7 +1953,7 @@ Public Class MainForm
     End Function
 
     Private Sub PrepareUiForRun(options As CopyJobOptions, clearLog As Boolean)
-        ApplyOptionsToUi(options)
+        ApplyOptionsToUi(options, applyDestination:=options.OperationMode <> JobOperationMode.ScanOnly)
 
         If clearLog Then
             ClearLogView()
@@ -1870,8 +1986,11 @@ Public Class MainForm
         _continueCheckBox.Checked = _settings.DefaultContinueOnFileError
         _verifyCheckBox.Checked = _settings.DefaultVerifyAfterCopy
         _adaptiveBufferCheckBox.Checked = _settings.DefaultUseAdaptiveBuffer
+        _useBadRangeMapCheckBox.Checked = _settings.DefaultUseBadRangeMap
+        _skipKnownBadRangesCheckBox.Checked = _settings.DefaultSkipKnownBadRanges
         _waitForMediaCheckBox.Checked = _settings.DefaultWaitForMediaAvailability
         SetActiveSalvageFillPattern(SettingsValueConverter.ToSalvageFillPattern(_settings.DefaultSalvageFillPattern))
+        UpdateBadRangeMapOptionStates()
 
         Dim bufferMb = Math.Max(CInt(_bufferMbNumeric.Minimum), Math.Min(CInt(_bufferMbNumeric.Maximum), _settings.DefaultBufferSizeMb))
         _bufferMbNumeric.Value = bufferMb
@@ -1892,7 +2011,12 @@ Public Class MainForm
         End If
 
         Return New CopyJobOptions() With {
+            .OperationMode = JobOperationMode.Copy,
             .SelectedRelativePaths = New List(Of String)(),
+            .UseBadRangeMap = safeSettings.DefaultUseBadRangeMap,
+            .SkipKnownBadRanges = safeSettings.DefaultSkipKnownBadRanges,
+            .UpdateBadRangeMapFromRun = safeSettings.DefaultUpdateBadRangeMapFromRun,
+            .BadRangeMapMaxAgeDays = Math.Max(0, safeSettings.DefaultBadRangeMapMaxAgeDays),
             .OverwritePolicy = SettingsValueConverter.ToOverwritePolicy(safeSettings.DefaultOverwritePolicy),
             .SymlinkHandling = SettingsValueConverter.ToSymlinkHandling(safeSettings.DefaultSymlinkHandling),
             .CopyEmptyDirectories = safeSettings.DefaultCopyEmptyDirectories,
@@ -1936,18 +2060,23 @@ Public Class MainForm
         }
     End Function
 
-    Private Sub ApplyOptionsToUi(options As CopyJobOptions)
+    Private Sub ApplyOptionsToUi(options As CopyJobOptions, Optional applyDestination As Boolean = True)
         _suspendSourceTextChanged = True
         _sourceTextBox.Text = options.SourceRoot
         _suspendSourceTextChanged = False
-        _destinationTextBox.Text = options.DestinationRoot
+        If applyDestination Then
+            _destinationTextBox.Text = options.DestinationRoot
+        End If
         _resumeCheckBox.Checked = options.ResumeFromJournal
         _salvageCheckBox.Checked = options.SalvageUnreadableBlocks
         _continueCheckBox.Checked = options.ContinueOnFileError
         _verifyCheckBox.Checked = options.VerifyAfterCopy OrElse options.VerificationMode <> VerificationMode.None
         _adaptiveBufferCheckBox.Checked = options.UseAdaptiveBufferSizing
+        _useBadRangeMapCheckBox.Checked = options.UseBadRangeMap
+        _skipKnownBadRangesCheckBox.Checked = options.SkipKnownBadRanges
         _waitForMediaCheckBox.Checked = options.WaitForMediaAvailability
         SetActiveSalvageFillPattern(options.SalvageFillPattern)
+        UpdateBadRangeMapOptionStates()
 
         Dim bufferMb = Math.Ceiling(CDbl(Math.Max(4096, options.BufferSizeBytes)) / (1024.0R * 1024.0R))
         bufferMb = Math.Max(CDbl(_bufferMbNumeric.Minimum), Math.Min(CDbl(_bufferMbNumeric.Maximum), bufferMb))
@@ -1977,10 +2106,13 @@ Public Class MainForm
 
     Private Function BuildOptions() As CopyJobOptions
         Dim candidate = BuildDefaultCopyOptionsFromSettings()
+        candidate.OperationMode = JobOperationMode.Copy
         candidate.SourceRoot = _sourceTextBox.Text.Trim()
         candidate.DestinationRoot = _destinationTextBox.Text.Trim()
         candidate.BufferSizeBytes = CInt(_bufferMbNumeric.Value) * 1024 * 1024
         candidate.UseAdaptiveBufferSizing = _adaptiveBufferCheckBox.Checked
+        candidate.UseBadRangeMap = _useBadRangeMapCheckBox.Checked
+        candidate.SkipKnownBadRanges = _skipKnownBadRangesCheckBox.Checked
         candidate.WaitForMediaAvailability = _waitForMediaCheckBox.Checked
         candidate.MaxRetries = CInt(_retriesNumeric.Value)
         candidate.OperationTimeout = TimeSpan.FromSeconds(CDbl(_timeoutSecondsNumeric.Value))
@@ -2009,10 +2141,43 @@ Public Class MainForm
         Return NormalizeAndValidateOptions(candidate, showDialogs:=True)
     End Function
 
+    Private Function BuildScanOptions() As CopyJobOptions
+        Dim candidate = BuildDefaultCopyOptionsFromSettings()
+        candidate.OperationMode = JobOperationMode.ScanOnly
+        candidate.SourceRoot = _sourceTextBox.Text.Trim()
+        candidate.DestinationRoot = _destinationTextBox.Text.Trim()
+        candidate.BufferSizeBytes = CInt(_bufferMbNumeric.Value) * 1024 * 1024
+        candidate.UseAdaptiveBufferSizing = _adaptiveBufferCheckBox.Checked
+        candidate.UseBadRangeMap = _useBadRangeMapCheckBox.Checked
+        candidate.SkipKnownBadRanges = _skipKnownBadRangesCheckBox.Checked
+        candidate.WaitForMediaAvailability = _waitForMediaCheckBox.Checked
+        candidate.MaxRetries = CInt(_retriesNumeric.Value)
+        candidate.OperationTimeout = TimeSpan.FromSeconds(CDbl(_timeoutSecondsNumeric.Value))
+        candidate.ResumeFromJournal = _resumeCheckBox.Checked
+        candidate.VerifyAfterCopy = False
+        candidate.VerificationMode = VerificationMode.None
+        candidate.SalvageUnreadableBlocks = False
+        candidate.ContinueOnFileError = _continueCheckBox.Checked
+
+        Dim sourceKey = NormalizePathKey(candidate.SourceRoot)
+        If _explorerSelectedRelativePaths.Count > 0 AndAlso
+            sourceKey.Length > 0 AndAlso
+            String.Equals(sourceKey, _explorerSelectionSourceRoot, StringComparison.OrdinalIgnoreCase) Then
+
+            candidate.SelectedRelativePaths = New List(Of String)(_explorerSelectedRelativePaths)
+        Else
+            candidate.SelectedRelativePaths = New List(Of String)()
+        End If
+
+        Return NormalizeAndValidateOptions(candidate, showDialogs:=True)
+    End Function
+
     Private Sub AttachMediaIdentityExpectations(options As CopyJobOptions)
         If options Is Nothing Then
             Return
         End If
+
+        Dim scanOnly = options.OperationMode = JobOperationMode.ScanOnly
 
         If String.IsNullOrWhiteSpace(options.ExpectedSourceIdentity) Then
             Dim sourceIdentity = ResolveMediaIdentityWithTimeout(options.SourceRoot)
@@ -2024,7 +2189,7 @@ Public Class MainForm
             End If
         End If
 
-        If String.IsNullOrWhiteSpace(options.ExpectedDestinationIdentity) Then
+        If Not scanOnly AndAlso String.IsNullOrWhiteSpace(options.ExpectedDestinationIdentity) Then
             Dim destinationIdentity = ResolveMediaIdentityWithTimeout(options.DestinationRoot)
             If destinationIdentity.Length > 0 Then
                 options.ExpectedDestinationIdentity = destinationIdentity
@@ -2322,6 +2487,12 @@ Public Class MainForm
             Return Nothing
         End If
 
+        Dim operationMode = options.OperationMode
+        If operationMode <> JobOperationMode.Copy AndAlso operationMode <> JobOperationMode.ScanOnly Then
+            operationMode = JobOperationMode.Copy
+        End If
+
+        Dim scanOnly = operationMode = JobOperationMode.ScanOnly
         Dim sourceText = If(options.SourceRoot, String.Empty).Trim()
         Dim destinationText = If(options.DestinationRoot, String.Empty).Trim()
 
@@ -2330,7 +2501,7 @@ Public Class MainForm
             Return Nothing
         End If
 
-        If String.IsNullOrWhiteSpace(destinationText) Then
+        If Not scanOnly AndAlso String.IsNullOrWhiteSpace(destinationText) Then
             ShowValidation("Select a destination folder.", showDialogs)
             Return Nothing
         End If
@@ -2338,8 +2509,14 @@ Public Class MainForm
         Dim sourceFull As String
         Dim destinationFull As String
         Try
-            sourceFull = Path.GetFullPath(sourceText).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-            destinationFull = Path.GetFullPath(destinationText).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            sourceFull = NormalizeFullPathPreservingRoot(sourceText)
+            If scanOnly Then
+                destinationFull = sourceFull
+            ElseIf destinationText.Length = 0 Then
+                destinationFull = sourceFull
+            Else
+                destinationFull = NormalizeFullPathPreservingRoot(destinationText)
+            End If
         Catch ex As Exception
             ShowValidation("Invalid source or destination path: " & ex.Message, showDialogs)
             Return Nothing
@@ -2358,7 +2535,7 @@ Public Class MainForm
             End If
         End If
 
-        If StringComparer.OrdinalIgnoreCase.Equals(sourceFull, destinationFull) Then
+        If Not scanOnly AndAlso StringComparer.OrdinalIgnoreCase.Equals(sourceFull, destinationFull) Then
             ShowValidation("Source and destination cannot be the same path.", showDialogs)
             Return Nothing
         End If
@@ -2412,10 +2589,15 @@ Public Class MainForm
         End Select
 
         Return New CopyJobOptions() With {
+            .OperationMode = operationMode,
             .SourceRoot = sourceFull,
             .DestinationRoot = destinationFull,
             .ExpectedSourceIdentity = If(options.ExpectedSourceIdentity, String.Empty),
             .ExpectedDestinationIdentity = If(options.ExpectedDestinationIdentity, String.Empty),
+            .UseBadRangeMap = options.UseBadRangeMap,
+            .SkipKnownBadRanges = options.SkipKnownBadRanges,
+            .UpdateBadRangeMapFromRun = options.UpdateBadRangeMapFromRun,
+            .BadRangeMapMaxAgeDays = Math.Max(0, Math.Min(3650, options.BadRangeMapMaxAgeDays)),
             .ResumeJournalPathHint = If(options.ResumeJournalPathHint, String.Empty),
             .AllowJournalRootRemap = options.AllowJournalRootRemap,
             .SelectedRelativePaths = normalizedSelections,
@@ -2438,12 +2620,12 @@ Public Class MainForm
             .InitialRetryDelay = If(options.InitialRetryDelay <= TimeSpan.Zero, TimeSpan.FromMilliseconds(250), options.InitialRetryDelay),
             .MaxRetryDelay = If(options.MaxRetryDelay <= TimeSpan.Zero, TimeSpan.FromSeconds(8), options.MaxRetryDelay),
             .ResumeFromJournal = options.ResumeFromJournal,
-            .VerifyAfterCopy = options.VerifyAfterCopy,
-            .VerificationMode = mode,
+            .VerifyAfterCopy = If(scanOnly, False, options.VerifyAfterCopy),
+            .VerificationMode = If(scanOnly, VerificationMode.None, mode),
             .VerificationHashAlgorithm = options.VerificationHashAlgorithm,
             .SampleVerificationChunkBytes = Math.Max(4096, options.SampleVerificationChunkBytes),
             .SampleVerificationChunkCount = Math.Max(1, options.SampleVerificationChunkCount),
-            .SalvageUnreadableBlocks = options.SalvageUnreadableBlocks,
+            .SalvageUnreadableBlocks = If(scanOnly, False, options.SalvageUnreadableBlocks),
             .SalvageFillPattern = options.SalvageFillPattern,
             .ContinueOnFileError = options.ContinueOnFileError,
             .PreserveTimestamps = options.PreserveTimestamps,
@@ -2468,10 +2650,15 @@ Public Class MainForm
         End If
 
         Return New CopyJobOptions() With {
+            .OperationMode = options.OperationMode,
             .SourceRoot = options.SourceRoot,
             .DestinationRoot = options.DestinationRoot,
             .ExpectedSourceIdentity = options.ExpectedSourceIdentity,
             .ExpectedDestinationIdentity = options.ExpectedDestinationIdentity,
+            .UseBadRangeMap = options.UseBadRangeMap,
+            .SkipKnownBadRanges = options.SkipKnownBadRanges,
+            .UpdateBadRangeMapFromRun = options.UpdateBadRangeMapFromRun,
+            .BadRangeMapMaxAgeDays = options.BadRangeMapMaxAgeDays,
             .ResumeJournalPathHint = options.ResumeJournalPathHint,
             .AllowJournalRootRemap = options.AllowJournalRootRemap,
             .SelectedRelativePaths = New List(Of String)(If(options.SelectedRelativePaths, New List(Of String)())),
@@ -3362,12 +3549,14 @@ Public Class MainForm
         _continueCheckBox.Enabled = Not isRunning
         _verifyCheckBox.Enabled = Not isRunning
         _adaptiveBufferCheckBox.Enabled = Not isRunning
+        _useBadRangeMapCheckBox.Enabled = Not isRunning
         _waitForMediaCheckBox.Enabled = Not isRunning
         _bufferMbNumeric.Enabled = Not isRunning
         _retriesNumeric.Enabled = Not isRunning
         _timeoutSecondsNumeric.Enabled = Not isRunning
 
         _startButton.Enabled = Not isRunning
+        _scanBadBlocksButton.Enabled = Not isRunning
         _pauseButton.Enabled = isRunning
         _resumeButton.Enabled = isRunning
         _cancelButton.Enabled = isRunning
@@ -3376,6 +3565,7 @@ Public Class MainForm
         _pauseMenuItem.Enabled = isRunning
         _resumeMenuItem.Enabled = isRunning
         _cancelMenuItem.Enabled = isRunning
+        _scanBadBlocksMenuItem.Enabled = Not isRunning
 
         _saveCurrentAsJobMenuItem.Enabled = Not isRunning
         _runNextQueuedJobMenuItem.Enabled = Not isRunning
@@ -3386,6 +3576,7 @@ Public Class MainForm
         End If
 
         UpdatePauseResumeUi()
+        UpdateBadRangeMapOptionStates()
         UpdateRecoveryMenuState()
     End Sub
 
@@ -3582,7 +3773,8 @@ Public Class MainForm
     End Sub
 
     Private Function BuildRunningWindowTitle(progress As CopyProgressSnapshot) As String
-        Dim statusText = If(_isPaused, "Paused", "Copying")
+        Dim isScanRun = _activeRunOptions IsNot Nothing AndAlso _activeRunOptions.OperationMode = JobOperationMode.ScanOnly
+        Dim statusText = If(_isPaused, "Paused", If(isScanRun, "Scanning", "Copying"))
         Dim percent = Math.Clamp(progress.OverallProgress, 0.0R, 1.0R) * 100.0R
         Dim totalFiles = Math.Max(0, progress.TotalFiles)
         Dim completedFiles = Math.Max(0, progress.CompletedFiles)

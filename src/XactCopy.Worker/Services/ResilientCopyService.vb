@@ -36,6 +36,7 @@ Namespace Services
         Private ReadOnly _options As CopyJobOptions
         Private ReadOnly _executionControl As CopyExecutionControl
         Private ReadOnly _journalStore As JobJournalStore
+        Private ReadOnly _badRangeMapStore As BadRangeMapStore
 #If DEBUG Then
         Private ReadOnly _devFaultInjector As DevFaultInjector
 #End If
@@ -46,6 +47,10 @@ Namespace Services
         Private _expectedDestinationIdentity As String = String.Empty
         Private _lastSourceIdentityMismatchLogUtc As DateTimeOffset = DateTimeOffset.MinValue
         Private _lastDestinationIdentityMismatchLogUtc As DateTimeOffset = DateTimeOffset.MinValue
+        Private _badRangeMap As BadRangeMap
+        Private _badRangeMapPath As String = String.Empty
+        Private _badRangeMapLoaded As Boolean
+        Private _badRangeMapReadHintsEnabled As Boolean
 
         <DllImport("kernel32.dll", CharSet:=CharSet.Unicode, SetLastError:=True)>
         Private Shared Function GetVolumeInformation(
@@ -63,6 +68,7 @@ Namespace Services
             _options = options
             _executionControl = If(executionControl, New CopyExecutionControl())
             _journalStore = New JobJournalStore()
+            _badRangeMapStore = New BadRangeMapStore()
 #If DEBUG Then
             _devFaultInjector = DevFaultInjector.TryCreateFromEnvironment()
 #End If
@@ -76,12 +82,17 @@ Namespace Services
             End If
 #End If
 
+            Dim scanOnly = (_options.OperationMode = JobOperationMode.ScanOnly)
             Dim sourceRoot = Path.GetFullPath(_options.SourceRoot)
             Dim destinationRoot = Path.GetFullPath(_options.DestinationRoot)
             InitializeMediaIdentityExpectations(sourceRoot, destinationRoot)
             Await WaitForMediaAvailabilityAsync(sourceRoot, destinationRoot, cancellationToken).ConfigureAwait(False)
             EnsureMediaIdentityIntegrity(sourceRoot, destinationRoot)
-            Directory.CreateDirectory(destinationRoot)
+            If Not scanOnly Then
+                Directory.CreateDirectory(destinationRoot)
+            End If
+
+            Await InitializeBadRangeMapAsync(sourceRoot, cancellationToken).ConfigureAwait(False)
 
             EmitLog($"Scanning source: {sourceRoot}")
             Dim scanResult = DirectoryScanner.ScanSource(
@@ -93,9 +104,13 @@ Namespace Services
             Dim sourceFiles = scanResult.Files
             Dim totalBytes = sourceFiles.Sum(Function(fileDescriptor) fileDescriptor.Length)
             EmitLog($"Scan complete. {sourceFiles.Count} file(s), {FormatBytes(totalBytes)} total.")
-            EmitDestinationCapacityWarning(destinationRoot, totalBytes)
+            If scanOnly Then
+                EmitLog("Operation mode: Scan only (read-only bad-block detection).")
+            Else
+                EmitDestinationCapacityWarning(destinationRoot, totalBytes)
+            End If
 
-            If _options.CopyEmptyDirectories AndAlso scanResult.Directories.Count > 0 Then
+            If Not scanOnly AndAlso _options.CopyEmptyDirectories AndAlso scanResult.Directories.Count > 0 Then
                 EmitLog($"Preparing {scanResult.Directories.Count} destination directory path(s).")
                 For Each relativeDirectory In scanResult.Directories
                     cancellationToken.ThrowIfCancellationRequested()
@@ -149,35 +164,115 @@ Namespace Services
 
                 Dim entry = journal.Files(descriptor.RelativePath)
 
-                Dim skipReason As String = String.Empty
-                If ShouldSkipByOverwritePolicy(descriptor, destinationRoot, skipReason) Then
-                    progress.SkippedFiles += 1
-                    progress.TotalBytesCopied += descriptor.Length
-                    EmitLog($"Skipped: {descriptor.RelativePath} ({skipReason})")
-                    EmitProgress(
-                        progress,
-                        descriptor.RelativePath,
-                        descriptor.Length,
-                        descriptor.Length,
-                        lastChunkBytesTransferred:=0,
-                        bufferSizeBytes:=ResolveBufferSizeForFile(descriptor.Length))
-                    Continue For
-                End If
-
-                If IsAlreadyCompleted(entry, descriptor, destinationRoot) Then
-                    progress.SkippedFiles += 1
-                    progress.TotalBytesCopied += descriptor.Length
-                    If entry.State = FileCopyState.CompletedWithRecovery Then
-                        progress.RecoveredFiles += 1
+                If Not scanOnly Then
+                    Dim skipReason As String = String.Empty
+                    If ShouldSkipByOverwritePolicy(descriptor, destinationRoot, skipReason) Then
+                        progress.SkippedFiles += 1
+                        progress.TotalBytesCopied += descriptor.Length
+                        EmitLog($"Skipped: {descriptor.RelativePath} ({skipReason})")
+                        EmitProgress(
+                            progress,
+                            descriptor.RelativePath,
+                            descriptor.Length,
+                            descriptor.Length,
+                            lastChunkBytesTransferred:=0,
+                            bufferSizeBytes:=ResolveBufferSizeForFile(descriptor.Length))
+                        Continue For
                     End If
 
-                    EmitProgress(
-                        progress,
-                        descriptor.RelativePath,
-                        descriptor.Length,
-                        descriptor.Length,
-                        lastChunkBytesTransferred:=0,
-                        bufferSizeBytes:=ResolveBufferSizeForFile(descriptor.Length))
+                    If IsAlreadyCompleted(entry, descriptor, destinationRoot) Then
+                        progress.SkippedFiles += 1
+                        progress.TotalBytesCopied += descriptor.Length
+                        If entry.State = FileCopyState.CompletedWithRecovery Then
+                            progress.RecoveredFiles += 1
+                        End If
+
+                        EmitProgress(
+                            progress,
+                            descriptor.RelativePath,
+                            descriptor.Length,
+                            descriptor.Length,
+                            lastChunkBytesTransferred:=0,
+                            bufferSizeBytes:=ResolveBufferSizeForFile(descriptor.Length))
+                        Continue For
+                    End If
+                End If
+
+                If scanOnly Then
+                    If entry.State = FileCopyState.Failed Then
+                        entry.State = FileCopyState.Pending
+                        entry.LastError = String.Empty
+                    End If
+
+                    Dim scanException As Exception = Nothing
+                    Dim scanDetectedBadRanges = False
+                    Dim scanFileTimeoutCts As CancellationTokenSource = Nothing
+                    Dim scanFileToken = cancellationToken
+
+                    Try
+                        If _options.PerFileTimeout > TimeSpan.Zero Then
+                            scanFileTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+                            scanFileTimeoutCts.CancelAfter(_options.PerFileTimeout)
+                            scanFileToken = scanFileTimeoutCts.Token
+                        End If
+
+                        entry.State = FileCopyState.InProgress
+                        entry.LastError = String.Empty
+                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+
+                        scanDetectedBadRanges = Await ScanSingleFileForBadRangesAsync(
+                            descriptor,
+                            entry,
+                            progress,
+                            journal,
+                            journalPath,
+                            scanFileToken).ConfigureAwait(False)
+                    Catch ex As SourceMutationSkippedException
+                        progress.SkippedFiles += 1
+                        entry.State = FileCopyState.Pending
+                        entry.LastError = ex.Message
+                        EmitLog($"Skipped scan: {descriptor.RelativePath} ({ex.Message})")
+                        FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).GetAwaiter().GetResult()
+                        Continue For
+                    Catch ex As OperationCanceledException When cancellationToken.IsCancellationRequested
+                        Throw
+                    Catch ex As OperationCanceledException
+                        scanException = New TimeoutException(
+                            $"Per-file timeout ({CInt(Math.Round(_options.PerFileTimeout.TotalSeconds))} sec) reached while scanning {descriptor.RelativePath}.",
+                            ex)
+                    Catch ex As Exception
+                        scanException = ex
+                    Finally
+                        If scanFileTimeoutCts IsNot Nothing Then
+                            scanFileTimeoutCts.Dispose()
+                        End If
+                    End Try
+
+                    If scanException Is Nothing Then
+                        progress.CompletedFiles += 1
+                        If scanDetectedBadRanges Then
+                            progress.RecoveredFiles += 1
+                        End If
+
+                        entry.State = If(scanDetectedBadRanges, FileCopyState.CompletedWithRecovery, FileCopyState.Completed)
+                        entry.BytesCopied = descriptor.Length
+                        entry.LastError = String.Empty
+                        Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken).ConfigureAwait(False)
+                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+                        Continue For
+                    End If
+
+                    progress.FailedFiles += 1
+                    entry.State = FileCopyState.Failed
+                    entry.LastError = scanException.Message
+                    EmitLog($"Scan failed: {descriptor.RelativePath} ({scanException.Message})")
+                    Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken).ConfigureAwait(False)
+                    Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+
+                    If Not _options.ContinueOnFileError Then
+                        Return CreateResult(progress, journalPath, succeeded:=False, cancelled:=False, errorMessage:=scanException.Message)
+                    End If
+
                     Continue For
                 End If
 
@@ -241,6 +336,7 @@ Namespace Services
                     entry.State = If(recovered, FileCopyState.CompletedWithRecovery, FileCopyState.Completed)
                     entry.BytesCopied = descriptor.Length
                     entry.LastError = String.Empty
+                    Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken).ConfigureAwait(False)
                     Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
                     Continue For
                 End If
@@ -249,6 +345,7 @@ Namespace Services
                 entry.State = FileCopyState.Failed
                 entry.LastError = copyException.Message
                 EmitLog($"Failed: {descriptor.RelativePath} ({copyException.Message})")
+                Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken).ConfigureAwait(False)
                 Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
 
                 If Not _options.ContinueOnFileError Then
@@ -256,6 +353,7 @@ Namespace Services
                 End If
             Next
 
+            Await FlushBadRangeMapAsync(cancellationToken).ConfigureAwait(False)
             Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
             Return CreateResult(progress, journalPath, succeeded:=(progress.FailedFiles = 0), cancelled:=False, errorMessage:=String.Empty)
         End Function
@@ -265,18 +363,27 @@ Namespace Services
                 Throw New InvalidOperationException("Source path is required.")
             End If
 
-            If String.IsNullOrWhiteSpace(_options.DestinationRoot) Then
+            Dim scanOnly = _options.OperationMode = JobOperationMode.ScanOnly
+            If _options.OperationMode <> JobOperationMode.Copy AndAlso Not scanOnly Then
+                Throw New InvalidOperationException("OperationMode is invalid.")
+            End If
+
+            If Not scanOnly AndAlso String.IsNullOrWhiteSpace(_options.DestinationRoot) Then
                 Throw New InvalidOperationException("Destination path is required.")
+            End If
+
+            If scanOnly AndAlso String.IsNullOrWhiteSpace(_options.DestinationRoot) Then
+                _options.DestinationRoot = _options.SourceRoot
             End If
 
             If Not _options.WaitForMediaAvailability AndAlso Not Directory.Exists(_options.SourceRoot) Then
                 Throw New DirectoryNotFoundException($"Source directory not found: {_options.SourceRoot}")
             End If
 
-            Dim sourceRoot = Path.GetFullPath(_options.SourceRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-            Dim destinationRoot = Path.GetFullPath(_options.DestinationRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            Dim sourceRoot = NormalizeRootPath(_options.SourceRoot)
+            Dim destinationRoot = NormalizeRootPath(_options.DestinationRoot)
 
-            If StringComparer.OrdinalIgnoreCase.Equals(sourceRoot, destinationRoot) Then
+            If Not scanOnly AndAlso StringComparer.OrdinalIgnoreCase.Equals(sourceRoot, destinationRoot) Then
                 Throw New InvalidOperationException("Source and destination cannot be the same path.")
             End If
 
@@ -310,6 +417,10 @@ Namespace Services
 
             If _options.SampleVerificationChunkCount <= 0 Then
                 Throw New InvalidOperationException("SampleVerificationChunkCount must be greater than zero.")
+            End If
+
+            If _options.BadRangeMapMaxAgeDays < 0 Then
+                Throw New InvalidOperationException("BadRangeMapMaxAgeDays cannot be negative.")
             End If
 
             If _options.RescueFastScanChunkBytes < 0 OrElse
@@ -537,6 +648,7 @@ Namespace Services
             Try
                 Using transferSession As New FileTransferSession(descriptor.FullPath, destinationPath, activeBufferSize)
                     entry.RescueRanges = BuildRescueRanges(entry, descriptor.Length, destinationLength)
+                    Dim mappedUnreadableBytes = ApplyKnownBadRangesFromMap(sourceRoot:=_options.SourceRoot, descriptor:=descriptor, entry:=entry)
                     entry.LastRescuePass = "Init"
 
                     Dim alreadySatisfiedBytes = GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Good, RescueRangeState.Recovered)
@@ -551,11 +663,11 @@ Namespace Services
                         lastChunkBytesTransferred:=0,
                         bufferSizeBytes:=activeBufferSize,
                         rescuePass:=entry.LastRescuePass,
-                        rescueBadRegionCount:=GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad),
-                        rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad))
+                        rescueBadRegionCount:=GetUnreadableRegionCount(entry.RescueRanges),
+                        rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad, RescueRangeState.KnownBad))
 
                     Dim recoveredAny = False
-                    Dim useSmallFileFastPath = ShouldUseSmallFileFastPath(descriptor.Length, hasPersistedCoverage)
+                    Dim useSmallFileFastPath = ShouldUseSmallFileFastPath(descriptor.Length, hasPersistedCoverage) AndAlso mappedUnreadableBytes <= 0
                     If useSmallFileFastPath Then
                         entry.LastRescuePass = "SmallFileFast"
                         recoveredAny = Await CopySmallFileFastAsync(
@@ -593,8 +705,8 @@ Namespace Services
                                 journalPath,
                                 cancellationToken).ConfigureAwait(False)
 
-                            Dim remainingBadRegions = GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad)
-                            Dim passRemainingBadBytes = GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Bad)
+                            Dim remainingBadRegions = GetUnreadableRegionCount(entry.RescueRanges)
+                            Dim passRemainingBadBytes = GetUnreadableRangeBytes(entry.RescueRanges)
                             badDensity = ComputeRescueBadDensity(entry.RescueRanges, descriptor.Length)
                             If ShouldLogRescuePassSummary(passDefinition, passOutcome, remainingBadRegions) Then
                                 EmitLog(
@@ -606,11 +718,11 @@ Namespace Services
                         Next
 
                         recoveredAny = GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Recovered) > 0
-                        Dim remainingBadBytes = GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Bad)
+                        Dim remainingBadBytes = GetUnreadableRangeBytes(entry.RescueRanges)
                         If remainingBadBytes > 0 Then
                             If Not _options.SalvageUnreadableBlocks Then
                                 Throw New IOException(
-                                    $"[{RescueCoreName}] Unrecoverable regions remain on {descriptor.RelativePath}: {FormatBytes(remainingBadBytes)} in {GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad)} block(s).")
+                                    $"[{RescueCoreName}] Unrecoverable regions remain on {descriptor.RelativePath}: {FormatBytes(remainingBadBytes)} in {GetUnreadableRegionCount(entry.RescueRanges)} block(s).")
                             End If
 
                             entry.LastRescuePass = "SalvageFill"
@@ -655,6 +767,466 @@ Namespace Services
             Finally
                 ArrayPool(Of Byte).Shared.Return(ioBuffer, clearArray:=False)
             End Try
+        End Function
+
+        Private Async Function ScanSingleFileForBadRangesAsync(
+            descriptor As SourceFileDescriptor,
+            entry As JournalFileEntry,
+            progress As ProgressAccumulator,
+            journal As JobJournal,
+            journalPath As String,
+            cancellationToken As CancellationToken) As Task(Of Boolean)
+
+            Dim activeBufferSize = ResolveBufferSizeForFile(descriptor.Length)
+            Dim ioBuffer = ArrayPool(Of Byte).Shared.Rent(Math.Max(activeBufferSize, MinimumRescueBlockSize))
+
+            Try
+                Using transferSession As New FileTransferSession(descriptor.FullPath, String.Empty, activeBufferSize)
+                    entry.RescueRanges = New List(Of RescueRange)()
+                    AppendRescueRange(entry.RescueRanges, 0L, descriptor.Length, RescueRangeState.Pending)
+                    If entry.RecoveredRanges Is Nothing Then
+                        entry.RecoveredRanges = New List(Of ByteRange)()
+                    Else
+                        entry.RecoveredRanges.Clear()
+                    End If
+
+                    Dim mappedUnreadableBytes = ApplyKnownBadRangesFromMap(sourceRoot:=_options.SourceRoot, descriptor:=descriptor, entry:=entry)
+                    entry.LastRescuePass = "Init"
+                    SyncEntryBytesCopied(entry)
+                    progress.TotalBytesCopied += entry.BytesCopied
+
+                    EmitProgress(
+                        progress,
+                        descriptor.RelativePath,
+                        entry.BytesCopied,
+                        descriptor.Length,
+                        lastChunkBytesTransferred:=0,
+                        bufferSizeBytes:=activeBufferSize,
+                        rescuePass:=entry.LastRescuePass,
+                        rescueBadRegionCount:=GetUnreadableRegionCount(entry.RescueRanges),
+                        rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad, RescueRangeState.KnownBad))
+
+                    If mappedUnreadableBytes > 0 Then
+                        EmitLog($"[{RescueCoreName}] Scan seeded with map hints: {FormatBytes(mappedUnreadableBytes)} known unreadable on {descriptor.RelativePath}.")
+                    End If
+
+                    Dim passPlan = BuildRescuePassPlan(activeBufferSize).ToList()
+                    Dim badDensity = ComputeRescueBadDensity(entry.RescueRanges, descriptor.Length)
+                    For passIndex = 0 To passPlan.Count - 1
+                        Dim passDefinition = AdaptRescuePassDefinitionForDensity(passPlan(passIndex), badDensity, activeBufferSize)
+                        Dim targetCount = GetRescueRegionCount(entry.RescueRanges, passDefinition.TargetState)
+                        If targetCount <= 0 Then
+                            Continue For
+                        End If
+
+                        entry.LastRescuePass = passDefinition.Name
+
+                        Dim passOutcome = Await ExecuteRescuePassAsync(
+                            passDefinition,
+                            descriptor,
+                            entry,
+                            destinationPath:=String.Empty,
+                            transferSession:=transferSession,
+                            ioBuffer:=ioBuffer,
+                            progress:=progress,
+                            journal:=journal,
+                            journalPath:=journalPath,
+                            cancellationToken:=cancellationToken,
+                            writeRecovered:=False,
+                            countFailedAsProcessed:=True).ConfigureAwait(False)
+
+                        Dim remainingUnreadableRegions = GetUnreadableRegionCount(entry.RescueRanges)
+                        Dim remainingUnreadableBytes = GetUnreadableRangeBytes(entry.RescueRanges)
+                        badDensity = ComputeRescueBadDensity(entry.RescueRanges, descriptor.Length)
+                        If ShouldLogRescuePassSummary(passDefinition, passOutcome, remainingUnreadableRegions) Then
+                            EmitLog(
+                                $"[{RescueCoreName}] {passDefinition.Name} {descriptor.RelativePath}: attempts {passOutcome.AttemptedSegments}, recovered {FormatBytes(passOutcome.RecoveredBytes)}, failed {passOutcome.FailedSegments}, remaining bad {remainingUnreadableRegions} ({FormatBytes(remainingUnreadableBytes)}), density {badDensity:P1}.")
+                        End If
+
+                        SyncEntryBytesCopied(entry)
+                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+                    Next
+
+                    Dim finalUnreadableBytes = GetUnreadableRangeBytes(entry.RescueRanges)
+                    Dim finalUnreadableRegions = GetUnreadableRegionCount(entry.RescueRanges)
+                    entry.RecoveredRanges = MergeByteRanges(
+                        SnapshotRangesByState(
+                            entry.RescueRanges,
+                            RescueRangeState.Bad,
+                            RescueRangeState.KnownBad))
+                    SyncEntryBytesCopied(entry)
+
+                    EmitProgress(
+                        progress,
+                        descriptor.RelativePath,
+                        entry.BytesCopied,
+                        descriptor.Length,
+                        lastChunkBytesTransferred:=0,
+                        bufferSizeBytes:=activeBufferSize,
+                        rescuePass:="ScanComplete",
+                        rescueBadRegionCount:=finalUnreadableRegions,
+                        rescueRemainingBytes:=finalUnreadableBytes)
+
+                    If finalUnreadableBytes > 0 Then
+                        EmitLog($"[{RescueCoreName}] Scan detected unreadable ranges on {descriptor.RelativePath}: {FormatBytes(finalUnreadableBytes)} in {finalUnreadableRegions} segment(s).")
+                    End If
+
+                    Return finalUnreadableBytes > 0
+                End Using
+            Finally
+                ArrayPool(Of Byte).Shared.Return(ioBuffer, clearArray:=False)
+            End Try
+        End Function
+
+        Private Function ShouldTrackBadRangeMap() As Boolean
+            Return _options.OperationMode = JobOperationMode.ScanOnly OrElse
+                _options.UseBadRangeMap OrElse
+                _options.UpdateBadRangeMapFromRun
+        End Function
+
+        Private Async Function InitializeBadRangeMapAsync(sourceRoot As String, cancellationToken As CancellationToken) As Task
+            _badRangeMap = Nothing
+            _badRangeMapPath = String.Empty
+            _badRangeMapLoaded = False
+            _badRangeMapReadHintsEnabled = False
+
+            If Not ShouldTrackBadRangeMap() Then
+                Return
+            End If
+
+            Dim normalizedSourceRoot = NormalizeRootPath(sourceRoot)
+            _badRangeMapPath = BadRangeMapStore.GetDefaultMapPath(normalizedSourceRoot)
+
+            Dim loadedMap As BadRangeMap = Nothing
+            Try
+                loadedMap = Await _badRangeMapStore.LoadAsync(_badRangeMapPath, cancellationToken).ConfigureAwait(False)
+            Catch ex As OperationCanceledException
+                Throw
+            Catch ex As Exception
+                EmitLog($"Bad-range map load failed, starting fresh: {ex.Message}")
+                loadedMap = Nothing
+            End Try
+
+            Dim allowReadHints = False
+            If loadedMap IsNot Nothing Then
+                Dim mapSource = NormalizeRootPath(loadedMap.SourceRoot)
+                If mapSource.Length > 0 AndAlso
+                    Not String.Equals(mapSource, normalizedSourceRoot, StringComparison.OrdinalIgnoreCase) Then
+                    EmitLog("Bad-range map source root mismatch; ignoring existing map payload.")
+                    loadedMap = Nothing
+                End If
+            End If
+
+            If loadedMap Is Nothing Then
+                loadedMap = New BadRangeMap() With {
+                    .SchemaVersion = 1,
+                    .SourceRoot = normalizedSourceRoot,
+                    .SourceIdentity = If(_expectedSourceIdentity, String.Empty),
+                    .UpdatedUtc = DateTimeOffset.UtcNow,
+                    .Files = New Dictionary(Of String, BadRangeMapFileEntry)(StringComparer.OrdinalIgnoreCase)
+                }
+                EmitLog("Bad-range map: initialized new map for this source.")
+            Else
+                If loadedMap.Files Is Nothing Then
+                    loadedMap.Files = New Dictionary(Of String, BadRangeMapFileEntry)(StringComparer.OrdinalIgnoreCase)
+                End If
+
+                loadedMap.SourceRoot = normalizedSourceRoot
+                If loadedMap.SchemaVersion <= 0 Then
+                    loadedMap.SchemaVersion = 1
+                End If
+
+                loadedMap.SourceIdentity = If(_expectedSourceIdentity, loadedMap.SourceIdentity)
+                allowReadHints = IsBadRangeMapFresh(loadedMap, _options.BadRangeMapMaxAgeDays)
+
+                If allowReadHints Then
+                    EmitLog($"Bad-range map loaded: {loadedMap.Files.Count} file entr{If(loadedMap.Files.Count = 1, "y", "ies")} available.")
+                ElseIf _options.UseBadRangeMap AndAlso _options.SkipKnownBadRanges Then
+                    EmitLog($"Bad-range map is stale (>{_options.BadRangeMapMaxAgeDays} days). Skip hints disabled for this run.")
+                End If
+            End If
+
+            _badRangeMap = loadedMap
+            _badRangeMapLoaded = True
+            _badRangeMapReadHintsEnabled = _options.UseBadRangeMap AndAlso _options.SkipKnownBadRanges AndAlso allowReadHints
+        End Function
+
+        Private Shared Function IsBadRangeMapFresh(map As BadRangeMap, maxAgeDays As Integer) As Boolean
+            If map Is Nothing Then
+                Return False
+            End If
+
+            If maxAgeDays <= 0 Then
+                Return True
+            End If
+
+            If map.UpdatedUtc = DateTimeOffset.MinValue Then
+                Return False
+            End If
+
+            Dim age = DateTimeOffset.UtcNow - map.UpdatedUtc
+            Return age <= TimeSpan.FromDays(maxAgeDays)
+        End Function
+
+        Private Function ApplyKnownBadRangesFromMap(
+            sourceRoot As String,
+            descriptor As SourceFileDescriptor,
+            entry As JournalFileEntry) As Long
+
+            If Not _badRangeMapReadHintsEnabled OrElse descriptor Is Nothing OrElse entry Is Nothing Then
+                Return 0L
+            End If
+
+            Dim mapEntry As BadRangeMapFileEntry = Nothing
+            If Not TryGetBadRangeMapEntry(sourceRoot, descriptor, mapEntry) Then
+                Return 0L
+            End If
+
+            Dim totalMappedBytes = 0L
+            For Each badRange In mapEntry.BadRanges
+                If badRange Is Nothing OrElse badRange.Length <= 0 Then
+                    Continue For
+                End If
+
+                Dim rangeStart = Math.Max(0L, badRange.Offset)
+                If rangeStart >= descriptor.Length Then
+                    Continue For
+                End If
+
+                Dim rangeLength = CInt(Math.Min(CLng(Integer.MaxValue), Math.Min(CLng(badRange.Length), descriptor.Length - rangeStart)))
+                If rangeLength <= 0 Then
+                    Continue For
+                End If
+
+                SetRescueRangeState(entry.RescueRanges, rangeStart, rangeLength, RescueRangeState.KnownBad)
+                totalMappedBytes += rangeLength
+            Next
+
+            If totalMappedBytes > 0 Then
+                EmitLog($"[{RescueCoreName}] Applied bad-range map hints to {descriptor.RelativePath}: {FormatBytes(totalMappedBytes)}.")
+            End If
+
+            Return totalMappedBytes
+        End Function
+
+        Private Function TryGetBadRangeMapEntry(
+            sourceRoot As String,
+            descriptor As SourceFileDescriptor,
+            ByRef mapEntry As BadRangeMapFileEntry) As Boolean
+
+            mapEntry = Nothing
+            If _badRangeMap Is Nothing OrElse _badRangeMap.Files Is Nothing OrElse descriptor Is Nothing Then
+                Return False
+            End If
+
+            Dim sourceRootKey = NormalizeRootPath(sourceRoot)
+            Dim mapSourceRootKey = NormalizeRootPath(_badRangeMap.SourceRoot)
+            If mapSourceRootKey.Length > 0 AndAlso
+                sourceRootKey.Length > 0 AndAlso
+                Not String.Equals(sourceRootKey, mapSourceRootKey, StringComparison.OrdinalIgnoreCase) Then
+                Return False
+            End If
+
+            Dim relativePath = NormalizeRelativePath(descriptor.RelativePath)
+            If relativePath.Length = 0 Then
+                Return False
+            End If
+
+            Dim candidate As BadRangeMapFileEntry = Nothing
+            If Not _badRangeMap.Files.TryGetValue(relativePath, candidate) Then
+                Return False
+            End If
+
+            If candidate Is Nothing OrElse candidate.BadRanges Is Nothing OrElse candidate.BadRanges.Count = 0 Then
+                Return False
+            End If
+
+            If Not IsBadRangeMapEntryCompatible(descriptor, candidate) Then
+                Return False
+            End If
+
+            mapEntry = candidate
+            Return True
+        End Function
+
+        Private Shared Function IsBadRangeMapEntryCompatible(descriptor As SourceFileDescriptor, mapEntry As BadRangeMapFileEntry) As Boolean
+            If descriptor Is Nothing OrElse mapEntry Is Nothing Then
+                Return False
+            End If
+
+            If mapEntry.SourceLength > 0 AndAlso mapEntry.SourceLength <> descriptor.Length Then
+                Return False
+            End If
+
+            If mapEntry.LastWriteUtcTicks > 0 AndAlso mapEntry.LastWriteUtcTicks <> descriptor.LastWriteTimeUtc.Ticks Then
+                Return False
+            End If
+
+            Dim fingerprint = If(mapEntry.FileFingerprint, String.Empty).Trim()
+            If fingerprint.Length = 0 Then
+                Return True
+            End If
+
+            Return String.Equals(
+                fingerprint,
+                BuildFileFingerprint(descriptor),
+                StringComparison.OrdinalIgnoreCase)
+        End Function
+
+        Private Async Function TryPersistBadRangeMapEntryAsync(
+            sourceRoot As String,
+            descriptor As SourceFileDescriptor,
+            entry As JournalFileEntry,
+            cancellationToken As CancellationToken) As Task
+
+            If descriptor Is Nothing OrElse entry Is Nothing Then
+                Return
+            End If
+
+            If Not _badRangeMapLoaded OrElse _badRangeMapStore Is Nothing OrElse String.IsNullOrWhiteSpace(_badRangeMapPath) Then
+                Return
+            End If
+
+            If Not _options.UpdateBadRangeMapFromRun AndAlso _options.OperationMode <> JobOperationMode.ScanOnly Then
+                Return
+            End If
+
+            If _badRangeMap Is Nothing Then
+                Return
+            End If
+
+            If _badRangeMap.Files Is Nothing Then
+                _badRangeMap.Files = New Dictionary(Of String, BadRangeMapFileEntry)(StringComparer.OrdinalIgnoreCase)
+            End If
+
+            Dim relativePath = NormalizeRelativePath(descriptor.RelativePath)
+            If relativePath.Length = 0 Then
+                Return
+            End If
+
+            Dim unreadableRanges = MergeByteRanges(
+                SnapshotRangesByState(
+                    entry.RescueRanges,
+                    RescueRangeState.Bad,
+                    RescueRangeState.KnownBad,
+                    RescueRangeState.Recovered))
+
+            If unreadableRanges.Count = 0 Then
+                _badRangeMap.Files.Remove(relativePath)
+            Else
+                Dim mapEntry As New BadRangeMapFileEntry() With {
+                    .RelativePath = relativePath,
+                    .SourceLength = descriptor.Length,
+                    .LastWriteUtcTicks = descriptor.LastWriteTimeUtc.Ticks,
+                    .FileFingerprint = BuildFileFingerprint(descriptor),
+                    .BadRanges = unreadableRanges,
+                    .LastScanUtc = DateTimeOffset.UtcNow,
+                    .LastError = If(entry.LastError, String.Empty)
+                }
+                _badRangeMap.Files(relativePath) = mapEntry
+            End If
+
+            _badRangeMap.SourceRoot = NormalizeRootPath(sourceRoot)
+            _badRangeMap.SourceIdentity = If(_expectedSourceIdentity, String.Empty)
+            _badRangeMap.UpdatedUtc = DateTimeOffset.UtcNow
+            If _badRangeMap.SchemaVersion <= 0 Then
+                _badRangeMap.SchemaVersion = 1
+            End If
+
+            Try
+                Await _badRangeMapStore.SaveAsync(_badRangeMapPath, _badRangeMap, cancellationToken).ConfigureAwait(False)
+            Catch ex As OperationCanceledException
+                If cancellationToken.IsCancellationRequested Then
+                    Return
+                End If
+                EmitLog($"Bad-range map save canceled: {ex.Message}")
+            Catch ex As Exception
+                EmitLog($"Bad-range map save failed: {ex.Message}")
+            End Try
+        End Function
+
+        Private Async Function FlushBadRangeMapAsync(cancellationToken As CancellationToken) As Task
+            If Not _badRangeMapLoaded OrElse _badRangeMap Is Nothing OrElse String.IsNullOrWhiteSpace(_badRangeMapPath) Then
+                Return
+            End If
+
+            If Not _options.UpdateBadRangeMapFromRun AndAlso _options.OperationMode <> JobOperationMode.ScanOnly Then
+                Return
+            End If
+
+            Try
+                _badRangeMap.UpdatedUtc = DateTimeOffset.UtcNow
+                Await _badRangeMapStore.SaveAsync(_badRangeMapPath, _badRangeMap, cancellationToken).ConfigureAwait(False)
+            Catch ex As OperationCanceledException
+                If cancellationToken.IsCancellationRequested Then
+                    Return
+                End If
+                EmitLog($"Bad-range map final flush canceled: {ex.Message}")
+            Catch ex As Exception
+                EmitLog($"Bad-range map final flush failed: {ex.Message}")
+            End Try
+        End Function
+
+        Private Shared Function BuildFileFingerprint(descriptor As SourceFileDescriptor) As String
+            If descriptor Is Nothing Then
+                Return String.Empty
+            End If
+
+            Return $"{descriptor.Length:X16}:{descriptor.LastWriteTimeUtc.Ticks:X16}"
+        End Function
+
+        Private Shared Function NormalizeRootPath(pathValue As String) As String
+            If String.IsNullOrWhiteSpace(pathValue) Then
+                Return String.Empty
+            End If
+
+            Try
+                Dim fullPath = Path.GetFullPath(pathValue)
+                Return TrimTrailingSeparatorsPreservingRoot(fullPath)
+            Catch
+                Return pathValue.Trim()
+            End Try
+        End Function
+
+        Private Shared Function TrimTrailingSeparatorsPreservingRoot(pathValue As String) As String
+            If String.IsNullOrWhiteSpace(pathValue) Then
+                Return String.Empty
+            End If
+
+            Dim trimmed = pathValue.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            If trimmed.Length = 0 Then
+                Return pathValue
+            End If
+
+            Dim root = Path.GetPathRoot(pathValue)
+            If String.IsNullOrWhiteSpace(root) Then
+                Return trimmed
+            End If
+
+            Dim normalizedRoot = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            If normalizedRoot.Length = 0 Then
+                normalizedRoot = root
+            End If
+
+            If String.Equals(trimmed, normalizedRoot, StringComparison.OrdinalIgnoreCase) Then
+                Return root
+            End If
+
+            Return trimmed
+        End Function
+
+        Private Shared Function NormalizeRelativePath(pathValue As String) As String
+            Dim value = If(pathValue, String.Empty).Trim()
+            If value.Length = 0 Then
+                Return String.Empty
+            End If
+
+            value = value.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar)
+            If value = "." Then
+                Return String.Empty
+            End If
+
+            Return value.Trim(Path.DirectorySeparatorChar)
         End Function
 
         Private Shared Sub PrepareDestinationFile(
@@ -775,8 +1347,8 @@ Namespace Services
                     lastChunkBytesTransferred:=bytesRead,
                     bufferSizeBytes:=ioBufferSize,
                     rescuePass:=entry.LastRescuePass,
-                    rescueBadRegionCount:=GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad),
-                    rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad))
+                    rescueBadRegionCount:=GetUnreadableRegionCount(entry.RescueRanges),
+                    rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad, RescueRangeState.KnownBad))
 
                 offset += bytesRead
                 remaining -= bytesRead
@@ -829,7 +1401,7 @@ Namespace Services
 
         Private Shared Function NormalizeRescueRangeState(value As RescueRangeState) As RescueRangeState
             Select Case value
-                Case RescueRangeState.Pending, RescueRangeState.Good, RescueRangeState.Bad, RescueRangeState.Recovered
+                Case RescueRangeState.Pending, RescueRangeState.Good, RescueRangeState.Bad, RescueRangeState.Recovered, RescueRangeState.KnownBad
                     Return value
                 Case Else
                     Return RescueRangeState.Pending
@@ -1002,28 +1574,33 @@ Namespace Services
             Return totalBytes
         End Function
 
-        Private Shared Function GetRescueRegionCount(ranges As IEnumerable(Of RescueRange), state As RescueRangeState) As Integer
-            If ranges Is Nothing Then
+        Private Shared Function GetRescueRegionCount(ranges As IEnumerable(Of RescueRange), ParamArray states() As RescueRangeState) As Integer
+            If ranges Is Nothing OrElse states Is Nothing OrElse states.Length = 0 Then
                 Return 0
             End If
 
-            Dim targetState = NormalizeRescueRangeState(state)
-            Return ranges.Count(Function(item) item IsNot Nothing AndAlso item.Length > 0 AndAlso NormalizeRescueRangeState(item.State) = targetState)
+            Dim stateSet = New HashSet(Of RescueRangeState)(states.Select(AddressOf NormalizeRescueRangeState))
+            Return ranges.Count(
+                Function(item)
+                    Return item IsNot Nothing AndAlso
+                        item.Length > 0 AndAlso
+                        stateSet.Contains(NormalizeRescueRangeState(item.State))
+                End Function)
         End Function
 
-        Private Shared Function SnapshotRangesByState(ranges As IEnumerable(Of RescueRange), state As RescueRangeState) As List(Of ByteRange)
+        Private Shared Function SnapshotRangesByState(ranges As IEnumerable(Of RescueRange), ParamArray states() As RescueRangeState) As List(Of ByteRange)
             Dim snapshots As New List(Of ByteRange)()
-            If ranges Is Nothing Then
+            If ranges Is Nothing OrElse states Is Nothing OrElse states.Length = 0 Then
                 Return snapshots
             End If
 
-            Dim targetState = NormalizeRescueRangeState(state)
+            Dim stateSet = New HashSet(Of RescueRangeState)(states.Select(AddressOf NormalizeRescueRangeState))
             For Each item In ranges
                 If item Is Nothing OrElse item.Length <= 0 Then
                     Continue For
                 End If
 
-                If NormalizeRescueRangeState(item.State) <> targetState Then
+                If Not stateSet.Contains(NormalizeRescueRangeState(item.State)) Then
                     Continue For
                 End If
 
@@ -1077,8 +1654,26 @@ Namespace Services
             ranges.AddRange(MergeRescueRanges(updated))
         End Sub
 
+        Private Shared Function GetUnreadableRangeBytes(ranges As IEnumerable(Of RescueRange)) As Long
+            Return GetRescueRangeBytes(ranges, RescueRangeState.Bad, RescueRangeState.KnownBad)
+        End Function
+
+        Private Shared Function GetUnreadableRegionCount(ranges As IEnumerable(Of RescueRange)) As Integer
+            Return GetRescueRegionCount(ranges, RescueRangeState.Bad, RescueRangeState.KnownBad)
+        End Function
+
         Private Sub SyncEntryBytesCopied(entry As JournalFileEntry)
             If entry Is Nothing Then
+                Return
+            End If
+
+            If _options.OperationMode = JobOperationMode.ScanOnly Then
+                entry.BytesCopied = GetRescueRangeBytes(
+                    entry.RescueRanges,
+                    RescueRangeState.Good,
+                    RescueRangeState.Recovered,
+                    RescueRangeState.Bad,
+                    RescueRangeState.KnownBad)
                 Return
             End If
 
@@ -1153,7 +1748,7 @@ Namespace Services
                 Return 0.0R
             End If
 
-            Dim badBytes = GetRescueRangeBytes(ranges, RescueRangeState.Bad)
+            Dim badBytes = GetRescueRangeBytes(ranges, RescueRangeState.Bad, RescueRangeState.KnownBad)
             Return Math.Clamp(CDbl(badBytes) / CDbl(totalBytes), 0.0R, 1.0R)
         End Function
 
@@ -1246,7 +1841,9 @@ Namespace Services
             progress As ProgressAccumulator,
             journal As JobJournal,
             journalPath As String,
-            cancellationToken As CancellationToken) As Task(Of RescuePassOutcome)
+            cancellationToken As CancellationToken,
+            Optional writeRecovered As Boolean = True,
+            Optional countFailedAsProcessed As Boolean = False) As Task(Of RescuePassOutcome)
 
             Dim outcome As New RescuePassOutcome()
             Dim targetSnapshots = SnapshotRangesByState(entry.RescueRanges, passDefinition.TargetState)
@@ -1315,16 +1912,20 @@ Namespace Services
                         allowSalvage:=False).ConfigureAwait(False)
 
                     If bytesRead > 0 Then
-                        Await WriteChunkWithRetriesAsync(
-                            destinationPath,
-                            descriptor.RelativePath,
-                            segment.Offset,
-                            ioBuffer,
-                            bytesRead,
-                            passDefinition.ChunkSizeBytes,
-                            transferSession,
-                            cancellationToken).ConfigureAwait(False)
-                        Await ApplyThroughputThrottleAsync(bytesRead, cancellationToken).ConfigureAwait(False)
+                        If writeRecovered Then
+                            Await WriteChunkWithRetriesAsync(
+                                destinationPath,
+                                descriptor.RelativePath,
+                                segment.Offset,
+                                ioBuffer,
+                                bytesRead,
+                                passDefinition.ChunkSizeBytes,
+                                transferSession,
+                                cancellationToken).ConfigureAwait(False)
+                            Await ApplyThroughputThrottleAsync(bytesRead, cancellationToken).ConfigureAwait(False)
+                        Else
+                            Await ApplyThroughputThrottleAsync(bytesRead, cancellationToken).ConfigureAwait(False)
+                        End If
 
                         SetRescueRangeState(entry.RescueRanges, segment.Offset, bytesRead, RescueRangeState.Good)
                         progress.TotalBytesCopied += bytesRead
@@ -1337,8 +1938,8 @@ Namespace Services
                             lastChunkBytesTransferred:=bytesRead,
                             bufferSizeBytes:=passDefinition.ChunkSizeBytes,
                             rescuePass:=passDefinition.Name,
-                            rescueBadRegionCount:=GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad),
-                            rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad))
+                            rescueBadRegionCount:=GetUnreadableRegionCount(entry.RescueRanges),
+                            rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad, RescueRangeState.KnownBad))
                         Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
                         outcome.RecoveredBytes += bytesRead
                         Continue While
@@ -1373,6 +1974,9 @@ Namespace Services
                     End If
 
                     SetRescueRangeState(entry.RescueRanges, segment.Offset, segmentLength, RescueRangeState.Bad)
+                    If countFailedAsProcessed Then
+                        progress.TotalBytesCopied += segmentLength
+                    End If
                     SyncEntryBytesCopied(entry)
                     EmitProgress(
                         progress,
@@ -1382,8 +1986,8 @@ Namespace Services
                         lastChunkBytesTransferred:=0,
                         bufferSizeBytes:=passDefinition.ChunkSizeBytes,
                         rescuePass:=passDefinition.Name,
-                        rescueBadRegionCount:=GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad),
-                        rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad))
+                        rescueBadRegionCount:=GetUnreadableRegionCount(entry.RescueRanges),
+                        rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad, RescueRangeState.KnownBad))
                     Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
                     outcome.FailedSegments += 1
                 End While
@@ -1423,7 +2027,7 @@ Namespace Services
             cancellationToken As CancellationToken) As Task(Of Boolean)
 
             Dim recoveredAny = False
-            Dim badSnapshots = SnapshotRangesByState(entry.RescueRanges, RescueRangeState.Bad)
+            Dim badSnapshots = SnapshotRangesByState(entry.RescueRanges, RescueRangeState.Bad, RescueRangeState.KnownBad)
             For Each badRange In badSnapshots
                 Dim offset = badRange.Offset
                 Dim remaining = badRange.Length
@@ -1461,8 +2065,8 @@ Namespace Services
                         lastChunkBytesTransferred:=chunkLength,
                         bufferSizeBytes:=ioBufferSize,
                         rescuePass:="SalvageFill",
-                        rescueBadRegionCount:=GetRescueRegionCount(entry.RescueRanges, RescueRangeState.Bad),
-                        rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad))
+                        rescueBadRegionCount:=GetUnreadableRegionCount(entry.RescueRanges),
+                        rescueRemainingBytes:=GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Pending, RescueRangeState.Bad, RescueRangeState.KnownBad))
                     Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
 
                     offset += chunkLength

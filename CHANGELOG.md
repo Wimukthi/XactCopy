@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.6.2] - 2026-02-17
+
+### Added
+
+- Scan-only bad-block workflow:
+  - Added explicit `ScanOnly` operation mode in shared job options/contracts.
+  - Added `Scan Bad Blocks` start action on the main window for a read-only scan run.
+  - Added persistent bad-range map model/storage (`BadRangeMap`, `BadRangeMapFileEntry`, `BadRangeMapStore`) so scan data can be reused by later copy runs.
+
+### Changed
+
+- Main UI and worker option pipelines now carry scan mode end-to-end (UI, supervisor, recovery, and job manager cloning paths).
+- Path normalization now preserves drive roots (`D:\`) instead of trimming to drive-relative forms (`D:`), preventing accidental remap to current-working-directory paths.
+- Running window title now reflects mode (`Scanning` vs `Copying`) during active runs.
+
+### Fixed
+
+- Scan-only runs no longer execute copy-only overwrite/completed-file skip checks, preventing false `Skipped (destination is newer or same age)` outcomes.
+- Starting a scan-only run no longer writes normalized destination fallback back into the destination textbox.
+- Selecting a drive-root source path now remains stable and does not drift to the executable/current directory path.
+
 ## [1.0.5.9] - 2026-02-17
 
 ### Added

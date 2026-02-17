@@ -53,6 +53,10 @@ Friend Class SettingsForm
     Private ReadOnly _defaultWaitForMediaCheckBox As New CheckBox()
     Private ReadOnly _defaultWaitForLockReleaseCheckBox As New CheckBox()
     Private ReadOnly _defaultTreatAccessDeniedContentionCheckBox As New CheckBox()
+    Private ReadOnly _defaultUseBadRangeMapCheckBox As New CheckBox()
+    Private ReadOnly _defaultSkipKnownBadRangesCheckBox As New CheckBox()
+    Private ReadOnly _defaultUpdateBadRangeMapCheckBox As New CheckBox()
+    Private ReadOnly _defaultBadRangeMapMaxAgeDaysNumeric As New ThemedNumericUpDown()
     Private ReadOnly _overwritePolicyComboBox As New ComboBox()
     Private ReadOnly _symlinkHandlingComboBox As New ComboBox()
     Private ReadOnly _salvageFillPatternComboBox As New ComboBox()
@@ -301,6 +305,10 @@ Friend Class SettingsForm
         _toolTip.SetToolTip(_defaultWaitForMediaCheckBox, "Wait indefinitely for source/destination media to become available.")
         _toolTip.SetToolTip(_defaultWaitForLockReleaseCheckBox, "When file locks are detected, wait for the lock to clear instead of only doing bounded retries.")
         _toolTip.SetToolTip(_defaultTreatAccessDeniedContentionCheckBox, "Treat transient Access Denied errors as contention (for AV/EDR/indexer interference).")
+        _toolTip.SetToolTip(_defaultUseBadRangeMapCheckBox, "Load saved bad-range maps for matching sources.")
+        _toolTip.SetToolTip(_defaultSkipKnownBadRangesCheckBox, "Skip read attempts for ranges already known unreadable from previous scans/copies.")
+        _toolTip.SetToolTip(_defaultUpdateBadRangeMapCheckBox, "Update bad-range maps from new scans/copies.")
+        _toolTip.SetToolTip(_defaultBadRangeMapMaxAgeDaysNumeric, "Maximum map age in days before map data is ignored (0 = never expire).")
 
         _toolTip.SetToolTip(_overwritePolicyComboBox, "Default conflict behavior when destination files already exist. 'Always ask' prompts Yes/No/Cancel for each conflict.")
         _toolTip.SetToolTip(_symlinkHandlingComboBox, "Choose whether symbolic links are skipped or followed during scans.")
@@ -567,7 +575,7 @@ Friend Class SettingsForm
         Return page
     End Function
     Private Function BuildCopyDefaultsPage() As Control
-        Dim page = CreatePageContainer(2)
+        Dim page = CreatePageContainer(3)
 
         Dim behavior = CreateSingleColumnGrid(8)
 
@@ -614,8 +622,34 @@ Friend Class SettingsForm
         policy.Controls.Add(CreateFieldLabel("Salvage fill pattern"), 0, 2)
         policy.Controls.Add(_salvageFillPatternComboBox, 1, 2)
 
+        Dim badMap = CreateFieldGrid(4)
+        _defaultUseBadRangeMapCheckBox.Text = "Use bad-range map when available"
+        _defaultSkipKnownBadRangesCheckBox.Text = "Skip known bad ranges during copy"
+        _defaultUpdateBadRangeMapCheckBox.Text = "Update bad-range map from scan/copy runs"
+
+        For Each box As CheckBox In New CheckBox() {
+            _defaultUseBadRangeMapCheckBox,
+            _defaultSkipKnownBadRangesCheckBox,
+            _defaultUpdateBadRangeMapCheckBox}
+            ConfigureCheckBox(box)
+        Next
+
+        AddHandler _defaultUseBadRangeMapCheckBox.CheckedChanged, AddressOf BadRangeMapControl_CheckedChanged
+        ConfigureNumeric(_defaultBadRangeMapMaxAgeDaysNumeric, 0D, 3650D, 30D)
+        _defaultBadRangeMapMaxAgeDaysNumeric.Increment = 5D
+
+        badMap.Controls.Add(_defaultUseBadRangeMapCheckBox, 0, 0)
+        badMap.SetColumnSpan(_defaultUseBadRangeMapCheckBox, 3)
+        badMap.Controls.Add(_defaultSkipKnownBadRangesCheckBox, 0, 1)
+        badMap.SetColumnSpan(_defaultSkipKnownBadRangesCheckBox, 3)
+        badMap.Controls.Add(_defaultUpdateBadRangeMapCheckBox, 0, 2)
+        badMap.SetColumnSpan(_defaultUpdateBadRangeMapCheckBox, 3)
+        badMap.Controls.Add(CreateFieldLabel("Map max age (days, 0=never)"), 0, 3)
+        badMap.Controls.Add(_defaultBadRangeMapMaxAgeDaysNumeric, 1, 3)
+
         page.Controls.Add(CreateSection("Default Run Behavior", behavior), 0, 0)
         page.Controls.Add(CreateSection("Policies", policy), 0, 1)
+        page.Controls.Add(CreateSection("Bad Range Map", badMap), 0, 2)
         Return page
     End Function
 
@@ -1222,6 +1256,10 @@ Friend Class SettingsForm
             _defaultWaitForMediaCheckBox.Checked = _workingSettings.DefaultWaitForMediaAvailability
             _defaultWaitForLockReleaseCheckBox.Checked = _workingSettings.DefaultWaitForFileLockRelease
             _defaultTreatAccessDeniedContentionCheckBox.Checked = _workingSettings.DefaultTreatAccessDeniedAsContention
+            _defaultUseBadRangeMapCheckBox.Checked = _workingSettings.DefaultUseBadRangeMap
+            _defaultSkipKnownBadRangesCheckBox.Checked = _workingSettings.DefaultSkipKnownBadRanges
+            _defaultUpdateBadRangeMapCheckBox.Checked = _workingSettings.DefaultUpdateBadRangeMapFromRun
+            _defaultBadRangeMapMaxAgeDaysNumeric.Value = ClampNumeric(_defaultBadRangeMapMaxAgeDaysNumeric, _workingSettings.DefaultBadRangeMapMaxAgeDays)
 
             _defaultAdaptiveBufferCheckBox.Checked = _workingSettings.DefaultUseAdaptiveBuffer
             _defaultBufferMbNumeric.Value = ClampNumeric(_defaultBufferMbNumeric, _workingSettings.DefaultBufferSizeMb)
@@ -1389,6 +1427,7 @@ Friend Class SettingsForm
             UpdateRecoveryControlStates()
             UpdateVerificationControlStates()
             UpdateExplorerControlStates()
+            UpdateBadRangeMapControlStates()
             If _showDiagnosticsStatusRowCheckBox.Checked <> _uiShowDiagnosticsCheckBox.Checked Then
                 _showDiagnosticsStatusRowCheckBox.Checked = _uiShowDiagnosticsCheckBox.Checked
             End If
@@ -1530,6 +1569,10 @@ Friend Class SettingsForm
         capturedSettings.DefaultWaitForMediaAvailability = _defaultWaitForMediaCheckBox.Checked
         capturedSettings.DefaultWaitForFileLockRelease = _defaultWaitForLockReleaseCheckBox.Checked
         capturedSettings.DefaultTreatAccessDeniedAsContention = _defaultTreatAccessDeniedContentionCheckBox.Checked
+        capturedSettings.DefaultUseBadRangeMap = _defaultUseBadRangeMapCheckBox.Checked
+        capturedSettings.DefaultSkipKnownBadRanges = _defaultSkipKnownBadRangesCheckBox.Checked
+        capturedSettings.DefaultUpdateBadRangeMapFromRun = _defaultUpdateBadRangeMapCheckBox.Checked
+        capturedSettings.DefaultBadRangeMapMaxAgeDays = CInt(_defaultBadRangeMapMaxAgeDaysNumeric.Value)
         capturedSettings.DefaultUseAdaptiveBuffer = _defaultAdaptiveBufferCheckBox.Checked
         capturedSettings.DefaultBufferSizeMb = CInt(_defaultBufferMbNumeric.Value)
         capturedSettings.DefaultMaxRetries = CInt(_defaultRetriesNumeric.Value)
@@ -1708,6 +1751,10 @@ Friend Class SettingsForm
         UpdateRecoveryControlStates()
     End Sub
 
+    Private Sub BadRangeMapControl_CheckedChanged(sender As Object, e As EventArgs)
+        UpdateBadRangeMapControlStates()
+    End Sub
+
     Private Sub DefaultVerifyCheckBox_CheckedChanged(sender As Object, e As EventArgs)
         UpdateVerificationControlStates()
     End Sub
@@ -1763,6 +1810,12 @@ Friend Class SettingsForm
             Return
         End If
         _keepResumePromptCheckBox.Enabled = _promptResumeAfterCrashCheckBox.Checked
+    End Sub
+
+    Private Sub UpdateBadRangeMapControlStates()
+        Dim enabled = _defaultUseBadRangeMapCheckBox.Checked
+        _defaultSkipKnownBadRangesCheckBox.Enabled = enabled
+        _defaultBadRangeMapMaxAgeDaysNumeric.Enabled = enabled
     End Sub
 
     Private Sub UpdateVerificationControlStates()

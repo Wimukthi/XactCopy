@@ -119,6 +119,8 @@ Namespace Configuration
 
             settings.DefaultBufferSizeMb =
                 SettingsValueConverter.ClampInteger(settings.DefaultBufferSizeMb, 1, 256, 4)
+            settings.DefaultBadRangeMapMaxAgeDays =
+                SettingsValueConverter.ClampInteger(settings.DefaultBadRangeMapMaxAgeDays, 0, 3650, 30)
             settings.DefaultMaxRetries =
                 SettingsValueConverter.ClampInteger(settings.DefaultMaxRetries, 0, 1000, 12)
             settings.DefaultOperationTimeoutSeconds =

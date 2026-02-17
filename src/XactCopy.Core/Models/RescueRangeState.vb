@@ -4,5 +4,6 @@ Namespace Models
         Good = 1
         Bad = 2
         Recovered = 3
+        KnownBad = 4
     End Enum
 End Namespace

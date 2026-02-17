@@ -36,6 +36,10 @@ Namespace Configuration
         Public Property DefaultSalvageUnreadableBlocks As Boolean = True
         Public Property DefaultContinueOnFileError As Boolean = True
         Public Property DefaultVerifyAfterCopy As Boolean = False
+        Public Property DefaultUseBadRangeMap As Boolean = True
+        Public Property DefaultSkipKnownBadRanges As Boolean = True
+        Public Property DefaultUpdateBadRangeMapFromRun As Boolean = True
+        Public Property DefaultBadRangeMapMaxAgeDays As Integer = 30
         Public Property DefaultUseAdaptiveBuffer As Boolean = False
         Public Property DefaultWaitForMediaAvailability As Boolean = False
         Public Property DefaultWaitForFileLockRelease As Boolean = False

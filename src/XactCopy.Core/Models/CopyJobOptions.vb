@@ -1,9 +1,14 @@
 Namespace Models
     Public Class CopyJobOptions
+        Public Property OperationMode As JobOperationMode = JobOperationMode.Copy
         Public Property SourceRoot As String = String.Empty
         Public Property DestinationRoot As String = String.Empty
         Public Property ExpectedSourceIdentity As String = String.Empty
         Public Property ExpectedDestinationIdentity As String = String.Empty
+        Public Property UseBadRangeMap As Boolean = False
+        Public Property SkipKnownBadRanges As Boolean = True
+        Public Property UpdateBadRangeMapFromRun As Boolean = True
+        Public Property BadRangeMapMaxAgeDays As Integer = 30
         Public Property ResumeJournalPathHint As String = String.Empty
         Public Property AllowJournalRootRemap As Boolean = False
         Public Property SelectedRelativePaths As New List(Of String)()
