@@ -379,6 +379,11 @@ Namespace Services
                 Await EnsureWorkerConnectedAsync(CancellationToken.None).ConfigureAwait(False)
 
                 If _autoRecoverJob AndAlso _isJobRunning AndAlso _currentJobOptions IsNot Nothing Then
+                    If Not _currentJobOptions.ResumeFromJournal Then
+                        _currentJobOptions.ResumeFromJournal = True
+                        RaiseEvent LogMessage(Me, "[Supervisor] Forced resume-from-journal after worker recovery.")
+                    End If
+
                     Await SendStartJobCommandAsync(CancellationToken.None).ConfigureAwait(False)
                     If _isJobPaused Then
                         Dim pauseCommand As New PauseJobCommand() With {
@@ -503,6 +508,10 @@ Namespace Services
             Return New CopyJobOptions() With {
                 .SourceRoot = options.SourceRoot,
                 .DestinationRoot = options.DestinationRoot,
+                .ExpectedSourceIdentity = options.ExpectedSourceIdentity,
+                .ExpectedDestinationIdentity = options.ExpectedDestinationIdentity,
+                .ResumeJournalPathHint = options.ResumeJournalPathHint,
+                .AllowJournalRootRemap = options.AllowJournalRootRemap,
                 .SelectedRelativePaths = New List(Of String)(If(options.SelectedRelativePaths, New List(Of String)())),
                 .OverwritePolicy = options.OverwritePolicy,
                 .SymlinkHandling = options.SymlinkHandling,
@@ -513,6 +522,10 @@ Namespace Services
                 .ParallelSmallFileWorkers = options.ParallelSmallFileWorkers,
                 .SmallFileThresholdBytes = options.SmallFileThresholdBytes,
                 .WaitForMediaAvailability = options.WaitForMediaAvailability,
+                .WaitForFileLockRelease = options.WaitForFileLockRelease,
+                .TreatAccessDeniedAsContention = options.TreatAccessDeniedAsContention,
+                .LockContentionProbeInterval = options.LockContentionProbeInterval,
+                .SourceMutationPolicy = options.SourceMutationPolicy,
                 .MaxRetries = options.MaxRetries,
                 .OperationTimeout = options.OperationTimeout,
                 .PerFileTimeout = options.PerFileTimeout,

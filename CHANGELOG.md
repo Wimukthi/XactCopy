@@ -4,6 +4,39 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.5.8] - 2026-02-17
+
+### Added
+
+- Media identity guards for both source and destination paths:
+  - Run-time options now carry expected media identities (`ExpectedSourceIdentity` / `ExpectedDestinationIdentity`).
+  - New runs capture baseline identity (volume serial for local roots, normalized `\\server\share` identity for UNC roots) when available.
+  - Worker availability checks now validate identity, preventing writes to a different device accidentally mounted on the same path/drive letter.
+
+### Changed
+
+- Supervisor recovery now forces `ResumeFromJournal = True` before re-dispatching a job after worker disconnect/crash, ensuring journal-based continuation semantics.
+- Availability/error classification now uses Win32/HResult-aware checks (not only message text), improving handling reliability for localized Windows environments.
+- Journal initialization now probes writability before run start and automatically falls back to `%TEMP%\XactCopy\journals` when the default journal directory is unavailable.
+- Worker now emits destination free-space preflight warnings when estimated payload exceeds currently available space.
+- Added remap-capable resume plumbing:
+  - New run options `ResumeJournalPathHint` and `AllowJournalRootRemap` let resumed jobs load an existing journal and continue even after source/destination path remap.
+  - Completion flow now offers a guided remap-and-resume prompt for media/path-style failures.
+- Added explicit hardening policies for lock/AV contention and source mutation:
+  - `WaitForFileLockRelease`
+  - `TreatAccessDeniedAsContention`
+  - `LockContentionProbeInterval`
+  - `SourceMutationPolicy` (`FailFile`, `SkipFile`, `WaitForReappearance`)
+- Performance settings now expose new default controls for the above policies.
+
+### Safety
+
+- Saved job templates now clear run-scoped media identity fields to avoid stale identity locks between unrelated runs.
+- Write path now fails fast on non-recoverable destination errors (`disk full`, `access denied`) with explicit user-facing messages instead of exhausting generic retry loops.
+- Read salvage now avoids masking media/path-unavailable conditions by escalating unavailability failures as hard read errors.
+- Media identity matching is now remap-safe for local volumes by comparing volume serial identity (with compatibility for legacy identity strings that included drive letters).
+- Source-file disappearance during active runs is now policy-driven rather than implicitly treated as generic media outage.
+
 ## [1.0.5.0] - 2026-02-16
 
 ### Changed

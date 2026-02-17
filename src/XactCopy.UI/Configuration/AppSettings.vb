@@ -38,6 +38,10 @@ Namespace Configuration
         Public Property DefaultVerifyAfterCopy As Boolean = False
         Public Property DefaultUseAdaptiveBuffer As Boolean = False
         Public Property DefaultWaitForMediaAvailability As Boolean = False
+        Public Property DefaultWaitForFileLockRelease As Boolean = False
+        Public Property DefaultTreatAccessDeniedAsContention As Boolean = False
+        Public Property DefaultLockContentionProbeIntervalMs As Integer = 500
+        Public Property DefaultSourceMutationPolicy As String = "fail-file"
         Public Property DefaultBufferSizeMb As Integer = 4
         Public Property DefaultMaxRetries As Integer = 12
         Public Property DefaultOperationTimeoutSeconds As Integer = 10

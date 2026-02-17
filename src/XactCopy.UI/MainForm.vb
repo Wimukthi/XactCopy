@@ -2,6 +2,7 @@ Imports System.Diagnostics
 Imports System.IO
 Imports System.Collections.Generic
 Imports System.Linq
+Imports System.Runtime.InteropServices
 Imports System.Threading
 Imports System.Threading.Tasks
 
@@ -28,6 +29,8 @@ Public Class MainForm
     Private Const MinimumMaxLogLines As Integer = 1000
     Private Const DefaultDiagnosticsRefreshIntervalMs As Integer = 250
     Private Const MinimumDiagnosticsRefreshIntervalMs As Integer = 100
+    Private Const FileSystemProbeTimeoutMs As Integer = 350
+    Private Const FileSystemProbeWarningCooldownSeconds As Integer = 10
     Private Const ThinProgressBarHeight As Integer = 10
     Private Const StandardProgressBarHeight As Integer = 17
     Private Const ThickProgressBarHeight As Integer = 24
@@ -38,6 +41,18 @@ Public Class MainForm
 
     Private Shared ReadOnly JournalsDirectory As String = Path.Combine(AppDataRoot, "journals")
     Private Shared ReadOnly CrashDirectory As String = Path.Combine(AppDataRoot, "crash")
+
+    <DllImport("kernel32.dll", CharSet:=CharSet.Unicode, SetLastError:=True)>
+    Private Shared Function GetVolumeInformation(
+        lpRootPathName As String,
+        lpVolumeNameBuffer As IntPtr,
+        nVolumeNameSize As UInteger,
+        ByRef lpVolumeSerialNumber As UInteger,
+        ByRef lpMaximumComponentLength As UInteger,
+        ByRef lpFileSystemFlags As UInteger,
+        lpFileSystemNameBuffer As IntPtr,
+        nFileSystemNameSize As UInteger) As Boolean
+    End Function
 
     Private ReadOnly _sourceTextBox As New TextBox()
     Private ReadOnly _destinationTextBox As New TextBox()
@@ -120,6 +135,7 @@ Public Class MainForm
     Private _startupRecovery As RecoveryStartupInfo
     Private _interruptedRun As RecoveryActiveRun
     Private _activeRun As ManagedJobRun
+    Private _activeRunOptions As CopyJobOptions
     Private _activeRunJournalPath As String = String.Empty
     Private _isCheckingUpdates As Boolean
     Private _isRunning As Boolean
@@ -132,6 +148,7 @@ Public Class MainForm
     Private _bufferSampleBytesTotal As Long
     Private _lastChunkUtilization As Double
     Private _lastRecoveryTouchUtc As DateTimeOffset = DateTimeOffset.MinValue
+    Private _lastFileSystemProbeWarningUtc As DateTimeOffset = DateTimeOffset.MinValue
     Private _explorerSelectionSourceRoot As String = String.Empty
     Private ReadOnly _explorerSelectedRelativePaths As New List(Of String)()
     Private _suspendSourceTextChanged As Boolean
@@ -158,6 +175,7 @@ Public Class MainForm
     Private _uiLogLinesRendered As Long
     Private _uiLogLinesDropped As Long
     Private _uiWorkerSuppressedLogLines As Long
+    Private _remapPromptInFlight As Integer
 
     Public Sub New(Optional launchOptions As LaunchOptions = Nothing)
         Text = AppTitle
@@ -790,7 +808,7 @@ Public Class MainForm
 
     Private Sub ShowSettingsDialog()
         Using dialog As New SettingsForm(_settings)
-            ThemeManager.ApplyTheme(dialog, ThemeSettings.GetPreferredColorMode(_settings), _settings)
+            PrepareDialogFirstPaint(dialog)
 
             If dialog.ShowDialog(Me) <> DialogResult.OK Then
                 Return
@@ -814,6 +832,24 @@ Public Class MainForm
                 OfferRestartAfterSettingsChange(restartReasonText)
             End If
         End Using
+    End Sub
+
+    Private Sub PrepareDialogFirstPaint(dialog As Form)
+        If dialog Is Nothing Then
+            Return
+        End If
+
+        dialog.SuspendLayout()
+        Try
+            ' Ensure native handles exist before applying dark theme colors,
+            ' so the very first visible frame is already fully themed.
+            dialog.CreateControl()
+            ThemeManager.ApplyTheme(dialog, ThemeSettings.GetPreferredColorMode(_settings), _settings)
+            dialog.PerformLayout()
+            dialog.Invalidate(invalidateChildren:=True)
+        Finally
+            dialog.ResumeLayout(performLayout:=True)
+        End Try
     End Sub
 
     Private Sub OfferRestartAfterSettingsChange(reasonText As String)
@@ -976,7 +1012,10 @@ Public Class MainForm
         End If
 
         Dim nextJob = queuedWorkItem.Job
-        Dim normalized = NormalizeAndValidateOptions(nextJob.Options, showDialogs:=manualTrigger)
+        Dim normalized = NormalizeAndValidateOptions(
+            nextJob.Options,
+            showDialogs:=manualTrigger,
+            skipAvailabilityValidation:=Not manualTrigger)
         Dim trigger = If(manualTrigger, "queued-manual", "queued-auto")
         Dim queuedRun = _jobManager.CreateRunForJob(nextJob.JobId, trigger, queuedWorkItem.QueueEntryId, queuedWorkItem.Attempt)
 
@@ -1642,7 +1681,8 @@ Public Class MainForm
             dialog.UseDescriptionForTitle = True
             dialog.Description = "Select folder"
 
-            If Directory.Exists(targetTextBox.Text) Then
+            Dim initialDirectoryExists As Boolean
+            If TryProbeDirectoryExists(targetTextBox.Text, initialDirectoryExists) AndAlso initialDirectoryExists Then
                 dialog.InitialDirectory = targetTextBox.Text
             End If
 
@@ -1737,6 +1777,8 @@ Public Class MainForm
         End If
         normalizedOptions = resolvedOptions
 
+        AttachMediaIdentityExpectations(normalizedOptions)
+
         If run Is Nothing Then
             run = _jobManager.CreateAdHocRun(normalizedOptions, "Manual Copy", "manual")
         End If
@@ -1750,6 +1792,7 @@ Public Class MainForm
         UpdateShellIndicatorsForStarting()
 
         _activeRun = run
+        _activeRunOptions = CloneCopyOptions(normalizedOptions)
         _activeRunJournalPath = ComputeJournalPath(normalizedOptions)
         _jobManager.MarkRunRunning(_activeRun.RunId, _activeRunJournalPath)
         _recoveryService.MarkJobStarted(_activeRun, normalizedOptions, _activeRunJournalPath, _settings)
@@ -1785,6 +1828,7 @@ Public Class MainForm
             _jobManager.MarkRunCompleted(_activeRun.RunId, failureResult)
             _recoveryService.MarkJobEnded(_activeRun.RunId)
             _activeRun = Nothing
+            _activeRunOptions = Nothing
             _activeRunJournalPath = String.Empty
             UpdateRecoveryMenuState()
 
@@ -1858,6 +1902,10 @@ Public Class MainForm
             .ParallelSmallFileWorkers = 1,
             .SmallFileThresholdBytes = 256 * 1024,
             .WaitForMediaAvailability = safeSettings.DefaultWaitForMediaAvailability,
+            .WaitForFileLockRelease = safeSettings.DefaultWaitForFileLockRelease,
+            .TreatAccessDeniedAsContention = safeSettings.DefaultTreatAccessDeniedAsContention,
+            .LockContentionProbeInterval = TimeSpan.FromMilliseconds(Math.Max(100, safeSettings.DefaultLockContentionProbeIntervalMs)),
+            .SourceMutationPolicy = SettingsValueConverter.ToSourceMutationPolicy(safeSettings.DefaultSourceMutationPolicy),
             .MaxRetries = Math.Max(0, safeSettings.DefaultMaxRetries),
             .OperationTimeout = TimeSpan.FromSeconds(Math.Max(1, safeSettings.DefaultOperationTimeoutSeconds)),
             .PerFileTimeout = TimeSpan.FromSeconds(Math.Max(0, safeSettings.DefaultPerFileTimeoutSeconds)),
@@ -1961,6 +2009,127 @@ Public Class MainForm
         Return NormalizeAndValidateOptions(candidate, showDialogs:=True)
     End Function
 
+    Private Sub AttachMediaIdentityExpectations(options As CopyJobOptions)
+        If options Is Nothing Then
+            Return
+        End If
+
+        If String.IsNullOrWhiteSpace(options.ExpectedSourceIdentity) Then
+            Dim sourceIdentity = ResolveMediaIdentityWithTimeout(options.SourceRoot)
+            If sourceIdentity.Length > 0 Then
+                options.ExpectedSourceIdentity = sourceIdentity
+                AppendLog("Source media identity guard armed for this run.")
+            Else
+                AppendLog("Source media identity guard unavailable for this run (path offline or probe timeout).")
+            End If
+        End If
+
+        If String.IsNullOrWhiteSpace(options.ExpectedDestinationIdentity) Then
+            Dim destinationIdentity = ResolveMediaIdentityWithTimeout(options.DestinationRoot)
+            If destinationIdentity.Length > 0 Then
+                options.ExpectedDestinationIdentity = destinationIdentity
+                AppendLog("Destination media identity guard armed for this run.")
+            Else
+                AppendLog("Destination media identity guard unavailable for this run (path offline or probe timeout).")
+            End If
+        End If
+    End Sub
+
+    Private Function ResolveMediaIdentityWithTimeout(path As String) As String
+        If String.IsNullOrWhiteSpace(path) Then
+            Return String.Empty
+        End If
+
+        Dim probeTask = Task.Run(Function() ResolveMediaIdentity(path))
+        Try
+            If probeTask.Wait(FileSystemProbeTimeoutMs) Then
+                Return If(probeTask.Result, String.Empty)
+            End If
+        Catch
+        End Try
+
+        Return String.Empty
+    End Function
+
+    Private Shared Function ResolveMediaIdentity(pathValue As String) As String
+        If String.IsNullOrWhiteSpace(pathValue) Then
+            Return String.Empty
+        End If
+
+        Dim fullPath As String
+        Try
+            fullPath = System.IO.Path.GetFullPath(pathValue)
+        Catch
+            Return String.Empty
+        End Try
+
+        Dim root = System.IO.Path.GetPathRoot(fullPath)
+        If String.IsNullOrWhiteSpace(root) Then
+            Return String.Empty
+        End If
+
+        Dim normalizedRoot = root.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar)
+        If normalizedRoot.StartsWith("\\", StringComparison.OrdinalIgnoreCase) Then
+            Dim uncShare = NormalizeUncShareRoot(normalizedRoot)
+            If uncShare.Length = 0 Then
+                Return String.Empty
+            End If
+
+            Return "unc:" & uncShare.ToUpperInvariant()
+        End If
+
+        Dim serial As UInteger
+        If Not TryGetVolumeSerial(root, serial) Then
+            Return String.Empty
+        End If
+
+        Return $"vol:{serial:X8}"
+    End Function
+
+    Private Shared Function NormalizeUncShareRoot(value As String) As String
+        If String.IsNullOrWhiteSpace(value) Then
+            Return String.Empty
+        End If
+
+        Dim trimmed = value.Trim().Trim("\"c)
+        If trimmed.Length = 0 Then
+            Return String.Empty
+        End If
+
+        Dim parts = trimmed.Split("\"c, StringSplitOptions.RemoveEmptyEntries)
+        If parts.Length < 2 Then
+            Return String.Empty
+        End If
+
+        Return "\\" & parts(0) & "\" & parts(1)
+    End Function
+
+    Private Shared Function TryGetVolumeSerial(rootPath As String, ByRef serial As UInteger) As Boolean
+        serial = 0UI
+        If String.IsNullOrWhiteSpace(rootPath) Then
+            Return False
+        End If
+
+        Dim normalizedRoot = rootPath
+        If Not normalizedRoot.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal) AndAlso
+            Not normalizedRoot.EndsWith(Path.AltDirectorySeparatorChar.ToString(), StringComparison.Ordinal) Then
+            normalizedRoot &= Path.DirectorySeparatorChar
+        End If
+
+        Dim maxComponentLength As UInteger = 0UI
+        Dim fileSystemFlags As UInteger = 0UI
+
+        Return GetVolumeInformation(
+            normalizedRoot,
+            IntPtr.Zero,
+            0UI,
+            serial,
+            maxComponentLength,
+            fileSystemFlags,
+            IntPtr.Zero,
+            0UI)
+    End Function
+
     Private Async Function ResolveAskOverwritePolicyAsync(options As CopyJobOptions) As Task(Of CopyJobOptions)
         If options Is Nothing Then
             Return Nothing
@@ -1990,6 +2159,28 @@ Public Class MainForm
         End Try
 
         If sourceFiles Is Nothing OrElse sourceFiles.Count = 0 Then
+            options.OverwritePolicy = OverwritePolicy.Overwrite
+            Return options
+        End If
+
+        Dim destinationRootPath As String = options.DestinationRoot
+        Try
+            destinationRootPath = Path.GetPathRoot(Path.GetFullPath(options.DestinationRoot))
+        Catch
+            destinationRootPath = options.DestinationRoot
+        End Try
+
+        Dim destinationRootOnline As Boolean
+        Dim destinationProbeCompleted = TryProbeDirectoryExists(destinationRootPath, destinationRootOnline)
+        If Not destinationProbeCompleted Then
+            EmitFileSystemProbeWarning(
+                $"Destination availability probe timed out for '{destinationRootPath}'. Overwrite prompts were skipped to keep the UI responsive.")
+            options.OverwritePolicy = OverwritePolicy.Overwrite
+            Return options
+        End If
+
+        If Not destinationRootOnline Then
+            AppendLog("Destination is currently offline. Overwrite prompts were skipped for this start attempt.")
             options.OverwritePolicy = OverwritePolicy.Overwrite
             Return options
         End If
@@ -2123,7 +2314,10 @@ Public Class MainForm
         Return Math.Max(0, Math.Min(1000, value))
     End Function
 
-    Private Function NormalizeAndValidateOptions(options As CopyJobOptions, showDialogs As Boolean) As CopyJobOptions
+    Private Function NormalizeAndValidateOptions(
+        options As CopyJobOptions,
+        showDialogs As Boolean,
+        Optional skipAvailabilityValidation As Boolean = False) As CopyJobOptions
         If options Is Nothing Then
             Return Nothing
         End If
@@ -2151,9 +2345,17 @@ Public Class MainForm
             Return Nothing
         End Try
 
-        If Not options.WaitForMediaAvailability AndAlso Not Directory.Exists(sourceFull) Then
-            ShowValidation($"Source does not exist: {sourceFull}", showDialogs)
-            Return Nothing
+        If Not options.WaitForMediaAvailability AndAlso Not skipAvailabilityValidation Then
+            Dim sourceExists As Boolean
+            If TryProbeDirectoryExists(sourceFull, sourceExists) Then
+                If Not sourceExists Then
+                    ShowValidation($"Source does not exist: {sourceFull}", showDialogs)
+                    Return Nothing
+                End If
+            Else
+                EmitFileSystemProbeWarning(
+                    $"Source availability probe timed out for '{sourceFull}'. Continuing without a blocking UI check.")
+            End If
         End If
 
         If StringComparer.OrdinalIgnoreCase.Equals(sourceFull, destinationFull) Then
@@ -2182,10 +2384,6 @@ Public Class MainForm
                     Continue For
                 End If
 
-                If Not options.WaitForMediaAvailability AndAlso Not File.Exists(candidatePath) AndAlso Not Directory.Exists(candidatePath) Then
-                    Continue For
-                End If
-
                 If seen.Add(relativeSelection) Then
                     normalizedSelections.Add(relativeSelection)
                 End If
@@ -2205,9 +2403,21 @@ Public Class MainForm
             mode = VerificationMode.None
         End If
 
+        Dim sourceMutationPolicy = options.SourceMutationPolicy
+        Select Case sourceMutationPolicy
+            Case SourceMutationPolicy.FailFile, SourceMutationPolicy.SkipFile, SourceMutationPolicy.WaitForReappearance
+                ' Valid.
+            Case Else
+                sourceMutationPolicy = SourceMutationPolicy.FailFile
+        End Select
+
         Return New CopyJobOptions() With {
             .SourceRoot = sourceFull,
             .DestinationRoot = destinationFull,
+            .ExpectedSourceIdentity = If(options.ExpectedSourceIdentity, String.Empty),
+            .ExpectedDestinationIdentity = If(options.ExpectedDestinationIdentity, String.Empty),
+            .ResumeJournalPathHint = If(options.ResumeJournalPathHint, String.Empty),
+            .AllowJournalRootRemap = options.AllowJournalRootRemap,
             .SelectedRelativePaths = normalizedSelections,
             .OverwritePolicy = options.OverwritePolicy,
             .SymlinkHandling = options.SymlinkHandling,
@@ -2218,6 +2428,10 @@ Public Class MainForm
             .ParallelSmallFileWorkers = Math.Max(1, options.ParallelSmallFileWorkers),
             .SmallFileThresholdBytes = Math.Max(4096, options.SmallFileThresholdBytes),
             .WaitForMediaAvailability = options.WaitForMediaAvailability,
+            .WaitForFileLockRelease = options.WaitForFileLockRelease,
+            .TreatAccessDeniedAsContention = options.TreatAccessDeniedAsContention,
+            .LockContentionProbeInterval = If(options.LockContentionProbeInterval <= TimeSpan.Zero, TimeSpan.FromMilliseconds(500), options.LockContentionProbeInterval),
+            .SourceMutationPolicy = sourceMutationPolicy,
             .MaxRetries = Math.Max(0, options.MaxRetries),
             .OperationTimeout = If(options.OperationTimeout <= TimeSpan.Zero, TimeSpan.FromSeconds(10), options.OperationTimeout),
             .PerFileTimeout = If(options.PerFileTimeout < TimeSpan.Zero, TimeSpan.Zero, options.PerFileTimeout),
@@ -2247,6 +2461,105 @@ Public Class MainForm
             .RescueScrapeRetries = ClampRescueRetries(options.RescueScrapeRetries)
         }
     End Function
+
+    Private Shared Function CloneCopyOptions(options As CopyJobOptions) As CopyJobOptions
+        If options Is Nothing Then
+            Return Nothing
+        End If
+
+        Return New CopyJobOptions() With {
+            .SourceRoot = options.SourceRoot,
+            .DestinationRoot = options.DestinationRoot,
+            .ExpectedSourceIdentity = options.ExpectedSourceIdentity,
+            .ExpectedDestinationIdentity = options.ExpectedDestinationIdentity,
+            .ResumeJournalPathHint = options.ResumeJournalPathHint,
+            .AllowJournalRootRemap = options.AllowJournalRootRemap,
+            .SelectedRelativePaths = New List(Of String)(If(options.SelectedRelativePaths, New List(Of String)())),
+            .OverwritePolicy = options.OverwritePolicy,
+            .SymlinkHandling = options.SymlinkHandling,
+            .CopyEmptyDirectories = options.CopyEmptyDirectories,
+            .BufferSizeBytes = options.BufferSizeBytes,
+            .UseAdaptiveBufferSizing = options.UseAdaptiveBufferSizing,
+            .MaxThroughputBytesPerSecond = options.MaxThroughputBytesPerSecond,
+            .ParallelSmallFileWorkers = options.ParallelSmallFileWorkers,
+            .SmallFileThresholdBytes = options.SmallFileThresholdBytes,
+            .WaitForMediaAvailability = options.WaitForMediaAvailability,
+            .WaitForFileLockRelease = options.WaitForFileLockRelease,
+            .TreatAccessDeniedAsContention = options.TreatAccessDeniedAsContention,
+            .LockContentionProbeInterval = options.LockContentionProbeInterval,
+            .SourceMutationPolicy = options.SourceMutationPolicy,
+            .MaxRetries = options.MaxRetries,
+            .OperationTimeout = options.OperationTimeout,
+            .PerFileTimeout = options.PerFileTimeout,
+            .InitialRetryDelay = options.InitialRetryDelay,
+            .MaxRetryDelay = options.MaxRetryDelay,
+            .ResumeFromJournal = options.ResumeFromJournal,
+            .VerifyAfterCopy = options.VerifyAfterCopy,
+            .VerificationMode = options.VerificationMode,
+            .VerificationHashAlgorithm = options.VerificationHashAlgorithm,
+            .SampleVerificationChunkBytes = options.SampleVerificationChunkBytes,
+            .SampleVerificationChunkCount = options.SampleVerificationChunkCount,
+            .SalvageUnreadableBlocks = options.SalvageUnreadableBlocks,
+            .SalvageFillPattern = options.SalvageFillPattern,
+            .ContinueOnFileError = options.ContinueOnFileError,
+            .PreserveTimestamps = options.PreserveTimestamps,
+            .WorkerProcessPriorityClass = options.WorkerProcessPriorityClass,
+            .WorkerTelemetryProfile = options.WorkerTelemetryProfile,
+            .WorkerProgressEmitIntervalMs = options.WorkerProgressEmitIntervalMs,
+            .WorkerMaxLogsPerSecond = options.WorkerMaxLogsPerSecond,
+            .RescueFastScanChunkBytes = options.RescueFastScanChunkBytes,
+            .RescueTrimChunkBytes = options.RescueTrimChunkBytes,
+            .RescueScrapeChunkBytes = options.RescueScrapeChunkBytes,
+            .RescueRetryChunkBytes = options.RescueRetryChunkBytes,
+            .RescueSplitMinimumBytes = options.RescueSplitMinimumBytes,
+            .RescueFastScanRetries = options.RescueFastScanRetries,
+            .RescueTrimRetries = options.RescueTrimRetries,
+            .RescueScrapeRetries = options.RescueScrapeRetries
+        }
+    End Function
+
+    Private Function TryProbeDirectoryExists(path As String, ByRef exists As Boolean) As Boolean
+        exists = False
+        If String.IsNullOrWhiteSpace(path) Then
+            Return True
+        End If
+
+        Dim probeTask = Task.Run(
+            Function()
+                Try
+                    Return Directory.Exists(path)
+                Catch
+                    Return False
+                End Try
+            End Function)
+
+        Try
+            If probeTask.Wait(FileSystemProbeTimeoutMs) Then
+                exists = probeTask.Result
+                Return True
+            End If
+        Catch
+            exists = False
+            Return True
+        End Try
+
+        Return False
+    End Function
+
+    Private Sub EmitFileSystemProbeWarning(message As String)
+        If String.IsNullOrWhiteSpace(message) Then
+            Return
+        End If
+
+        Dim nowUtc = DateTimeOffset.UtcNow
+        If _lastFileSystemProbeWarningUtc <> DateTimeOffset.MinValue AndAlso
+            (nowUtc - _lastFileSystemProbeWarningUtc) < TimeSpan.FromSeconds(FileSystemProbeWarningCooldownSeconds) Then
+            Return
+        End If
+
+        _lastFileSystemProbeWarningUtc = nowUtc
+        QueueLogLine($"[Path Probe] {message}")
+    End Sub
 
     Private Sub ShowValidation(message As String, showDialog As Boolean)
         AppendLog(message)
@@ -2499,6 +2812,7 @@ Public Class MainForm
         End If
 
         Dim completedRun = _activeRun
+        Dim completedOptions = CloneCopyOptions(_activeRunOptions)
 
         _isRunning = False
         _isPaused = False
@@ -2508,6 +2822,7 @@ Public Class MainForm
         ApplyTerminalProgressFromResult(result)
         _journalLabel.Text = $"Journal: {result.JournalPath}"
         _activeRun = Nothing
+        _activeRunOptions = Nothing
         _activeRunJournalPath = String.Empty
         _lastRecoveryTouchUtc = DateTimeOffset.MinValue
 
@@ -2540,8 +2855,212 @@ Public Class MainForm
         AppendLog($"Journal saved at: {result.JournalPath}")
         RefreshDiagnosticsLabel(force:=True)
 
-        Dim queuedTask = RunNextQueuedJobAsync(manualTrigger:=False)
-        Dim ignoredQueuedTask = queuedTask
+        Dim remapPromptQueued = QueueRemapResumePromptIfNeeded(completedRun, completedOptions, result)
+        If Not remapPromptQueued Then
+            QueueAutoQueuedRun()
+        End If
+    End Sub
+
+    Private Function QueueRemapResumePromptIfNeeded(
+        completedRun As ManagedJobRun,
+        completedOptions As CopyJobOptions,
+        result As CopyJobResult) As Boolean
+
+        If _isRunning OrElse IsDisposed OrElse Disposing Then
+            Return False
+        End If
+
+        If completedOptions Is Nothing OrElse result Is Nothing Then
+            Return False
+        End If
+
+        If Not ShouldOfferRemapResume(result) Then
+            Return False
+        End If
+
+        If String.IsNullOrWhiteSpace(result.JournalPath) Then
+            Return False
+        End If
+
+        If Interlocked.CompareExchange(_remapPromptInFlight, 1, 0) <> 0 Then
+            Return False
+        End If
+
+        Try
+            BeginInvoke(New MethodInvoker(
+                Async Sub()
+                    Try
+                        Await ShowRemapResumePromptAsync(completedRun, completedOptions, result).ConfigureAwait(True)
+                    Catch ex As Exception
+                        AppendLog($"Remap resume prompt failed: {ex.Message}")
+                        QueueAutoQueuedRun()
+                    Finally
+                        Interlocked.Exchange(_remapPromptInFlight, 0)
+                    End Try
+                End Sub))
+        Catch
+            Interlocked.Exchange(_remapPromptInFlight, 0)
+            Return False
+        End Try
+
+        Return True
+    End Function
+
+    Private Async Function ShowRemapResumePromptAsync(
+        completedRun As ManagedJobRun,
+        completedOptions As CopyJobOptions,
+        result As CopyJobResult) As Task
+
+        If _isRunning OrElse completedOptions Is Nothing OrElse result Is Nothing Then
+            Return
+        End If
+
+        Dim shouldResume = MessageBox.Show(
+            Me,
+            "This run ended due to a media/path issue." & Environment.NewLine &
+            "Do you want to resume from journal now?" & Environment.NewLine & Environment.NewLine &
+            "You can optionally remap source and destination paths before resuming.",
+            "XactCopy - Resume With Remap",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question,
+            MessageBoxDefaultButton.Button1)
+
+        If shouldResume <> DialogResult.Yes Then
+            QueueAutoQueuedRun()
+            Return
+        End If
+
+        Dim remappedSource = completedOptions.SourceRoot
+        Dim remappedDestination = completedOptions.DestinationRoot
+
+        Dim sourceDecision = MessageBox.Show(
+            Me,
+            $"Current source:{Environment.NewLine}{remappedSource}{Environment.NewLine}{Environment.NewLine}" &
+            "Do you want to choose a different source path?",
+            "XactCopy - Remap Source",
+            MessageBoxButtons.YesNoCancel,
+            MessageBoxIcon.Question,
+            MessageBoxDefaultButton.Button2)
+        If sourceDecision = DialogResult.Cancel Then
+            QueueAutoQueuedRun()
+            Return
+        End If
+        If sourceDecision = DialogResult.Yes Then
+            Dim selectedSource = PromptForFolderPath("Select remapped source folder", remappedSource)
+            If String.IsNullOrWhiteSpace(selectedSource) Then
+                QueueAutoQueuedRun()
+                Return
+            End If
+            remappedSource = selectedSource
+        End If
+
+        Dim destinationDecision = MessageBox.Show(
+            Me,
+            $"Current destination:{Environment.NewLine}{remappedDestination}{Environment.NewLine}{Environment.NewLine}" &
+            "Do you want to choose a different destination path?",
+            "XactCopy - Remap Destination",
+            MessageBoxButtons.YesNoCancel,
+            MessageBoxIcon.Question,
+            MessageBoxDefaultButton.Button2)
+        If destinationDecision = DialogResult.Cancel Then
+            QueueAutoQueuedRun()
+            Return
+        End If
+        If destinationDecision = DialogResult.Yes Then
+            Dim selectedDestination = PromptForFolderPath("Select remapped destination folder", remappedDestination)
+            If String.IsNullOrWhiteSpace(selectedDestination) Then
+                QueueAutoQueuedRun()
+                Return
+            End If
+            remappedDestination = selectedDestination
+        End If
+
+        Dim remappedOptions = CloneCopyOptions(completedOptions)
+        remappedOptions.SourceRoot = remappedSource
+        remappedOptions.DestinationRoot = remappedDestination
+        remappedOptions.ExpectedSourceIdentity = String.Empty
+        remappedOptions.ExpectedDestinationIdentity = String.Empty
+        remappedOptions.ResumeFromJournal = True
+        remappedOptions.ResumeJournalPathHint = result.JournalPath
+        remappedOptions.AllowJournalRootRemap = True
+
+        Dim normalizedOptions = NormalizeAndValidateOptions(remappedOptions, showDialogs:=True)
+        If normalizedOptions Is Nothing Then
+            QueueAutoQueuedRun()
+            Return
+        End If
+
+        AppendLog($"Remap resume requested. Source='{normalizedOptions.SourceRoot}', Destination='{normalizedOptions.DestinationRoot}'.")
+        Dim runName = If(String.IsNullOrWhiteSpace(completedRun?.DisplayName), "Remap Resume", $"{completedRun.DisplayName} (Remap Resume)")
+        Dim resumeRun = _jobManager.CreateAdHocRun(normalizedOptions, runName, "remap-resume")
+        Await StartCopyAsync(normalizedOptions, resumeRun, clearLog:=False)
+    End Function
+
+    Private Function PromptForFolderPath(description As String, initialPath As String) As String
+        Using dialog As New FolderBrowserDialog()
+            dialog.Description = description
+            dialog.ShowNewFolderButton = True
+            If Not String.IsNullOrWhiteSpace(initialPath) Then
+                Try
+                    dialog.SelectedPath = initialPath
+                Catch
+                End Try
+            End If
+
+            If dialog.ShowDialog(Me) <> DialogResult.OK Then
+                Return String.Empty
+            End If
+
+            Dim selected = If(dialog.SelectedPath, String.Empty).Trim()
+            If selected.Length = 0 Then
+                Return String.Empty
+            End If
+
+            Try
+                Return Path.GetFullPath(selected)
+            Catch
+                Return selected
+            End Try
+        End Using
+    End Function
+
+    Private Shared Function ShouldOfferRemapResume(result As CopyJobResult) As Boolean
+        If result Is Nothing OrElse result.Cancelled OrElse result.Succeeded Then
+            Return False
+        End If
+
+        Dim message = If(result.ErrorMessage, String.Empty)
+        If message.Length = 0 Then
+            Return False
+        End If
+
+        Dim normalized = message.ToLowerInvariant()
+        Return normalized.Contains("media identity mismatch") OrElse
+            normalized.Contains("network path") OrElse
+            normalized.Contains("network name") OrElse
+            normalized.Contains("source directory not found") OrElse
+            normalized.Contains("destination directory not found") OrElse
+            normalized.Contains("source is unavailable") OrElse
+            normalized.Contains("destination is unavailable") OrElse
+            normalized.Contains("device is not ready")
+    End Function
+
+    Private Sub QueueAutoQueuedRun()
+        If IsDisposed OrElse Disposing Then
+            Return
+        End If
+
+        Try
+            BeginInvoke(New MethodInvoker(
+                Async Sub()
+                    Try
+                        Await RunNextQueuedJobAsync(manualTrigger:=False)
+                    Catch ex As Exception
+                        AppendLog($"Auto-queue dispatch failed: {ex.Message}")
+                    End Try
+                End Sub))
+        Catch
+        End Try
     End Sub
 
     Private Sub ApplyTerminalProgressFromResult(result As CopyJobResult)

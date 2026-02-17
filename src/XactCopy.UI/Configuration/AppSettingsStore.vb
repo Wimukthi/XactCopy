@@ -127,6 +127,8 @@ Namespace Configuration
                 SettingsValueConverter.ClampInteger(settings.DefaultPerFileTimeoutSeconds, 0, 86400, 0)
             settings.DefaultMaxThroughputMbPerSecond =
                 SettingsValueConverter.ClampInteger(settings.DefaultMaxThroughputMbPerSecond, 0, 4096, 0)
+            settings.DefaultLockContentionProbeIntervalMs =
+                SettingsValueConverter.ClampInteger(settings.DefaultLockContentionProbeIntervalMs, 100, 10000, 500)
             settings.DefaultRescueFastScanChunkKb =
                 SettingsValueConverter.ClampInteger(settings.DefaultRescueFastScanChunkKb, 0, 262144, 0)
             settings.DefaultRescueTrimChunkKb =
@@ -163,6 +165,9 @@ Namespace Configuration
             settings.DefaultSalvageFillPattern =
                 SettingsValueConverter.SalvageFillPatternToString(
                     SettingsValueConverter.ToSalvageFillPattern(settings.DefaultSalvageFillPattern))
+            settings.DefaultSourceMutationPolicy =
+                SettingsValueConverter.SourceMutationPolicyToString(
+                    SettingsValueConverter.ToSourceMutationPolicy(settings.DefaultSourceMutationPolicy))
 
             Return settings
         End Function

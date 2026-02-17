@@ -2,6 +2,10 @@ Namespace Models
     Public Class CopyJobOptions
         Public Property SourceRoot As String = String.Empty
         Public Property DestinationRoot As String = String.Empty
+        Public Property ExpectedSourceIdentity As String = String.Empty
+        Public Property ExpectedDestinationIdentity As String = String.Empty
+        Public Property ResumeJournalPathHint As String = String.Empty
+        Public Property AllowJournalRootRemap As Boolean = False
         Public Property SelectedRelativePaths As New List(Of String)()
         Public Property OverwritePolicy As OverwritePolicy = OverwritePolicy.Overwrite
         Public Property SymlinkHandling As SymlinkHandlingMode = SymlinkHandlingMode.Skip
@@ -12,6 +16,10 @@ Namespace Models
         Public Property ParallelSmallFileWorkers As Integer = 1
         Public Property SmallFileThresholdBytes As Integer = 256 * 1024
         Public Property WaitForMediaAvailability As Boolean = False
+        Public Property WaitForFileLockRelease As Boolean = False
+        Public Property TreatAccessDeniedAsContention As Boolean = False
+        Public Property LockContentionProbeInterval As TimeSpan = TimeSpan.FromMilliseconds(500)
+        Public Property SourceMutationPolicy As SourceMutationPolicy = SourceMutationPolicy.FailFile
         Public Property MaxRetries As Integer = 12
         Public Property OperationTimeout As TimeSpan = TimeSpan.FromSeconds(10)
         Public Property PerFileTimeout As TimeSpan = TimeSpan.Zero

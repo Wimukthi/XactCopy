@@ -1,6 +1,7 @@
 Imports System.Drawing
 Imports System.Linq
 Imports System.Reflection
+Imports System.Runtime.InteropServices
 Imports XactCopy.Configuration
 Imports XactCopy.Models
 
@@ -9,6 +10,7 @@ Friend Class SettingsForm
 
     Private Const LayoutWindowKey As String = "SettingsForm"
     Private Const LayoutSplitterKey As String = "SettingsForm.MainSplit"
+    Private Const WmSetRedraw As Integer = &HB
     Private Shared ReadOnly _fontCacheSyncRoot As New Object()
     Private Shared _cachedLogFontNames As IReadOnlyList(Of String)
     Private Shared ReadOnly _settingsProperties As PropertyInfo() =
@@ -49,6 +51,8 @@ Friend Class SettingsForm
     Private ReadOnly _defaultPreserveTimestampsCheckBox As New CheckBox()
     Private ReadOnly _defaultCopyEmptyDirectoriesCheckBox As New CheckBox()
     Private ReadOnly _defaultWaitForMediaCheckBox As New CheckBox()
+    Private ReadOnly _defaultWaitForLockReleaseCheckBox As New CheckBox()
+    Private ReadOnly _defaultTreatAccessDeniedContentionCheckBox As New CheckBox()
     Private ReadOnly _overwritePolicyComboBox As New ComboBox()
     Private ReadOnly _symlinkHandlingComboBox As New ComboBox()
     Private ReadOnly _salvageFillPatternComboBox As New ComboBox()
@@ -59,6 +63,8 @@ Friend Class SettingsForm
     Private ReadOnly _defaultOperationTimeoutNumeric As New ThemedNumericUpDown()
     Private ReadOnly _defaultPerFileTimeoutNumeric As New ThemedNumericUpDown()
     Private ReadOnly _defaultMaxThroughputNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _defaultLockProbeIntervalNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _defaultSourceMutationPolicyComboBox As New ComboBox()
     Private ReadOnly _rescueFastChunkKbNumeric As New ThemedNumericUpDown()
     Private ReadOnly _rescueTrimChunkKbNumeric As New ThemedNumericUpDown()
     Private ReadOnly _rescueScrapeChunkKbNumeric As New ThemedNumericUpDown()
@@ -112,6 +118,16 @@ Friend Class SettingsForm
     Private _suspendDirtyTracking As Boolean
     Private _activePageKey As String = String.Empty
     Private _activePageControl As Control
+    Private _initialRevealPending As Boolean = True
+    Private _nativeRedrawSuspended As Boolean
+
+    <DllImport("user32.dll", CharSet:=CharSet.Auto)>
+    Private Shared Function SendMessage(
+        hWnd As IntPtr,
+        msg As Integer,
+        wParam As IntPtr,
+        lParam As IntPtr) As IntPtr
+    End Function
 
     Public Sub New(settings As AppSettings)
         If settings Is Nothing Then
@@ -126,6 +142,7 @@ Friend Class SettingsForm
         StartPosition = FormStartPosition.CenterParent
         MinimumSize = New Size(960, 620)
         Size = New Size(1080, 720)
+        Opacity = 0.0R
         WindowIconHelper.Apply(Me)
         SetStyle(ControlStyles.AllPaintingInWmPaint Or ControlStyles.OptimizedDoubleBuffer, True)
         UpdateStyles()
@@ -138,6 +155,7 @@ Friend Class SettingsForm
 
         AddHandler _dirtyStateTimer.Tick, AddressOf DirtyStateTimer_Tick
         AddHandler Load, AddressOf SettingsForm_Load
+        AddHandler Shown, AddressOf SettingsForm_Shown
         AddHandler FormClosing, AddressOf SettingsForm_FormClosing
         If _categoryTreeView.Nodes.Count > 0 Then
             _categoryTreeView.SelectedNode = _categoryTreeView.Nodes(0)
@@ -281,6 +299,8 @@ Friend Class SettingsForm
         _toolTip.SetToolTip(_defaultPreserveTimestampsCheckBox, "Preserve source timestamps on copied files and folders.")
         _toolTip.SetToolTip(_defaultCopyEmptyDirectoriesCheckBox, "Create empty directories in destination even when they contain no files.")
         _toolTip.SetToolTip(_defaultWaitForMediaCheckBox, "Wait indefinitely for source/destination media to become available.")
+        _toolTip.SetToolTip(_defaultWaitForLockReleaseCheckBox, "When file locks are detected, wait for the lock to clear instead of only doing bounded retries.")
+        _toolTip.SetToolTip(_defaultTreatAccessDeniedContentionCheckBox, "Treat transient Access Denied errors as contention (for AV/EDR/indexer interference).")
 
         _toolTip.SetToolTip(_overwritePolicyComboBox, "Default conflict behavior when destination files already exist. 'Always ask' prompts Yes/No/Cancel for each conflict.")
         _toolTip.SetToolTip(_symlinkHandlingComboBox, "Choose whether symbolic links are skipped or followed during scans.")
@@ -292,6 +312,8 @@ Friend Class SettingsForm
         _toolTip.SetToolTip(_defaultOperationTimeoutNumeric, "Default operation timeout in seconds (1-3600).")
         _toolTip.SetToolTip(_defaultPerFileTimeoutNumeric, "Default per-file timeout in seconds (0 disables per-file timeout).")
         _toolTip.SetToolTip(_defaultMaxThroughputNumeric, "Optional throughput cap in MB/s (0 means unlimited).")
+        _toolTip.SetToolTip(_defaultLockProbeIntervalNumeric, "Milliseconds between lock-contention probes while waiting.")
+        _toolTip.SetToolTip(_defaultSourceMutationPolicyComboBox, "Behavior when source files disappear during an active copy.")
         _toolTip.SetToolTip(_rescueFastChunkKbNumeric, "AegisRescueCore FastScan chunk size in KB (0 = auto from buffer).")
         _toolTip.SetToolTip(_rescueTrimChunkKbNumeric, "AegisRescueCore TrimSweep chunk size in KB (0 = auto).")
         _toolTip.SetToolTip(_rescueScrapeChunkKbNumeric, "AegisRescueCore Scrape chunk size in KB (0 = auto).")
@@ -547,7 +569,7 @@ Friend Class SettingsForm
     Private Function BuildCopyDefaultsPage() As Control
         Dim page = CreatePageContainer(2)
 
-        Dim behavior = CreateSingleColumnGrid(6)
+        Dim behavior = CreateSingleColumnGrid(8)
 
         _defaultResumeCheckBox.Text = "Resume from journal"
         _defaultSalvageCheckBox.Text = "Salvage unreadable blocks"
@@ -555,8 +577,18 @@ Friend Class SettingsForm
         _defaultPreserveTimestampsCheckBox.Text = "Preserve source timestamps"
         _defaultCopyEmptyDirectoriesCheckBox.Text = "Copy empty directories"
         _defaultWaitForMediaCheckBox.Text = "Wait forever for source/destination"
+        _defaultWaitForLockReleaseCheckBox.Text = "Wait for lock/contention release"
+        _defaultTreatAccessDeniedContentionCheckBox.Text = "Treat Access Denied as transient contention"
 
-        For Each box As CheckBox In New CheckBox() {_defaultResumeCheckBox, _defaultSalvageCheckBox, _defaultContinueOnErrorCheckBox, _defaultPreserveTimestampsCheckBox, _defaultCopyEmptyDirectoriesCheckBox, _defaultWaitForMediaCheckBox}
+        For Each box As CheckBox In New CheckBox() {
+            _defaultResumeCheckBox,
+            _defaultSalvageCheckBox,
+            _defaultContinueOnErrorCheckBox,
+            _defaultPreserveTimestampsCheckBox,
+            _defaultCopyEmptyDirectoriesCheckBox,
+            _defaultWaitForMediaCheckBox,
+            _defaultWaitForLockReleaseCheckBox,
+            _defaultTreatAccessDeniedContentionCheckBox}
             ConfigureCheckBox(box)
             behavior.Controls.Add(box)
         Next
@@ -588,7 +620,7 @@ Friend Class SettingsForm
     End Function
 
     Private Function BuildPerformancePage() As Control
-        Dim page = CreatePageContainer(2)
+        Dim page = CreatePageContainer(3)
 
         Dim body = CreateFieldGrid(6)
 
@@ -613,6 +645,21 @@ Friend Class SettingsForm
         body.Controls.Add(_defaultPerFileTimeoutNumeric, 1, 4)
         body.Controls.Add(CreateFieldLabel("Max throughput (MB/s, 0=unlimited)"), 0, 5)
         body.Controls.Add(_defaultMaxThroughputNumeric, 1, 5)
+
+        Dim contention = CreateFieldGrid(2)
+        ConfigureNumeric(_defaultLockProbeIntervalNumeric, 100D, 10000D, 500D)
+
+        _defaultSourceMutationPolicyComboBox.DropDownStyle = ComboBoxStyle.DropDownList
+        _defaultSourceMutationPolicyComboBox.Items.AddRange(New Object() {
+            "Fail file when source disappears",
+            "Skip missing source file",
+            "Wait for source file to reappear"})
+        ConfigureComboBoxControl(_defaultSourceMutationPolicyComboBox, width:=360)
+
+        contention.Controls.Add(CreateFieldLabel("Lock probe interval (ms)"), 0, 0)
+        contention.Controls.Add(_defaultLockProbeIntervalNumeric, 1, 0)
+        contention.Controls.Add(CreateFieldLabel("Source mutation policy"), 0, 1)
+        contention.Controls.Add(_defaultSourceMutationPolicyComboBox, 1, 1)
 
         Dim rescue = CreateFieldGrid(8)
 
@@ -643,7 +690,8 @@ Friend Class SettingsForm
         rescue.Controls.Add(_rescueScrapeRetriesNumeric, 1, 7)
 
         page.Controls.Add(CreateSection("Transfer Tuning", body), 0, 0)
-        page.Controls.Add(CreateSection("AegisRescueCore Tuning", rescue), 0, 1)
+        page.Controls.Add(CreateSection("Contention & Source Mutation", contention), 0, 1)
+        page.Controls.Add(CreateSection("AegisRescueCore Tuning", rescue), 0, 2)
         Return page
     End Function
 
@@ -1005,6 +1053,7 @@ Friend Class SettingsForm
     End Function
 
     Private Sub SettingsForm_Load(sender As Object, e As EventArgs)
+        SuspendNativeRedraw()
         SuspendLayout()
         Try
             UiLayoutManager.ApplyWindow(Me, LayoutWindowKey)
@@ -1016,10 +1065,30 @@ Friend Class SettingsForm
             If _activePageControl Is Nothing Then
                 ShowPage(If(_categoryTreeView.SelectedNode?.Name, "appearance"))
             End If
+            ThemeManager.ApplyTheme(Me, ThemeSettings.GetPreferredColorMode(_workingSettings), _workingSettings)
         Finally
             _categoryTreeView.EndUpdate()
             ResumeLayout(performLayout:=True)
         End Try
+    End Sub
+
+    Private Sub SettingsForm_Shown(sender As Object, e As EventArgs)
+        If Not _initialRevealPending Then
+            Return
+        End If
+
+        _initialRevealPending = False
+        BeginInvoke(New Action(
+            Sub()
+                If IsDisposed Then
+                    Return
+                End If
+
+                ResumeNativeRedraw()
+                Opacity = 1.0R
+                Invalidate(invalidateChildren:=True)
+                Update()
+            End Sub))
     End Sub
 
     Private Shared Sub EnableDoubleBufferingForContainers(root As Control)
@@ -1039,6 +1108,7 @@ Friend Class SettingsForm
 
     Private Sub SettingsForm_FormClosing(sender As Object, e As FormClosingEventArgs)
         _dirtyStateTimer.Stop()
+        ResumeNativeRedraw()
         UiLayoutManager.CaptureSplitter(_mainSplit, LayoutSplitterKey)
         UiLayoutManager.CaptureWindow(Me, LayoutWindowKey)
     End Sub
@@ -1150,6 +1220,8 @@ Friend Class SettingsForm
             _defaultPreserveTimestampsCheckBox.Checked = _workingSettings.DefaultPreserveTimestamps
             _defaultCopyEmptyDirectoriesCheckBox.Checked = _workingSettings.DefaultCopyEmptyDirectories
             _defaultWaitForMediaCheckBox.Checked = _workingSettings.DefaultWaitForMediaAvailability
+            _defaultWaitForLockReleaseCheckBox.Checked = _workingSettings.DefaultWaitForFileLockRelease
+            _defaultTreatAccessDeniedContentionCheckBox.Checked = _workingSettings.DefaultTreatAccessDeniedAsContention
 
             _defaultAdaptiveBufferCheckBox.Checked = _workingSettings.DefaultUseAdaptiveBuffer
             _defaultBufferMbNumeric.Value = ClampNumeric(_defaultBufferMbNumeric, _workingSettings.DefaultBufferSizeMb)
@@ -1157,6 +1229,7 @@ Friend Class SettingsForm
             _defaultOperationTimeoutNumeric.Value = ClampNumeric(_defaultOperationTimeoutNumeric, _workingSettings.DefaultOperationTimeoutSeconds)
             _defaultPerFileTimeoutNumeric.Value = ClampNumeric(_defaultPerFileTimeoutNumeric, _workingSettings.DefaultPerFileTimeoutSeconds)
             _defaultMaxThroughputNumeric.Value = ClampNumeric(_defaultMaxThroughputNumeric, _workingSettings.DefaultMaxThroughputMbPerSecond)
+            _defaultLockProbeIntervalNumeric.Value = ClampNumeric(_defaultLockProbeIntervalNumeric, _workingSettings.DefaultLockContentionProbeIntervalMs)
             _rescueFastChunkKbNumeric.Value = ClampNumeric(_rescueFastChunkKbNumeric, _workingSettings.DefaultRescueFastScanChunkKb)
             _rescueTrimChunkKbNumeric.Value = ClampNumeric(_rescueTrimChunkKbNumeric, _workingSettings.DefaultRescueTrimChunkKb)
             _rescueScrapeChunkKbNumeric.Value = ClampNumeric(_rescueScrapeChunkKbNumeric, _workingSettings.DefaultRescueScrapeChunkKb)
@@ -1254,6 +1327,15 @@ Friend Class SettingsForm
                     _defaultVerificationModeComboBox.SelectedIndex = 0
             End Select
 
+            Select Case SettingsValueConverter.ToSourceMutationPolicy(_workingSettings.DefaultSourceMutationPolicy)
+                Case SourceMutationPolicy.SkipFile
+                    _defaultSourceMutationPolicyComboBox.SelectedIndex = 1
+                Case SourceMutationPolicy.WaitForReappearance
+                    _defaultSourceMutationPolicyComboBox.SelectedIndex = 2
+                Case Else
+                    _defaultSourceMutationPolicyComboBox.SelectedIndex = 0
+            End Select
+
             Select Case SettingsValueConverter.ToVerificationHashAlgorithm(_workingSettings.DefaultVerificationHashAlgorithm)
                 Case VerificationHashAlgorithm.Sha512
                     _defaultHashAlgorithmComboBox.SelectedIndex = 1
@@ -1289,6 +1371,7 @@ Friend Class SettingsForm
             EnsureSelection(_salvageFillPatternComboBox)
             EnsureSelection(_defaultVerificationModeComboBox)
             EnsureSelection(_defaultHashAlgorithmComboBox)
+            EnsureSelection(_defaultSourceMutationPolicyComboBox)
             EnsureSelection(_explorerSelectionModeComboBox)
             EnsureSelection(_workerTelemetryProfileComboBox)
 
@@ -1371,6 +1454,7 @@ Friend Class SettingsForm
         Dim salvagePatternIndex = If(_salvageFillPatternComboBox.SelectedIndex >= 0, _salvageFillPatternComboBox.SelectedIndex, 0)
         Dim verificationModeIndex = If(_defaultVerificationModeComboBox.SelectedIndex >= 0, _defaultVerificationModeComboBox.SelectedIndex, 0)
         Dim hashAlgorithmIndex = If(_defaultHashAlgorithmComboBox.SelectedIndex >= 0, _defaultHashAlgorithmComboBox.SelectedIndex, 0)
+        Dim sourceMutationPolicyIndex = If(_defaultSourceMutationPolicyComboBox.SelectedIndex >= 0, _defaultSourceMutationPolicyComboBox.SelectedIndex, 0)
         Dim explorerSelectionModeIndex = If(_explorerSelectionModeComboBox.SelectedIndex >= 0, _explorerSelectionModeComboBox.SelectedIndex, 0)
         Dim telemetryProfileIndex = If(_workerTelemetryProfileComboBox.SelectedIndex >= 0, _workerTelemetryProfileComboBox.SelectedIndex, 0)
         Dim accentModeIndex = If(_accentModeComboBox.SelectedIndex >= 0, _accentModeComboBox.SelectedIndex, 0)
@@ -1444,12 +1528,15 @@ Friend Class SettingsForm
         capturedSettings.DefaultPreserveTimestamps = _defaultPreserveTimestampsCheckBox.Checked
         capturedSettings.DefaultCopyEmptyDirectories = _defaultCopyEmptyDirectoriesCheckBox.Checked
         capturedSettings.DefaultWaitForMediaAvailability = _defaultWaitForMediaCheckBox.Checked
+        capturedSettings.DefaultWaitForFileLockRelease = _defaultWaitForLockReleaseCheckBox.Checked
+        capturedSettings.DefaultTreatAccessDeniedAsContention = _defaultTreatAccessDeniedContentionCheckBox.Checked
         capturedSettings.DefaultUseAdaptiveBuffer = _defaultAdaptiveBufferCheckBox.Checked
         capturedSettings.DefaultBufferSizeMb = CInt(_defaultBufferMbNumeric.Value)
         capturedSettings.DefaultMaxRetries = CInt(_defaultRetriesNumeric.Value)
         capturedSettings.DefaultOperationTimeoutSeconds = CInt(_defaultOperationTimeoutNumeric.Value)
         capturedSettings.DefaultPerFileTimeoutSeconds = CInt(_defaultPerFileTimeoutNumeric.Value)
         capturedSettings.DefaultMaxThroughputMbPerSecond = CInt(_defaultMaxThroughputNumeric.Value)
+        capturedSettings.DefaultLockContentionProbeIntervalMs = CInt(_defaultLockProbeIntervalNumeric.Value)
         capturedSettings.DefaultRescueFastScanChunkKb = CInt(_rescueFastChunkKbNumeric.Value)
         capturedSettings.DefaultRescueTrimChunkKb = CInt(_rescueTrimChunkKbNumeric.Value)
         capturedSettings.DefaultRescueScrapeChunkKb = CInt(_rescueScrapeChunkKbNumeric.Value)
@@ -1500,6 +1587,11 @@ Friend Class SettingsForm
                                                                SettingsValueConverter.VerificationHashAlgorithmToString(VerificationHashAlgorithm.Sha256))
         capturedSettings.DefaultSampleVerificationChunkKb = CInt(_sampleChunkKbNumeric.Value)
         capturedSettings.DefaultSampleVerificationChunkCount = CInt(_sampleChunkCountNumeric.Value)
+        capturedSettings.DefaultSourceMutationPolicy = If(sourceMutationPolicyIndex = 1,
+                                                          SettingsValueConverter.SourceMutationPolicyToString(SourceMutationPolicy.SkipFile),
+                                                          If(sourceMutationPolicyIndex = 2,
+                                                             SettingsValueConverter.SourceMutationPolicyToString(SourceMutationPolicy.WaitForReappearance),
+                                                             SettingsValueConverter.SourceMutationPolicyToString(SourceMutationPolicy.FailFile)))
 
         Select Case telemetryProfileIndex
             Case 1
@@ -1763,5 +1855,23 @@ Friend Class SettingsForm
 
         Return clone
     End Function
+
+    Private Sub SuspendNativeRedraw()
+        If _nativeRedrawSuspended OrElse Not IsHandleCreated Then
+            Return
+        End If
+
+        SendMessage(Handle, WmSetRedraw, IntPtr.Zero, IntPtr.Zero)
+        _nativeRedrawSuspended = True
+    End Sub
+
+    Private Sub ResumeNativeRedraw()
+        If Not _nativeRedrawSuspended OrElse Not IsHandleCreated Then
+            Return
+        End If
+
+        SendMessage(Handle, WmSetRedraw, New IntPtr(1), IntPtr.Zero)
+        _nativeRedrawSuspended = False
+    End Sub
 
 End Class

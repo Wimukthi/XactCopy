@@ -358,5 +358,27 @@ Namespace Configuration
                     Return "normal"
             End Select
         End Function
+
+        Public Function ToSourceMutationPolicy(value As String) As SourceMutationPolicy
+            Select Case NormalizeChoice(value, "fail-file", "fail-file", "skip-file", "wait-for-reappearance")
+                Case "skip-file"
+                    Return SourceMutationPolicy.SkipFile
+                Case "wait-for-reappearance"
+                    Return SourceMutationPolicy.WaitForReappearance
+                Case Else
+                    Return SourceMutationPolicy.FailFile
+            End Select
+        End Function
+
+        Public Function SourceMutationPolicyToString(value As SourceMutationPolicy) As String
+            Select Case value
+                Case SourceMutationPolicy.SkipFile
+                    Return "skip-file"
+                Case SourceMutationPolicy.WaitForReappearance
+                    Return "wait-for-reappearance"
+                Case Else
+                    Return "fail-file"
+            End Select
+        End Function
     End Module
 End Namespace

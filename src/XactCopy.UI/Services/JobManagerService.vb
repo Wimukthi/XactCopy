@@ -155,7 +155,12 @@ Namespace Services
                 End If
 
                 job.Name = trimmedName
-                job.Options = CloneOptions(options)
+                Dim templateOptions = CloneOptions(options)
+                templateOptions.ExpectedSourceIdentity = String.Empty
+                templateOptions.ExpectedDestinationIdentity = String.Empty
+                templateOptions.ResumeJournalPathHint = String.Empty
+                templateOptions.AllowJournalRootRemap = False
+                job.Options = templateOptions
                 job.UpdatedUtc = nowUtc
 
                 SaveCatalogLocked()
@@ -753,6 +758,10 @@ Namespace Services
             Return New CopyJobOptions() With {
                 .SourceRoot = options.SourceRoot,
                 .DestinationRoot = options.DestinationRoot,
+                .ExpectedSourceIdentity = options.ExpectedSourceIdentity,
+                .ExpectedDestinationIdentity = options.ExpectedDestinationIdentity,
+                .ResumeJournalPathHint = options.ResumeJournalPathHint,
+                .AllowJournalRootRemap = options.AllowJournalRootRemap,
                 .SelectedRelativePaths = New List(Of String)(If(options.SelectedRelativePaths, New List(Of String)())),
                 .OverwritePolicy = options.OverwritePolicy,
                 .SymlinkHandling = options.SymlinkHandling,
@@ -763,6 +772,10 @@ Namespace Services
                 .ParallelSmallFileWorkers = options.ParallelSmallFileWorkers,
                 .SmallFileThresholdBytes = options.SmallFileThresholdBytes,
                 .WaitForMediaAvailability = options.WaitForMediaAvailability,
+                .WaitForFileLockRelease = options.WaitForFileLockRelease,
+                .TreatAccessDeniedAsContention = options.TreatAccessDeniedAsContention,
+                .LockContentionProbeInterval = options.LockContentionProbeInterval,
+                .SourceMutationPolicy = options.SourceMutationPolicy,
                 .MaxRetries = options.MaxRetries,
                 .OperationTimeout = options.OperationTimeout,
                 .PerFileTimeout = options.PerFileTimeout,

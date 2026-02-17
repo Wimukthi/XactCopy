@@ -2,6 +2,8 @@ Imports System.Collections.Generic
 Imports System.Buffers
 Imports System.IO
 Imports System.Linq
+Imports System.Globalization
+Imports System.Runtime.InteropServices
 Imports System.Security.Cryptography
 Imports System.Threading
 Imports Microsoft.Win32.SafeHandles
@@ -17,26 +19,68 @@ Namespace Services
         Private Const RescueCoreName As String = "AegisRescueCore"
         Private Const MinimumRescueBlockSize As Integer = 4096
         Private Const MaximumIoBufferSize As Integer = 256 * 1024 * 1024
+        Private Const IdentityMismatchLogIntervalSeconds As Integer = 5
+        Private Const ErrorFileNotFound As Integer = 2
+        Private Const ErrorPathNotFound As Integer = 3
+        Private Const ErrorAccessDenied As Integer = 5
+        Private Const ErrorNotReady As Integer = 21
+        Private Const ErrorSharingViolation As Integer = 32
+        Private Const ErrorLockViolation As Integer = 33
+        Private Const ErrorHandleDiskFull As Integer = 39
+        Private Const ErrorBadNetPath As Integer = 53
+        Private Const ErrorNetNameDeleted As Integer = 64
+        Private Const ErrorBadNetName As Integer = 67
+        Private Const ErrorDiskFull As Integer = 112
+        Private Const ErrorDeviceNotConnected As Integer = 1167
 
         Private ReadOnly _options As CopyJobOptions
         Private ReadOnly _executionControl As CopyExecutionControl
         Private ReadOnly _journalStore As JobJournalStore
+#If DEBUG Then
+        Private ReadOnly _devFaultInjector As DevFaultInjector
+#End If
         Private _lastJournalFlushUtc As DateTimeOffset = DateTimeOffset.MinValue
         Private _throttleWindowStartUtc As DateTimeOffset = DateTimeOffset.MinValue
         Private _throttleWindowBytes As Long
+        Private _expectedSourceIdentity As String = String.Empty
+        Private _expectedDestinationIdentity As String = String.Empty
+        Private _lastSourceIdentityMismatchLogUtc As DateTimeOffset = DateTimeOffset.MinValue
+        Private _lastDestinationIdentityMismatchLogUtc As DateTimeOffset = DateTimeOffset.MinValue
+
+        <DllImport("kernel32.dll", CharSet:=CharSet.Unicode, SetLastError:=True)>
+        Private Shared Function GetVolumeInformation(
+            lpRootPathName As String,
+            lpVolumeNameBuffer As IntPtr,
+            nVolumeNameSize As UInteger,
+            ByRef lpVolumeSerialNumber As UInteger,
+            ByRef lpMaximumComponentLength As UInteger,
+            ByRef lpFileSystemFlags As UInteger,
+            lpFileSystemNameBuffer As IntPtr,
+            nFileSystemNameSize As UInteger) As Boolean
+        End Function
 
         Public Sub New(options As CopyJobOptions, Optional executionControl As CopyExecutionControl = Nothing)
             _options = options
             _executionControl = If(executionControl, New CopyExecutionControl())
             _journalStore = New JobJournalStore()
+#If DEBUG Then
+            _devFaultInjector = DevFaultInjector.TryCreateFromEnvironment()
+#End If
         End Sub
 
         Public Async Function RunAsync(cancellationToken As CancellationToken) As Task(Of CopyJobResult)
             ValidateOptions()
+#If DEBUG Then
+            If _devFaultInjector IsNot Nothing Then
+                EmitLog($"[DevFault] Enabled: {_devFaultInjector.Description}")
+            End If
+#End If
 
             Dim sourceRoot = Path.GetFullPath(_options.SourceRoot)
             Dim destinationRoot = Path.GetFullPath(_options.DestinationRoot)
+            InitializeMediaIdentityExpectations(sourceRoot, destinationRoot)
             Await WaitForMediaAvailabilityAsync(sourceRoot, destinationRoot, cancellationToken).ConfigureAwait(False)
+            EnsureMediaIdentityIntegrity(sourceRoot, destinationRoot)
             Directory.CreateDirectory(destinationRoot)
 
             EmitLog($"Scanning source: {sourceRoot}")
@@ -49,6 +93,7 @@ Namespace Services
             Dim sourceFiles = scanResult.Files
             Dim totalBytes = sourceFiles.Sum(Function(fileDescriptor) fileDescriptor.Length)
             EmitLog($"Scan complete. {sourceFiles.Count} file(s), {FormatBytes(totalBytes)} total.")
+            EmitDestinationCapacityWarning(destinationRoot, totalBytes)
 
             If _options.CopyEmptyDirectories AndAlso scanResult.Directories.Count > 0 Then
                 EmitLog($"Preparing {scanResult.Directories.Count} destination directory path(s).")
@@ -67,14 +112,20 @@ Namespace Services
             End If
 
             Dim jobId = JobJournalStore.BuildJobId(sourceRoot, destinationRoot)
-            Dim journalPath = JobJournalStore.GetDefaultJournalPath(jobId)
+            Dim defaultJournalPath = JobJournalStore.GetDefaultJournalPath(jobId)
+            Dim journalPath = ResolveWritableJournalPath(jobId, defaultJournalPath)
 
             Dim existingJournal As JobJournal = Nothing
             If _options.ResumeFromJournal Then
-                existingJournal = Await _journalStore.LoadAsync(journalPath, cancellationToken).ConfigureAwait(False)
-                If existingJournal IsNot Nothing Then
-                    EmitLog($"Loaded journal: {journalPath}")
-                Else
+                For Each candidatePath In GetJournalLoadCandidates(defaultJournalPath, journalPath)
+                    existingJournal = Await _journalStore.LoadAsync(candidatePath, cancellationToken).ConfigureAwait(False)
+                    If existingJournal IsNot Nothing Then
+                        EmitLog($"Loaded journal: {candidatePath}")
+                        Exit For
+                    End If
+                Next
+
+                If existingJournal Is Nothing Then
                     EmitLog("No journal found. Creating a fresh state.")
                 End If
             Else
@@ -94,6 +145,7 @@ Namespace Services
                 cancellationToken.ThrowIfCancellationRequested()
                 Await _executionControl.WaitIfPausedAsync(cancellationToken).ConfigureAwait(False)
                 Await WaitForMediaAvailabilityAsync(sourceRoot, destinationRoot, cancellationToken).ConfigureAwait(False)
+                EnsureMediaIdentityIntegrity(sourceRoot, destinationRoot)
 
                 Dim entry = journal.Files(descriptor.RelativePath)
 
@@ -159,6 +211,13 @@ Namespace Services
                         journalPath,
                         fileToken).ConfigureAwait(False)
 
+                Catch ex As SourceMutationSkippedException
+                    progress.SkippedFiles += 1
+                    entry.State = FileCopyState.Pending
+                    entry.LastError = ex.Message
+                    EmitLog($"Skipped: {descriptor.RelativePath} ({ex.Message})")
+                    FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).GetAwaiter().GetResult()
+                    Continue For
                 Catch ex As OperationCanceledException When cancellationToken.IsCancellationRequested
                     Throw
                 Catch ex As OperationCanceledException
@@ -237,6 +296,10 @@ Namespace Services
                 Throw New InvalidOperationException("PerFileTimeout cannot be negative.")
             End If
 
+            If _options.LockContentionProbeInterval <= TimeSpan.Zero Then
+                Throw New InvalidOperationException("LockContentionProbeInterval must be greater than zero.")
+            End If
+
             If _options.MaxThroughputBytesPerSecond < 0 Then
                 Throw New InvalidOperationException("MaxThroughputBytesPerSecond cannot be negative.")
             End If
@@ -262,6 +325,13 @@ Namespace Services
                 _options.RescueScrapeRetries < 0 Then
                 Throw New InvalidOperationException("Rescue pass retries cannot be negative.")
             End If
+
+            Select Case _options.SourceMutationPolicy
+                Case SourceMutationPolicy.FailFile, SourceMutationPolicy.SkipFile, SourceMutationPolicy.WaitForReappearance
+                    ' Valid.
+                Case Else
+                    Throw New InvalidOperationException("SourceMutationPolicy is invalid.")
+            End Select
         End Sub
 
         Private Function MergeJournal(
@@ -272,8 +342,14 @@ Namespace Services
             jobId As String) As JobJournal
 
             Dim canReuseJournal = existing IsNot Nothing AndAlso
-                StringComparer.OrdinalIgnoreCase.Equals(Path.GetFullPath(existing.SourceRoot), sourceRoot) AndAlso
-                StringComparer.OrdinalIgnoreCase.Equals(Path.GetFullPath(existing.DestinationRoot), destinationRoot)
+                (AreJournalRootsEquivalent(existing.SourceRoot, sourceRoot) AndAlso
+                 AreJournalRootsEquivalent(existing.DestinationRoot, destinationRoot))
+
+            If Not canReuseJournal AndAlso existing IsNot Nothing AndAlso _options.AllowJournalRootRemap Then
+                canReuseJournal = True
+                EmitLog(
+                    $"Journal root remap enabled. Reusing existing journal rooted at source='{existing.SourceRoot}', destination='{existing.DestinationRoot}'.")
+            End If
 
             Dim journal As JobJournal
             If canReuseJournal Then
@@ -349,6 +425,16 @@ Namespace Services
             Next
 
             Return journal
+        End Function
+
+        Private Shared Function AreJournalRootsEquivalent(leftPath As String, rightPath As String) As Boolean
+            Try
+                Return StringComparer.OrdinalIgnoreCase.Equals(Path.GetFullPath(leftPath), rightPath)
+            Catch
+                Return StringComparer.OrdinalIgnoreCase.Equals(
+                    If(leftPath, String.Empty).Trim(),
+                    If(rightPath, String.Empty).Trim())
+            End Try
         End Function
 
         Private Function IsAlreadyCompleted(entry As JournalFileEntry, descriptor As SourceFileDescriptor, destinationRoot As String) As Boolean
@@ -1494,8 +1580,18 @@ Namespace Services
 
             While attempt <= effectiveMaxRetries
                 cancellationToken.ThrowIfCancellationRequested()
+                ThrowIfMediaIdentityMismatch(sourcePath, _expectedSourceIdentity, isSource:=True)
 
                 Try
+#If DEBUG Then
+                    Dim injectedReadFault As Exception = Nothing
+                    If _devFaultInjector IsNot Nothing Then
+                        injectedReadFault = _devFaultInjector.CreateReadFault(relativePath, offset, length)
+                    End If
+                    If injectedReadFault IsNot Nothing Then
+                        Throw injectedReadFault
+                    End If
+#End If
                     Using linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
                         linkedCts.CancelAfter(_options.OperationTimeout)
                         Dim bytesRead = Await ReadChunkOnceAsync(
@@ -1519,7 +1615,36 @@ Namespace Services
                     lastError = ex
                 End Try
 
-                If _options.WaitForMediaAvailability AndAlso IsAvailabilityRelatedException(lastError) Then
+                If IsSourceFileMissingException(lastError) Then
+                    Select Case _options.SourceMutationPolicy
+                        Case SourceMutationPolicy.SkipFile
+                            Throw New SourceMutationSkippedException(
+                                $"Source file disappeared during copy: {relativePath}.",
+                                lastError)
+                        Case SourceMutationPolicy.WaitForReappearance
+                            transferSession?.InvalidateSource()
+                            EmitLog($"Source file disappeared during copy of {relativePath}. Waiting for it to reappear.")
+                            Await WaitForSourceFileAsync(sourcePath, cancellationToken, allowWithoutMediaWait:=True).ConfigureAwait(False)
+                            attempt = 0
+                            Continue While
+                        Case Else
+                            Throw New IOException($"Source file disappeared during copy: {relativePath}.", lastError)
+                    End Select
+                End If
+
+                If IsReadContentionException(lastError) AndAlso _options.WaitForFileLockRelease Then
+                    transferSession?.InvalidateSource()
+                    EmitLog($"Source contention detected on {relativePath}; waiting for lock release.")
+                    Await WaitForSourceReadAccessAsync(sourcePath, cancellationToken).ConfigureAwait(False)
+                    attempt = 0
+                    Continue While
+                End If
+
+                If IsFatalReadException(lastError, _options.TreatAccessDeniedAsContention) Then
+                    Exit While
+                End If
+
+                If _options.WaitForMediaAvailability AndAlso IsAvailabilityRelatedException(lastError, includeFileNotFound:=False) Then
                     transferSession?.InvalidateSource()
                     EmitLog($"Source unavailable during read of {relativePath}. Waiting for media to return.")
                     Await WaitForSourceFileAsync(sourcePath, cancellationToken).ConfigureAwait(False)
@@ -1528,6 +1653,10 @@ Namespace Services
                 End If
 
                 transferSession?.InvalidateSource()
+
+                If IsReadContentionException(lastError) Then
+                    EmitLog($"Source file contention detected on {relativePath}; retrying.")
+                End If
 
                 attempt += 1
                 If attempt > effectiveMaxRetries Then
@@ -1538,8 +1667,12 @@ Namespace Services
                 Await DelayForRetryAsync(attempt, cancellationToken).ConfigureAwait(False)
             End While
 
-            If IsFatalReadException(lastError) Then
+            If IsFatalReadException(lastError, _options.TreatAccessDeniedAsContention) Then
                 Throw New IOException($"Read failed on {relativePath} at offset {offset}.", lastError)
+            End If
+
+            If IsAvailabilityRelatedException(lastError) Then
+                Throw New IOException($"Read failed on {relativePath} at offset {offset} because source is unavailable.", lastError)
             End If
 
             If allowSalvage AndAlso _options.SalvageUnreadableBlocks Then
@@ -1637,8 +1770,18 @@ Namespace Services
 
             While attempt <= _options.MaxRetries
                 cancellationToken.ThrowIfCancellationRequested()
+                ThrowIfMediaIdentityMismatch(destinationPath, _expectedDestinationIdentity, isSource:=False)
 
                 Try
+#If DEBUG Then
+                    Dim injectedWriteFault As Exception = Nothing
+                    If _devFaultInjector IsNot Nothing Then
+                        injectedWriteFault = _devFaultInjector.CreateWriteFault(relativePath, offset, count)
+                    End If
+                    If injectedWriteFault IsNot Nothing Then
+                        Throw injectedWriteFault
+                    End If
+#End If
                     Using linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
                         linkedCts.CancelAfter(_options.OperationTimeout)
                         Await WriteChunkOnceAsync(
@@ -1657,6 +1800,28 @@ Namespace Services
                     lastError = ex
                 End Try
 
+                If IsDiskFullException(lastError) Then
+                    transferSession?.InvalidateDestination()
+                    Throw New IOException(
+                        $"Destination is out of free space while writing {relativePath} at offset {offset}.",
+                        lastError)
+                End If
+
+                If IsAccessDeniedException(lastError) AndAlso Not _options.TreatAccessDeniedAsContention Then
+                    transferSession?.InvalidateDestination()
+                    Throw New IOException(
+                        $"Destination access denied while writing {relativePath} at offset {offset}.",
+                        lastError)
+                End If
+
+                If IsWriteContentionException(lastError) AndAlso _options.WaitForFileLockRelease Then
+                    transferSession?.InvalidateDestination()
+                    EmitLog($"Destination contention detected on {relativePath}; waiting for lock release.")
+                    Await WaitForDestinationWriteAccessAsync(destinationPath, cancellationToken).ConfigureAwait(False)
+                    attempt = 0
+                    Continue While
+                End If
+
                 If _options.WaitForMediaAvailability AndAlso IsAvailabilityRelatedException(lastError) Then
                     transferSession?.InvalidateDestination()
                     EmitLog($"Destination unavailable during write of {relativePath}. Waiting for media to return.")
@@ -1666,6 +1831,10 @@ Namespace Services
                 End If
 
                 transferSession?.InvalidateDestination()
+
+                If IsWriteContentionException(lastError) Then
+                    EmitLog($"Destination file contention detected on {relativePath}; retrying.")
+                End If
 
                 attempt += 1
                 If attempt > _options.MaxRetries Then
@@ -1839,6 +2008,13 @@ Namespace Services
                         lastError = ex
                     End Try
 
+                    If IsReadContentionException(lastError) AndAlso _options.WaitForFileLockRelease Then
+                        EmitLog($"Verification contention detected on {context}; waiting for lock release.")
+                        Await WaitForSourceReadAccessAsync(filePath, cancellationToken).ConfigureAwait(False)
+                        attempt = 0
+                        Continue While
+                    End If
+
                     attempt += 1
                     If attempt > _options.MaxRetries Then
                         Exit While
@@ -1887,6 +2063,13 @@ Namespace Services
                 Catch ex As Exception
                     lastError = ex
                 End Try
+
+                If IsReadContentionException(lastError) AndAlso _options.WaitForFileLockRelease Then
+                    EmitLog($"Hash contention detected on {context}; waiting for lock release.")
+                    Await WaitForSourceReadAccessAsync(filePath, cancellationToken).ConfigureAwait(False)
+                    attempt = 0
+                    Continue While
+                End If
 
                 attempt += 1
                 If attempt > _options.MaxRetries Then
@@ -1952,6 +2135,86 @@ Namespace Services
             Await Task.Delay(delayMs, cancellationToken).ConfigureAwait(False)
         End Function
 
+        Private Sub EmitDestinationCapacityWarning(destinationRoot As String, totalBytes As Long)
+            If totalBytes <= 0 OrElse String.IsNullOrWhiteSpace(destinationRoot) Then
+                Return
+            End If
+
+            Try
+                Dim fullPath = Path.GetFullPath(destinationRoot)
+                Dim root = Path.GetPathRoot(fullPath)
+                If String.IsNullOrWhiteSpace(root) OrElse root.StartsWith("\\", StringComparison.OrdinalIgnoreCase) Then
+                    Return
+                End If
+
+                Dim drive = New DriveInfo(root)
+                If Not drive.IsReady Then
+                    Return
+                End If
+
+                If drive.AvailableFreeSpace < totalBytes Then
+                    EmitLog(
+                        $"Destination free-space warning: estimated {FormatBytes(totalBytes)} required, {FormatBytes(drive.AvailableFreeSpace)} available.")
+                End If
+            Catch
+                ' Ignore preflight failures and continue copy flow.
+            End Try
+        End Sub
+
+        Private Iterator Function GetJournalLoadCandidates(defaultPath As String, activePath As String) As IEnumerable(Of String)
+            Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+            Dim hintedPath = If(_options.ResumeJournalPathHint, String.Empty).Trim()
+            If hintedPath.Length > 0 AndAlso seen.Add(hintedPath) Then
+                Yield hintedPath
+            End If
+
+            If Not String.IsNullOrWhiteSpace(activePath) AndAlso seen.Add(activePath) Then
+                Yield activePath
+            End If
+
+            If Not String.IsNullOrWhiteSpace(defaultPath) AndAlso seen.Add(defaultPath) Then
+                Yield defaultPath
+            End If
+        End Function
+
+        Private Function ResolveWritableJournalPath(jobId As String, defaultJournalPath As String) As String
+            If IsJournalPathWritable(defaultJournalPath) Then
+                Return defaultJournalPath
+            End If
+
+            Dim fallbackDirectory = Path.Combine(Path.GetTempPath(), "XactCopy", "journals")
+            Dim fallbackPath = Path.Combine(fallbackDirectory, $"job-{jobId}.json")
+            If IsJournalPathWritable(fallbackPath) Then
+                EmitLog($"Journal path fallback active: {fallbackPath}")
+                Return fallbackPath
+            End If
+
+            Throw New IOException(
+                $"Unable to write journal at default path '{defaultJournalPath}' or fallback '{fallbackPath}'.")
+        End Function
+
+        Private Shared Function IsJournalPathWritable(journalPath As String) As Boolean
+            If String.IsNullOrWhiteSpace(journalPath) Then
+                Return False
+            End If
+
+            Try
+                Dim directoryPath = Path.GetDirectoryName(journalPath)
+                If String.IsNullOrWhiteSpace(directoryPath) Then
+                    Return False
+                End If
+
+                Directory.CreateDirectory(directoryPath)
+                Dim probePath = Path.Combine(directoryPath, $".xactcopy-probe-{Guid.NewGuid():N}.tmp")
+                File.WriteAllText(probePath, "ok")
+                File.Delete(probePath)
+                Return True
+            Catch
+                Return False
+            End Try
+        End Function
+
         Private Async Function FlushJournalAsync(
             journalPath As String,
             journal As JobJournal,
@@ -1997,6 +2260,244 @@ Namespace Services
             RaiseEvent ProgressChanged(Me, snapshot)
         End Sub
 
+        Private Sub InitializeMediaIdentityExpectations(sourceRoot As String, destinationRoot As String)
+            _expectedSourceIdentity = NormalizeIdentity(_options.ExpectedSourceIdentity)
+            _expectedDestinationIdentity = NormalizeIdentity(_options.ExpectedDestinationIdentity)
+
+            If _expectedSourceIdentity.Length = 0 Then
+                Dim sourceIdentity = ResolveMediaIdentity(sourceRoot)
+                If sourceIdentity.Length > 0 Then
+                    _expectedSourceIdentity = sourceIdentity
+                    _options.ExpectedSourceIdentity = sourceIdentity
+                    EmitLog("Source media identity baseline captured.")
+                End If
+            End If
+
+            If _expectedDestinationIdentity.Length = 0 Then
+                Dim destinationIdentity = ResolveMediaIdentity(destinationRoot)
+                If destinationIdentity.Length > 0 Then
+                    _expectedDestinationIdentity = destinationIdentity
+                    _options.ExpectedDestinationIdentity = destinationIdentity
+                    EmitLog("Destination media identity baseline captured.")
+                End If
+            End If
+        End Sub
+
+        Private Sub EnsureMediaIdentityIntegrity(sourceRoot As String, destinationRoot As String)
+            ThrowIfMediaIdentityMismatch(sourceRoot, _expectedSourceIdentity, isSource:=True)
+            ThrowIfMediaIdentityMismatch(destinationRoot, _expectedDestinationIdentity, isSource:=False)
+        End Sub
+
+        Private Function IsSourceAvailable(sourceRoot As String) As Boolean
+            If String.IsNullOrWhiteSpace(sourceRoot) Then
+                Return False
+            End If
+
+            If Not Directory.Exists(sourceRoot) Then
+                Return False
+            End If
+
+            Return IsMediaIdentityAccepted(sourceRoot, _expectedSourceIdentity, isSource:=True, allowAutoCapture:=True)
+        End Function
+
+        Private Function IsMediaIdentityAccepted(pathValue As String, ByRef expectedIdentity As String, isSource As Boolean, allowAutoCapture As Boolean) As Boolean
+            expectedIdentity = NormalizeIdentity(expectedIdentity)
+            Dim currentIdentity = ResolveMediaIdentity(pathValue)
+            If currentIdentity.Length = 0 Then
+                Return expectedIdentity.Length = 0
+            End If
+
+            If expectedIdentity.Length = 0 Then
+                If allowAutoCapture Then
+                    expectedIdentity = currentIdentity
+                    If isSource Then
+                        _expectedSourceIdentity = currentIdentity
+                        _options.ExpectedSourceIdentity = currentIdentity
+                    Else
+                        _expectedDestinationIdentity = currentIdentity
+                        _options.ExpectedDestinationIdentity = currentIdentity
+                    End If
+                    EmitLog($"{If(isSource, "Source", "Destination")} media identity baseline captured.")
+                End If
+
+                Return True
+            End If
+
+            If AreMediaIdentitiesEquivalent(expectedIdentity, currentIdentity) Then
+                Return True
+            End If
+
+            EmitMediaIdentityMismatch(isSource, expectedIdentity, currentIdentity, pathValue)
+            Return False
+        End Function
+
+        Private Sub ThrowIfMediaIdentityMismatch(pathValue As String, expectedIdentity As String, isSource As Boolean)
+            Dim expected = NormalizeIdentity(expectedIdentity)
+            If expected.Length = 0 Then
+                Return
+            End If
+
+            Dim currentIdentity = ResolveMediaIdentity(pathValue)
+            If currentIdentity.Length = 0 Then
+                Return
+            End If
+
+            If AreMediaIdentitiesEquivalent(expected, currentIdentity) Then
+                Return
+            End If
+
+            Throw New IOException(
+                $"{If(isSource, "Source", "Destination")} media identity mismatch. Expected '{expected}', found '{currentIdentity}'.")
+        End Sub
+
+        Private Function ResolveMediaIdentity(pathValue As String) As String
+            If String.IsNullOrWhiteSpace(pathValue) Then
+                Return String.Empty
+            End If
+
+            Dim fullPath As String
+            Try
+                fullPath = System.IO.Path.GetFullPath(pathValue)
+            Catch
+                Return String.Empty
+            End Try
+
+            Dim root = System.IO.Path.GetPathRoot(fullPath)
+            If String.IsNullOrWhiteSpace(root) Then
+                Return String.Empty
+            End If
+
+            Dim normalizedRoot = root.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar)
+            If normalizedRoot.StartsWith("\\", StringComparison.OrdinalIgnoreCase) Then
+                Dim uncShare = NormalizeUncShareRoot(normalizedRoot)
+                If uncShare.Length = 0 Then
+                    Return String.Empty
+                End If
+
+                Return "unc:" & uncShare.ToUpperInvariant()
+            End If
+
+            Dim serial As UInteger
+            If Not TryGetVolumeSerial(root, serial) Then
+                Return String.Empty
+            End If
+
+            Return $"vol:{serial:X8}"
+        End Function
+
+        Private Shared Function AreMediaIdentitiesEquivalent(expectedIdentity As String, currentIdentity As String) As Boolean
+            Dim expected = NormalizeIdentity(expectedIdentity)
+            Dim current = NormalizeIdentity(currentIdentity)
+            If expected.Length = 0 OrElse current.Length = 0 Then
+                Return expected.Length = current.Length
+            End If
+
+            If String.Equals(expected, current, StringComparison.OrdinalIgnoreCase) Then
+                Return True
+            End If
+
+            Dim expectedSerial As String = Nothing
+            Dim currentSerial As String = Nothing
+            If TryExtractVolumeSerial(expected, expectedSerial) AndAlso
+                TryExtractVolumeSerial(current, currentSerial) Then
+                Return String.Equals(expectedSerial, currentSerial, StringComparison.OrdinalIgnoreCase)
+            End If
+
+            Return False
+        End Function
+
+        Private Shared Function TryExtractVolumeSerial(identity As String, ByRef serial As String) As Boolean
+            serial = String.Empty
+            Dim normalized = NormalizeIdentity(identity)
+            If Not normalized.StartsWith("vol:", StringComparison.OrdinalIgnoreCase) Then
+                Return False
+            End If
+
+            Dim parts = normalized.Split(":"c, StringSplitOptions.RemoveEmptyEntries)
+            If parts.Length < 2 Then
+                Return False
+            End If
+
+            Dim candidate = parts(parts.Length - 1).Trim()
+            Dim parsed As UInteger
+            If Not UInteger.TryParse(candidate, NumberStyles.HexNumber, CultureInfo.InvariantCulture, parsed) Then
+                Return False
+            End If
+
+            serial = parsed.ToString("X8", CultureInfo.InvariantCulture)
+            Return True
+        End Function
+
+        Private Shared Function NormalizeUncShareRoot(value As String) As String
+            If String.IsNullOrWhiteSpace(value) Then
+                Return String.Empty
+            End If
+
+            Dim trimmed = value.Trim().Trim("\"c)
+            If trimmed.Length = 0 Then
+                Return String.Empty
+            End If
+
+            Dim parts = trimmed.Split("\"c, StringSplitOptions.RemoveEmptyEntries)
+            If parts.Length < 2 Then
+                Return String.Empty
+            End If
+
+            Return "\\" & parts(0) & "\" & parts(1)
+        End Function
+
+        Private Shared Function TryGetVolumeSerial(rootPath As String, ByRef serial As UInteger) As Boolean
+            serial = 0UI
+            If String.IsNullOrWhiteSpace(rootPath) Then
+                Return False
+            End If
+
+            Dim normalizedRoot = rootPath
+            If Not normalizedRoot.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal) AndAlso
+                Not normalizedRoot.EndsWith(Path.AltDirectorySeparatorChar.ToString(), StringComparison.Ordinal) Then
+                normalizedRoot &= Path.DirectorySeparatorChar
+            End If
+
+            Dim maxComponentLength As UInteger = 0UI
+            Dim fileSystemFlags As UInteger = 0UI
+
+            Return GetVolumeInformation(
+                normalizedRoot,
+                IntPtr.Zero,
+                0UI,
+                serial,
+                maxComponentLength,
+                fileSystemFlags,
+                IntPtr.Zero,
+                0UI)
+        End Function
+
+        Private Shared Function NormalizeIdentity(value As String) As String
+            Return If(value, String.Empty).Trim()
+        End Function
+
+        Private Sub EmitMediaIdentityMismatch(isSource As Boolean, expectedIdentity As String, currentIdentity As String, path As String)
+            Dim nowUtc = DateTimeOffset.UtcNow
+            If isSource Then
+                If _lastSourceIdentityMismatchLogUtc <> DateTimeOffset.MinValue AndAlso
+                    (nowUtc - _lastSourceIdentityMismatchLogUtc) < TimeSpan.FromSeconds(IdentityMismatchLogIntervalSeconds) Then
+                    Return
+                End If
+
+                _lastSourceIdentityMismatchLogUtc = nowUtc
+            Else
+                If _lastDestinationIdentityMismatchLogUtc <> DateTimeOffset.MinValue AndAlso
+                    (nowUtc - _lastDestinationIdentityMismatchLogUtc) < TimeSpan.FromSeconds(IdentityMismatchLogIntervalSeconds) Then
+                    Return
+                End If
+
+                _lastDestinationIdentityMismatchLogUtc = nowUtc
+            End If
+
+            EmitLog(
+                $"{If(isSource, "Source", "Destination")} media identity mismatch on '{path}'. Expected {expectedIdentity}, found {currentIdentity}.")
+        End Sub
+
         Private Async Function WaitForMediaAvailabilityAsync(
             sourceRoot As String,
             destinationRoot As String,
@@ -2011,7 +2512,7 @@ Namespace Services
                 cancellationToken.ThrowIfCancellationRequested()
                 Await _executionControl.WaitIfPausedAsync(cancellationToken).ConfigureAwait(False)
 
-                Dim sourceAvailable = Directory.Exists(sourceRoot)
+                Dim sourceAvailable = IsSourceAvailable(sourceRoot)
                 Dim destinationAvailable = IsDestinationAvailable(destinationRoot)
                 If sourceAvailable AndAlso destinationAvailable Then
                     Return
@@ -2027,8 +2528,12 @@ Namespace Services
             Loop
         End Function
 
-        Private Async Function WaitForSourceFileAsync(sourcePath As String, cancellationToken As CancellationToken) As Task
-            If Not _options.WaitForMediaAvailability Then
+        Private Async Function WaitForSourceFileAsync(
+            sourcePath As String,
+            cancellationToken As CancellationToken,
+            Optional allowWithoutMediaWait As Boolean = False) As Task
+
+            If Not _options.WaitForMediaAvailability AndAlso Not allowWithoutMediaWait Then
                 Return
             End If
 
@@ -2040,14 +2545,15 @@ Namespace Services
                 Dim directoryPath = Path.GetDirectoryName(sourcePath)
                 Dim fileAvailable = File.Exists(sourcePath)
                 Dim directoryAvailable = Not String.IsNullOrWhiteSpace(directoryPath) AndAlso Directory.Exists(directoryPath)
+                Dim identityAccepted = IsMediaIdentityAccepted(sourcePath, _expectedSourceIdentity, isSource:=True, allowAutoCapture:=True)
 
-                If fileAvailable Then
+                If fileAvailable AndAlso identityAccepted Then
                     Return
                 End If
 
                 Dim nowUtc = DateTimeOffset.UtcNow
                 If (nowUtc - lastLogUtc).TotalSeconds >= 5 Then
-                    EmitLog($"Waiting for source path: {sourcePath} (directory {(If(directoryAvailable, "online", "offline"))})")
+                    EmitLog($"Waiting for source path: {sourcePath} (directory {(If(directoryAvailable, "online", "offline"))}, identity {(If(identityAccepted, "ok", "mismatch/offline"))})")
                     lastLogUtc = nowUtc
                 End If
 
@@ -2082,7 +2588,93 @@ Namespace Services
             Loop
         End Function
 
-        Private Shared Function IsDestinationAvailable(targetPath As String) As Boolean
+        Private Async Function WaitForSourceReadAccessAsync(sourcePath As String, cancellationToken As CancellationToken) As Task
+            Await WaitForPathAccessAsync(
+                Function()
+                    If Not File.Exists(sourcePath) Then
+                        Return False
+                    End If
+
+                    Using stream = New FileStream(
+                        sourcePath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.ReadWrite Or FileShare.Delete,
+                        MinimumRescueBlockSize,
+                        FileOptions.None)
+                    End Using
+                    Return True
+                End Function,
+                $"Waiting for source lock/access release: {sourcePath}",
+                cancellationToken).ConfigureAwait(False)
+        End Function
+
+        Private Async Function WaitForDestinationWriteAccessAsync(destinationPath As String, cancellationToken As CancellationToken) As Task
+            Await WaitForPathAccessAsync(
+                Function()
+                    Dim directoryPath = Path.GetDirectoryName(destinationPath)
+                    If Not String.IsNullOrWhiteSpace(directoryPath) Then
+                        Directory.CreateDirectory(directoryPath)
+                    End If
+
+                    Using stream = New FileStream(
+                        destinationPath,
+                        FileMode.OpenOrCreate,
+                        FileAccess.Write,
+                        FileShare.Read,
+                        MinimumRescueBlockSize,
+                        FileOptions.None)
+                    End Using
+                    Return True
+                End Function,
+                $"Waiting for destination lock/access release: {destinationPath}",
+                cancellationToken).ConfigureAwait(False)
+        End Function
+
+        Private Async Function WaitForPathAccessAsync(
+            probe As Func(Of Boolean),
+            logText As String,
+            cancellationToken As CancellationToken) As Task
+
+            Dim lastLogUtc = DateTimeOffset.MinValue
+            Dim waitInterval = _options.LockContentionProbeInterval
+            If waitInterval <= TimeSpan.Zero Then
+                waitInterval = TimeSpan.FromMilliseconds(500)
+            End If
+
+            Do
+                cancellationToken.ThrowIfCancellationRequested()
+                Await _executionControl.WaitIfPausedAsync(cancellationToken).ConfigureAwait(False)
+
+                Dim ready = False
+                Try
+                    ready = probe()
+                Catch
+                    ready = False
+                End Try
+
+                If ready Then
+                    Return
+                End If
+
+                If _options.WaitForMediaAvailability Then
+                    Try
+                        Await WaitForMediaAvailabilityAsync(_options.SourceRoot, _options.DestinationRoot, cancellationToken).ConfigureAwait(False)
+                    Catch
+                    End Try
+                End If
+
+                Dim nowUtc = DateTimeOffset.UtcNow
+                If (nowUtc - lastLogUtc).TotalSeconds >= 5 Then
+                    EmitLog(logText)
+                    lastLogUtc = nowUtc
+                End If
+
+                Await Task.Delay(waitInterval, cancellationToken).ConfigureAwait(False)
+            Loop
+        End Function
+
+        Private Function IsDestinationAvailable(targetPath As String) As Boolean
             If String.IsNullOrWhiteSpace(targetPath) Then
                 Return False
             End If
@@ -2094,44 +2686,215 @@ Namespace Services
                     Return False
                 End If
 
-                Directory.CreateDirectory(fullPath)
-                Return True
+                If Not IsMediaIdentityAccepted(fullPath, _expectedDestinationIdentity, isSource:=False, allowAutoCapture:=True) Then
+                    Return False
+                End If
+
+                Dim probePath = fullPath
+                If File.Exists(probePath) Then
+                    Return True
+                End If
+
+                If Directory.Exists(probePath) Then
+                    Return True
+                End If
+
+                Dim parentPath = Path.GetDirectoryName(probePath)
+                While Not String.IsNullOrWhiteSpace(parentPath)
+                    If Directory.Exists(parentPath) Then
+                        Return True
+                    End If
+
+                    Dim nextParent = Path.GetDirectoryName(parentPath)
+                    If String.Equals(nextParent, parentPath, StringComparison.OrdinalIgnoreCase) Then
+                        Exit While
+                    End If
+
+                    parentPath = nextParent
+                End While
             Catch
-                Return False
             End Try
+
+            Return False
         End Function
 
-        Private Shared Function IsAvailabilityRelatedException(ex As Exception) As Boolean
+        Private Shared Function IsAvailabilityRelatedException(ex As Exception, Optional includeFileNotFound As Boolean = True) As Boolean
             If ex Is Nothing Then
                 Return False
             End If
 
-            If TypeOf ex Is DriveNotFoundException OrElse TypeOf ex Is DirectoryNotFoundException Then
+            For Each candidate In EnumerateExceptionChain(ex)
+                If TypeOf candidate Is DriveNotFoundException OrElse TypeOf candidate Is DirectoryNotFoundException Then
+                    Return True
+                End If
+
+                Dim win32Code As Integer
+                If TryGetWin32ErrorCode(candidate, win32Code) Then
+                    Select Case win32Code
+                        Case ErrorPathNotFound, ErrorNotReady, ErrorBadNetPath, ErrorNetNameDeleted, ErrorBadNetName, ErrorDeviceNotConnected
+                            Return True
+                        Case ErrorFileNotFound
+                            If includeFileNotFound Then
+                                Return True
+                            End If
+                    End Select
+                End If
+
+                Dim ioEx = TryCast(candidate, IOException)
+                If ioEx IsNot Nothing Then
+                    Dim message = ioEx.Message.ToLowerInvariant()
+                    If message.Contains("device is not ready") OrElse
+                        message.Contains("network path") OrElse
+                        message.Contains("network name") OrElse
+                        message.Contains("specified network") OrElse
+                        message.Contains("media identity mismatch") Then
+                        Return True
+                    End If
+
+                    If includeFileNotFound AndAlso
+                        (message.Contains("cannot find the path") OrElse message.Contains("file not found")) Then
+                        Return True
+                    End If
+                End If
+            Next
+
+            Return False
+        End Function
+
+        Private Shared Function IsDiskFullException(ex As Exception) As Boolean
+            If ex Is Nothing Then
+                Return False
+            End If
+
+            For Each candidate In EnumerateExceptionChain(ex)
+                Dim win32Code As Integer
+                If TryGetWin32ErrorCode(candidate, win32Code) Then
+                    If win32Code = ErrorDiskFull OrElse win32Code = ErrorHandleDiskFull Then
+                        Return True
+                    End If
+                End If
+
+                Dim ioEx = TryCast(candidate, IOException)
+                If ioEx IsNot Nothing Then
+                    Dim message = ioEx.Message.ToLowerInvariant()
+                    If message.Contains("not enough space") OrElse
+                        message.Contains("disk full") OrElse
+                        message.Contains("there is not enough space") Then
+                        Return True
+                    End If
+                End If
+            Next
+
+            Return False
+        End Function
+
+        Private Shared Function IsAccessDeniedException(ex As Exception) As Boolean
+            If ex Is Nothing Then
+                Return False
+            End If
+
+            For Each candidate In EnumerateExceptionChain(ex)
+                If TypeOf candidate Is UnauthorizedAccessException Then
+                    Return True
+                End If
+
+                Dim win32Code As Integer
+                If TryGetWin32ErrorCode(candidate, win32Code) AndAlso win32Code = ErrorAccessDenied Then
+                    Return True
+                End If
+            Next
+
+            Return False
+        End Function
+
+        Private Shared Function IsFileLockException(ex As Exception) As Boolean
+            If ex Is Nothing Then
+                Return False
+            End If
+
+            For Each candidate In EnumerateExceptionChain(ex)
+                Dim win32Code As Integer
+                If TryGetWin32ErrorCode(candidate, win32Code) Then
+                    If win32Code = ErrorSharingViolation OrElse win32Code = ErrorLockViolation Then
+                        Return True
+                    End If
+                End If
+            Next
+
+            Return False
+        End Function
+
+        Private Shared Function IsSourceFileMissingException(ex As Exception) As Boolean
+            If ex Is Nothing Then
+                Return False
+            End If
+
+            For Each candidate In EnumerateExceptionChain(ex)
+                If TypeOf candidate Is FileNotFoundException Then
+                    Return True
+                End If
+
+                Dim win32Code As Integer
+                If TryGetWin32ErrorCode(candidate, win32Code) Then
+                    If win32Code = ErrorFileNotFound OrElse win32Code = ErrorPathNotFound Then
+                        Return True
+                    End If
+                End If
+            Next
+
+            Return False
+        End Function
+
+        Private Function IsReadContentionException(ex As Exception) As Boolean
+            Return IsFileLockException(ex) OrElse (_options.TreatAccessDeniedAsContention AndAlso IsAccessDeniedException(ex))
+        End Function
+
+        Private Function IsWriteContentionException(ex As Exception) As Boolean
+            Return IsFileLockException(ex) OrElse (_options.TreatAccessDeniedAsContention AndAlso IsAccessDeniedException(ex))
+        End Function
+
+        Private Shared Iterator Function EnumerateExceptionChain(ex As Exception) As IEnumerable(Of Exception)
+            Dim current = ex
+            While current IsNot Nothing
+                Yield current
+                current = current.InnerException
+            End While
+        End Function
+
+        Private Shared Function TryGetWin32ErrorCode(ex As Exception, ByRef code As Integer) As Boolean
+            code = 0
+            If ex Is Nothing Then
+                Return False
+            End If
+
+            Dim hresult = ex.HResult
+            Dim facility = (hresult >> 16) And &H1FFF
+            If facility = 7 Then
+                code = hresult And &HFFFF
                 Return True
             End If
 
-            Dim ioEx = TryCast(ex, IOException)
-            If ioEx Is Nothing Then
-                Return False
-            End If
-
-            Dim message = ioEx.Message.ToLowerInvariant()
-            Return message.Contains("device is not ready") OrElse
-                message.Contains("network path") OrElse
-                message.Contains("network name") OrElse
-                message.Contains("cannot find the path") OrElse
-                message.Contains("specified network")
+            Return False
         End Function
 
-        Private Shared Function IsFatalReadException(ex As Exception) As Boolean
+        Private Shared Function IsFatalReadException(ex As Exception, treatAccessDeniedAsContention As Boolean) As Boolean
             If ex Is Nothing Then
                 Return False
             End If
 
-            Return TypeOf ex Is UnauthorizedAccessException OrElse
-                TypeOf ex Is NotSupportedException OrElse
-                TypeOf ex Is System.Security.SecurityException OrElse
-                TypeOf ex Is ArgumentException
+            If Not treatAccessDeniedAsContention AndAlso IsAccessDeniedException(ex) Then
+                Return True
+            End If
+
+            For Each candidate In EnumerateExceptionChain(ex)
+                If TypeOf candidate Is NotSupportedException OrElse
+                    TypeOf candidate Is System.Security.SecurityException OrElse
+                    TypeOf candidate Is ArgumentException Then
+                    Return True
+                End If
+            Next
+
+            Return False
         End Function
 
         Private Function ResolveVerificationMode() As VerificationMode
@@ -2354,6 +3117,283 @@ Namespace Services
             End Sub
         End Class
 
+#If DEBUG Then
+        Private NotInheritable Class DevFaultInjector
+            Private Const RulesEnvVar As String = "XACTCOPY_DEV_FAULT_RULES"
+            Private Const SeedEnvVar As String = "XACTCOPY_DEV_FAULT_SEED"
+
+            Private ReadOnly _rules As List(Of DevFaultRule)
+            Private ReadOnly _random As Random
+            Private ReadOnly _syncRoot As New Object()
+
+            Private Sub New(rules As IEnumerable(Of DevFaultRule), seed As Integer)
+                _rules = rules.ToList()
+                _random = New Random(seed)
+            End Sub
+
+            Public ReadOnly Property Description As String
+                Get
+                    Return $"{_rules.Count} rule(s) via {RulesEnvVar}"
+                End Get
+            End Property
+
+            Public Shared Function TryCreateFromEnvironment() As DevFaultInjector
+                Dim rawRules = Environment.GetEnvironmentVariable(RulesEnvVar)
+                If String.IsNullOrWhiteSpace(rawRules) Then
+                    Return Nothing
+                End If
+
+                Dim parsedRules As New List(Of DevFaultRule)()
+                For Each token In rawRules.Split(";"c)
+                    Dim candidate = token.Trim()
+                    If candidate.Length = 0 Then
+                        Continue For
+                    End If
+
+                    Dim parsedRule As DevFaultRule = Nothing
+                    If DevFaultRule.TryParse(candidate, parsedRule) Then
+                        parsedRules.Add(parsedRule)
+                    End If
+                Next
+
+                If parsedRules.Count = 0 Then
+                    Return Nothing
+                End If
+
+                Dim seed = 1337
+                Dim rawSeed = Environment.GetEnvironmentVariable(SeedEnvVar)
+                If Not String.IsNullOrWhiteSpace(rawSeed) Then
+                    Dim parsedSeed As Integer
+                    If Integer.TryParse(rawSeed, NumberStyles.Integer, CultureInfo.InvariantCulture, parsedSeed) Then
+                        seed = parsedSeed
+                    End If
+                End If
+
+                Return New DevFaultInjector(parsedRules, seed)
+            End Function
+
+            Public Function CreateReadFault(relativePath As String, offset As Long, length As Integer) As Exception
+                Return CreateFault(DevFaultOperation.ReadOperation, relativePath, offset, length)
+            End Function
+
+            Public Function CreateWriteFault(relativePath As String, offset As Long, length As Integer) As Exception
+                Return CreateFault(DevFaultOperation.WriteOperation, relativePath, offset, length)
+            End Function
+
+            Private Function CreateFault(
+                operationType As DevFaultOperation,
+                relativePath As String,
+                offset As Long,
+                length As Integer) As Exception
+
+                SyncLock _syncRoot
+                    For Each rule In _rules
+                        Dim injected = rule.TryCreateFault(operationType, relativePath, offset, length, _random)
+                        If injected IsNot Nothing Then
+                            Return injected
+                        End If
+                    Next
+                End SyncLock
+
+                Return Nothing
+            End Function
+        End Class
+
+        Private Enum DevFaultOperation
+            ReadOperation = 0
+            WriteOperation = 1
+        End Enum
+
+        Private Enum DevFaultTriggerMode
+            Once = 0
+            Always = 1
+            Percent = 2
+            Every = 3
+        End Enum
+
+        Private Enum DevFaultErrorKind
+            Io = 0
+            Timeout = 1
+            Offline = 2
+        End Enum
+
+        Private NotInheritable Class DevFaultRule
+            Private ReadOnly _operation As DevFaultOperation
+            Private ReadOnly _offset As Long
+            Private ReadOnly _length As Long
+            Private ReadOnly _trigger As DevFaultTriggerMode
+            Private ReadOnly _errorKind As DevFaultErrorKind
+            Private ReadOnly _parameter As Integer
+            Private _matchCount As Integer
+            Private _fireCount As Integer
+
+            Private Sub New(
+                operationType As DevFaultOperation,
+                offset As Long,
+                length As Long,
+                trigger As DevFaultTriggerMode,
+                errorKind As DevFaultErrorKind,
+                parameter As Integer)
+
+                _operation = operationType
+                _offset = Math.Max(0L, offset)
+                _length = Math.Max(0L, length)
+                _trigger = trigger
+                _errorKind = errorKind
+                _parameter = Math.Max(0, parameter)
+            End Sub
+
+            Public Shared Function TryParse(text As String, ByRef rule As DevFaultRule) As Boolean
+                rule = Nothing
+                If String.IsNullOrWhiteSpace(text) Then
+                    Return False
+                End If
+
+                ' Rule format:
+                ' op,offset,length,mode,error[,param]
+                ' Example:
+                ' read,4096,4096,always,io
+                ' write,0,0,percent,io,30
+                Dim parts = text.Split(","c)
+                If parts.Length < 5 Then
+                    Return False
+                End If
+
+                Dim operationType As DevFaultOperation
+                Select Case parts(0).Trim().ToLowerInvariant()
+                    Case "read"
+                        operationType = DevFaultOperation.ReadOperation
+                    Case "write"
+                        operationType = DevFaultOperation.WriteOperation
+                    Case Else
+                        Return False
+                End Select
+
+                Dim offset As Long
+                If Not Long.TryParse(parts(1).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, offset) Then
+                    Return False
+                End If
+
+                Dim length As Long
+                If Not Long.TryParse(parts(2).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, length) Then
+                    Return False
+                End If
+
+                Dim trigger As DevFaultTriggerMode
+                Select Case parts(3).Trim().ToLowerInvariant()
+                    Case "once"
+                        trigger = DevFaultTriggerMode.Once
+                    Case "always"
+                        trigger = DevFaultTriggerMode.Always
+                    Case "percent"
+                        trigger = DevFaultTriggerMode.Percent
+                    Case "every"
+                        trigger = DevFaultTriggerMode.Every
+                    Case Else
+                        Return False
+                End Select
+
+                Dim errorKind As DevFaultErrorKind
+                Select Case parts(4).Trim().ToLowerInvariant()
+                    Case "io"
+                        errorKind = DevFaultErrorKind.Io
+                    Case "timeout"
+                        errorKind = DevFaultErrorKind.Timeout
+                    Case "offline"
+                        errorKind = DevFaultErrorKind.Offline
+                    Case Else
+                        Return False
+                End Select
+
+                Dim parameter = 0
+                If parts.Length >= 6 Then
+                    Integer.TryParse(parts(5).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, parameter)
+                End If
+
+                If trigger = DevFaultTriggerMode.Percent Then
+                    parameter = Math.Clamp(parameter, 1, 100)
+                ElseIf trigger = DevFaultTriggerMode.Every Then
+                    parameter = Math.Max(1, parameter)
+                End If
+
+                rule = New DevFaultRule(operationType, offset, length, trigger, errorKind, parameter)
+                Return True
+            End Function
+
+            Public Function TryCreateFault(
+                operationType As DevFaultOperation,
+                relativePath As String,
+                offset As Long,
+                length As Integer,
+                random As Random) As Exception
+
+                If operationType <> _operation Then
+                    Return Nothing
+                End If
+
+                If length <= 0 Then
+                    Return Nothing
+                End If
+
+                If Not Overlaps(offset, length) Then
+                    Return Nothing
+                End If
+
+                _matchCount += 1
+                If Not ShouldTrigger(random) Then
+                    Return Nothing
+                End If
+
+                _fireCount += 1
+                Return BuildException(relativePath, offset, length)
+            End Function
+
+            Private Function Overlaps(offset As Long, length As Integer) As Boolean
+                Dim requestStart = Math.Max(0L, offset)
+                Dim requestEnd = requestStart + Math.Max(0L, CLng(length))
+                If requestEnd <= requestStart Then
+                    Return False
+                End If
+
+                Dim ruleStart = _offset
+                Dim ruleEnd = If(_length <= 0, Long.MaxValue, ruleStart + _length)
+                Return requestStart < ruleEnd AndAlso requestEnd > ruleStart
+            End Function
+
+            Private Function ShouldTrigger(random As Random) As Boolean
+                Select Case _trigger
+                    Case DevFaultTriggerMode.Once
+                        Return _fireCount = 0
+                    Case DevFaultTriggerMode.Always
+                        Return True
+                    Case DevFaultTriggerMode.Percent
+                        Dim chance = Math.Clamp(_parameter, 1, 100)
+                        Return random.Next(0, 100) < chance
+                    Case DevFaultTriggerMode.Every
+                        Dim interval = Math.Max(1, _parameter)
+                        Return (_matchCount Mod interval) = 0
+                    Case Else
+                        Return False
+                End Select
+            End Function
+
+            Private Function BuildException(relativePath As String, offset As Long, length As Integer) As Exception
+                Dim operationLabel = If(_operation = DevFaultOperation.ReadOperation, "read", "write")
+                Dim pathLabel = If(String.IsNullOrWhiteSpace(relativePath), "?", relativePath)
+                Dim message = $"[DevFault] Injected {operationLabel} fault on {pathLabel} at {FormatBytes(offset)} ({length} B)."
+
+                Select Case _errorKind
+                    Case DevFaultErrorKind.Timeout
+                        Return New TimeoutException(message)
+                    Case DevFaultErrorKind.Offline
+                        Return New DriveNotFoundException(message)
+                    Case Else
+                        Return New IOException(message)
+                End Select
+            End Function
+        End Class
+#End If
+
         Private NotInheritable Class ProgressAccumulator
             Public Property TotalFiles As Integer
             Public Property TotalBytes As Long
@@ -2362,6 +3402,14 @@ Namespace Services
             Public Property FailedFiles As Integer
             Public Property RecoveredFiles As Integer
             Public Property SkippedFiles As Integer
+        End Class
+
+        Private NotInheritable Class SourceMutationSkippedException
+            Inherits IOException
+
+            Public Sub New(message As String, innerException As Exception)
+                MyBase.New(message, innerException)
+            End Sub
         End Class
     End Class
 End Namespace
