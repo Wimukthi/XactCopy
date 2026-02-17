@@ -64,6 +64,7 @@ dotnet run --project src/XactCopy.UI/XactCopy.UI.vbproj
 
 ## Brief Version History
 
+- `v1.0.5.9` Hardened journal integrity with signed hash-chained ledger records, multi-generation backups, mirrored snapshots, trust/sequence-aware recovery fallback, and legacy journal compatibility retention.
 - `v1.0.5.8` Added advanced resilience hardening: remap-and-resume from existing journals after path/media failures, configurable lock/AV contention handling, policy-based source-mutation behavior (fail/skip/wait), and serial-based media identity matching that is safer across drive-letter remaps.
 - `v1.0.5.0` Added a major worker performance milestone with handle-based `RandomAccess` chunk I/O, adaptive and reverse-direction rescue passes, and a dedicated small-file fast path for lower overhead and steadier throughput.
 - `v1.0.4.9` Optimized worker copy throughput by pooling hot-path buffers, reusing per-file transfer streams, and reducing retry-path allocation/stream churn for smoother sustained transfers.

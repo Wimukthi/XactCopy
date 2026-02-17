@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.5.9] - 2026-02-17
+
+### Added
+
+- Journal durability and anti-corruption hardening:
+  - Multi-generation snapshot backups (`.bak1`..`.bak3`) for each journal save.
+  - Mirrored journal snapshots under `%LocalAppData%\XactCopy\journals-mirror`.
+  - Append-only journal ledger (`.ledger`) with framed records and checksum validation.
+  - Hash-chained, HMAC-signed ledger records and signed anchor metadata (`.anchor`) to detect tampering and rollback.
+
+### Changed
+
+- Journal load/recovery selection is now trust-aware and sequence-aware:
+  - Prefers the newest signed snapshot recorded in trusted ledger history.
+  - Falls back across primary, backup, and mirror candidates when corruption or loss is detected.
+- Added journal seed-state caching in the storage layer to avoid repeated full-ledger scans during frequent save flushes.
+- Journal normalization on load/save now enforces stable defaults for IDs/timestamps/file-entry maps before persistence decisions.
+
+### Fixed
+
+- Resume reliability is improved when the primary journal file is modified or partially corrupted: signed backup/mirror states are now used automatically.
+- Legacy plain-JSON journals remain loadable when signed metadata does not yet exist, preserving backward compatibility.
+
 ## [1.0.5.8] - 2026-02-17
 
 ### Added
