@@ -10,10 +10,12 @@ GNU GPL v3.0. See `LICENSE`.
 
 - Out-of-process worker process with supervisor restart handling.
 - Journal-based resume and recovery after unexpected exits.
+- Scan-only bad-block detection mode (`Scan Bad Blocks`) with reusable bad-range maps.
 - Pause/resume/cancel controls with run-state persistence.
 - Salvage mode for unreadable sectors with configurable fill pattern.
 - Retry/backoff timeout controls for degraded disks.
 - Adaptive buffer mode with live speed, ETA, and buffer telemetry.
+- AegisRescueCore multi-pass recovery pipeline with tunable pass parameters.
 - Job manager (saved jobs, queue, history).
 - Explorer context menu integration (`Copy with XactCopy`).
 - Dark/system/classic theme support.
@@ -47,6 +49,12 @@ dotnet test XactCopy.slnx
 dotnet run --project src/XactCopy.UI/XactCopy.UI.vbproj
 ```
 
+## Publish (Windows x64)
+
+```powershell
+dotnet publish src/XactCopy.UI/XactCopy.UI.vbproj -c Release -r win-x64 --self-contained false -o artifacts/publish/win-x64
+```
+
 ## Versioning
 
 - A monotonic build counter is stored in `src/XactCopy.UI/BuildVersion.txt`.
@@ -61,9 +69,12 @@ dotnet run --project src/XactCopy.UI/XactCopy.UI.vbproj
 
 - Changelog entries: `CHANGELOG.md`
 - Release process notes: `docs/RELEASE_PROCESS.md`
+- Architecture overview: `ARCHITECTURE.md`
+- Contribution guide: `CONTRIBUTING.md`
 
 ## Brief Version History
 
+- `v1.0.6.3` Performed a focused codebase comment pass and refreshed project documentation (`ARCHITECTURE`, `README`, `CONTRIBUTING`, and release process docs) to match current scan-mode, bad-range-map, and resiliency behavior.
 - `v1.0.6.2` Added scan-only bad-block mode with reusable bad-range maps, fixed scan/copy mode separation bugs, preserved drive-root path normalization (`D:\`), and updated title-bar mode text to show `Scanning` during scan runs.
 - `v1.0.5.9` Hardened journal integrity with signed hash-chained ledger records, multi-generation backups, mirrored snapshots, trust/sequence-aware recovery fallback, and legacy journal compatibility retention.
 - `v1.0.5.8` Added advanced resilience hardening: remap-and-resume from existing journals after path/media failures, configurable lock/AV contention handling, policy-based source-mutation behavior (fail/skip/wait), and serial-based media identity matching that is safer across drive-letter remaps.

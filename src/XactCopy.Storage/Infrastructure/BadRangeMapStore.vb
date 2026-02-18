@@ -8,6 +8,10 @@ Imports System.Threading
 Imports XactCopy.Models
 
 Namespace Infrastructure
+    ''' <summary>
+    ''' Durable bad-range map persistence with atomic writes, rotating backups, mirrored snapshots,
+    ''' and signed envelopes to detect tampering/corruption.
+    ''' </summary>
     Public Class BadRangeMapStore
         Private Const BackupGenerationCount As Integer = 2
         Private Const SecurityKeyFileName As String = "badmap-hmac.key"
@@ -52,7 +56,7 @@ Namespace Infrastructure
                 End If
             Next
 
-            ' Legacy compatibility: plain-map snapshots without envelope/signature.
+            ' Legacy compatibility: accept pre-envelope snapshots so existing installs keep working.
             For Each candidate In candidates
                 Dim legacyMap = Await TryLoadLegacyAsync(candidate, cancellationToken).ConfigureAwait(False)
                 If legacyMap IsNot Nothing Then
@@ -92,6 +96,7 @@ Namespace Infrastructure
             Dim envelopeBytes = JsonSerializer.SerializeToUtf8Bytes(envelope, _serializerOptions)
             Dim mirrorPath = BuildMirrorMapPath(mapPath)
 
+            ' Primary + mirror snapshots reduce single-path corruption/loss risk.
             Await SaveSnapshotSetAsync(mapPath, envelopeBytes, cancellationToken).ConfigureAwait(False)
             Await SaveSnapshotSetAsync(mirrorPath, envelopeBytes, cancellationToken).ConfigureAwait(False)
         End Function
@@ -165,6 +170,7 @@ Namespace Infrastructure
             cancellationToken As CancellationToken) As Task
 
             EnsureDirectoryForPath(snapshotPath)
+            ' Keep the last N known-good states before replacing the live snapshot.
             RotateBackups(snapshotPath)
             Await WriteAtomicBytesAsync(snapshotPath, payload, cancellationToken).ConfigureAwait(False)
         End Function
@@ -193,6 +199,7 @@ Namespace Infrastructure
                     stream.Flush(flushToDisk:=True)
                 End Using
 
+                ' Single rename is the commit point; partial temp files are never treated as live state.
                 File.Move(tempPath, path, overwrite:=True)
             Catch
                 If File.Exists(tempPath) Then
@@ -348,6 +355,7 @@ Namespace Infrastructure
                 End If
 
                 If loadedKey Is Nothing OrElse loadedKey.Length <> HmacKeySizeBytes Then
+                    ' Regenerate key if missing/invalid and persist atomically.
                     loadedKey = New Byte(HmacKeySizeBytes - 1) {}
                     RandomNumberGenerator.Fill(loadedKey)
 

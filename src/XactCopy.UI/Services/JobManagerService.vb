@@ -755,6 +755,7 @@ Namespace Services
                 Return New CopyJobOptions()
             End If
 
+            ' Jobs/runs keep an independent option snapshot to preserve historical accuracy.
             Return New CopyJobOptions() With {
                 .OperationMode = options.OperationMode,
                 .SourceRoot = options.SourceRoot,

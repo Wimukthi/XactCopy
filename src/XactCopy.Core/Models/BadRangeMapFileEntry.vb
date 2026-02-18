@@ -1,4 +1,7 @@
 Namespace Models
+    ''' <summary>
+    ''' Per-file bad-range metadata stored inside <see cref="BadRangeMap"/>.
+    ''' </summary>
     Public Class BadRangeMapFileEntry
         Public Property RelativePath As String = String.Empty
         Public Property SourceLength As Long

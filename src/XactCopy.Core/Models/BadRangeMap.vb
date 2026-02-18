@@ -1,4 +1,7 @@
 Namespace Models
+    ''' <summary>
+    ''' Persistent source-level map of known unreadable byte regions discovered during scan/copy runs.
+    ''' </summary>
     Public Class BadRangeMap
         Public Property SchemaVersion As Integer = 1
         Public Property SourceRoot As String = String.Empty

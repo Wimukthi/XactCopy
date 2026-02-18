@@ -505,6 +505,7 @@ Namespace Services
                 Return New CopyJobOptions()
             End If
 
+            ' Full deep clone protects active dispatch state from live UI mutations.
             Return New CopyJobOptions() With {
                 .OperationMode = options.OperationMode,
                 .SourceRoot = options.SourceRoot,

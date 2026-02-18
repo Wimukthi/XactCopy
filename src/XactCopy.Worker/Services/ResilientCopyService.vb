@@ -164,6 +164,8 @@ Namespace Services
 
                 Dim entry = journal.Files(descriptor.RelativePath)
 
+                ' Overwrite/existing-destination semantics are copy-only. Scan mode must always
+                ' attempt source reads to discover bad ranges.
                 If Not scanOnly Then
                     Dim skipReason As String = String.Empty
                     If ShouldSkipByOverwritePolicy(descriptor, destinationRoot, skipReason) Then
@@ -373,6 +375,7 @@ Namespace Services
             End If
 
             If scanOnly AndAlso String.IsNullOrWhiteSpace(_options.DestinationRoot) Then
+                ' Scan mode is read-only; worker keeps destination aligned to source for journal IDs.
                 _options.DestinationRoot = _options.SourceRoot
             End If
 
@@ -1189,6 +1192,7 @@ Namespace Services
         End Function
 
         Private Shared Function TrimTrailingSeparatorsPreservingRoot(pathValue As String) As String
+            ' Preserve roots such as "D:\" to avoid accidental drive-relative normalization ("D:").
             If String.IsNullOrWhiteSpace(pathValue) Then
                 Return String.Empty
             End If

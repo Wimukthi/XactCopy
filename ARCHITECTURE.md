@@ -1,85 +1,108 @@
 # XactCopy Architecture
 
-## Goal
+## Objective
 
-Copy files from unstable media with maximal forward progress, predictable recovery, and minimal operator babysitting.
+XactCopy is a resilient Windows file mover/scanner designed for unstable sources and destinations (failing disks, intermittent USB/network paths, lock contention, and unclean exits). The design prioritizes:
 
-## Reliability Contract
+- Maximum forward progress.
+- Recoverability after interruption.
+- Clear operator control of risk/performance tradeoffs.
+- UI responsiveness while heavy I/O runs in a separate process.
 
-- The app must stay responsive while copying.
-- Single-file failures must not crash the process.
-- Copy progress must survive app restarts through a durable journal.
-- I/O stalls must be bounded by retry + timeout policy.
-- Worker process failure/stall must be recoverable without restarting the UI.
-- Operators must be able to choose strict mode or salvage mode.
+## Runtime Topology
 
-## Main Components
+### `XactCopy.UI` (WinForms host)
 
-### `XactCopy.UI` (`MainForm` + `WorkerSupervisor`)
+- Owns user interaction, settings, theming, queue/jobs, and updater UX.
+- Dispatches runs through `WorkerSupervisor`.
+- Persists recovery metadata and can auto-prompt resume after unclean exits.
+- Applies throttled progress/log updates to keep UI responsive under high event rates.
 
-- GUI for configuring source/destination and reliability options.
-- Starts and cancels copy jobs asynchronously.
-- Displays live progress, per-file status, and event logs.
-- Supervises the worker with heartbeat timeout detection.
-- Restarts worker automatically and reissues the active job command when safe.
+### `XactCopy.Worker` (`XactCopyExecutive`)
 
-### `XactCopy.Worker` (`Program` + `ResilientCopyService`)
+- Out-of-process execution engine connected via versioned named-pipe IPC.
+- Runs copy/scan pipelines, retry/backoff, rescue passes, verification, and persistence flushes.
+- Emits structured progress, logs, heartbeats, completion, and fatal events.
 
-- Hosts a named-pipe server and executes copy jobs out-of-process.
-- Emits heartbeat, progress, log, result, and fatal messages over IPC.
-- Runs block-based copy with retry/timeout/salvage semantics.
+### Shared libraries
 
-### `XactCopy.Core`
+- `XactCopy.Core`: run options, contracts, enums, and shared models.
+- `XactCopy.Storage`: durable stores for journal and bad-range map state.
 
-- Shared copy models.
-- Versioned IPC envelope/message contract.
-- Length-prefixed JSON message framing utilities.
+## Core Data Stores
 
-### `XactCopy.Storage` (`JobJournalStore`)
+### Job Journal (`JobJournalStore`)
 
-- Atomic journal persistence (temp-write + replace).
-- Deterministic job IDs from source/destination pair.
-- Resume state for file bytes copied and recovered ranges.
+- Tracks per-file state and range coverage so runs can resume.
+- Uses atomic write/replace semantics with integrity hardening:
+  - Multi-generation backups.
+  - Mirror snapshots.
+  - Signed/hash-chained ledger metadata.
+- Recovery loads prefer trusted/latest candidates and gracefully fall back across snapshot sets.
 
-### `DirectoryScanner` (worker)
+### Bad-Range Map (`BadRangeMapStore`)
 
-- Enumerates the source tree safely.
-- Catches per-directory/per-file enumeration failures and logs them.
+- Source-scoped map of unreadable byte ranges discovered by scan/copy.
+- Used to seed rescue state and optionally skip known-bad ranges on later runs.
+- Persisted with:
+  - Atomic writes.
+  - Rotating backups.
+  - Mirror snapshots.
+  - Signed envelope validation with per-machine HMAC key.
+- Legacy plain JSON maps remain readable for backward compatibility.
 
-## Copy Pipeline
+## Operation Modes
 
-1. Validate options and normalize paths.
-2. Scan source files and build/merge journal.
-3. For each file:
-   - Resume from saved offset when possible.
-   - Read block with timeout and retries.
-   - If read still fails and salvage is enabled, zero-fill block and continue.
-   - Write block with timeout and retries.
-   - Persist journal periodically and on important transitions.
-4. Optionally verify with SHA-256 (only when no salvage blocks were used).
-5. Emit final result summary.
+### `Copy`
 
-## Failure Behavior
+- Source-to-destination transfer with overwrite policy, verification policy, salvage policy, and retry profile.
+- Existing destination handling (`overwrite/skip/newer/ask`) is applied.
+- Optional `AegisRescueCore` passes recover difficult regions.
 
-- Read timeout or transient `IOException`: retry with exponential backoff.
-- Persistent read failure:
-  - Salvage enabled: fill block with zeros and continue.
-  - Salvage disabled: fail file.
-- Write timeout/failure: retry, then fail file if retries are exhausted.
-- File failure:
-  - Continue-on-error enabled: proceed to next file.
-  - Disabled: stop job immediately.
-- Worker process stall/crash: supervisor restarts worker and resumes from journal.
-- Unexpected UI/process exception: captured to crash log path.
+### `ScanOnly`
+
+- Read-only analysis mode (no destination file writes).
+- Enumerates and reads source content to detect bad ranges.
+- Updates bad-range map for future copy optimization/hardening.
+- Copy-only skip/overwrite rules are not applied.
+
+## Worker Pipeline
+
+1. Validate options and normalize roots (root-safe normalization preserves `D:\` semantics).
+2. Resolve source file set (`DirectoryScanner` + optional Explorer selected-items subset).
+3. Load/merge journal state.
+4. Load bad-range map and seed known-bad ranges where enabled.
+5. Execute file loop:
+   - Availability checks (source/destination).
+   - Media identity guard checks (serial/share identity).
+   - Mode-specific behavior (`Copy` or `ScanOnly`).
+   - Retry/backoff on transient failures.
+   - Optional salvage fill, verification, and rescue passes.
+6. Periodic + terminal persistence flushes (journal/map).
+7. Emit completion result.
+
+## Reliability and Hardening Features
+
+- Supervisor-managed worker restart and run continuity.
+- Pause/resume/cancel support via execution control.
+- Policy-driven handling for:
+  - Media disappearance (`WaitForMediaAvailability`).
+  - File lock contention (`WaitForFileLockRelease`, `TreatAccessDeniedAsContention`).
+  - Source mutation/disappearance (`SourceMutationPolicy`).
+- Media identity capture/validation to reduce wrong-target writes after remounts.
+- Journal path fallback when default storage is not writable.
+- Settings/run cloning paths preserve complete option snapshots for historical accuracy.
+
+## UI and Performance Strategy
+
+- Heavy I/O and retry loops are isolated from UI thread by worker process boundary.
+- Main form receives throttled progress/log events and uses virtualized log rendering.
+- Job Manager uses virtual grid patterns for large run-history datasets.
+- Diagnostics strip/telemetry provides rendering and event-pressure visibility.
 
 ## Known Limits
 
-- If the OS kernel blocks file open/read/write at a level where cancellation cannot complete, the operation can still stall longer than expected.
-- Salvage mode preserves job continuity, not original bytes in unreadable sectors.
-- Verification requires readable source data and is skipped for recovered files.
+- No user-space copier can bypass kernel/storage stack hangs in all scenarios.
+- Salvage mode preserves continuity, not original unreadable bytes.
+- Verification behavior depends on selected mode and salvage outcomes.
 
-## Future Hardening
-
-- Add manifest export for forensic reporting of recovered/failed byte ranges.
-- Add volume-health telemetry and adaptive timeout profiles.
-- Add multi-worker scheduling for controlled parallel copy on healthy media.

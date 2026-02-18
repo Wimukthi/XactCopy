@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.6.3] - 2026-02-18
+
+### Changed
+
+- Codebase comment pass:
+  - Added focused explanatory comments around operation-mode semantics, root-safe path normalization, clone/snapshot boundaries, and bad-range-map durability logic.
+- Documentation refresh to match current implementation:
+  - Rewrote `ARCHITECTURE.md` to document current runtime topology, scan mode, bad-range maps, integrity hardening, and worker/UI responsibilities.
+  - Updated `README.md` highlights/build instructions and documentation links.
+  - Updated `CONTRIBUTING.md` and `docs/RELEASE_PROCESS.md` with current contribution/release expectations.
+
 ## [1.0.6.2] - 2026-02-17
 
 ### Added

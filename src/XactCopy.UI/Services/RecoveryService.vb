@@ -272,6 +272,7 @@ Namespace Services
                 Return New CopyJobOptions()
             End If
 
+            ' Persisted recovery snapshots must be self-contained and immutable once recorded.
             Return New CopyJobOptions() With {
                 .OperationMode = options.OperationMode,
                 .SourceRoot = options.SourceRoot,

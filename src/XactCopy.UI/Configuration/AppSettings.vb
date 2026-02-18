@@ -1,7 +1,11 @@
 Namespace Configuration
+    ''' <summary>
+    ''' User-scoped persisted preferences for UI behavior, defaults, integration, and resiliency policy.
+    ''' </summary>
     Public NotInheritable Class AppSettings
         Public Const DefaultUpdateReleaseUrl As String = "https://api.github.com/repos/Wimukthi/XactCopy/releases/latest"
 
+        ' Appearance.
         Public Property Theme As String = "dark"
         Public Property AccentColorMode As String = "auto"
         Public Property AccentColorHex As String = "#5A78C8"
@@ -18,10 +22,12 @@ Namespace Configuration
         Public Property ShowBufferStatusRow As Boolean = True
         Public Property ShowRescueStatusRow As Boolean = True
 
+        ' Updates.
         Public Property CheckUpdatesOnLaunch As Boolean = False
         Public Property UpdateReleaseUrl As String = DefaultUpdateReleaseUrl
         Public Property UserAgent As String = String.Empty
 
+        ' Recovery/startup.
         Public Property EnableRecoveryAutostart As Boolean = True
         Public Property PromptResumeAfterCrash As Boolean = True
         Public Property AutoResumeAfterCrash As Boolean = False
@@ -29,9 +35,11 @@ Namespace Configuration
         Public Property AutoRunQueuedJobsOnStartup As Boolean = False
         Public Property RecoveryTouchIntervalSeconds As Integer = 2
 
+        ' Explorer integration.
         Public Property EnableExplorerContextMenu As Boolean = False
         Public Property ExplorerSelectionMode As String = "selected-items"
 
+        ' Default copy/scan policy.
         Public Property DefaultResumeFromJournal As Boolean = True
         Public Property DefaultSalvageUnreadableBlocks As Boolean = True
         Public Property DefaultContinueOnFileError As Boolean = True

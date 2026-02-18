@@ -2,6 +2,9 @@ Imports System.IO
 Imports System.Text.Json
 
 Namespace Configuration
+    ''' <summary>
+    ''' JSON-backed user settings persistence with normalization of legacy/out-of-range values.
+    ''' </summary>
     Public NotInheritable Class AppSettingsStore
         Private ReadOnly _settingsPath As String
 
@@ -38,6 +41,7 @@ Namespace Configuration
                     Return New AppSettings()
                 End If
 
+                ' Normalize during load to keep behavior deterministic even with edited/legacy config.
                 Return Normalize(settings)
             Catch
                 Return New AppSettings()

@@ -1634,6 +1634,7 @@ Public Class MainForm
     End Function
 
     Private Shared Function TrimTrailingSeparatorsPreservingRoot(pathValue As String) As String
+        ' Preserve root paths like "D:\". A bare "D:" becomes drive-relative and can drift.
         If String.IsNullOrWhiteSpace(pathValue) Then
             Return String.Empty
         End If
@@ -1859,6 +1860,7 @@ Public Class MainForm
     End Function
 
     Private Async Function StartBadBlockScanAsync() As Task
+        ' Scan runs share the supervisor path but are normalized as ScanOnly operations.
         Dim options = BuildScanOptions()
         If options Is Nothing Then
             Return
@@ -3773,6 +3775,7 @@ Public Class MainForm
     End Sub
 
     Private Function BuildRunningWindowTitle(progress As CopyProgressSnapshot) As String
+        ' Use a mode-aware verb so scan sessions are clearly identified in shell/taskbar text.
         Dim isScanRun = _activeRunOptions IsNot Nothing AndAlso _activeRunOptions.OperationMode = JobOperationMode.ScanOnly
         Dim statusText = If(_isPaused, "Paused", If(isScanRun, "Scanning", "Copying"))
         Dim percent = Math.Clamp(progress.OverallProgress, 0.0R, 1.0R) * 100.0R
