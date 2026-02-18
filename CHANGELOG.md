@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.6.7] - 2026-02-18
+
+### Fixed
+
+- Updater apply cleanup hardening:
+  - Zip payload root resolution now targets the actual app payload directory to avoid leaving wrapper folders (for example `win-x64`) inside the install directory.
+  - Apply script now removes stale wrapper folders created by previous update packages.
+  - Post-apply cleanup now removes temporary updater staging/script files after restart handoff.
+  - Cancel/failure close paths now perform best-effort cleanup of temporary updater directories.
+
 ## [1.0.6.5] - 2026-02-18
 
 ### Fixed

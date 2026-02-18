@@ -1,6 +1,7 @@
 Imports System.Diagnostics
 Imports System.IO
 Imports System.IO.Compression
+Imports System.Linq
 Imports System.Text
 Imports System.Threading
 Imports System.Threading.Tasks
@@ -359,9 +360,7 @@ Friend Class UpdateForm
 
         Await Task.Run(Sub() ZipFile.ExtractToDirectory(downloadPath, extractRoot, overwriteFiles:=True))
 
-        Dim executableCandidates = Directory.GetFiles(extractRoot, executableName, SearchOption.AllDirectories)
-        Dim executablePath = If(executableCandidates.Length > 0, executableCandidates(0), String.Empty)
-        Dim sourceDirectory = If(String.IsNullOrWhiteSpace(executablePath), extractRoot, Path.GetDirectoryName(executablePath))
+        Dim sourceDirectory = ResolvePayloadSourceDirectory(extractRoot, executableName)
         If String.IsNullOrWhiteSpace(sourceDirectory) OrElse Not Directory.Exists(sourceDirectory) Then
             Throw New InvalidOperationException("Unable to locate update files in downloaded package.")
         End If
@@ -407,6 +406,7 @@ Friend Class UpdateForm
         script.AppendLine($"set ""TARGET={normalizedTarget}""")
         script.AppendLine($"set ""BACKUP={backupDirectory}""")
         script.AppendLine($"set ""LOG={logPath}""")
+        script.AppendLine($"set ""TEMPROOT={tempRoot}""")
         script.AppendLine(">""%LOG%"" echo XactCopy update log")
         script.AppendLine(":wait")
         script.AppendLine("tasklist /FI ""PID eq %PID%"" | find /I ""%PID%"" >nul")
@@ -427,9 +427,22 @@ Friend Class UpdateForm
         script.AppendLine("if %RC% GEQ 8 (")
         script.AppendLine("  echo Update copy failed with error %RC%. Restoring backup. >>""%LOG%""")
         script.AppendLine("  robocopy ""%BACKUP%"" ""%TARGET%"" /E /COPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >>""%LOG%""")
+        script.AppendLine(") else (")
+        script.AppendLine("  if exist ""%TARGET%\win-x64\XactCopy.dll"" (")
+        script.AppendLine("    echo Removing stale wrapper folder %TARGET%\win-x64 >>""%LOG%""")
+        script.AppendLine("    rd /s /q ""%TARGET%\win-x64"" >nul 2>&1")
+        script.AppendLine("  )")
         script.AppendLine(")")
         script.AppendLine(":launch")
         script.AppendLine($"start """" ""{executablePath}""")
+        script.AppendLine("set ""CLEANUP=%TEMP%\xactcopy-cleanup-%RANDOM%%RANDOM%%RANDOM%.cmd""")
+        script.AppendLine("( ")
+        script.AppendLine("  echo @echo off")
+        script.AppendLine("  echo timeout /t 8 /nobreak ^>nul")
+        script.AppendLine("  echo rd /s /q ""%TEMPROOT%"" ^>nul 2^>^&1")
+        script.AppendLine("  echo del /f /q ""%%~f0"" ^>nul 2^>^&1")
+        script.AppendLine(") > ""%CLEANUP%""")
+        script.AppendLine("start """" /b cmd /c """"%CLEANUP%""""")
         script.AppendLine("endlocal")
 
         File.WriteAllText(scriptPath, script.ToString(), Encoding.ASCII)
@@ -442,6 +455,100 @@ Friend Class UpdateForm
 
         Process.Start(startInfo)
     End Sub
+
+    Private Shared Function ResolvePayloadSourceDirectory(extractRoot As String, executableName As String) As String
+        If String.IsNullOrWhiteSpace(extractRoot) OrElse Not Directory.Exists(extractRoot) Then
+            Return String.Empty
+        End If
+
+        Dim markerNames As New List(Of String)()
+        If Not String.IsNullOrWhiteSpace(executableName) Then
+            markerNames.Add(executableName)
+        End If
+        markerNames.Add("XactCopy.exe")
+        markerNames.Add("XactCopy.dll")
+        markerNames.Add("XactCopy.runtimeconfig.json")
+
+        Dim candidates As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+        For Each marker In markerNames.Distinct(StringComparer.OrdinalIgnoreCase)
+            For Each match In Directory.EnumerateFiles(extractRoot, marker, SearchOption.AllDirectories)
+                Dim directoryPath = Path.GetDirectoryName(match)
+                If String.IsNullOrWhiteSpace(directoryPath) Then
+                    Continue For
+                End If
+
+                If IsLikelyPayloadDirectory(directoryPath, executableName) Then
+                    candidates.Add(directoryPath)
+                End If
+            Next
+        Next
+
+        If candidates.Count = 0 Then
+            Dim childDirectories = Directory.GetDirectories(extractRoot)
+            Dim childFiles = Directory.GetFiles(extractRoot)
+            If childDirectories.Length = 1 AndAlso childFiles.Length = 0 Then
+                Return ResolvePayloadSourceDirectory(childDirectories(0), executableName)
+            End If
+
+            Return String.Empty
+        End If
+
+        Dim normalizedRoot = EnsureTrailingSeparator(Path.GetFullPath(extractRoot))
+        Return candidates.
+            OrderBy(Function(pathValue) GetRelativeDepth(normalizedRoot, pathValue)).
+            ThenBy(Function(pathValue) pathValue.Length).
+            First()
+    End Function
+
+    Private Shared Function IsLikelyPayloadDirectory(candidateDirectory As String, executableName As String) As Boolean
+        If String.IsNullOrWhiteSpace(candidateDirectory) OrElse Not Directory.Exists(candidateDirectory) Then
+            Return False
+        End If
+
+        Dim hasManagedHost = File.Exists(Path.Combine(candidateDirectory, "XactCopy.dll")) AndAlso
+            File.Exists(Path.Combine(candidateDirectory, "XactCopy.runtimeconfig.json"))
+        Dim hasExecutable = False
+
+        If Not String.IsNullOrWhiteSpace(executableName) Then
+            hasExecutable = File.Exists(Path.Combine(candidateDirectory, executableName))
+        End If
+
+        If Not hasExecutable Then
+            hasExecutable = File.Exists(Path.Combine(candidateDirectory, "XactCopy.exe"))
+        End If
+
+        Return hasManagedHost OrElse hasExecutable
+    End Function
+
+    Private Shared Function EnsureTrailingSeparator(pathValue As String) As String
+        If String.IsNullOrWhiteSpace(pathValue) Then
+            Return String.Empty
+        End If
+
+        If pathValue.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal) OrElse
+            pathValue.EndsWith(Path.AltDirectorySeparatorChar.ToString(), StringComparison.Ordinal) Then
+            Return pathValue
+        End If
+
+        Return pathValue & Path.DirectorySeparatorChar
+    End Function
+
+    Private Shared Function GetRelativeDepth(rootPath As String, candidatePath As String) As Integer
+        Try
+            Dim fullCandidate = Path.GetFullPath(candidatePath)
+            If fullCandidate.StartsWith(rootPath, StringComparison.OrdinalIgnoreCase) Then
+                Dim relative = fullCandidate.Substring(rootPath.Length)
+                If relative.Length = 0 Then
+                    Return 0
+                End If
+
+                Return relative.Split(New Char() {Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar}, StringSplitOptions.RemoveEmptyEntries).Length
+            End If
+        Catch
+        End Try
+
+        Return Integer.MaxValue
+    End Function
 
     Protected Overrides Sub OnFormClosing(e As FormClosingEventArgs)
         If _isDownloading AndAlso _cancellation IsNot Nothing Then
@@ -458,6 +565,30 @@ Friend Class UpdateForm
         End If
 
         MyBase.OnFormClosing(e)
+    End Sub
+
+    Protected Overrides Sub OnFormClosed(e As FormClosedEventArgs)
+        MyBase.OnFormClosed(e)
+
+        If _isApplying Then
+            Return
+        End If
+
+        CleanupTempRootNoThrow()
+    End Sub
+
+    Private Sub CleanupTempRootNoThrow()
+        If String.IsNullOrWhiteSpace(_tempRoot) Then
+            Return
+        End If
+
+        Try
+            If Directory.Exists(_tempRoot) Then
+                Directory.Delete(_tempRoot, recursive:=True)
+            End If
+        Catch
+            ' Ignore best-effort cleanup failures.
+        End Try
     End Sub
 
     Private Shared Function NormalizeReleaseNotes(value As String) As String

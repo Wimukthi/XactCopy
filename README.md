@@ -74,6 +74,7 @@ dotnet publish src/XactCopy.UI/XactCopy.UI.vbproj -c Release -r win-x64 --self-c
 
 ## Brief Version History
 
+- `v1.0.6.7` Fixed updater cleanup so extracted package artifacts (including wrapper folders like `win-x64`) and temporary staging/script files are removed after update apply/restart.
 - `v1.0.6.5` Hardened startup initialization to avoid `SetCompatibleTextRenderingDefault` ordering crashes during edge restart/recovery conditions.
 - `v1.0.6.3` Performed a focused codebase comment pass and refreshed project documentation (`ARCHITECTURE`, `README`, `CONTRIBUTING`, and release process docs) to match current scan-mode, bad-range-map, and resiliency behavior.
 - `v1.0.6.2` Added scan-only bad-block mode with reusable bad-range maps, fixed scan/copy mode separation bugs, preserved drive-root path normalization (`D:\`), and updated title-bar mode text to show `Scanning` during scan runs.
