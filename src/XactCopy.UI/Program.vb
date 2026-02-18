@@ -16,11 +16,21 @@ Friend Module Program
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException)
 
         Dim launchOptions As LaunchOptions = LaunchOptions.Parse(args)
-        Application.SetColorMode(ThemeSettings.GetPreferredColorMode())
         Application.SetHighDpiMode(HighDpiMode.SystemAware)
         Application.EnableVisualStyles()
-        Application.SetCompatibleTextRenderingDefault(False)
+        ConfigureCompatibleTextRenderingDefault()
+        Application.SetColorMode(ThemeSettings.GetPreferredColorMode())
         Application.Run(New MainForm(launchOptions))
+    End Sub
+
+    Private Sub ConfigureCompatibleTextRenderingDefault()
+        Try
+            ' Keep WinForms startup resilient even if a window/control handle was created
+            ' earlier by framework code or another startup path.
+            Application.SetCompatibleTextRenderingDefault(False)
+        Catch ex As InvalidOperationException
+            LogFatal("Startup warning: compatible text rendering default could not be set.", ex)
+        End Try
     End Sub
 
     Private Sub HandleThreadException(sender As Object, e As ThreadExceptionEventArgs)

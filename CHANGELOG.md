@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.6.5] - 2026-02-18
+
+### Fixed
+
+- Startup crash hardening:
+  - `Program.Main` now configures `SetCompatibleTextRenderingDefault(False)` before color-mode initialization and guards the call with a safe fallback logger path.
+  - Prevents `InvalidOperationException` (`SetCompatibleTextRenderingDefault must be called before the first IWin32Window object is created`) from terminating launch in edge restart/recovery paths.
+
 ## [1.0.6.3] - 2026-02-18
 
 ### Changed
