@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.6.8] - 2026-02-18
+
+### Fixed
+
+- Operations log rendering hardening across consecutive jobs:
+  - Reset now clears pending queued log messages and dispatch flags before a new run begins, preventing stale queued lines from corrupting first repaint after completion.
+  - Virtual log view size updates now use a dedicated refresh path that forces safe redraw/invalidate for virtual list content.
+  - Diagnostics row now refreshes immediately after log reset so telemetry state does not lag behind the visible log view.
+
 ## [1.0.6.7] - 2026-02-18
 
 ### Fixed

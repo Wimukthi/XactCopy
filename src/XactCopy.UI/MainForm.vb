@@ -1684,7 +1684,7 @@ Public Class MainForm
         _diagnosticsRefreshIntervalMs = Math.Max(MinimumDiagnosticsRefreshIntervalMs, safeSettings.UiDiagnosticsRefreshMs)
 
         TrimLogBufferIfNeeded()
-        _logListView.VirtualListSize = _logEntries.Count
+        RefreshLogViewVirtualSize()
         ApplyStatusRowVisibility(safeSettings)
         If _showUiDiagnostics Then
             RefreshDiagnosticsLabel(force:=True)
@@ -3458,7 +3458,7 @@ Public Class MainForm
         End If
 
         TrimLogBufferIfNeeded()
-        _logListView.VirtualListSize = _logEntries.Count
+        RefreshLogViewVirtualSize()
         If shouldAutoScroll Then
             EnsureLogTailVisible()
         End If
@@ -3512,8 +3512,40 @@ Public Class MainForm
     End Sub
 
     Private Sub ClearLogView()
+        SyncLock _logDispatchLock
+            _pendingLogLines.Clear()
+            _droppedLogLines = 0
+        End SyncLock
+
+        Interlocked.Exchange(_logDispatchQueued, 0)
+
         _logEntries.Clear()
-        _logListView.VirtualListSize = 0
+        RefreshLogViewVirtualSize()
+        RefreshDiagnosticsLabel(force:=True)
+    End Sub
+
+    Private Sub RefreshLogViewVirtualSize()
+        If _logListView Is Nothing Then
+            Return
+        End If
+
+        Dim targetSize = Math.Max(0, _logEntries.Count)
+        If _logListView.VirtualListSize <> targetSize Then
+            _logListView.VirtualListSize = targetSize
+        End If
+
+        If Not _logListView.IsHandleCreated Then
+            Return
+        End If
+
+        Try
+            If targetSize > 0 Then
+                _logListView.RedrawItems(0, targetSize - 1, invalidateOnly:=True)
+            End If
+            _logListView.Invalidate()
+        Catch
+            ' Best-effort refresh only; keep copy loop resilient.
+        End Try
     End Sub
 
     Private Sub CaptureWorkerSuppressedLogTelemetry(line As String)

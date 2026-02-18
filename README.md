@@ -74,6 +74,7 @@ dotnet publish src/XactCopy.UI/XactCopy.UI.vbproj -c Release -r win-x64 --self-c
 
 ## Brief Version History
 
+- `v1.0.6.8` Fixed operations log rendering after completing one job and starting another by hard-resetting pending log queues and forcing a safe virtual-list redraw path.
 - `v1.0.6.7` Fixed updater cleanup so extracted package artifacts (including wrapper folders like `win-x64`) and temporary staging/script files are removed after update apply/restart.
 - `v1.0.6.5` Hardened startup initialization to avoid `SetCompatibleTextRenderingDefault` ordering crashes during edge restart/recovery conditions.
 - `v1.0.6.3` Performed a focused codebase comment pass and refreshed project documentation (`ARCHITECTURE`, `README`, `CONTRIBUTING`, and release process docs) to match current scan-mode, bad-range-map, and resiliency behavior.
