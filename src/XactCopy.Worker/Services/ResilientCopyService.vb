@@ -796,6 +796,22 @@ Namespace Services
                     entry.RecoveredRanges.Clear()
                     entry.RescueRanges.Clear()
                     entry.LastRescuePass = String.Empty
+                    Continue For
+                End If
+
+                If entry.State = FileCopyState.InProgress Then
+                    If _options.FragileMediaMode AndAlso _options.SkipFileOnFirstReadError Then
+                        entry.State = FileCopyState.Failed
+                        entry.LastError = "Fragile media guard: previous attempt stalled while this file was in progress."
+                        entry.DoNotRetry = True
+                        EmitLog($"[Fragile] Promoted stale in-progress entry to non-retry: {descriptor.RelativePath}")
+                    Else
+                        entry.State = FileCopyState.Pending
+                        If String.IsNullOrWhiteSpace(entry.LastError) Then
+                            entry.LastError = "Previous attempt ended while file was in progress."
+                        End If
+                        entry.DoNotRetry = False
+                    End If
                 End If
             Next
 
@@ -842,7 +858,7 @@ Namespace Services
 
             Return entry.State = FileCopyState.Failed AndAlso
                 entry.DoNotRetry AndAlso
-                _options.PersistFragileSkipAcrossResume
+                (_options.PersistFragileSkipAcrossResume OrElse _options.FragileMediaMode)
         End Function
 
         Private Async Function HandleFragileReadSkipAsync(

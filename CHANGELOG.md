@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.8.3] - 2026-02-19
+
+### Fixed
+
+- Fragile-media restart/resume hardening for stalled files:
+  - Journal entries left in `InProgress` after worker stall/recovery are now normalized before the next run pass.
+  - In fragile mode (`Skip file on first read error`), stale in-progress entries are promoted to non-retry failed entries and skipped, preventing repeated hammering of the same unstable file after worker restarts.
+  - Added explicit worker log signal when stale entries are promoted to fragile non-retry state.
+
 ## [1.0.8.2] - 2026-02-19
 
 ### Added
