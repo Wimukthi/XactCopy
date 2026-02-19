@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.8.1] - 2026-02-19
+
+### Added
+
+- Operations log severity color-coding:
+  - Main operations log now classifies lines (info/success/warning/error/critical) and renders them with severity-aware colors.
+  - New Appearance setting to enable/disable severity coloring (`Color-code log by severity`).
+
+### Changed
+
+- Destination metadata hot path now uses Win32 `GetFileAttributesExW` for existence/size/last-write checks used by overwrite/completed-file decisions, reducing per-file metadata overhead.
+- Source directory scanning now prefers Win32 enumeration (`FindFirstFileEx`/`FindNextFile`) with managed fallback for unsupported cases.
+- Rescue range state updates now mutate only affected segments with localized merge, reducing full-list rebuild churn on large range maps.
+
+### Fixed
+
+- Cancellation hang hardening:
+  - Worker IPC sends are now frame-safe under cancellation (no mid-frame cancellation token abort), preventing malformed IPC payloads.
+  - Supervisor now handles repeated malformed IPC frames as stream desync, recovers deterministically, and force-finalizes active runs instead of waiting indefinitely for cancellation acknowledgement.
+  - When channel loss happens after user cancel, supervisor force-stops the worker and completes the run state as cancelled with a clear reason.
+
 ## [1.0.7.0] - 2026-02-19
 
 ### Changed

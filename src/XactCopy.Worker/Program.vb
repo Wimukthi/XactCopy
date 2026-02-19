@@ -660,7 +660,8 @@ Module Program
         Dim json = IpcSerializer.SerializeEnvelope(messageType, payload)
         Await SendLock.WaitAsync(cancellationToken).ConfigureAwait(False)
         Try
-            Await JsonMessagePipe.WriteMessageAsync(stream, json, cancellationToken).ConfigureAwait(False)
+            ' Never cancel mid-frame write; partial writes can desynchronize supervisor IPC parsing.
+            Await JsonMessagePipe.WriteMessageAsync(stream, json, CancellationToken.None).ConfigureAwait(False)
         Finally
             SendLock.Release()
         End Try

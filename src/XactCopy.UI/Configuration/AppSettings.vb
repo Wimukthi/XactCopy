@@ -14,6 +14,7 @@ Namespace Configuration
         Public Property UiScalePercent As Integer = 100
         Public Property LogFontFamily As String = "Consolas"
         Public Property LogFontSizePoints As Integer = 9
+        Public Property UiColorizeLogBySeverity As Boolean = True
         Public Property GridAlternatingRows As Boolean = True
         Public Property GridRowHeight As Integer = 24
         Public Property GridHeaderStyle As String = "default"
@@ -48,6 +49,7 @@ Namespace Configuration
         Public Property DefaultSkipKnownBadRanges As Boolean = True
         Public Property DefaultUpdateBadRangeMapFromRun As Boolean = True
         Public Property DefaultBadRangeMapMaxAgeDays As Integer = 30
+        Public Property DefaultUseExperimentalRawDiskScan As Boolean = False
         Public Property DefaultUseAdaptiveBuffer As Boolean = False
         Public Property DefaultWaitForMediaAvailability As Boolean = False
         Public Property DefaultWaitForFileLockRelease As Boolean = False

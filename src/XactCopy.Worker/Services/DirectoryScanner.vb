@@ -1,5 +1,7 @@
 Imports System.IO
 Imports System.Linq
+Imports System.Runtime.InteropServices
+Imports Microsoft.Win32.SafeHandles
 Imports XactCopy.Models
 
 Namespace Services
@@ -9,6 +11,14 @@ Namespace Services
     End Class
 
     Public NotInheritable Class DirectoryScanner
+        Private Const FindExInfoBasic As Integer = 1
+        Private Const FindExSearchNameMatch As Integer = 0
+        Private Const FindFirstExLargeFetch As UInteger = 2UI
+        Private Const ErrorFileNotFound As Integer = 2
+        Private Const ErrorPathNotFound As Integer = 3
+        Private Const ErrorNoMoreFiles As Integer = 18
+        Private Const ErrorInvalidParameter As Integer = 87
+
         Private Sub New()
         End Sub
 
@@ -38,59 +48,58 @@ Namespace Services
                     discoveredDirectories.Add(currentRelativeDirectory)
                 End If
 
-                Try
-                    For Each subDirectory In Directory.EnumerateDirectories(currentDirectory)
-                        Dim relativeSubDirectory = NormalizeRelativePath(Path.GetRelativePath(normalizedRoot, subDirectory))
+                Dim entries As List(Of DirectoryEntryInfo) = Nothing
+                Dim enumerationError As Exception = Nothing
+                If Not TryEnumerateDirectoryEntries(currentDirectory, entries, enumerationError) Then
+                    log?.Invoke($"Directory skipped: {currentDirectory} ({enumerationError.Message})")
+                    log?.Invoke($"Files skipped in: {currentDirectory} ({enumerationError.Message})")
+                    Continue While
+                End If
+
+                For Each entry In entries
+                    If entry Is Nothing Then
+                        Continue For
+                    End If
+
+                    If entry.IsDirectory Then
+                        Dim relativeSubDirectory = NormalizeRelativePath(Path.GetRelativePath(normalizedRoot, entry.FullPath))
                         If Not filter.ShouldTraverseDirectory(relativeSubDirectory) Then
                             Continue For
                         End If
 
-                        Dim directoryIsSymlink = IsReparsePoint(subDirectory)
-                        If directoryIsSymlink AndAlso symlinkHandling = SymlinkHandlingMode.Skip Then
-                            log?.Invoke($"Skipping symbolic-link directory: {subDirectory}")
+                        If entry.IsReparsePoint AndAlso symlinkHandling = SymlinkHandlingMode.Skip Then
+                            log?.Invoke($"Skipping symbolic-link directory: {entry.FullPath}")
                             Continue For
                         End If
 
-                        Dim identity = GetDirectoryIdentity(subDirectory, symlinkHandling, log)
+                        Dim identity = GetDirectoryIdentity(entry.FullPath, symlinkHandling, log)
                         If visitedDirectoryIdentities.Contains(identity) Then
-                            log?.Invoke($"Skipping already visited directory target: {subDirectory}")
+                            log?.Invoke($"Skipping already visited directory target: {entry.FullPath}")
                             Continue For
                         End If
 
                         visitedDirectoryIdentities.Add(identity)
-                        pending.Push(subDirectory)
-                    Next
-                Catch ex As Exception
-                    log?.Invoke($"Directory skipped: {currentDirectory} ({ex.Message})")
-                End Try
+                        pending.Push(entry.FullPath)
+                        Continue For
+                    End If
 
-                Try
-                    For Each filePath In Directory.EnumerateFiles(currentDirectory)
-                        Dim relativePath = NormalizeRelativePath(Path.GetRelativePath(normalizedRoot, filePath))
-                        If Not filter.ShouldIncludeFile(relativePath) Then
-                            Continue For
-                        End If
+                    Dim relativePath = NormalizeRelativePath(Path.GetRelativePath(normalizedRoot, entry.FullPath))
+                    If Not filter.ShouldIncludeFile(relativePath) Then
+                        Continue For
+                    End If
 
-                        If IsReparsePoint(filePath) AndAlso symlinkHandling = SymlinkHandlingMode.Skip Then
-                            log?.Invoke($"Skipping symbolic-link file: {filePath}")
-                            Continue For
-                        End If
+                    If entry.IsReparsePoint AndAlso symlinkHandling = SymlinkHandlingMode.Skip Then
+                        log?.Invoke($"Skipping symbolic-link file: {entry.FullPath}")
+                        Continue For
+                    End If
 
-                        Try
-                            Dim fileInfo As New FileInfo(filePath)
-                            discoveredFiles.Add(New SourceFileDescriptor() With {
-                                .RelativePath = relativePath,
-                                .FullPath = filePath,
-                                .Length = fileInfo.Length,
-                                .LastWriteTimeUtc = fileInfo.LastWriteTimeUtc
-                            })
-                        Catch ex As Exception
-                            log?.Invoke($"File metadata skipped: {filePath} ({ex.Message})")
-                        End Try
-                    Next
-                Catch ex As Exception
-                    log?.Invoke($"Files skipped in: {currentDirectory} ({ex.Message})")
-                End Try
+                    discoveredFiles.Add(New SourceFileDescriptor() With {
+                        .RelativePath = relativePath,
+                        .FullPath = entry.FullPath,
+                        .Length = entry.Length,
+                        .LastWriteTimeUtc = entry.LastWriteTimeUtc
+                    })
+                Next
             End While
 
             discoveredFiles.Sort(Function(left, right) StringComparer.OrdinalIgnoreCase.Compare(left.RelativePath, right.RelativePath))
@@ -102,6 +111,172 @@ Namespace Services
                 .Files = discoveredFiles,
                 .Directories = directories
             }
+        End Function
+
+        Private Shared Function TryEnumerateDirectoryEntries(
+            directoryPath As String,
+            ByRef entries As List(Of DirectoryEntryInfo),
+            ByRef [error] As Exception) As Boolean
+
+            entries = New List(Of DirectoryEntryInfo)()
+            [error] = Nothing
+
+            If String.IsNullOrWhiteSpace(directoryPath) Then
+                Return True
+            End If
+
+            If TryEnumerateDirectoryEntriesWin32(directoryPath, entries, [error]) Then
+                Return True
+            End If
+
+            entries.Clear()
+            [error] = Nothing
+            Try
+                For Each subDirectory In Directory.EnumerateDirectories(directoryPath)
+                    entries.Add(New DirectoryEntryInfo() With {
+                        .FullPath = subDirectory,
+                        .IsDirectory = True,
+                        .IsReparsePoint = IsReparsePoint(subDirectory),
+                        .Length = 0L,
+                        .LastWriteTimeUtc = DateTime.MinValue
+                    })
+                Next
+
+                For Each filePath In Directory.EnumerateFiles(directoryPath)
+                    Dim fileInfo As New FileInfo(filePath)
+                    entries.Add(New DirectoryEntryInfo() With {
+                        .FullPath = filePath,
+                        .IsDirectory = False,
+                        .IsReparsePoint = IsReparsePoint(filePath),
+                        .Length = fileInfo.Length,
+                        .LastWriteTimeUtc = fileInfo.LastWriteTimeUtc
+                    })
+                Next
+
+                Return True
+            Catch ex As Exception
+                [error] = ex
+                Return False
+            End Try
+        End Function
+
+        Private Shared Function TryEnumerateDirectoryEntriesWin32(
+            directoryPath As String,
+            entries As List(Of DirectoryEntryInfo),
+            ByRef [error] As Exception) As Boolean
+
+            [error] = Nothing
+            If entries Is Nothing Then
+                entries = New List(Of DirectoryEntryInfo)()
+            End If
+
+            Dim searchPath As String
+            Try
+                searchPath = Path.Combine(directoryPath, "*")
+            Catch ex As Exception
+                [error] = ex
+                Return False
+            End Try
+
+            Dim findData As New Win32FindData()
+            Dim handle As SafeFindHandle = FindFirstFileEx(
+                searchPath,
+                FindExInfoBasic,
+                findData,
+                FindExSearchNameMatch,
+                IntPtr.Zero,
+                FindFirstExLargeFetch)
+
+            If handle Is Nothing OrElse handle.IsInvalid Then
+                Dim win32Error = Marshal.GetLastWin32Error()
+                If win32Error = ErrorInvalidParameter Then
+                    findData = New Win32FindData()
+                    handle = FindFirstFileEx(
+                        searchPath,
+                        FindExInfoBasic,
+                        findData,
+                        FindExSearchNameMatch,
+                        IntPtr.Zero,
+                        0UI)
+                    If handle IsNot Nothing AndAlso Not handle.IsInvalid Then
+                        win32Error = 0
+                    Else
+                        win32Error = Marshal.GetLastWin32Error()
+                    End If
+                End If
+
+                If win32Error = ErrorFileNotFound OrElse
+                    win32Error = ErrorPathNotFound OrElse
+                    win32Error = ErrorNoMoreFiles Then
+                    Return True
+                End If
+
+                [error] = New IOException($"Native enumeration failed ({win32Error}).")
+                Try
+                    handle?.Dispose()
+                Catch
+                End Try
+                Return False
+            End If
+
+            Using handle
+                Do
+                    If Not TryAppendFindDataEntry(directoryPath, findData, entries) Then
+                        Continue Do
+                    End If
+                Loop While FindNextFile(handle, findData)
+
+                Dim finalError = Marshal.GetLastWin32Error()
+                If finalError <> 0 AndAlso finalError <> ErrorNoMoreFiles Then
+                    [error] = New IOException($"Native enumeration aborted ({finalError}).")
+                    Return False
+                End If
+            End Using
+
+            Return True
+        End Function
+
+        Private Shared Function TryAppendFindDataEntry(
+            directoryPath As String,
+            findData As Win32FindData,
+            entries As List(Of DirectoryEntryInfo)) As Boolean
+
+            Dim name = If(findData.FileName, String.Empty)
+            If name.Length = 0 OrElse name = "." OrElse name = ".." Then
+                Return False
+            End If
+
+            Dim attributes = CType(findData.FileAttributes, FileAttributes)
+            Dim isDirectory = (attributes And FileAttributes.Directory) = FileAttributes.Directory
+            Dim isReparsePoint = (attributes And FileAttributes.ReparsePoint) = FileAttributes.ReparsePoint
+            Dim fullPath = Path.Combine(directoryPath, name)
+            Dim fileLength = 0L
+            If Not isDirectory Then
+                Dim rawLength = (CULng(findData.FileSizeHigh) << 32) Or CULng(findData.FileSizeLow)
+                fileLength = If(rawLength > CULng(Long.MaxValue), Long.MaxValue, CLng(rawLength))
+            End If
+
+            entries.Add(New DirectoryEntryInfo() With {
+                .FullPath = fullPath,
+                .IsDirectory = isDirectory,
+                .IsReparsePoint = isReparsePoint,
+                .Length = fileLength,
+                .LastWriteTimeUtc = FileTimeToDateTimeUtc(findData.LastWriteTime)
+            })
+            Return True
+        End Function
+
+        Private Shared Function FileTimeToDateTimeUtc(fileTime As FileTime) As DateTime
+            Dim ticks = (CULng(fileTime.HighDateTime) << 32) Or CULng(fileTime.LowDateTime)
+            If ticks = 0UL Then
+                Return DateTime.MinValue
+            End If
+
+            Try
+                Return DateTime.FromFileTimeUtc(CLng(ticks))
+            Catch
+                Return DateTime.MinValue
+            End Try
         End Function
 
         Private Shared Function IsReparsePoint(path As String) As Boolean
@@ -272,5 +447,67 @@ Namespace Services
                 Return False
             End Function
         End Class
+
+        <StructLayout(LayoutKind.Sequential, CharSet:=CharSet.Unicode)>
+        Private Structure Win32FindData
+            Public FileAttributes As UInteger
+            Public CreationTime As FileTime
+            Public LastAccessTime As FileTime
+            Public LastWriteTime As FileTime
+            Public FileSizeHigh As UInteger
+            Public FileSizeLow As UInteger
+            Public Reserved0 As UInteger
+            Public Reserved1 As UInteger
+            <MarshalAs(UnmanagedType.ByValTStr, SizeConst:=260)>
+            Public FileName As String
+            <MarshalAs(UnmanagedType.ByValTStr, SizeConst:=14)>
+            Public AlternateFileName As String
+        End Structure
+
+        <StructLayout(LayoutKind.Sequential)>
+        Private Structure FileTime
+            Public LowDateTime As UInteger
+            Public HighDateTime As UInteger
+        End Structure
+
+        Private NotInheritable Class DirectoryEntryInfo
+            Public Property FullPath As String = String.Empty
+            Public Property IsDirectory As Boolean
+            Public Property IsReparsePoint As Boolean
+            Public Property Length As Long
+            Public Property LastWriteTimeUtc As DateTime = DateTime.MinValue
+        End Class
+
+        Private NotInheritable Class SafeFindHandle
+            Inherits SafeHandleZeroOrMinusOneIsInvalid
+
+            Public Sub New()
+                MyBase.New(ownsHandle:=True)
+            End Sub
+
+            Protected Overrides Function ReleaseHandle() As Boolean
+                Return FindClose(handle)
+            End Function
+        End Class
+
+        <DllImport("kernel32.dll", CharSet:=CharSet.Unicode, SetLastError:=True)>
+        Private Shared Function FindFirstFileEx(
+            lpFileName As String,
+            fInfoLevelId As Integer,
+            ByRef lpFindFileData As Win32FindData,
+            fSearchOp As Integer,
+            lpSearchFilter As IntPtr,
+            dwAdditionalFlags As UInteger) As SafeFindHandle
+        End Function
+
+        <DllImport("kernel32.dll", CharSet:=CharSet.Unicode, SetLastError:=True)>
+        Private Shared Function FindNextFile(
+            hFindFile As SafeFindHandle,
+            ByRef lpFindFileData As Win32FindData) As Boolean
+        End Function
+
+        <DllImport("kernel32.dll", SetLastError:=True)>
+        Private Shared Function FindClose(hFindFile As IntPtr) As Boolean
+        End Function
     End Class
 End Namespace

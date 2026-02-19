@@ -94,7 +94,7 @@ Public Class MainForm
 
     Private ReadOnly _logListView As New ListView()
     Private ReadOnly _logListColumn As New ColumnHeader()
-    Private ReadOnly _logEntries As New List(Of String)()
+    Private ReadOnly _logEntries As New List(Of LogLineEntry)()
 
     Private ReadOnly _menuStrip As New MenuStrip()
     Private ReadOnly _fileMenu As New ToolStripMenuItem("&File")
@@ -163,7 +163,7 @@ Public Class MainForm
     Private _progressDispatchQueued As Integer
     Private _lastProgressRenderTick As Long
     Private ReadOnly _logDispatchLock As New Object()
-    Private ReadOnly _pendingLogLines As New Queue(Of String)()
+    Private ReadOnly _pendingLogEntries As New Queue(Of LogLineEntry)()
     Private _logDispatchQueued As Integer
     Private _droppedLogLines As Integer
     Private _recoveryTouchInFlight As Integer
@@ -180,6 +180,12 @@ Public Class MainForm
     Private _uiLogLinesDropped As Long
     Private _uiWorkerSuppressedLogLines As Long
     Private _remapPromptInFlight As Integer
+    Private _logSeverityColoringEnabled As Boolean = True
+    Private _logInfoColor As Color = Color.Gainsboro
+    Private _logSuccessColor As Color = Color.FromArgb(140, 220, 140)
+    Private _logWarningColor As Color = Color.FromArgb(255, 210, 120)
+    Private _logErrorColor As Color = Color.FromArgb(255, 150, 150)
+    Private _logCriticalColor As Color = Color.FromArgb(255, 96, 96)
 
     Public Sub New(Optional launchOptions As LaunchOptions = Nothing)
         Text = AppTitle
@@ -513,7 +519,10 @@ Public Class MainForm
             Return
         End If
 
-        e.Item = New ListViewItem(_logEntries(e.ItemIndex))
+        Dim entry = _logEntries(e.ItemIndex)
+        Dim item = New ListViewItem(entry.Text)
+        item.ForeColor = ResolveLogSeverityColor(entry.Severity)
+        e.Item = item
     End Sub
 
     Private Sub LogListView_Resize(sender As Object, e As EventArgs)
@@ -1696,6 +1705,7 @@ Public Class MainForm
         ApplyStatusRowVisibility(safeSettings)
         ApplyProgressBarPresentation(safeSettings)
         ApplyLogFontSettings(safeSettings)
+        ApplyLogSeverityColorSettings(safeSettings)
     End Sub
 
     Private Sub ApplyStatusRowVisibility(settings As AppSettings)
@@ -1749,6 +1759,28 @@ Public Class MainForm
         ResizeLogColumn()
     End Sub
 
+    Private Sub ApplyLogSeverityColorSettings(settings As AppSettings)
+        Dim safeSettings = If(settings, New AppSettings())
+        _logSeverityColoringEnabled = safeSettings.UiColorizeLogBySeverity
+
+        Dim darkPalette = ThemeSettings.GetPreferredColorMode(safeSettings) = SystemColorMode.Dark
+        If darkPalette Then
+            _logInfoColor = Color.Gainsboro
+            _logSuccessColor = Color.FromArgb(140, 220, 140)
+            _logWarningColor = Color.FromArgb(255, 210, 120)
+            _logErrorColor = Color.FromArgb(255, 150, 150)
+            _logCriticalColor = Color.FromArgb(255, 96, 96)
+        Else
+            _logInfoColor = _logListView.ForeColor
+            _logSuccessColor = Color.FromArgb(25, 120, 25)
+            _logWarningColor = Color.FromArgb(150, 100, 0)
+            _logErrorColor = Color.FromArgb(180, 40, 40)
+            _logCriticalColor = Color.FromArgb(130, 0, 0)
+        End If
+
+        RefreshLogViewVirtualSize()
+    End Sub
+
     Private Sub RefreshDiagnosticsLabel(Optional force As Boolean = False)
         If Not _showUiDiagnostics OrElse _diagnosticsLabel Is Nothing Then
             Return
@@ -1766,7 +1798,7 @@ Public Class MainForm
 
         Dim pendingLogQueueCount As Integer
         SyncLock _logDispatchLock
-            pendingLogQueueCount = _pendingLogLines.Count
+            pendingLogQueueCount = _pendingLogEntries.Count
         End SyncLock
 
         _diagnosticsLabel.Text =
@@ -1917,6 +1949,9 @@ Public Class MainForm
             AppendLog(If(scanOnly, "Starting bad-block scan through supervisor.", "Starting copy job through supervisor."))
             AppendLog($"Buffer mode: {If(normalizedOptions.UseAdaptiveBufferSizing, "Adaptive (max " & CInt(_bufferMbNumeric.Value) & " MB)", "Fixed (" & CInt(_bufferMbNumeric.Value) & " MB)")}.")
             AppendLog($"Media wait mode: {If(normalizedOptions.WaitForMediaAvailability, "Enabled (wait forever)", "Disabled")}.")
+            If scanOnly Then
+                AppendLog($"Scan backend: {If(normalizedOptions.UseExperimentalRawDiskScan, "Raw disk (experimental, auto-fallback enabled)", "Standard file I/O")}.")
+            End If
             If normalizedOptions.UseBadRangeMap Then
                 AppendLog($"Bad-range map: Enabled ({If(normalizedOptions.SkipKnownBadRanges, "skip known bad ranges", "read all ranges")}).")
             Else
@@ -2019,6 +2054,7 @@ Public Class MainForm
             .SkipKnownBadRanges = safeSettings.DefaultSkipKnownBadRanges,
             .UpdateBadRangeMapFromRun = safeSettings.DefaultUpdateBadRangeMapFromRun,
             .BadRangeMapMaxAgeDays = Math.Max(0, safeSettings.DefaultBadRangeMapMaxAgeDays),
+            .UseExperimentalRawDiskScan = safeSettings.DefaultUseExperimentalRawDiskScan,
             .OverwritePolicy = SettingsValueConverter.ToOverwritePolicy(safeSettings.DefaultOverwritePolicy),
             .SymlinkHandling = SettingsValueConverter.ToSymlinkHandling(safeSettings.DefaultSymlinkHandling),
             .CopyEmptyDirectories = safeSettings.DefaultCopyEmptyDirectories,
@@ -2600,6 +2636,7 @@ Public Class MainForm
             .SkipKnownBadRanges = options.SkipKnownBadRanges,
             .UpdateBadRangeMapFromRun = options.UpdateBadRangeMapFromRun,
             .BadRangeMapMaxAgeDays = Math.Max(0, Math.Min(3650, options.BadRangeMapMaxAgeDays)),
+            .UseExperimentalRawDiskScan = options.UseExperimentalRawDiskScan,
             .ResumeJournalPathHint = If(options.ResumeJournalPathHint, String.Empty),
             .AllowJournalRootRemap = options.AllowJournalRootRemap,
             .SelectedRelativePaths = normalizedSelections,
@@ -2661,6 +2698,7 @@ Public Class MainForm
             .SkipKnownBadRanges = options.SkipKnownBadRanges,
             .UpdateBadRangeMapFromRun = options.UpdateBadRangeMapFromRun,
             .BadRangeMapMaxAgeDays = options.BadRangeMapMaxAgeDays,
+            .UseExperimentalRawDiskScan = options.UseExperimentalRawDiskScan,
             .ResumeJournalPathHint = options.ResumeJournalPathHint,
             .AllowJournalRootRemap = options.AllowJournalRootRemap,
             .SelectedRelativePaths = New List(Of String)(If(options.SelectedRelativePaths, New List(Of String)())),
@@ -3343,7 +3381,7 @@ Public Class MainForm
             Return
         End If
 
-        AppendLogLines(New List(Of String) From {message})
+        AppendLogLines(New List(Of LogLineEntry) From {CreateLogLineEntry(message)})
     End Sub
 
     Private Sub QueueLogLine(message As String)
@@ -3351,13 +3389,14 @@ Public Class MainForm
             Return
         End If
 
+        Dim entry = CreateLogLineEntry(message)
         SyncLock _logDispatchLock
-            If _pendingLogLines.Count >= MaxQueuedLogLines Then
-                _pendingLogLines.Dequeue()
+            If _pendingLogEntries.Count >= MaxQueuedLogLines Then
+                _pendingLogEntries.Dequeue()
                 _droppedLogLines += 1
                 _uiLogLinesDropped += 1
             End If
-            _pendingLogLines.Enqueue(message)
+            _pendingLogEntries.Enqueue(entry)
         End SyncLock
 
         If Interlocked.CompareExchange(_logDispatchQueued, 1, 0) <> 0 Then
@@ -3392,16 +3431,19 @@ Public Class MainForm
             Return
         End If
 
-        Dim linesToAppend As New List(Of String)()
+        Dim linesToAppend As New List(Of LogLineEntry)()
 
         SyncLock _logDispatchLock
             If _droppedLogLines > 0 Then
-                linesToAppend.Add($"[Log] Dropped {_droppedLogLines} queued message(s) to keep UI responsive.")
+                linesToAppend.Add(New LogLineEntry() With {
+                    .Text = $"[Log] Dropped {_droppedLogLines} queued message(s) to keep UI responsive.",
+                    .Severity = LogSeverityLevel.Warning
+                })
                 _droppedLogLines = 0
             End If
 
-            While _pendingLogLines.Count > 0 AndAlso linesToAppend.Count < MaxLogLinesPerRender
-                linesToAppend.Add(_pendingLogLines.Dequeue())
+            While _pendingLogEntries.Count > 0 AndAlso linesToAppend.Count < MaxLogLinesPerRender
+                linesToAppend.Add(_pendingLogEntries.Dequeue())
             End While
         End SyncLock
 
@@ -3413,7 +3455,7 @@ Public Class MainForm
 
         Dim hasPending As Boolean
         SyncLock _logDispatchLock
-            hasPending = _pendingLogLines.Count > 0 OrElse _droppedLogLines > 0
+            hasPending = _pendingLogEntries.Count > 0 OrElse _droppedLogLines > 0
         End SyncLock
 
         If hasPending AndAlso Interlocked.CompareExchange(_logDispatchQueued, 1, 0) = 0 Then
@@ -3435,22 +3477,22 @@ Public Class MainForm
         Dim ignoredDrainTask = drainTask
     End Sub
 
-    Private Sub AppendLogLines(lines As IEnumerable(Of String))
+    Private Sub AppendLogLines(lines As IEnumerable(Of LogLineEntry))
         If lines Is Nothing Then
             Return
         End If
 
         Dim shouldAutoScroll = ShouldAutoScrollLogView()
         Dim appendedCount = 0
-        For Each line In lines
-            If String.IsNullOrWhiteSpace(line) Then
+        For Each entry In lines
+            If entry Is Nothing OrElse String.IsNullOrWhiteSpace(entry.Text) Then
                 Continue For
             End If
 
-            _logEntries.Add(line)
+            _logEntries.Add(entry)
             appendedCount += 1
             _uiLogLinesRendered += 1
-            CaptureWorkerSuppressedLogTelemetry(line)
+            CaptureWorkerSuppressedLogTelemetry(entry.Text)
         Next
 
         If appendedCount = 0 Then
@@ -3480,7 +3522,10 @@ Public Class MainForm
         End If
 
         _logEntries.RemoveRange(0, removeCount)
-        _logEntries.Insert(0, $"[Log trimmed] Removed {removeCount} older lines to keep UI responsive.")
+        _logEntries.Insert(0, New LogLineEntry() With {
+            .Text = $"[Log trimmed] Removed {removeCount} older lines to keep UI responsive.",
+            .Severity = LogSeverityLevel.Warning
+        })
     End Sub
 
     Private Function ShouldAutoScrollLogView() As Boolean
@@ -3513,7 +3558,7 @@ Public Class MainForm
 
     Private Sub ClearLogView()
         SyncLock _logDispatchLock
-            _pendingLogLines.Clear()
+            _pendingLogEntries.Clear()
             _droppedLogLines = 0
         End SyncLock
 
@@ -3571,6 +3616,72 @@ Public Class MainForm
             _uiWorkerSuppressedLogLines += suppressedCount
         End If
     End Sub
+
+    Private Function CreateLogLineEntry(message As String) As LogLineEntry
+        Dim text = If(message, String.Empty).Trim()
+        Return New LogLineEntry() With {
+            .Text = text,
+            .Severity = ClassifyLogSeverity(text)
+        }
+    End Function
+
+    Private Shared Function ClassifyLogSeverity(message As String) As LogSeverityLevel
+        If String.IsNullOrWhiteSpace(message) Then
+            Return LogSeverityLevel.Info
+        End If
+
+        Dim text = message.Trim()
+        Dim normalized = text.ToLowerInvariant()
+
+        If normalized.Contains("[worker fatal]") OrElse normalized.Contains("fatal error") Then
+            Return LogSeverityLevel.Critical
+        End If
+
+        If normalized.Contains(" failed") OrElse
+            normalized.StartsWith("failed:", StringComparison.OrdinalIgnoreCase) OrElse
+            normalized.Contains(" error") OrElse
+            normalized.Contains(" exception") Then
+            Return LogSeverityLevel.Error
+        End If
+
+        If normalized.Contains(" warning") OrElse
+            normalized.StartsWith("warning:", StringComparison.OrdinalIgnoreCase) OrElse
+            normalized.Contains(" retry ") OrElse
+            normalized.Contains(" fallback ") OrElse
+            normalized.Contains(" skipped") OrElse
+            normalized.Contains(" dropped ") OrElse
+            normalized.Contains(" waiting for ") OrElse
+            normalized.Contains(" unavailable") Then
+            Return LogSeverityLevel.Warning
+        End If
+
+        If normalized.Contains("completed successfully") OrElse
+            normalized.StartsWith("finished.", StringComparison.OrdinalIgnoreCase) OrElse
+            normalized.Contains("already up to date") Then
+            Return LogSeverityLevel.Success
+        End If
+
+        Return LogSeverityLevel.Info
+    End Function
+
+    Private Function ResolveLogSeverityColor(severity As LogSeverityLevel) As Color
+        If Not _logSeverityColoringEnabled Then
+            Return _logListView.ForeColor
+        End If
+
+        Select Case severity
+            Case LogSeverityLevel.Success
+                Return _logSuccessColor
+            Case LogSeverityLevel.Warning
+                Return _logWarningColor
+            Case LogSeverityLevel.[Error]
+                Return _logErrorColor
+            Case LogSeverityLevel.Critical
+                Return _logCriticalColor
+            Case Else
+                Return _logInfoColor
+        End Select
+    End Function
 
     Private Sub SetRunningState(isRunning As Boolean)
         _sourceTextBox.Enabled = Not isRunning
@@ -3876,6 +3987,19 @@ Public Class MainForm
 
         Return $"{size:0.##} {units(unitIndex)}"
     End Function
+
+    Private Enum LogSeverityLevel
+        Info = 0
+        Success = 1
+        Warning = 2
+        [Error] = 3
+        Critical = 4
+    End Enum
+
+    Private NotInheritable Class LogLineEntry
+        Public Property Text As String = String.Empty
+        Public Property Severity As LogSeverityLevel = LogSeverityLevel.Info
+    End Class
 End Class
 
 

@@ -15,6 +15,7 @@ Namespace Models
         Public Property SkipKnownBadRanges As Boolean = True
         Public Property UpdateBadRangeMapFromRun As Boolean = True
         Public Property BadRangeMapMaxAgeDays As Integer = 30
+        Public Property UseExperimentalRawDiskScan As Boolean = False
 
         ' Resume/remap state used by recovery paths.
         Public Property ResumeJournalPathHint As String = String.Empty

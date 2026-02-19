@@ -36,6 +36,7 @@ Friend Class SettingsForm
     Private ReadOnly _uiScaleComboBox As New ComboBox()
     Private ReadOnly _logFontFamilyComboBox As New ComboBox()
     Private ReadOnly _logFontSizeNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _logColorizeBySeverityCheckBox As New CheckBox()
     Private ReadOnly _gridAlternatingRowsCheckBox As New CheckBox()
     Private ReadOnly _gridRowHeightNumeric As New ThemedNumericUpDown()
     Private ReadOnly _gridHeaderStyleComboBox As New ComboBox()
@@ -56,6 +57,7 @@ Friend Class SettingsForm
     Private ReadOnly _defaultUseBadRangeMapCheckBox As New CheckBox()
     Private ReadOnly _defaultSkipKnownBadRangesCheckBox As New CheckBox()
     Private ReadOnly _defaultUpdateBadRangeMapCheckBox As New CheckBox()
+    Private ReadOnly _defaultUseRawDiskScanCheckBox As New CheckBox()
     Private ReadOnly _defaultBadRangeMapMaxAgeDaysNumeric As New ThemedNumericUpDown()
     Private ReadOnly _overwritePolicyComboBox As New ComboBox()
     Private ReadOnly _symlinkHandlingComboBox As New ComboBox()
@@ -288,6 +290,7 @@ Friend Class SettingsForm
         _toolTip.SetToolTip(_uiScaleComboBox, "Global UI text/control scale.")
         _toolTip.SetToolTip(_logFontFamilyComboBox, "Font family used by the operations log.")
         _toolTip.SetToolTip(_logFontSizeNumeric, "Font size for the operations log in points.")
+        _toolTip.SetToolTip(_logColorizeBySeverityCheckBox, "Color-code operations log lines by severity level.")
         _toolTip.SetToolTip(_gridAlternatingRowsCheckBox, "Use alternating row colors in data grids.")
         _toolTip.SetToolTip(_gridRowHeightNumeric, "Default data-grid row height.")
         _toolTip.SetToolTip(_gridHeaderStyleComboBox, "Header style used by data grids.")
@@ -308,6 +311,7 @@ Friend Class SettingsForm
         _toolTip.SetToolTip(_defaultUseBadRangeMapCheckBox, "Load saved bad-range maps for matching sources.")
         _toolTip.SetToolTip(_defaultSkipKnownBadRangesCheckBox, "Skip read attempts for ranges already known unreadable from previous scans/copies.")
         _toolTip.SetToolTip(_defaultUpdateBadRangeMapCheckBox, "Update bad-range maps from new scans/copies.")
+        _toolTip.SetToolTip(_defaultUseRawDiskScanCheckBox, "Experimental scan backend that reads local NTFS extents from raw disk for faster bad-block scanning; auto-falls back to standard scan when unsupported.")
         _toolTip.SetToolTip(_defaultBadRangeMapMaxAgeDaysNumeric, "Maximum map age in days before map data is ignored (0 = never expire).")
 
         _toolTip.SetToolTip(_overwritePolicyComboBox, "Default conflict behavior when destination files already exist. 'Always ask' prompts Yes/No/Cancel for each conflict.")
@@ -504,18 +508,22 @@ Friend Class SettingsForm
         layout.Controls.Add(CreateFieldLabel("UI scale"), 0, 1)
         layout.Controls.Add(_uiScaleComboBox, 1, 1)
 
-        Dim log = CreateFieldGrid(2)
+        Dim log = CreateFieldGrid(3)
 
         _logFontFamilyComboBox.DropDownStyle = ComboBoxStyle.DropDownList
         ConfigureComboBoxControl(_logFontFamilyComboBox, width:=320)
         PopulateLogFontFamilyComboBox()
 
         ConfigureNumeric(_logFontSizeNumeric, 7D, 20D, 9D)
+        _logColorizeBySeverityCheckBox.Text = "Color-code log by severity"
+        ConfigureCheckBox(_logColorizeBySeverityCheckBox)
 
         log.Controls.Add(CreateFieldLabel("Operations log font"), 0, 0)
         log.Controls.Add(_logFontFamilyComboBox, 1, 0)
         log.Controls.Add(CreateFieldLabel("Operations log size (pt)"), 0, 1)
         log.Controls.Add(_logFontSizeNumeric, 1, 1)
+        log.Controls.Add(_logColorizeBySeverityCheckBox, 0, 2)
+        log.SetColumnSpan(_logColorizeBySeverityCheckBox, 3)
 
         Dim grid = CreateFieldGrid(3)
 
@@ -622,15 +630,17 @@ Friend Class SettingsForm
         policy.Controls.Add(CreateFieldLabel("Salvage fill pattern"), 0, 2)
         policy.Controls.Add(_salvageFillPatternComboBox, 1, 2)
 
-        Dim badMap = CreateFieldGrid(4)
+        Dim badMap = CreateFieldGrid(5)
         _defaultUseBadRangeMapCheckBox.Text = "Use bad-range map when available"
         _defaultSkipKnownBadRangesCheckBox.Text = "Skip known bad ranges during copy"
         _defaultUpdateBadRangeMapCheckBox.Text = "Update bad-range map from scan/copy runs"
+        _defaultUseRawDiskScanCheckBox.Text = "Use experimental raw disk scan backend (local NTFS)"
 
         For Each box As CheckBox In New CheckBox() {
             _defaultUseBadRangeMapCheckBox,
             _defaultSkipKnownBadRangesCheckBox,
-            _defaultUpdateBadRangeMapCheckBox}
+            _defaultUpdateBadRangeMapCheckBox,
+            _defaultUseRawDiskScanCheckBox}
             ConfigureCheckBox(box)
         Next
 
@@ -644,8 +654,10 @@ Friend Class SettingsForm
         badMap.SetColumnSpan(_defaultSkipKnownBadRangesCheckBox, 3)
         badMap.Controls.Add(_defaultUpdateBadRangeMapCheckBox, 0, 2)
         badMap.SetColumnSpan(_defaultUpdateBadRangeMapCheckBox, 3)
-        badMap.Controls.Add(CreateFieldLabel("Map max age (days, 0=never)"), 0, 3)
-        badMap.Controls.Add(_defaultBadRangeMapMaxAgeDaysNumeric, 1, 3)
+        badMap.Controls.Add(_defaultUseRawDiskScanCheckBox, 0, 3)
+        badMap.SetColumnSpan(_defaultUseRawDiskScanCheckBox, 3)
+        badMap.Controls.Add(CreateFieldLabel("Map max age (days, 0=never)"), 0, 4)
+        badMap.Controls.Add(_defaultBadRangeMapMaxAgeDaysNumeric, 1, 4)
 
         page.Controls.Add(CreateSection("Default Run Behavior", behavior), 0, 0)
         page.Controls.Add(CreateSection("Policies", policy), 0, 1)
@@ -1228,6 +1240,7 @@ Friend Class SettingsForm
                 0)
             _uiScaleComboBox.SelectedItem = $"{Math.Max(90, Math.Min(125, _workingSettings.UiScalePercent))}%"
             _logFontSizeNumeric.Value = ClampNumeric(_logFontSizeNumeric, _workingSettings.LogFontSizePoints)
+            _logColorizeBySeverityCheckBox.Checked = _workingSettings.UiColorizeLogBySeverity
             _gridAlternatingRowsCheckBox.Checked = _workingSettings.GridAlternatingRows
             _gridRowHeightNumeric.Value = ClampNumeric(_gridRowHeightNumeric, _workingSettings.GridRowHeight)
             _showBufferStatusRowCheckBox.Checked = _workingSettings.ShowBufferStatusRow
@@ -1259,6 +1272,7 @@ Friend Class SettingsForm
             _defaultUseBadRangeMapCheckBox.Checked = _workingSettings.DefaultUseBadRangeMap
             _defaultSkipKnownBadRangesCheckBox.Checked = _workingSettings.DefaultSkipKnownBadRanges
             _defaultUpdateBadRangeMapCheckBox.Checked = _workingSettings.DefaultUpdateBadRangeMapFromRun
+            _defaultUseRawDiskScanCheckBox.Checked = _workingSettings.DefaultUseExperimentalRawDiskScan
             _defaultBadRangeMapMaxAgeDaysNumeric.Value = ClampNumeric(_defaultBadRangeMapMaxAgeDaysNumeric, _workingSettings.DefaultBadRangeMapMaxAgeDays)
 
             _defaultAdaptiveBufferCheckBox.Checked = _workingSettings.DefaultUseAdaptiveBuffer
@@ -1528,6 +1542,7 @@ Friend Class SettingsForm
             capturedSettings.LogFontFamily = "Consolas"
         End If
         capturedSettings.LogFontSizePoints = CInt(_logFontSizeNumeric.Value)
+        capturedSettings.UiColorizeLogBySeverity = _logColorizeBySeverityCheckBox.Checked
         capturedSettings.GridAlternatingRows = _gridAlternatingRowsCheckBox.Checked
         capturedSettings.GridRowHeight = CInt(_gridRowHeightNumeric.Value)
         capturedSettings.GridHeaderStyle = If(
@@ -1572,6 +1587,7 @@ Friend Class SettingsForm
         capturedSettings.DefaultUseBadRangeMap = _defaultUseBadRangeMapCheckBox.Checked
         capturedSettings.DefaultSkipKnownBadRanges = _defaultSkipKnownBadRangesCheckBox.Checked
         capturedSettings.DefaultUpdateBadRangeMapFromRun = _defaultUpdateBadRangeMapCheckBox.Checked
+        capturedSettings.DefaultUseExperimentalRawDiskScan = _defaultUseRawDiskScanCheckBox.Checked
         capturedSettings.DefaultBadRangeMapMaxAgeDays = CInt(_defaultBadRangeMapMaxAgeDaysNumeric.Value)
         capturedSettings.DefaultUseAdaptiveBuffer = _defaultAdaptiveBufferCheckBox.Checked
         capturedSettings.DefaultBufferSizeMb = CInt(_defaultBufferMbNumeric.Value)

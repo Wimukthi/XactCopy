@@ -4,6 +4,7 @@ Imports System.IO
 Imports System.Linq
 Imports System.Globalization
 Imports System.Runtime.InteropServices
+Imports System.Security.Principal
 Imports System.Security.Cryptography
 Imports System.Threading
 Imports Microsoft.Win32.SafeHandles
@@ -17,6 +18,7 @@ Namespace Services
 
         Private Const JournalFlushIntervalSeconds As Integer = 1
         Private Const BadRangeMapFlushIntervalSeconds As Integer = 2
+        Private Const MediaIdentityProbeIntervalMilliseconds As Integer = 1000
         Private Const RescueCoreName As String = "AegisRescueCore"
         Private Const MinimumRescueBlockSize As Integer = 4096
         Private Const MaximumIoBufferSize As Integer = 256 * 1024 * 1024
@@ -28,11 +30,14 @@ Namespace Services
         Private Const ErrorSharingViolation As Integer = 32
         Private Const ErrorLockViolation As Integer = 33
         Private Const ErrorHandleDiskFull As Integer = 39
+        Private Const ErrorNotSupported As Integer = 50
         Private Const ErrorBadNetPath As Integer = 53
         Private Const ErrorNetNameDeleted As Integer = 64
         Private Const ErrorBadNetName As Integer = 67
+        Private Const ErrorInvalidParameter As Integer = 87
         Private Const ErrorDiskFull As Integer = 112
         Private Const ErrorDeviceNotConnected As Integer = 1167
+        Private Const NativeCopyFastPathMaxBytes As Long = 64L * 1024L * 1024L
 
         Private ReadOnly _options As CopyJobOptions
         Private ReadOnly _executionControl As CopyExecutionControl
@@ -49,10 +54,14 @@ Namespace Services
         Private _expectedDestinationIdentity As String = String.Empty
         Private _lastSourceIdentityMismatchLogUtc As DateTimeOffset = DateTimeOffset.MinValue
         Private _lastDestinationIdentityMismatchLogUtc As DateTimeOffset = DateTimeOffset.MinValue
+        Private _lastSourceIdentityProbeUtc As DateTimeOffset = DateTimeOffset.MinValue
+        Private _lastDestinationIdentityProbeUtc As DateTimeOffset = DateTimeOffset.MinValue
         Private _badRangeMap As BadRangeMap
         Private _badRangeMapPath As String = String.Empty
         Private _badRangeMapLoaded As Boolean
         Private _badRangeMapReadHintsEnabled As Boolean
+        Private _rawDiskScanContext As RawDiskScanContext
+        Private ReadOnly _rawScanFallbackLoggedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
         <DllImport("kernel32.dll", CharSet:=CharSet.Unicode, SetLastError:=True)>
         Private Shared Function GetVolumeInformation(
@@ -64,6 +73,83 @@ Namespace Services
             ByRef lpFileSystemFlags As UInteger,
             lpFileSystemNameBuffer As IntPtr,
             nFileSystemNameSize As UInteger) As Boolean
+        End Function
+
+        <DllImport("kernel32.dll", SetLastError:=True)>
+        Private Shared Function CancelIoEx(
+            hFile As SafeFileHandle,
+            lpOverlapped As IntPtr) As Boolean
+        End Function
+
+        <Flags>
+        Private Enum CopyFileFlags As UInteger
+            None = 0UI
+            Restartable = &H2UI
+            OpenSourceForWrite = &H4UI
+            AllowDecryptedDestination = &H8UI
+            CopySymlink = &H800UI
+            NoBuffering = &H1000UI
+            RequestSecurityPrivileges = &H2000UI
+            ResumeFromPause = &H4000UI
+            NoOffload = &H40000000UI
+        End Enum
+
+        Private Enum CopyProgressCallbackReason As UInteger
+            ChunkFinished = 0UI
+            StreamSwitch = 1UI
+        End Enum
+
+        Private Enum CopyProgressResult As UInteger
+            ContinueCopy = 0UI
+            CancelCopy = 1UI
+            StopCopy = 2UI
+            Quiet = 3UI
+        End Enum
+
+        <UnmanagedFunctionPointer(CallingConvention.Winapi)>
+        Private Delegate Function CopyProgressRoutine(
+            totalFileSize As Long,
+            totalBytesTransferred As Long,
+            streamSize As Long,
+            streamBytesTransferred As Long,
+            dwStreamNumber As UInteger,
+            dwCallbackReason As CopyProgressCallbackReason,
+            hSourceFile As IntPtr,
+            hDestinationFile As IntPtr,
+            lpData As IntPtr) As CopyProgressResult
+
+        <DllImport("kernel32.dll", CharSet:=CharSet.Unicode, SetLastError:=True)>
+        Private Shared Function CopyFileEx(
+            lpExistingFileName As String,
+            lpNewFileName As String,
+            lpProgressRoutine As CopyProgressRoutine,
+            lpData As IntPtr,
+            ByRef pbCancel As Integer,
+            dwCopyFlags As CopyFileFlags) As Boolean
+        End Function
+
+        Private Enum GetFileExInfoLevels As Integer
+            GetFileExInfoStandard = 0
+        End Enum
+
+        <StructLayout(LayoutKind.Sequential)>
+        Private Structure Win32FileAttributeData
+            Public FileAttributes As UInteger
+            Public CreationTimeLow As UInteger
+            Public CreationTimeHigh As UInteger
+            Public LastAccessTimeLow As UInteger
+            Public LastAccessTimeHigh As UInteger
+            Public LastWriteTimeLow As UInteger
+            Public LastWriteTimeHigh As UInteger
+            Public FileSizeHigh As UInteger
+            Public FileSizeLow As UInteger
+        End Structure
+
+        <DllImport("kernel32.dll", CharSet:=CharSet.Unicode, SetLastError:=True, EntryPoint:="GetFileAttributesExW")>
+        Private Shared Function GetFileAttributesEx(
+            lpFileName As String,
+            fInfoLevelId As GetFileExInfoLevels,
+            ByRef lpFileInformation As Win32FileAttributeData) As Boolean
         End Function
 
         Public Sub New(options As CopyJobOptions, Optional executionControl As CopyExecutionControl = Nothing)
@@ -83,92 +169,95 @@ Namespace Services
                 EmitLog($"[DevFault] Enabled: {_devFaultInjector.Description}")
             End If
 #End If
+            Try
+                _rawScanFallbackLoggedPaths.Clear()
 
-            Dim scanOnly = (_options.OperationMode = JobOperationMode.ScanOnly)
-            Dim sourceRoot = Path.GetFullPath(_options.SourceRoot)
-            Dim destinationRoot = Path.GetFullPath(_options.DestinationRoot)
-            InitializeMediaIdentityExpectations(sourceRoot, destinationRoot)
-            Await WaitForMediaAvailabilityAsync(sourceRoot, destinationRoot, cancellationToken).ConfigureAwait(False)
-            EnsureMediaIdentityIntegrity(sourceRoot, destinationRoot)
-            If Not scanOnly Then
-                Directory.CreateDirectory(destinationRoot)
-            End If
+                Dim scanOnly = (_options.OperationMode = JobOperationMode.ScanOnly)
+                Dim sourceRoot = Path.GetFullPath(_options.SourceRoot)
+                Dim destinationRoot = Path.GetFullPath(_options.DestinationRoot)
+                InitializeMediaIdentityExpectations(sourceRoot, destinationRoot)
+                Await WaitForMediaAvailabilityAsync(sourceRoot, destinationRoot, cancellationToken).ConfigureAwait(False)
+                EnsureMediaIdentityIntegrity(sourceRoot, destinationRoot, includeDestination:=Not scanOnly, force:=True)
+                InitializeRawDiskScanContext(scanOnly, sourceRoot)
+                If Not scanOnly Then
+                    Directory.CreateDirectory(destinationRoot)
+                End If
 
-            Await InitializeBadRangeMapAsync(sourceRoot, cancellationToken).ConfigureAwait(False)
+                Await InitializeBadRangeMapAsync(sourceRoot, cancellationToken).ConfigureAwait(False)
 
-            EmitLog($"Scanning source: {sourceRoot}")
-            Dim scanResult = DirectoryScanner.ScanSource(
-                sourceRoot,
-                _options.SelectedRelativePaths,
-                _options.SymlinkHandling,
-                _options.CopyEmptyDirectories,
-                AddressOf EmitLog)
-            Dim sourceFiles = scanResult.Files
-            Dim totalBytes = sourceFiles.Sum(Function(fileDescriptor) fileDescriptor.Length)
-            EmitLog($"Scan complete. {sourceFiles.Count} file(s), {FormatBytes(totalBytes)} total.")
-            If scanOnly Then
-                EmitLog("Operation mode: Scan only (read-only bad-block detection).")
-            Else
-                EmitDestinationCapacityWarning(destinationRoot, totalBytes)
-            End If
+                EmitLog($"Scanning source: {sourceRoot}")
+                Dim scanResult = DirectoryScanner.ScanSource(
+                    sourceRoot,
+                    _options.SelectedRelativePaths,
+                    _options.SymlinkHandling,
+                    _options.CopyEmptyDirectories,
+                    AddressOf EmitLog)
+                Dim sourceFiles = scanResult.Files
+                Dim totalBytes = sourceFiles.Sum(Function(fileDescriptor) fileDescriptor.Length)
+                EmitLog($"Scan complete. {sourceFiles.Count} file(s), {FormatBytes(totalBytes)} total.")
+                If scanOnly Then
+                    EmitLog("Operation mode: Scan only (read-only bad-block detection).")
+                Else
+                    EmitDestinationCapacityWarning(destinationRoot, totalBytes)
+                End If
 
-            If Not scanOnly AndAlso _options.CopyEmptyDirectories AndAlso scanResult.Directories.Count > 0 Then
-                EmitLog($"Preparing {scanResult.Directories.Count} destination directory path(s).")
-                For Each relativeDirectory In scanResult.Directories
+                If Not scanOnly AndAlso _options.CopyEmptyDirectories AndAlso scanResult.Directories.Count > 0 Then
+                    EmitLog($"Preparing {scanResult.Directories.Count} destination directory path(s).")
+                    For Each relativeDirectory In scanResult.Directories
+                        cancellationToken.ThrowIfCancellationRequested()
+                        Await _executionControl.WaitIfPausedAsync(cancellationToken).ConfigureAwait(False)
+                        Await WaitForMediaAvailabilityAsync(sourceRoot, destinationRoot, cancellationToken).ConfigureAwait(False)
+
+                        Dim directoryPath = Path.Combine(destinationRoot, relativeDirectory)
+                        Try
+                            Directory.CreateDirectory(directoryPath)
+                        Catch ex As Exception
+                            EmitLog($"Destination directory skipped: {relativeDirectory} ({ex.Message})")
+                        End Try
+                    Next
+                End If
+
+                Dim jobId = JobJournalStore.BuildJobId(sourceRoot, destinationRoot)
+                Dim defaultJournalPath = JobJournalStore.GetDefaultJournalPath(jobId)
+                Dim journalPath = ResolveWritableJournalPath(jobId, defaultJournalPath)
+
+                Dim existingJournal As JobJournal = Nothing
+                If _options.ResumeFromJournal Then
+                    For Each candidatePath In GetJournalLoadCandidates(defaultJournalPath, journalPath)
+                        existingJournal = Await _journalStore.LoadAsync(candidatePath, cancellationToken).ConfigureAwait(False)
+                        If existingJournal IsNot Nothing Then
+                            EmitLog($"Loaded journal: {candidatePath}")
+                            Exit For
+                        End If
+                    Next
+
+                    If existingJournal Is Nothing Then
+                        EmitLog("No journal found. Creating a fresh state.")
+                    End If
+                Else
+                    EmitLog("Resume disabled. Starting with a fresh state.")
+                End If
+
+                Dim journal = MergeJournal(existingJournal, sourceFiles, sourceRoot, destinationRoot, jobId)
+                Await _journalStore.SaveAsync(journalPath, journal, cancellationToken).ConfigureAwait(False)
+                _lastJournalFlushUtc = DateTimeOffset.UtcNow
+
+                Dim progress As New ProgressAccumulator() With {
+                    .TotalFiles = sourceFiles.Count,
+                    .TotalBytes = totalBytes
+                }
+
+                For Each descriptor In sourceFiles
                     cancellationToken.ThrowIfCancellationRequested()
                     Await _executionControl.WaitIfPausedAsync(cancellationToken).ConfigureAwait(False)
                     Await WaitForMediaAvailabilityAsync(sourceRoot, destinationRoot, cancellationToken).ConfigureAwait(False)
+                    EnsureMediaIdentityIntegrity(sourceRoot, destinationRoot, includeDestination:=Not scanOnly, force:=False)
 
-                    Dim directoryPath = Path.Combine(destinationRoot, relativeDirectory)
-                    Try
-                        Directory.CreateDirectory(directoryPath)
-                    Catch ex As Exception
-                        EmitLog($"Destination directory skipped: {relativeDirectory} ({ex.Message})")
-                    End Try
-                Next
-            End If
-
-            Dim jobId = JobJournalStore.BuildJobId(sourceRoot, destinationRoot)
-            Dim defaultJournalPath = JobJournalStore.GetDefaultJournalPath(jobId)
-            Dim journalPath = ResolveWritableJournalPath(jobId, defaultJournalPath)
-
-            Dim existingJournal As JobJournal = Nothing
-            If _options.ResumeFromJournal Then
-                For Each candidatePath In GetJournalLoadCandidates(defaultJournalPath, journalPath)
-                    existingJournal = Await _journalStore.LoadAsync(candidatePath, cancellationToken).ConfigureAwait(False)
-                    If existingJournal IsNot Nothing Then
-                        EmitLog($"Loaded journal: {candidatePath}")
-                        Exit For
-                    End If
-                Next
-
-                If existingJournal Is Nothing Then
-                    EmitLog("No journal found. Creating a fresh state.")
-                End If
-            Else
-                EmitLog("Resume disabled. Starting with a fresh state.")
-            End If
-
-            Dim journal = MergeJournal(existingJournal, sourceFiles, sourceRoot, destinationRoot, jobId)
-            Await _journalStore.SaveAsync(journalPath, journal, cancellationToken).ConfigureAwait(False)
-            _lastJournalFlushUtc = DateTimeOffset.UtcNow
-
-            Dim progress As New ProgressAccumulator() With {
-                .TotalFiles = sourceFiles.Count,
-                .TotalBytes = totalBytes
-            }
-
-            For Each descriptor In sourceFiles
-                cancellationToken.ThrowIfCancellationRequested()
-                Await _executionControl.WaitIfPausedAsync(cancellationToken).ConfigureAwait(False)
-                Await WaitForMediaAvailabilityAsync(sourceRoot, destinationRoot, cancellationToken).ConfigureAwait(False)
-                EnsureMediaIdentityIntegrity(sourceRoot, destinationRoot)
-
-                Dim entry = journal.Files(descriptor.RelativePath)
+                    Dim entry = journal.Files(descriptor.RelativePath)
 
                 ' Overwrite/existing-destination semantics are copy-only. Scan mode must always
                 ' attempt source reads to discover bad ranges.
-                If Not scanOnly Then
+                    If Not scanOnly Then
                     Dim skipReason As String = String.Empty
                     If ShouldSkipByOverwritePolicy(descriptor, destinationRoot, skipReason) Then
                         progress.SkippedFiles += 1
@@ -202,7 +291,7 @@ Namespace Services
                     End If
                 End If
 
-                If scanOnly Then
+                    If scanOnly Then
                     If entry.State = FileCopyState.Failed Then
                         entry.State = FileCopyState.Pending
                         entry.LastError = String.Empty
@@ -222,7 +311,7 @@ Namespace Services
 
                         entry.State = FileCopyState.InProgress
                         entry.LastError = String.Empty
-                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
 
                         scanDetectedBadRanges = Await ScanSingleFileForBadRangesAsync(
                             descriptor,
@@ -262,7 +351,7 @@ Namespace Services
                         entry.BytesCopied = descriptor.Length
                         entry.LastError = String.Empty
                         Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken, forceSave:=False).ConfigureAwait(False)
-                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
                         Continue For
                     End If
 
@@ -271,31 +360,32 @@ Namespace Services
                     entry.LastError = scanException.Message
                     EmitLog($"Scan failed: {descriptor.RelativePath} ({scanException.Message})")
                     Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken, forceSave:=False).ConfigureAwait(False)
-                    Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+                    Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
 
                     If Not _options.ContinueOnFileError Then
+                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
                         Return CreateResult(progress, journalPath, succeeded:=False, cancelled:=False, errorMessage:=scanException.Message)
                     End If
 
                     Continue For
                 End If
 
-                If entry.State = FileCopyState.Failed Then
+                    If entry.State = FileCopyState.Failed Then
                     entry.State = FileCopyState.Pending
                     entry.LastError = String.Empty
                 End If
 
-                Dim copyException As Exception = Nothing
-                Dim recovered = False
-                Dim fileTimeoutCts As CancellationTokenSource = Nothing
-                Dim fileToken = cancellationToken
+                    Dim copyException As Exception = Nothing
+                    Dim recovered = False
+                    Dim fileTimeoutCts As CancellationTokenSource = Nothing
+                    Dim fileToken = cancellationToken
 
-                Try
-                    If _options.PerFileTimeout > TimeSpan.Zero Then
-                        fileTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-                        fileTimeoutCts.CancelAfter(_options.PerFileTimeout)
-                        fileToken = fileTimeoutCts.Token
-                    End If
+                    Try
+                        If _options.PerFileTimeout > TimeSpan.Zero Then
+                            fileTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+                            fileTimeoutCts.CancelAfter(_options.PerFileTimeout)
+                            fileToken = fileTimeoutCts.Token
+                        End If
 
                     entry.State = FileCopyState.InProgress
                     entry.LastError = String.Empty
@@ -310,28 +400,28 @@ Namespace Services
                         journalPath,
                         fileToken).ConfigureAwait(False)
 
-                Catch ex As SourceMutationSkippedException
+                    Catch ex As SourceMutationSkippedException
                     progress.SkippedFiles += 1
                     entry.State = FileCopyState.Pending
                     entry.LastError = ex.Message
                     EmitLog($"Skipped: {descriptor.RelativePath} ({ex.Message})")
                     FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).GetAwaiter().GetResult()
                     Continue For
-                Catch ex As OperationCanceledException When cancellationToken.IsCancellationRequested
-                    Throw
-                Catch ex As OperationCanceledException
+                    Catch ex As OperationCanceledException When cancellationToken.IsCancellationRequested
+                        Throw
+                    Catch ex As OperationCanceledException
                     copyException = New TimeoutException(
                         $"Per-file timeout ({CInt(Math.Round(_options.PerFileTimeout.TotalSeconds))} sec) reached while copying {descriptor.RelativePath}.",
                         ex)
-                Catch ex As Exception
-                    copyException = ex
-                Finally
-                    If fileTimeoutCts IsNot Nothing Then
-                        fileTimeoutCts.Dispose()
-                    End If
-                End Try
+                    Catch ex As Exception
+                        copyException = ex
+                    Finally
+                        If fileTimeoutCts IsNot Nothing Then
+                            fileTimeoutCts.Dispose()
+                        End If
+                    End Try
 
-                If copyException Is Nothing Then
+                    If copyException Is Nothing Then
                     progress.CompletedFiles += 1
                     If recovered Then
                         progress.RecoveredFiles += 1
@@ -343,23 +433,26 @@ Namespace Services
                     Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken).ConfigureAwait(False)
                     Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
                     Continue For
-                End If
+                    End If
 
-                progress.FailedFiles += 1
-                entry.State = FileCopyState.Failed
-                entry.LastError = copyException.Message
-                EmitLog($"Failed: {descriptor.RelativePath} ({copyException.Message})")
-                Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken).ConfigureAwait(False)
+                    progress.FailedFiles += 1
+                    entry.State = FileCopyState.Failed
+                    entry.LastError = copyException.Message
+                    EmitLog($"Failed: {descriptor.RelativePath} ({copyException.Message})")
+                    Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken).ConfigureAwait(False)
+                    Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+
+                    If Not _options.ContinueOnFileError Then
+                        Return CreateResult(progress, journalPath, succeeded:=False, cancelled:=False, errorMessage:=copyException.Message)
+                    End If
+                Next
+
+                Await FlushBadRangeMapAsync(cancellationToken).ConfigureAwait(False)
                 Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
-
-                If Not _options.ContinueOnFileError Then
-                    Return CreateResult(progress, journalPath, succeeded:=False, cancelled:=False, errorMessage:=copyException.Message)
-                End If
-            Next
-
-            Await FlushBadRangeMapAsync(cancellationToken).ConfigureAwait(False)
-            Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
-            Return CreateResult(progress, journalPath, succeeded:=(progress.FailedFiles = 0), cancelled:=False, errorMessage:=String.Empty)
+                Return CreateResult(progress, journalPath, succeeded:=(progress.FailedFiles = 0), cancelled:=False, errorMessage:=String.Empty)
+            Finally
+                DisposeRawDiskScanContext()
+            End Try
         End Function
 
         Private Sub ValidateOptions()
@@ -448,6 +541,87 @@ Namespace Services
                 Case Else
                     Throw New InvalidOperationException("SourceMutationPolicy is invalid.")
             End Select
+        End Sub
+
+        Private Sub InitializeRawDiskScanContext(scanOnly As Boolean, sourceRoot As String)
+            DisposeRawDiskScanContext()
+            _rawScanFallbackLoggedPaths.Clear()
+
+            If Not scanOnly OrElse Not _options.UseExperimentalRawDiskScan Then
+                Return
+            End If
+
+            If Not IsProcessElevated() Then
+                EmitLog("Scan backend: Raw disk requested but worker is not elevated. Using standard file reads. Run XactCopy as Administrator to enable raw scan.")
+                Return
+            End If
+
+            Dim context As RawDiskScanContext = Nothing
+            Dim reason As String = String.Empty
+            If RawDiskScanContext.TryCreate(sourceRoot, context, reason) Then
+                _rawDiskScanContext = context
+                EmitLog($"Scan backend: Raw disk (experimental) enabled. Cluster size {FormatBytes(context.ClusterSizeBytes)}.")
+                Return
+            End If
+
+            Dim normalizedReason = If(String.IsNullOrWhiteSpace(reason), "unsupported source/media", reason)
+            EmitLog($"Scan backend: Raw disk unavailable ({normalizedReason}); using standard file reads.")
+        End Sub
+
+        Private Shared Function IsProcessElevated() As Boolean
+            If Not OperatingSystem.IsWindows() Then
+                Return False
+            End If
+
+            Try
+                Using identity = WindowsIdentity.GetCurrent()
+                    If identity Is Nothing Then
+                        Return False
+                    End If
+
+                    Dim principal As New WindowsPrincipal(identity)
+                    Return principal.IsInRole(WindowsBuiltInRole.Administrator)
+                End Using
+            Catch
+                Return False
+            End Try
+        End Function
+
+        Private Sub DisposeRawDiskScanContext()
+            If _rawDiskScanContext Is Nothing Then
+                Return
+            End If
+
+            Try
+                _rawDiskScanContext.Dispose()
+            Catch
+            Finally
+                _rawDiskScanContext = Nothing
+            End Try
+        End Sub
+
+        Private Function ShouldUseRawDiskReadBackend() As Boolean
+            Return _options.OperationMode = JobOperationMode.ScanOnly AndAlso
+                _options.UseExperimentalRawDiskScan AndAlso
+                _rawDiskScanContext IsNot Nothing
+        End Function
+
+        Private Sub EmitRawDiskFallbackOnce(sourcePath As String, reason As String)
+            Dim key = NormalizeRootPath(sourcePath)
+            If key.Length = 0 Then
+                key = If(sourcePath, String.Empty)
+            End If
+
+            If key.Length = 0 Then
+                key = "(unknown)"
+            End If
+
+            If Not _rawScanFallbackLoggedPaths.Add(key) Then
+                Return
+            End If
+
+            Dim normalizedReason = If(String.IsNullOrWhiteSpace(reason), "unsupported source layout", reason)
+            EmitLog($"Raw disk scan fallback for '{key}': {normalizedReason}.")
         End Sub
 
         Private Function MergeJournal(
@@ -563,16 +737,12 @@ Namespace Services
             End If
 
             Dim destinationPath = Path.Combine(destinationRoot, descriptor.RelativePath)
-            If Not File.Exists(destinationPath) Then
+            Dim destinationMetadata As ExistingFileMetadata = Nothing
+            If Not TryGetExistingFileMetadata(destinationPath, destinationMetadata) Then
                 Return False
             End If
 
-            Try
-                Dim destinationInfo As New FileInfo(destinationPath)
-                Return destinationInfo.Length = descriptor.Length
-            Catch
-                Return False
-            End Try
+            Return destinationMetadata.Length = descriptor.Length
         End Function
 
         Private Function ShouldSkipByOverwritePolicy(
@@ -582,7 +752,8 @@ Namespace Services
 
             reason = String.Empty
             Dim destinationPath = Path.Combine(destinationRoot, descriptor.RelativePath)
-            If Not File.Exists(destinationPath) Then
+            Dim destinationMetadata As ExistingFileMetadata = Nothing
+            If Not TryGetExistingFileMetadata(destinationPath, destinationMetadata) Then
                 Return False
             End If
 
@@ -592,15 +763,10 @@ Namespace Services
                     Return True
 
                 Case OverwritePolicy.OverwriteIfSourceNewer
-                    Try
-                        Dim destinationInfo As New FileInfo(destinationPath)
-                        If descriptor.LastWriteTimeUtc <= destinationInfo.LastWriteTimeUtc Then
-                            reason = "destination is newer or same age"
-                            Return True
-                        End If
-                    Catch
-                        Return False
-                    End Try
+                    If descriptor.LastWriteTimeUtc <= destinationMetadata.LastWriteTimeUtc Then
+                        reason = "destination is newer or same age"
+                        Return True
+                    End If
 
                 Case OverwritePolicy.Ask
                     Return False
@@ -646,6 +812,53 @@ Namespace Services
 
             PrepareDestinationFile(destinationPath, descriptor.Length, destinationLength, shouldPreserveExisting)
             destinationLength = GetExistingFileLength(destinationPath)
+
+            Dim nativeFastPathBaselineBytes = progress.TotalBytesCopied
+            Dim nativeFastPathAttempt = Await TryCopyWithNativeFastPathAsync(
+                descriptor,
+                entry,
+                destinationPath,
+                destinationLength,
+                hasPersistedCoverage,
+                progress,
+                journal,
+                journalPath,
+                cancellationToken).ConfigureAwait(False)
+
+            If nativeFastPathAttempt.Attempted Then
+                If nativeFastPathAttempt.Succeeded Then
+                    If _options.PreserveTimestamps Then
+                        File.SetLastWriteTimeUtc(destinationPath, descriptor.LastWriteTimeUtc)
+                    End If
+
+                    Dim nativeVerificationMode = ResolveVerificationMode()
+                    If nativeVerificationMode <> VerificationMode.None Then
+                        Await VerifyFileWithRetriesAsync(
+                            descriptor.FullPath,
+                            destinationPath,
+                            descriptor.RelativePath,
+                            nativeVerificationMode,
+                            cancellationToken).ConfigureAwait(False)
+                    End If
+
+                    Return False
+                End If
+
+                progress.TotalBytesCopied = nativeFastPathBaselineBytes
+                entry.BytesCopied = 0
+                entry.LastRescuePass = "Init"
+
+                If nativeFastPathAttempt.FallbackReason.Length > 0 Then
+                    EmitLog($"Native fast-path fallback on {descriptor.RelativePath}: {nativeFastPathAttempt.FallbackReason}")
+                End If
+
+                PrepareDestinationFile(
+                    destinationPath,
+                    descriptor.Length,
+                    GetExistingFileLength(destinationPath),
+                    preserveExisting:=False)
+                destinationLength = GetExistingFileLength(destinationPath)
+            End If
 
             Dim activeBufferSize = ResolveBufferSizeForFile(descriptor.Length)
             Dim ioBuffer = ArrayPool(Of Byte).Shared.Rent(Math.Max(activeBufferSize, MinimumRescueBlockSize))
@@ -1365,6 +1578,34 @@ Namespace Services
             Return fileLength > 0 AndAlso fileLength <= thresholdBytes
         End Function
 
+        Private Function ShouldUseNativeCopyFastPath(
+            fileLength As Long,
+            destinationLength As Long,
+            hasPersistedCoverage As Boolean) As Boolean
+
+            If fileLength <= 0 Then
+                Return False
+            End If
+
+            If fileLength > NativeCopyFastPathMaxBytes Then
+                Return False
+            End If
+
+            If destinationLength > 0 OrElse hasPersistedCoverage Then
+                Return False
+            End If
+
+            If _options.MaxThroughputBytesPerSecond > 0 Then
+                Return False
+            End If
+
+            If _options.UseBadRangeMap AndAlso _options.SkipKnownBadRanges Then
+                Return False
+            End If
+
+            Return _options.OperationMode = JobOperationMode.Copy
+        End Function
+
         Private Async Function CopySmallFileFastAsync(
             descriptor As SourceFileDescriptor,
             entry As JournalFileEntry,
@@ -1460,6 +1701,145 @@ Namespace Services
             Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
 
             Return recoveredAny
+        End Function
+
+        Private Async Function TryCopyWithNativeFastPathAsync(
+            descriptor As SourceFileDescriptor,
+            entry As JournalFileEntry,
+            destinationPath As String,
+            destinationLength As Long,
+            hasPersistedCoverage As Boolean,
+            progress As ProgressAccumulator,
+            journal As JobJournal,
+            journalPath As String,
+            cancellationToken As CancellationToken) As Task(Of NativeFastPathAttemptResult)
+
+            Dim result As New NativeFastPathAttemptResult()
+            If descriptor Is Nothing OrElse entry Is Nothing Then
+                Return result
+            End If
+
+            If Not ShouldUseNativeCopyFastPath(descriptor.Length, destinationLength, hasPersistedCoverage) Then
+                Return result
+            End If
+
+            result.Attempted = True
+            Dim baselineBytes = progress.TotalBytesCopied
+            Dim lastTransferred = 0L
+            Dim cancelledForPause = False
+            Dim progressCallback As CopyProgressRoutine =
+                Function(
+                    totalFileSize As Long,
+                    totalBytesTransferred As Long,
+                    streamSize As Long,
+                    streamBytesTransferred As Long,
+                    dwStreamNumber As UInteger,
+                    dwCallbackReason As CopyProgressCallbackReason,
+                    hSourceFile As IntPtr,
+                    hDestinationFile As IntPtr,
+                    lpData As IntPtr) As CopyProgressResult
+
+                    If cancellationToken.IsCancellationRequested Then
+                        Return CopyProgressResult.CancelCopy
+                    End If
+
+                    If _executionControl IsNot Nothing AndAlso _executionControl.IsPaused Then
+                        cancelledForPause = True
+                        Return CopyProgressResult.CancelCopy
+                    End If
+
+                    Dim boundedTransferred = Math.Max(0L, Math.Min(descriptor.Length, totalBytesTransferred))
+                    Dim chunkBytes = boundedTransferred - lastTransferred
+                    If chunkBytes < 0L Then
+                        chunkBytes = 0L
+                    End If
+
+                    lastTransferred = boundedTransferred
+                    result.BytesTransferred = boundedTransferred
+                    entry.BytesCopied = boundedTransferred
+                    progress.TotalBytesCopied = baselineBytes + boundedTransferred
+                    EmitProgress(
+                        progress,
+                        descriptor.RelativePath,
+                        boundedTransferred,
+                        descriptor.Length,
+                        lastChunkBytesTransferred:=CInt(Math.Min(CLng(Integer.MaxValue), chunkBytes)),
+                        bufferSizeBytes:=ResolveBufferSizeForFile(descriptor.Length),
+                        rescuePass:="NativeFastPath",
+                        rescueBadRegionCount:=0,
+                        rescueRemainingBytes:=0L)
+
+                    Return CopyProgressResult.ContinueCopy
+                End Function
+
+            Dim cancelFlag = 0
+            Dim copySucceeded = False
+            Dim lastWin32Error = 0
+            Try
+                copySucceeded = CopyFileEx(
+                    descriptor.FullPath,
+                    destinationPath,
+                    progressCallback,
+                    IntPtr.Zero,
+                    cancelFlag,
+                    CopyFileFlags.AllowDecryptedDestination)
+                If Not copySucceeded Then
+                    lastWin32Error = Marshal.GetLastWin32Error()
+                End If
+            Catch ex As Exception
+                result.FallbackReason = ex.Message
+                progress.TotalBytesCopied = baselineBytes
+                entry.BytesCopied = 0
+                Return result
+            End Try
+
+            If copySucceeded Then
+                result.Succeeded = True
+                result.BytesTransferred = descriptor.Length
+                progress.TotalBytesCopied = baselineBytes + descriptor.Length
+                entry.BytesCopied = descriptor.Length
+                entry.LastError = String.Empty
+                entry.LastRescuePass = "NativeFastPath"
+                If entry.RecoveredRanges Is Nothing Then
+                    entry.RecoveredRanges = New List(Of ByteRange)()
+                Else
+                    entry.RecoveredRanges.Clear()
+                End If
+
+                entry.RescueRanges = New List(Of RescueRange)()
+                AppendRescueRange(entry.RescueRanges, 0L, descriptor.Length, RescueRangeState.Good)
+                SyncEntryBytesCopied(entry)
+
+                EmitProgress(
+                    progress,
+                    descriptor.RelativePath,
+                    entry.BytesCopied,
+                    descriptor.Length,
+                    lastChunkBytesTransferred:=CInt(Math.Min(CLng(Integer.MaxValue), Math.Max(0L, descriptor.Length - lastTransferred))),
+                    bufferSizeBytes:=ResolveBufferSizeForFile(descriptor.Length),
+                    rescuePass:="NativeFastPath",
+                    rescueBadRegionCount:=0,
+                    rescueRemainingBytes:=0L)
+
+                Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
+                Return result
+            End If
+
+            progress.TotalBytesCopied = baselineBytes
+            entry.BytesCopied = 0
+            result.Succeeded = False
+
+            If cancellationToken.IsCancellationRequested Then
+                Throw New OperationCanceledException(cancellationToken)
+            End If
+
+            If cancelledForPause Then
+                result.FallbackReason = "paused by user during native fast-path copy."
+                Return result
+            End If
+
+            result.FallbackReason = $"CopyFileEx failed ({lastWin32Error})."
+            Return result
         End Function
 
         Private Function BuildRescueRanges(entry As JournalFileEntry, fileLength As Long, destinationLength As Long) As List(Of RescueRange)
@@ -1725,34 +2105,146 @@ Namespace Services
                 Return
             End If
 
-            Dim updated As New List(Of RescueRange)()
-            For Each item In ranges
+            Dim normalizedState = NormalizeRescueRangeState(newState)
+
+            Dim startIndex = 0
+            While startIndex < ranges.Count
+                Dim candidate = ranges(startIndex)
+                If candidate Is Nothing OrElse candidate.Length <= 0 Then
+                    ranges.RemoveAt(startIndex)
+                    Continue While
+                End If
+
+                Dim candidateEnd = candidate.Offset + CLng(candidate.Length)
+                If candidateEnd > targetStart Then
+                    Exit While
+                End If
+
+                startIndex += 1
+            End While
+
+            If startIndex >= ranges.Count Then
+                Return
+            End If
+
+            Dim replacement As New List(Of RescueRange)()
+            Dim index = startIndex
+            Dim affectedCount = 0
+
+            While index < ranges.Count
+                Dim item = ranges(index)
                 If item Is Nothing OrElse item.Length <= 0 Then
-                    Continue For
+                    index += 1
+                    Continue While
                 End If
 
                 Dim itemStart = item.Offset
-                Dim itemEnd = itemStart + CLng(item.Length)
-                If itemEnd <= targetStart OrElse itemStart >= targetEnd Then
-                    AppendRescueRange(updated, itemStart, itemEnd - itemStart, item.State)
-                    Continue For
+                If itemStart >= targetEnd Then
+                    Exit While
                 End If
 
+                Dim itemEnd = itemStart + CLng(item.Length)
+                If itemEnd <= targetStart Then
+                    startIndex += 1
+                    index += 1
+                    Continue While
+                End If
+
+                affectedCount += 1
+
                 If itemStart < targetStart Then
-                    AppendRescueRange(updated, itemStart, targetStart - itemStart, item.State)
+                    AppendRescueRange(replacement, itemStart, targetStart - itemStart, item.State)
                 End If
 
                 Dim overlapStart = Math.Max(itemStart, targetStart)
                 Dim overlapEnd = Math.Min(itemEnd, targetEnd)
-                AppendRescueRange(updated, overlapStart, overlapEnd - overlapStart, newState)
+                If overlapEnd > overlapStart Then
+                    AppendRescueRange(replacement, overlapStart, overlapEnd - overlapStart, normalizedState)
+                End If
 
                 If itemEnd > targetEnd Then
-                    AppendRescueRange(updated, targetEnd, itemEnd - targetEnd, item.State)
+                    AppendRescueRange(replacement, targetEnd, itemEnd - targetEnd, item.State)
                 End If
-            Next
 
-            ranges.Clear()
-            ranges.AddRange(MergeRescueRanges(updated))
+                index += 1
+            End While
+
+            If affectedCount <= 0 Then
+                Return
+            End If
+
+            ranges.RemoveRange(startIndex, affectedCount)
+            If replacement.Count > 0 Then
+                ranges.InsertRange(startIndex, replacement)
+            End If
+
+            MergeAdjacentRescueRangesInPlace(ranges, Math.Max(0, startIndex - 1))
+        End Sub
+
+        Private Shared Sub MergeAdjacentRescueRangesInPlace(ranges As List(Of RescueRange), startIndex As Integer)
+            If ranges Is Nothing OrElse ranges.Count <= 1 Then
+                Return
+            End If
+
+            Dim index = Math.Max(0, startIndex)
+            If index >= ranges.Count Then
+                index = ranges.Count - 1
+            End If
+
+            If index > 0 Then
+                index -= 1
+            End If
+
+            While index < ranges.Count - 1
+                Dim left = ranges(index)
+                If left Is Nothing OrElse left.Length <= 0 Then
+                    ranges.RemoveAt(index)
+                    If index > 0 Then
+                        index -= 1
+                    End If
+                    Continue While
+                End If
+
+                Dim right = ranges(index + 1)
+                If right Is Nothing OrElse right.Length <= 0 Then
+                    ranges.RemoveAt(index + 1)
+                    Continue While
+                End If
+
+                Dim leftState = NormalizeRescueRangeState(left.State)
+                Dim rightState = NormalizeRescueRangeState(right.State)
+                Dim leftEnd = left.Offset + CLng(left.Length)
+                Dim rightEnd = right.Offset + CLng(right.Length)
+
+                If leftEnd < right.Offset Then
+                    left.State = leftState
+                    right.State = rightState
+                    ranges(index) = left
+                    ranges(index + 1) = right
+                    index += 1
+                    Continue While
+                End If
+
+                If leftState = rightState Then
+                    Dim mergedEnd = Math.Max(leftEnd, rightEnd)
+                    left.Length = CInt(Math.Min(CLng(Integer.MaxValue), Math.Max(0L, mergedEnd - left.Offset)))
+                    left.State = leftState
+                    ranges(index) = left
+                    ranges.RemoveAt(index + 1)
+                    Continue While
+                End If
+
+                If rightEnd <= leftEnd Then
+                    ranges.RemoveAt(index + 1)
+                    Continue While
+                End If
+
+                right.Offset = leftEnd
+                right.Length = CInt(Math.Min(CLng(Integer.MaxValue), rightEnd - leftEnd))
+                right.State = rightState
+                ranges(index + 1) = right
+                index += 1
+            End While
         End Sub
 
         Private Shared Function GetUnreadableRangeBytes(ranges As IEnumerable(Of RescueRange)) As Long
@@ -2246,16 +2738,73 @@ Namespace Services
             Public Property FailedSegments As Integer
         End Class
 
+        Private NotInheritable Class ExistingFileMetadata
+            Public Property Length As Long
+            Public Property LastWriteTimeUtc As DateTime
+        End Class
+
         Private Shared Function GetExistingFileLength(path As String) As Long
-            If Not File.Exists(path) Then
+            Dim metadata As ExistingFileMetadata = Nothing
+            If Not TryGetExistingFileMetadata(path, metadata) Then
                 Return 0
             End If
 
+            Return metadata.Length
+        End Function
+
+        Private Shared Function TryGetExistingFileMetadata(path As String, ByRef metadata As ExistingFileMetadata) As Boolean
+            metadata = Nothing
+            If String.IsNullOrWhiteSpace(path) Then
+                Return False
+            End If
+
+            Dim attributeData As New Win32FileAttributeData()
+            If GetFileAttributesEx(path, GetFileExInfoLevels.GetFileExInfoStandard, attributeData) Then
+                Dim attributes = CType(attributeData.FileAttributes, FileAttributes)
+                If (attributes And FileAttributes.Directory) = FileAttributes.Directory Then
+                    Return False
+                End If
+
+                Dim rawLength = (CULng(attributeData.FileSizeHigh) << 32) Or CULng(attributeData.FileSizeLow)
+                Dim boundedLength = If(rawLength > CULng(Long.MaxValue), Long.MaxValue, CLng(rawLength))
+                Dim lastWriteTicks = (CULng(attributeData.LastWriteTimeHigh) << 32) Or CULng(attributeData.LastWriteTimeLow)
+                metadata = New ExistingFileMetadata() With {
+                    .Length = Math.Max(0L, boundedLength),
+                    .LastWriteTimeUtc = FileTimeTicksToUtc(lastWriteTicks)
+                }
+                Return True
+            End If
+
+            Dim win32Error = Marshal.GetLastWin32Error()
+            If win32Error = ErrorFileNotFound OrElse win32Error = ErrorPathNotFound Then
+                Return False
+            End If
+
             Try
-                Dim info As New FileInfo(path)
-                Return info.Length
+                If Not File.Exists(path) Then
+                    Return False
+                End If
+
+                Dim fileInfo As New FileInfo(path)
+                metadata = New ExistingFileMetadata() With {
+                    .Length = Math.Max(0L, fileInfo.Length),
+                    .LastWriteTimeUtc = fileInfo.LastWriteTimeUtc
+                }
+                Return True
             Catch
-                Return 0
+                Return False
+            End Try
+        End Function
+
+        Private Shared Function FileTimeTicksToUtc(fileTimeTicks As ULong) As DateTime
+            If fileTimeTicks = 0UL Then
+                Return DateTime.MinValue
+            End If
+
+            Try
+                Return DateTime.FromFileTimeUtc(CLng(fileTimeTicks))
+            Catch
+                Return DateTime.MinValue
             End Try
         End Function
 
@@ -2285,7 +2834,7 @@ Namespace Services
 
             While attempt <= effectiveMaxRetries
                 cancellationToken.ThrowIfCancellationRequested()
-                ThrowIfMediaIdentityMismatch(sourcePath, _expectedSourceIdentity, isSource:=True)
+                ThrowIfMediaIdentityMismatchThrottled(sourcePath, _expectedSourceIdentity, isSource:=True)
 
                 Try
 #If DEBUG Then
@@ -2301,6 +2850,7 @@ Namespace Services
                         linkedCts.CancelAfter(_options.OperationTimeout)
                         Dim bytesRead = Await ReadChunkOnceAsync(
                             sourcePath,
+                            relativePath,
                             offset,
                             buffer,
                             length,
@@ -2315,6 +2865,7 @@ Namespace Services
                         Return bytesRead
                     End Using
                 Catch ex As OperationCanceledException When Not cancellationToken.IsCancellationRequested
+                    CancelPendingIo(transferSession, isSource:=True)
                     lastError = New TimeoutException($"Read timeout at offset {offset}.", ex)
                 Catch ex As Exception
                     lastError = ex
@@ -2392,12 +2943,35 @@ Namespace Services
 
         Private Async Function ReadChunkOnceAsync(
             sourcePath As String,
+            relativePath As String,
             offset As Long,
             buffer As Byte(),
             count As Integer,
             ioBufferSize As Integer,
             transferSession As FileTransferSession,
             cancellationToken As CancellationToken) As Task(Of Integer)
+
+            If ShouldUseRawDiskReadBackend() Then
+                Dim rawOutcome = Await TryReadChunkViaRawDiskAsync(
+                    sourcePath,
+                    relativePath,
+                    offset,
+                    buffer,
+                    count,
+                    cancellationToken).ConfigureAwait(False)
+
+                If rawOutcome.Handled Then
+                    If rawOutcome.ReadError IsNot Nothing Then
+                        Throw rawOutcome.ReadError
+                    End If
+
+                    Return rawOutcome.BytesRead
+                End If
+
+                If rawOutcome.FallbackReason.Length > 0 Then
+                    EmitRawDiskFallbackOnce(sourcePath, rawOutcome.FallbackReason)
+                End If
+            End If
 
             If transferSession Is Nothing Then
                 Using stream = New FileStream(
@@ -2415,6 +2989,144 @@ Namespace Services
 
             Dim sourceHandle = transferSession.GetSourceHandle()
             Return Await ReadExactlyAsync(sourceHandle, offset, buffer, count, cancellationToken).ConfigureAwait(False)
+        End Function
+
+        Private Async Function TryReadChunkViaRawDiskAsync(
+            sourcePath As String,
+            relativePath As String,
+            offset As Long,
+            buffer As Byte(),
+            count As Integer,
+            cancellationToken As CancellationToken) As Task(Of RawReadAttemptOutcome)
+
+            Dim outcome As New RawReadAttemptOutcome()
+
+            If _rawDiskScanContext Is Nothing Then
+                Return outcome
+            End If
+
+            Dim plan As IReadOnlyList(Of RawDiskReadSegment) = Nothing
+            If Not _rawDiskScanContext.TryCreateReadPlan(sourcePath, offset, count, plan, outcome.FallbackReason) Then
+                Return outcome
+            End If
+
+            outcome.Handled = True
+            Try
+                Dim destinationOffset = 0
+                For Each segment In plan
+                    cancellationToken.ThrowIfCancellationRequested()
+                    If segment Is Nothing OrElse segment.Length <= 0 Then
+                        Continue For
+                    End If
+
+                    If segment.IsSparse Then
+                        Array.Clear(buffer, destinationOffset, segment.Length)
+                        destinationOffset += segment.Length
+                        Continue For
+                    End If
+
+                    Await ReadRawSegmentAlignedAsync(
+                        _rawDiskScanContext.VolumeHandle,
+                        segment.VolumeOffsetBytes,
+                        buffer,
+                        destinationOffset,
+                        segment.Length,
+                        _rawDiskScanContext.SectorSizeBytes,
+                        cancellationToken).ConfigureAwait(False)
+                    destinationOffset += segment.Length
+                Next
+
+                outcome.BytesRead = destinationOffset
+                If outcome.BytesRead <> count Then
+                    Throw New IOException(
+                        $"Raw disk read length mismatch on {If(String.IsNullOrWhiteSpace(relativePath), sourcePath, relativePath)} at offset {offset}. Expected {count}, got {outcome.BytesRead}.")
+                End If
+
+                Return outcome
+            Catch ex As Exception
+                If IsRawReadFallbackException(ex) Then
+                    outcome.Handled = False
+                    outcome.ReadError = Nothing
+                    outcome.FallbackReason = $"raw read unavailable ({ex.Message})"
+                    Try
+                        _rawDiskScanContext.MarkPathUnsupported(sourcePath, outcome.FallbackReason)
+                    Catch
+                    End Try
+                    Return outcome
+                End If
+
+                outcome.ReadError = ex
+                Return outcome
+            End Try
+        End Function
+
+        Private Shared Async Function ReadRawSegmentAlignedAsync(
+            handle As SafeFileHandle,
+            volumeOffset As Long,
+            destinationBuffer As Byte(),
+            destinationOffset As Integer,
+            segmentLength As Integer,
+            sectorSizeBytes As Integer,
+            cancellationToken As CancellationToken) As Task
+
+            If handle Is Nothing OrElse handle.IsInvalid Then
+                Throw New IOException("Raw volume handle is invalid.")
+            End If
+
+            If destinationBuffer Is Nothing Then
+                Throw New ArgumentNullException(NameOf(destinationBuffer))
+            End If
+
+            If destinationOffset < 0 OrElse segmentLength < 0 OrElse destinationOffset + segmentLength > destinationBuffer.Length Then
+                Throw New ArgumentOutOfRangeException(NameOf(destinationOffset))
+            End If
+
+            If segmentLength = 0 Then
+                Return
+            End If
+
+            Dim sector = Math.Max(512, sectorSizeBytes)
+            Dim alignedStart = (volumeOffset \ sector) * sector
+            Dim endOffset = volumeOffset + CLng(segmentLength)
+            Dim alignedEnd = ((endOffset + sector - 1) \ sector) * sector
+            Dim alignedLengthLong = alignedEnd - alignedStart
+            If alignedLengthLong <= 0 OrElse alignedLengthLong > Integer.MaxValue Then
+                Throw New IOException("Raw read alignment produced an invalid length.")
+            End If
+
+            Dim alignedLength = CInt(alignedLengthLong)
+            If alignedStart = volumeOffset AndAlso alignedLength = segmentLength Then
+                Dim directRead = Await ReadExactlyAsync(
+                    handle,
+                    volumeOffset,
+                    destinationBuffer,
+                    destinationOffset,
+                    segmentLength,
+                    cancellationToken).ConfigureAwait(False)
+                If directRead <> segmentLength Then
+                    Throw New IOException($"Raw disk short read. Expected {segmentLength}, got {directRead}.")
+                End If
+                Return
+            End If
+
+            Dim alignedBuffer = ArrayPool(Of Byte).Shared.Rent(alignedLength)
+            Try
+                Dim alignedRead = Await ReadExactlyAsync(
+                    handle,
+                    alignedStart,
+                    alignedBuffer,
+                    bufferOffset:=0,
+                    count:=alignedLength,
+                    cancellationToken:=cancellationToken).ConfigureAwait(False)
+                If alignedRead <> alignedLength Then
+                    Throw New IOException($"Raw disk short aligned read. Expected {alignedLength}, got {alignedRead}.")
+                End If
+
+                Dim copyOffset = CInt(volumeOffset - alignedStart)
+                Buffer.BlockCopy(alignedBuffer, copyOffset, destinationBuffer, destinationOffset, segmentLength)
+            Finally
+                ArrayPool(Of Byte).Shared.Return(alignedBuffer, clearArray:=False)
+            End Try
         End Function
 
         Private Shared Async Function ReadExactlyAsync(
@@ -2443,11 +3155,36 @@ Namespace Services
             count As Integer,
             cancellationToken As CancellationToken) As Task(Of Integer)
 
+            Return Await ReadExactlyAsync(
+                handle,
+                offset,
+                buffer,
+                bufferOffset:=0,
+                count:=count,
+                cancellationToken:=cancellationToken).ConfigureAwait(False)
+        End Function
+
+        Private Shared Async Function ReadExactlyAsync(
+            handle As SafeFileHandle,
+            offset As Long,
+            buffer As Byte(),
+            bufferOffset As Integer,
+            count As Integer,
+            cancellationToken As CancellationToken) As Task(Of Integer)
+
+            If buffer Is Nothing Then
+                Throw New ArgumentNullException(NameOf(buffer))
+            End If
+
+            If bufferOffset < 0 OrElse count < 0 OrElse bufferOffset + count > buffer.Length Then
+                Throw New ArgumentOutOfRangeException(NameOf(bufferOffset))
+            End If
+
             Dim totalRead = 0
             While totalRead < count
                 Dim readNow = Await RandomAccess.ReadAsync(
                     handle,
-                    buffer.AsMemory(totalRead, count - totalRead),
+                    buffer.AsMemory(bufferOffset + totalRead, count - totalRead),
                     offset + totalRead,
                     cancellationToken).ConfigureAwait(False)
                 If readNow = 0 Then
@@ -2475,7 +3212,7 @@ Namespace Services
 
             While attempt <= _options.MaxRetries
                 cancellationToken.ThrowIfCancellationRequested()
-                ThrowIfMediaIdentityMismatch(destinationPath, _expectedDestinationIdentity, isSource:=False)
+                ThrowIfMediaIdentityMismatchThrottled(destinationPath, _expectedDestinationIdentity, isSource:=False)
 
                 Try
 #If DEBUG Then
@@ -2500,6 +3237,7 @@ Namespace Services
                         Return
                     End Using
                 Catch ex As OperationCanceledException When Not cancellationToken.IsCancellationRequested
+                    CancelPendingIo(transferSession, isSource:=False)
                     lastError = New TimeoutException($"Write timeout at offset {offset}.", ex)
                 Catch ex As Exception
                     lastError = ex
@@ -2584,6 +3322,30 @@ Namespace Services
                 offset,
                 cancellationToken).ConfigureAwait(False)
         End Function
+
+        Private Sub CancelPendingIo(transferSession As FileTransferSession, isSource As Boolean)
+            If transferSession Is Nothing Then
+                Return
+            End If
+
+            Dim handle As SafeFileHandle = If(
+                isSource,
+                transferSession.TryGetOpenSourceHandle(),
+                transferSession.TryGetOpenDestinationHandle())
+            SafeCancelPendingIo(handle)
+        End Sub
+
+        Private Shared Sub SafeCancelPendingIo(handle As SafeFileHandle)
+            If handle Is Nothing OrElse handle.IsInvalid OrElse handle.IsClosed Then
+                Return
+            End If
+
+            Try
+                Dim ignored = CancelIoEx(handle, IntPtr.Zero)
+            Catch
+                ' Best effort only.
+            End Try
+        End Sub
 
         Private Async Function VerifyFileWithRetriesAsync(
             sourcePath As String,
@@ -2694,6 +3456,7 @@ Namespace Services
 
                             Dim bytesRead = Await ReadChunkOnceAsync(
                                 filePath,
+                                context,
                                 offset,
                                 rentedBuffer,
                                 count,
@@ -2988,9 +3751,18 @@ Namespace Services
             End If
         End Sub
 
-        Private Sub EnsureMediaIdentityIntegrity(sourceRoot As String, destinationRoot As String)
-            ThrowIfMediaIdentityMismatch(sourceRoot, _expectedSourceIdentity, isSource:=True)
-            ThrowIfMediaIdentityMismatch(destinationRoot, _expectedDestinationIdentity, isSource:=False)
+        Private Sub EnsureMediaIdentityIntegrity(
+            sourceRoot As String,
+            destinationRoot As String,
+            Optional includeDestination As Boolean = True,
+            Optional force As Boolean = False)
+
+            ThrowIfMediaIdentityMismatchThrottled(sourceRoot, _expectedSourceIdentity, isSource:=True, force:=force)
+            If Not includeDestination Then
+                Return
+            End If
+
+            ThrowIfMediaIdentityMismatchThrottled(destinationRoot, _expectedDestinationIdentity, isSource:=False, force:=force)
         End Sub
 
         Private Function IsSourceAvailable(sourceRoot As String) As Boolean
@@ -3054,6 +3826,35 @@ Namespace Services
             Throw New IOException(
                 $"{If(isSource, "Source", "Destination")} media identity mismatch. Expected '{expected}', found '{currentIdentity}'.")
         End Sub
+
+        Private Sub ThrowIfMediaIdentityMismatchThrottled(
+            pathValue As String,
+            expectedIdentity As String,
+            isSource As Boolean,
+            Optional force As Boolean = False)
+
+            If Not force AndAlso Not ShouldProbeMediaIdentity(isSource) Then
+                Return
+            End If
+
+            ThrowIfMediaIdentityMismatch(pathValue, expectedIdentity, isSource)
+        End Sub
+
+        Private Function ShouldProbeMediaIdentity(isSource As Boolean) As Boolean
+            Dim nowUtc = DateTimeOffset.UtcNow
+            Dim lastProbeUtc = If(isSource, _lastSourceIdentityProbeUtc, _lastDestinationIdentityProbeUtc)
+            If lastProbeUtc = DateTimeOffset.MinValue OrElse
+                (nowUtc - lastProbeUtc).TotalMilliseconds >= MediaIdentityProbeIntervalMilliseconds Then
+                If isSource Then
+                    _lastSourceIdentityProbeUtc = nowUtc
+                Else
+                    _lastDestinationIdentityProbeUtc = nowUtc
+                End If
+                Return True
+            End If
+
+            Return False
+        End Function
 
         Private Function ResolveMediaIdentity(pathValue As String) As String
             If String.IsNullOrWhiteSpace(pathValue) Then
@@ -3602,6 +4403,37 @@ Namespace Services
             Return False
         End Function
 
+        Private Shared Function IsRawReadFallbackException(ex As Exception) As Boolean
+            If ex Is Nothing Then
+                Return False
+            End If
+
+            For Each candidate In EnumerateExceptionChain(ex)
+                If TypeOf candidate Is ArgumentException Then
+                    Return True
+                End If
+
+                Dim win32Code As Integer
+                If TryGetWin32ErrorCode(candidate, win32Code) Then
+                    If win32Code = ErrorInvalidParameter OrElse win32Code = ErrorNotSupported Then
+                        Return True
+                    End If
+                End If
+
+                Dim ioEx = TryCast(candidate, IOException)
+                If ioEx IsNot Nothing Then
+                    Dim message = ioEx.Message.ToLowerInvariant()
+                    If message.Contains("parameter is incorrect") OrElse
+                        message.Contains("invalid parameter") OrElse
+                        message.Contains("request is not supported") Then
+                        Return True
+                    End If
+                End If
+            Next
+
+            Return False
+        End Function
+
         Private Function ResolveVerificationMode() As VerificationMode
             If _options.VerificationMode <> VerificationMode.None Then
                 Return _options.VerificationMode
@@ -3733,6 +4565,665 @@ Namespace Services
             }
         End Function
 
+        Private NotInheritable Class NativeFastPathAttemptResult
+            Public Property Attempted As Boolean
+            Public Property Succeeded As Boolean
+            Public Property BytesTransferred As Long
+            Public Property FallbackReason As String = String.Empty
+        End Class
+
+        Private NotInheritable Class RawReadAttemptOutcome
+            Public Property Handled As Boolean
+            Public Property BytesRead As Integer
+            Public Property ReadError As Exception
+            Public Property FallbackReason As String = String.Empty
+        End Class
+
+        Private NotInheritable Class RawDiskScanContext
+            Implements IDisposable
+
+            Private Const FsctlGetRetrievalPointers As UInteger = &H90073UI
+            Private Const ErrorMoreData As Integer = 234
+
+            Private ReadOnly _sourceRoot As String
+            Private ReadOnly _sourceVolumeRoot As String
+            Private ReadOnly _volumeHandle As SafeFileHandle
+            Private ReadOnly _sectorSizeBytes As Integer
+            Private ReadOnly _clusterSizeBytes As Integer
+            Private ReadOnly _layoutCache As New Dictionary(Of String, RawDiskFileLayout)(StringComparer.OrdinalIgnoreCase)
+            Private _disposed As Boolean
+
+            <DllImport("kernel32.dll", CharSet:=CharSet.Unicode, SetLastError:=True)>
+            Private Shared Function GetDiskFreeSpace(
+                lpRootPathName As String,
+                ByRef lpSectorsPerCluster As UInteger,
+                ByRef lpBytesPerSector As UInteger,
+                ByRef lpNumberOfFreeClusters As UInteger,
+                ByRef lpTotalNumberOfClusters As UInteger) As Boolean
+            End Function
+
+            <DllImport("kernel32.dll", SetLastError:=True)>
+            Private Shared Function DeviceIoControl(
+                hDevice As SafeFileHandle,
+                dwIoControlCode As UInteger,
+                lpInBuffer As IntPtr,
+                nInBufferSize As Integer,
+                lpOutBuffer As IntPtr,
+                nOutBufferSize As Integer,
+                ByRef lpBytesReturned As Integer,
+                lpOverlapped As IntPtr) As Boolean
+            End Function
+
+            <StructLayout(LayoutKind.Sequential)>
+            Private Structure StartingVcnInputBuffer
+                Public StartingVcn As Long
+            End Structure
+
+            <StructLayout(LayoutKind.Sequential)>
+            Private Structure RetrievalPointersBufferHeader
+                Public ExtentCount As UInteger
+                Public StartingVcn As Long
+            End Structure
+
+            <StructLayout(LayoutKind.Sequential)>
+            Private Structure RetrievalPointersExtent
+                Public NextVcn As Long
+                Public Lcn As Long
+            End Structure
+
+            Private Sub New(
+                sourceRoot As String,
+                sourceVolumeRoot As String,
+                volumeHandle As SafeFileHandle,
+                sectorSizeBytes As Integer,
+                clusterSizeBytes As Integer)
+
+                _sourceRoot = NormalizePathForCache(sourceRoot)
+                _sourceVolumeRoot = NormalizeVolumeRoot(sourceVolumeRoot)
+                _volumeHandle = volumeHandle
+                _sectorSizeBytes = Math.Max(512, sectorSizeBytes)
+                _clusterSizeBytes = Math.Max(MinimumRescueBlockSize, clusterSizeBytes)
+            End Sub
+
+            Public ReadOnly Property VolumeHandle As SafeFileHandle
+                Get
+                    Return _volumeHandle
+                End Get
+            End Property
+
+            Public ReadOnly Property ClusterSizeBytes As Integer
+                Get
+                    Return _clusterSizeBytes
+                End Get
+            End Property
+
+            Public ReadOnly Property SectorSizeBytes As Integer
+                Get
+                    Return _sectorSizeBytes
+                End Get
+            End Property
+
+            Public Shared Function TryCreate(sourceRoot As String, ByRef context As RawDiskScanContext, ByRef reason As String) As Boolean
+                context = Nothing
+                reason = String.Empty
+
+                Dim normalizedSourceRoot = NormalizePathForCache(sourceRoot)
+                If String.IsNullOrWhiteSpace(normalizedSourceRoot) Then
+                    reason = "source path is empty."
+                    Return False
+                End If
+
+                Dim volumeRoot = NormalizeVolumeRoot(Path.GetPathRoot(normalizedSourceRoot))
+                If String.IsNullOrWhiteSpace(volumeRoot) Then
+                    reason = "unable to resolve source volume."
+                    Return False
+                End If
+
+                If volumeRoot.StartsWith("\\", StringComparison.OrdinalIgnoreCase) Then
+                    reason = "UNC/network roots are not supported."
+                    Return False
+                End If
+
+                Dim drive As DriveInfo = Nothing
+                Try
+                    drive = New DriveInfo(volumeRoot)
+                Catch
+                    reason = "unable to inspect source drive."
+                    Return False
+                End Try
+
+                Try
+                    If Not drive.IsReady Then
+                        reason = "source drive is not ready."
+                        Return False
+                    End If
+                Catch
+                    reason = "source drive readiness could not be determined."
+                    Return False
+                End Try
+
+                If drive.DriveType = DriveType.Network Then
+                    reason = "network drives are not supported."
+                    Return False
+                End If
+
+                Dim format = String.Empty
+                Try
+                    format = If(drive.DriveFormat, String.Empty)
+                Catch
+                    format = String.Empty
+                End Try
+
+                If Not String.Equals(format, "NTFS", StringComparison.OrdinalIgnoreCase) Then
+                    reason = $"drive format '{format}' is unsupported (NTFS required)."
+                    Return False
+                End If
+
+                Dim sectorSizeBytes = 0
+                Dim clusterSizeBytes = 0
+                If Not TryGetDiskGeometry(volumeRoot, sectorSizeBytes, clusterSizeBytes, reason) Then
+                    Return False
+                End If
+
+                Dim volumePath = BuildRawVolumePath(volumeRoot)
+                If volumePath.Length = 0 Then
+                    reason = "unable to build raw volume path."
+                    Return False
+                End If
+
+                Dim volumeHandle As SafeFileHandle = Nothing
+                Try
+                    volumeHandle = File.OpenHandle(
+                        volumePath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.ReadWrite Or FileShare.Delete,
+                        FileOptions.Asynchronous)
+                Catch ex As UnauthorizedAccessException
+                    reason = "access denied opening raw volume (run elevated to enable raw scan backend)."
+                    Return False
+                Catch ex As Exception
+                    reason = ex.Message
+                    Return False
+                End Try
+
+                If volumeHandle Is Nothing OrElse volumeHandle.IsInvalid Then
+                    reason = "raw volume handle is invalid."
+                    Try
+                        volumeHandle?.Dispose()
+                    Catch
+                    End Try
+                    Return False
+                End If
+
+                context = New RawDiskScanContext(normalizedSourceRoot, volumeRoot, volumeHandle, sectorSizeBytes, clusterSizeBytes)
+                Return True
+            End Function
+
+            Public Function TryCreateReadPlan(
+                sourcePath As String,
+                offset As Long,
+                count As Integer,
+                ByRef plan As IReadOnlyList(Of RawDiskReadSegment),
+                ByRef reason As String) As Boolean
+
+                plan = Nothing
+                reason = String.Empty
+                If _disposed OrElse count <= 0 OrElse offset < 0 Then
+                    reason = "invalid read request."
+                    Return False
+                End If
+
+                Dim normalizedPath = NormalizePathForCache(sourcePath)
+                If normalizedPath.Length = 0 Then
+                    reason = "source path is invalid."
+                    Return False
+                End If
+
+                Dim layoutReason As String = String.Empty
+                Dim layout = GetOrCreateLayout(normalizedPath, layoutReason)
+                If layout Is Nothing OrElse Not layout.IsSupported Then
+                    reason = If(layoutReason, "file layout is unsupported.")
+                    Return False
+                End If
+
+                Dim endOffset = offset + CLng(count)
+                If endOffset < offset OrElse endOffset > layout.FileLength Then
+                    reason = "requested raw read range exceeds file bounds."
+                    Return False
+                End If
+
+                Dim segments As New List(Of RawDiskReadSegment)()
+                Dim extentIndex = 0
+                While extentIndex < layout.Extents.Count AndAlso
+                    (layout.Extents(extentIndex).FileOffsetBytes + layout.Extents(extentIndex).LengthBytes) <= offset
+                    extentIndex += 1
+                End While
+
+                Dim cursor = offset
+                While cursor < endOffset
+                    If extentIndex < layout.Extents.Count Then
+                        Dim extent = layout.Extents(extentIndex)
+                        Dim extentStart = extent.FileOffsetBytes
+                        Dim extentEnd = extentStart + extent.LengthBytes
+
+                        If cursor < extentStart Then
+                            Dim sparseLength = CInt(Math.Min(CLng(Integer.MaxValue), Math.Min(endOffset - cursor, extentStart - cursor)))
+                            segments.Add(RawDiskReadSegment.CreateSparse(sparseLength))
+                            cursor += sparseLength
+                            Continue While
+                        End If
+
+                        If cursor >= extentEnd Then
+                            extentIndex += 1
+                            Continue While
+                        End If
+
+                        Dim mappedLength = CInt(Math.Min(CLng(Integer.MaxValue), Math.Min(endOffset - cursor, extentEnd - cursor)))
+                        Dim volumeOffset = extent.VolumeOffsetBytes + (cursor - extentStart)
+                        segments.Add(RawDiskReadSegment.CreateMapped(volumeOffset, mappedLength))
+                        cursor += mappedLength
+                        Continue While
+                    End If
+
+                    Dim trailingSparseLength = CInt(Math.Min(CLng(Integer.MaxValue), endOffset - cursor))
+                    segments.Add(RawDiskReadSegment.CreateSparse(trailingSparseLength))
+                    cursor += trailingSparseLength
+                End While
+
+                plan = segments
+                Return True
+            End Function
+
+            Private Function GetOrCreateLayout(sourcePath As String, ByRef reason As String) As RawDiskFileLayout
+                reason = String.Empty
+                Dim cached As RawDiskFileLayout = Nothing
+                SyncLock _layoutCache
+                    If _layoutCache.TryGetValue(sourcePath, cached) Then
+                        reason = cached.UnsupportedReason
+                        Return cached
+                    End If
+                End SyncLock
+
+                Dim builtReason As String = String.Empty
+                Dim builtLayout = BuildLayout(sourcePath, builtReason)
+                If builtLayout Is Nothing Then
+                    builtLayout = RawDiskFileLayout.CreateUnsupported(0, If(builtReason, "file layout unavailable."))
+                End If
+
+                SyncLock _layoutCache
+                    _layoutCache(sourcePath) = builtLayout
+                End SyncLock
+                reason = builtLayout.UnsupportedReason
+                Return builtLayout
+            End Function
+
+            Public Sub MarkPathUnsupported(sourcePath As String, reason As String)
+                Dim normalizedPath = NormalizePathForCache(sourcePath)
+                If normalizedPath.Length = 0 Then
+                    Return
+                End If
+
+                Dim fileLength = 0L
+                Try
+                    fileLength = Math.Max(0L, New FileInfo(normalizedPath).Length)
+                Catch
+                    fileLength = 0L
+                End Try
+
+                Dim unsupported = RawDiskFileLayout.CreateUnsupported(fileLength, reason)
+                SyncLock _layoutCache
+                    _layoutCache(normalizedPath) = unsupported
+                End SyncLock
+            End Sub
+
+            Private Function BuildLayout(sourcePath As String, ByRef reason As String) As RawDiskFileLayout
+                reason = String.Empty
+
+                If String.IsNullOrWhiteSpace(sourcePath) Then
+                    reason = "source path is empty."
+                    Return RawDiskFileLayout.CreateUnsupported(0, reason)
+                End If
+
+                Dim volumeRoot = NormalizeVolumeRoot(Path.GetPathRoot(sourcePath))
+                If volumeRoot.Length = 0 OrElse
+                    Not String.Equals(volumeRoot, _sourceVolumeRoot, StringComparison.OrdinalIgnoreCase) Then
+                    reason = "file is outside the source volume."
+                    Return RawDiskFileLayout.CreateUnsupported(0, reason)
+                End If
+
+                Dim fileLength = 0L
+                Try
+                    Dim info As New FileInfo(sourcePath)
+                    fileLength = Math.Max(0L, info.Length)
+                Catch ex As Exception
+                    reason = ex.Message
+                    Return RawDiskFileLayout.CreateUnsupported(0, reason)
+                End Try
+
+                If fileLength = 0 Then
+                    Return RawDiskFileLayout.CreateSupported(fileLength, New List(Of RawDiskExtent)())
+                End If
+
+                Dim attributes As FileAttributes
+                Try
+                    attributes = File.GetAttributes(sourcePath)
+                Catch ex As Exception
+                    reason = ex.Message
+                    Return RawDiskFileLayout.CreateUnsupported(fileLength, reason)
+                End Try
+
+                If (attributes And FileAttributes.Compressed) <> 0 Then
+                    reason = "compressed files are not supported."
+                    Return RawDiskFileLayout.CreateUnsupported(fileLength, reason)
+                End If
+
+                If (attributes And FileAttributes.Encrypted) <> 0 Then
+                    reason = "encrypted files are not supported."
+                    Return RawDiskFileLayout.CreateUnsupported(fileLength, reason)
+                End If
+
+                Dim extents As List(Of RawDiskExtent) = Nothing
+                If Not TryGetRetrievalPointerExtents(sourcePath, fileLength, extents, reason) Then
+                    Return RawDiskFileLayout.CreateUnsupported(fileLength, reason)
+                End If
+
+                Return RawDiskFileLayout.CreateSupported(fileLength, extents)
+            End Function
+
+            Private Function TryGetRetrievalPointerExtents(
+                sourcePath As String,
+                fileLength As Long,
+                ByRef extents As List(Of RawDiskExtent),
+                ByRef reason As String) As Boolean
+
+                extents = New List(Of RawDiskExtent)()
+                reason = String.Empty
+
+                Const outputBufferSize As Integer = 64 * 1024
+                Dim inputSize = Marshal.SizeOf(Of StartingVcnInputBuffer)()
+                Dim headerSize = Marshal.SizeOf(Of RetrievalPointersBufferHeader)()
+                Dim extentSize = Marshal.SizeOf(Of RetrievalPointersExtent)()
+
+                Dim outputBuffer = Marshal.AllocHGlobal(outputBufferSize)
+                Dim inputBuffer = Marshal.AllocHGlobal(inputSize)
+                Try
+                    Using fileStream As New FileStream(
+                        sourcePath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.ReadWrite Or FileShare.Delete,
+                        MinimumRescueBlockSize,
+                        FileOptions.None)
+
+                        Dim fileHandle = fileStream.SafeFileHandle
+                        Dim startVcn = 0L
+                        Dim lastStartVcn = Long.MinValue
+                        Do
+                            Dim input As New StartingVcnInputBuffer() With {
+                                .StartingVcn = startVcn
+                            }
+                            Marshal.StructureToPtr(input, inputBuffer, fDeleteOld:=False)
+
+                            Dim bytesReturned = 0
+                            Dim success = DeviceIoControl(
+                                fileHandle,
+                                FsctlGetRetrievalPointers,
+                                inputBuffer,
+                                inputSize,
+                                outputBuffer,
+                                outputBufferSize,
+                                bytesReturned,
+                                IntPtr.Zero)
+
+                            Dim errorCode = If(success, 0, Marshal.GetLastWin32Error())
+                            If Not success AndAlso errorCode <> ErrorMoreData Then
+                                reason = $"FSCTL_GET_RETRIEVAL_POINTERS failed ({errorCode})."
+                                Return False
+                            End If
+
+                            If bytesReturned < headerSize Then
+                                reason = "retrieval-pointers response is too short."
+                                Return False
+                            End If
+
+                            Dim header = Marshal.PtrToStructure(Of RetrievalPointersBufferHeader)(outputBuffer)
+                            Dim currentVcn = header.StartingVcn
+                            For index = 0 To CInt(header.ExtentCount) - 1
+                                Dim extentPtr = IntPtr.Add(outputBuffer, headerSize + (index * extentSize))
+                                If IntPtr.Add(extentPtr, extentSize).ToInt64() > IntPtr.Add(outputBuffer, bytesReturned).ToInt64() Then
+                                    Exit For
+                                End If
+
+                                Dim extent = Marshal.PtrToStructure(Of RetrievalPointersExtent)(extentPtr)
+                                Dim nextVcn = extent.NextVcn
+                                If nextVcn <= currentVcn Then
+                                    Continue For
+                                End If
+
+                                Dim runClusters = nextVcn - currentVcn
+                                Dim runFileOffsetBytes = currentVcn * CLng(_clusterSizeBytes)
+                                Dim runLengthBytes = runClusters * CLng(_clusterSizeBytes)
+                                If extent.Lcn >= 0 Then
+                                    Dim volumeOffsetBytes = extent.Lcn * CLng(_clusterSizeBytes)
+                                    extents.Add(New RawDiskExtent(runFileOffsetBytes, volumeOffsetBytes, runLengthBytes))
+                                End If
+
+                                currentVcn = nextVcn
+                            Next
+
+                            If success Then
+                                Exit Do
+                            End If
+
+                            startVcn = currentVcn
+                            If startVcn <= lastStartVcn Then
+                                reason = "retrieval-pointers walk did not advance."
+                                Return False
+                            End If
+                            lastStartVcn = startVcn
+                        Loop
+                    End Using
+                Catch ex As Exception
+                    reason = ex.Message
+                    Return False
+                Finally
+                    Marshal.FreeHGlobal(inputBuffer)
+                    Marshal.FreeHGlobal(outputBuffer)
+                End Try
+
+                extents = NormalizeAndMergeExtents(extents, fileLength)
+                Return True
+            End Function
+
+            Private Shared Function NormalizeAndMergeExtents(extents As IEnumerable(Of RawDiskExtent), fileLength As Long) As List(Of RawDiskExtent)
+                Dim normalized As New List(Of RawDiskExtent)()
+                If extents Is Nothing OrElse fileLength <= 0 Then
+                    Return normalized
+                End If
+
+                Dim ordered = extents.
+                    Where(Function(item) item IsNot Nothing AndAlso item.LengthBytes > 0).
+                    OrderBy(Function(item) item.FileOffsetBytes).
+                    ToList()
+
+                For Each item In ordered
+                    Dim startOffset = Math.Max(0L, item.FileOffsetBytes)
+                    If startOffset >= fileLength Then
+                        Continue For
+                    End If
+
+                    Dim length = Math.Min(item.LengthBytes, fileLength - startOffset)
+                    If length <= 0 Then
+                        Continue For
+                    End If
+
+                    Dim candidate As New RawDiskExtent(startOffset, item.VolumeOffsetBytes + (startOffset - item.FileOffsetBytes), length)
+                    If normalized.Count = 0 Then
+                        normalized.Add(candidate)
+                        Continue For
+                    End If
+
+                    Dim previous = normalized(normalized.Count - 1)
+                    Dim previousFileEnd = previous.FileOffsetBytes + previous.LengthBytes
+                    Dim previousVolumeEnd = previous.VolumeOffsetBytes + previous.LengthBytes
+                    If previousFileEnd = candidate.FileOffsetBytes AndAlso previousVolumeEnd = candidate.VolumeOffsetBytes Then
+                        normalized(normalized.Count - 1) = New RawDiskExtent(previous.FileOffsetBytes, previous.VolumeOffsetBytes, previous.LengthBytes + candidate.LengthBytes)
+                    Else
+                        normalized.Add(candidate)
+                    End If
+                Next
+
+                Return normalized
+            End Function
+
+            Private Shared Function NormalizePathForCache(pathValue As String) As String
+                If String.IsNullOrWhiteSpace(pathValue) Then
+                    Return String.Empty
+                End If
+
+                Try
+                    Return Path.GetFullPath(pathValue).Trim()
+                Catch
+                    Return pathValue.Trim()
+                End Try
+            End Function
+
+            Private Shared Function NormalizeVolumeRoot(value As String) As String
+                If String.IsNullOrWhiteSpace(value) Then
+                    Return String.Empty
+                End If
+
+                Dim fullRoot = value.Trim()
+                If fullRoot.Length >= 2 AndAlso fullRoot(1) = ":"c Then
+                    Return fullRoot.Substring(0, 2).ToUpperInvariant() & Path.DirectorySeparatorChar
+                End If
+
+                Return fullRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            End Function
+
+            Private Shared Function BuildRawVolumePath(volumeRoot As String) As String
+                Dim normalized = NormalizeVolumeRoot(volumeRoot)
+                If normalized.Length < 2 OrElse normalized(1) <> ":"c Then
+                    Return String.Empty
+                End If
+
+                Dim driveLetter = Char.ToUpperInvariant(normalized(0))
+                Return $"\\.\{driveLetter}:"
+            End Function
+
+            Private Shared Function TryGetDiskGeometry(
+                volumeRoot As String,
+                ByRef sectorSizeBytes As Integer,
+                ByRef clusterSizeBytes As Integer,
+                ByRef reason As String) As Boolean
+
+                sectorSizeBytes = 0
+                clusterSizeBytes = 0
+                reason = String.Empty
+
+                Dim sectorsPerCluster As UInteger = 0UI
+                Dim bytesPerSector As UInteger = 0UI
+                Dim freeClusters As UInteger = 0UI
+                Dim totalClusters As UInteger = 0UI
+                Dim success = GetDiskFreeSpace(
+                    NormalizeVolumeRoot(volumeRoot),
+                    sectorsPerCluster,
+                    bytesPerSector,
+                    freeClusters,
+                    totalClusters)
+                If Not success Then
+                    reason = $"GetDiskFreeSpace failed ({Marshal.GetLastWin32Error()})."
+                    Return False
+                End If
+
+                If bytesPerSector < 512UI OrElse bytesPerSector > CUInt(Integer.MaxValue) Then
+                    reason = "invalid sector size reported by volume."
+                    Return False
+                End If
+
+                Dim computedSectorSize = CInt(bytesPerSector)
+                Dim computedCluster = CLng(sectorsPerCluster) * CLng(bytesPerSector)
+                If computedCluster < MinimumRescueBlockSize OrElse computedCluster > Integer.MaxValue Then
+                    reason = "invalid cluster size reported by volume."
+                    Return False
+                End If
+
+                sectorSizeBytes = computedSectorSize
+                clusterSizeBytes = CInt(computedCluster)
+                Return True
+            End Function
+
+            Public Sub Dispose() Implements IDisposable.Dispose
+                If _disposed Then
+                    Return
+                End If
+
+                _disposed = True
+                SyncLock _layoutCache
+                    _layoutCache.Clear()
+                End SyncLock
+                Try
+                    _volumeHandle?.Dispose()
+                Catch
+                End Try
+            End Sub
+        End Class
+
+        Private NotInheritable Class RawDiskFileLayout
+            Private Sub New(isSupported As Boolean, fileLength As Long, extents As List(Of RawDiskExtent), unsupportedReason As String)
+                Me.IsSupported = isSupported
+                Me.FileLength = Math.Max(0L, fileLength)
+                Me.Extents = If(extents, New List(Of RawDiskExtent)())
+                Me.UnsupportedReason = If(unsupportedReason, String.Empty).Trim()
+            End Sub
+
+            Public ReadOnly Property IsSupported As Boolean
+            Public ReadOnly Property FileLength As Long
+            Public ReadOnly Property Extents As List(Of RawDiskExtent)
+            Public ReadOnly Property UnsupportedReason As String
+
+            Public Shared Function CreateSupported(fileLength As Long, extents As List(Of RawDiskExtent)) As RawDiskFileLayout
+                Return New RawDiskFileLayout(True, fileLength, extents, String.Empty)
+            End Function
+
+            Public Shared Function CreateUnsupported(fileLength As Long, reason As String) As RawDiskFileLayout
+                Return New RawDiskFileLayout(False, fileLength, New List(Of RawDiskExtent)(), reason)
+            End Function
+        End Class
+
+        Private NotInheritable Class RawDiskExtent
+            Public Sub New(fileOffsetBytes As Long, volumeOffsetBytes As Long, lengthBytes As Long)
+                Me.FileOffsetBytes = Math.Max(0L, fileOffsetBytes)
+                Me.VolumeOffsetBytes = Math.Max(0L, volumeOffsetBytes)
+                Me.LengthBytes = Math.Max(0L, lengthBytes)
+            End Sub
+
+            Public ReadOnly Property FileOffsetBytes As Long
+            Public ReadOnly Property VolumeOffsetBytes As Long
+            Public ReadOnly Property LengthBytes As Long
+        End Class
+
+        Private NotInheritable Class RawDiskReadSegment
+            Private Sub New(isSparse As Boolean, volumeOffsetBytes As Long, length As Integer)
+                Me.IsSparse = isSparse
+                Me.VolumeOffsetBytes = Math.Max(0L, volumeOffsetBytes)
+                Me.Length = Math.Max(0, length)
+            End Sub
+
+            Public ReadOnly Property IsSparse As Boolean
+            Public ReadOnly Property VolumeOffsetBytes As Long
+            Public ReadOnly Property Length As Integer
+
+            Public Shared Function CreateMapped(volumeOffsetBytes As Long, length As Integer) As RawDiskReadSegment
+                Return New RawDiskReadSegment(False, volumeOffsetBytes, length)
+            End Function
+
+            Public Shared Function CreateSparse(length As Integer) As RawDiskReadSegment
+                Return New RawDiskReadSegment(True, 0L, length)
+            End Function
+        End Class
+
         Private NotInheritable Class FileTransferSession
             Implements IDisposable
 
@@ -3764,6 +5255,15 @@ Namespace Services
                 Return _sourceStream.SafeFileHandle
             End Function
 
+            Public Function TryGetOpenSourceHandle() As SafeFileHandle
+                ThrowIfDisposed()
+                If _sourceStream Is Nothing Then
+                    Return Nothing
+                End If
+
+                Return _sourceStream.SafeFileHandle
+            End Function
+
             Public Function GetDestinationHandle() As SafeFileHandle
                 ThrowIfDisposed()
                 If _destinationStream Is Nothing Then
@@ -3774,6 +5274,15 @@ Namespace Services
                         FileShare.Read,
                         _ioBufferSize,
                         FileOptions.Asynchronous Or FileOptions.SequentialScan)
+                End If
+
+                Return _destinationStream.SafeFileHandle
+            End Function
+
+            Public Function TryGetOpenDestinationHandle() As SafeFileHandle
+                ThrowIfDisposed()
+                If _destinationStream Is Nothing Then
+                    Return Nothing
                 End If
 
                 Return _destinationStream.SafeFileHandle

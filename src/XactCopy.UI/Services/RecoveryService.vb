@@ -283,6 +283,7 @@ Namespace Services
                 .SkipKnownBadRanges = options.SkipKnownBadRanges,
                 .UpdateBadRangeMapFromRun = options.UpdateBadRangeMapFromRun,
                 .BadRangeMapMaxAgeDays = options.BadRangeMapMaxAgeDays,
+                .UseExperimentalRawDiskScan = options.UseExperimentalRawDiskScan,
                 .ResumeJournalPathHint = options.ResumeJournalPathHint,
                 .AllowJournalRootRemap = options.AllowJournalRootRemap,
                 .SelectedRelativePaths = New List(Of String)(If(options.SelectedRelativePaths, New List(Of String)())),
