@@ -109,6 +109,59 @@ Public Class ResilientCopyServiceIntegrationTests
     End Function
 
     <Fact>
+    Public Async Function RunAsync_ScanOnlyMode_UsesSmallFileFastPass() As Task
+        Dim tempRoot = Path.Combine(Path.GetTempPath(), $"xactcopy-tests-scan-fast-{Guid.NewGuid():N}")
+        Dim sourceRoot = Path.Combine(tempRoot, "src")
+        Directory.CreateDirectory(sourceRoot)
+
+        File.WriteAllBytes(Path.Combine(sourceRoot, "a.bin"), New Byte(8 * 1024 - 1) {})
+        File.WriteAllBytes(Path.Combine(sourceRoot, "b.bin"), New Byte(12 * 1024 - 1) {})
+
+        Dim options As New CopyJobOptions() With {
+            .OperationMode = JobOperationMode.ScanOnly,
+            .SourceRoot = sourceRoot,
+            .DestinationRoot = String.Empty,
+            .UseBadRangeMap = True,
+            .SkipKnownBadRanges = True,
+            .UpdateBadRangeMapFromRun = True,
+            .ResumeFromJournal = False,
+            .SalvageUnreadableBlocks = False,
+            .ContinueOnFileError = False,
+            .UseAdaptiveBufferSizing = False,
+            .BufferSizeBytes = 4 * 1024,
+            .SmallFileThresholdBytes = 256 * 1024,
+            .MaxRetries = 1,
+            .OperationTimeout = TimeSpan.FromSeconds(5)
+        }
+
+        Dim observedPasses As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+        Dim service As New ResilientCopyService(options)
+        AddHandler service.ProgressChanged,
+            Sub(sender, snapshot)
+                If snapshot IsNot Nothing AndAlso Not String.IsNullOrWhiteSpace(snapshot.RescuePass) Then
+                    SyncLock observedPasses
+                        observedPasses.Add(snapshot.RescuePass)
+                    End SyncLock
+                End If
+            End Sub
+
+        Dim mapPath = BadRangeMapStore.GetDefaultMapPath(sourceRoot)
+
+        Try
+            Dim result = Await service.RunAsync(CancellationToken.None)
+
+            Assert.True(result.Succeeded)
+            Assert.Contains("ScanSmallFast", observedPasses)
+        Finally
+            CleanupJournal(sourceRoot, sourceRoot)
+            DeleteBadMapArtifacts(mapPath)
+            If Directory.Exists(tempRoot) Then
+                Directory.Delete(tempRoot, recursive:=True)
+            End If
+        End Try
+    End Function
+
+    <Fact>
     Public Async Function RunAsync_UseBadRangeMap_SkipsMappedUnreadableRangesAndSalvages() As Task
         Dim tempRoot = Path.Combine(Path.GetTempPath(), $"xactcopy-tests-map-{Guid.NewGuid():N}")
         Dim sourceRoot = Path.Combine(tempRoot, "src")

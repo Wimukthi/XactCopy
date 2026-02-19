@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.7.0] - 2026-02-19
+
+### Changed
+
+- Scan-mode small-file performance:
+  - Added a dedicated `ScanSmallFast` path so tiny files in scan mode avoid the heavier multi-pass rescue pipeline when no persisted rescue coverage exists.
+  - Retained rescue-state accounting/progress semantics so bad-range detection fidelity remains unchanged.
+
+### Fixed
+
+- Scan throughput regression on large small-file sets:
+  - Bad-range map persistence is now batched during scan runs (interval-based) instead of forcing a full map write per file.
+  - Final map flush remains durable at run end to preserve crash-safe behavior.
+
 ## [1.0.6.8] - 2026-02-18
 
 ### Fixed
