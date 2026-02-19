@@ -64,11 +64,17 @@ Friend Class SettingsForm
     Private ReadOnly _salvageFillPatternComboBox As New ComboBox()
 
     Private ReadOnly _defaultAdaptiveBufferCheckBox As New CheckBox()
+    Private ReadOnly _defaultFragileModeCheckBox As New CheckBox()
+    Private ReadOnly _defaultSkipFileOnFirstReadErrorCheckBox As New CheckBox()
+    Private ReadOnly _defaultPersistFragileSkipsCheckBox As New CheckBox()
     Private ReadOnly _defaultBufferMbNumeric As New ThemedNumericUpDown()
     Private ReadOnly _defaultRetriesNumeric As New ThemedNumericUpDown()
     Private ReadOnly _defaultOperationTimeoutNumeric As New ThemedNumericUpDown()
     Private ReadOnly _defaultPerFileTimeoutNumeric As New ThemedNumericUpDown()
     Private ReadOnly _defaultMaxThroughputNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _defaultFragileFailureWindowNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _defaultFragileFailureThresholdNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _defaultFragileCooldownNumeric As New ThemedNumericUpDown()
     Private ReadOnly _defaultLockProbeIntervalNumeric As New ThemedNumericUpDown()
     Private ReadOnly _defaultSourceMutationPolicyComboBox As New ComboBox()
     Private ReadOnly _rescueFastChunkKbNumeric As New ThemedNumericUpDown()
@@ -319,11 +325,17 @@ Friend Class SettingsForm
         _toolTip.SetToolTip(_salvageFillPatternComboBox, "Fill pattern used for unreadable blocks when salvage mode is enabled.")
 
         _toolTip.SetToolTip(_defaultAdaptiveBufferCheckBox, "Enable adaptive transfer buffer sizing by default.")
+        _toolTip.SetToolTip(_defaultFragileModeCheckBox, "Enable fragile-media protections by default. This uses conservative behavior to avoid drive lockups.")
+        _toolTip.SetToolTip(_defaultSkipFileOnFirstReadErrorCheckBox, "When fragile mode is enabled, stop reading a file after the first read failure and continue with the next file.")
+        _toolTip.SetToolTip(_defaultPersistFragileSkipsCheckBox, "Persist fragile-mode skipped files in the journal so resume/recovery does not hammer them again.")
         _toolTip.SetToolTip(_defaultBufferMbNumeric, "Maximum transfer buffer for new runs (1-256 MB).")
         _toolTip.SetToolTip(_defaultRetriesNumeric, "Default per-operation retry attempts for I/O failures (0-1000).")
         _toolTip.SetToolTip(_defaultOperationTimeoutNumeric, "Default operation timeout in seconds (1-3600).")
         _toolTip.SetToolTip(_defaultPerFileTimeoutNumeric, "Default per-file timeout in seconds (0 disables per-file timeout).")
         _toolTip.SetToolTip(_defaultMaxThroughputNumeric, "Optional throughput cap in MB/s (0 means unlimited).")
+        _toolTip.SetToolTip(_defaultFragileFailureWindowNumeric, "Rolling window size used by the fragile-mode failure circuit breaker.")
+        _toolTip.SetToolTip(_defaultFragileFailureThresholdNumeric, "Number of failed files in the rolling window before fragile-mode cooldown is applied.")
+        _toolTip.SetToolTip(_defaultFragileCooldownNumeric, "Cooldown delay in seconds once the fragile-mode failure threshold is reached (0 disables cooldown).")
         _toolTip.SetToolTip(_defaultLockProbeIntervalNumeric, "Milliseconds between lock-contention probes while waiting.")
         _toolTip.SetToolTip(_defaultSourceMutationPolicyComboBox, "Behavior when source files disappear during an active copy.")
         _toolTip.SetToolTip(_rescueFastChunkKbNumeric, "AegisRescueCore FastScan chunk size in KB (0 = auto from buffer).")
@@ -666,7 +678,7 @@ Friend Class SettingsForm
     End Function
 
     Private Function BuildPerformancePage() As Control
-        Dim page = CreatePageContainer(3)
+        Dim page = CreatePageContainer(4)
 
         Dim body = CreateFieldGrid(6)
 
@@ -691,6 +703,32 @@ Friend Class SettingsForm
         body.Controls.Add(_defaultPerFileTimeoutNumeric, 1, 4)
         body.Controls.Add(CreateFieldLabel("Max throughput (MB/s, 0=unlimited)"), 0, 5)
         body.Controls.Add(_defaultMaxThroughputNumeric, 1, 5)
+
+        Dim fragile = CreateFieldGrid(6)
+        _defaultFragileModeCheckBox.Text = "Enable fragile media mode by default"
+        _defaultSkipFileOnFirstReadErrorCheckBox.Text = "Skip file on first read error (fragile mode)"
+        _defaultPersistFragileSkipsCheckBox.Text = "Persist skipped files across resume/recovery"
+        ConfigureCheckBox(_defaultFragileModeCheckBox)
+        ConfigureCheckBox(_defaultSkipFileOnFirstReadErrorCheckBox)
+        ConfigureCheckBox(_defaultPersistFragileSkipsCheckBox)
+        AddHandler _defaultFragileModeCheckBox.CheckedChanged, AddressOf FragileControl_CheckedChanged
+
+        ConfigureNumeric(_defaultFragileFailureWindowNumeric, 1D, 3600D, 20D)
+        ConfigureNumeric(_defaultFragileFailureThresholdNumeric, 1D, 1000D, 3D)
+        ConfigureNumeric(_defaultFragileCooldownNumeric, 0D, 600D, 6D)
+
+        fragile.Controls.Add(_defaultFragileModeCheckBox, 0, 0)
+        fragile.SetColumnSpan(_defaultFragileModeCheckBox, 3)
+        fragile.Controls.Add(_defaultSkipFileOnFirstReadErrorCheckBox, 0, 1)
+        fragile.SetColumnSpan(_defaultSkipFileOnFirstReadErrorCheckBox, 3)
+        fragile.Controls.Add(_defaultPersistFragileSkipsCheckBox, 0, 2)
+        fragile.SetColumnSpan(_defaultPersistFragileSkipsCheckBox, 3)
+        fragile.Controls.Add(CreateFieldLabel("Failure window (sec)"), 0, 3)
+        fragile.Controls.Add(_defaultFragileFailureWindowNumeric, 1, 3)
+        fragile.Controls.Add(CreateFieldLabel("Failure threshold (files)"), 0, 4)
+        fragile.Controls.Add(_defaultFragileFailureThresholdNumeric, 1, 4)
+        fragile.Controls.Add(CreateFieldLabel("Cooldown (sec, 0=off)"), 0, 5)
+        fragile.Controls.Add(_defaultFragileCooldownNumeric, 1, 5)
 
         Dim contention = CreateFieldGrid(2)
         ConfigureNumeric(_defaultLockProbeIntervalNumeric, 100D, 10000D, 500D)
@@ -736,8 +774,9 @@ Friend Class SettingsForm
         rescue.Controls.Add(_rescueScrapeRetriesNumeric, 1, 7)
 
         page.Controls.Add(CreateSection("Transfer Tuning", body), 0, 0)
-        page.Controls.Add(CreateSection("Contention & Source Mutation", contention), 0, 1)
-        page.Controls.Add(CreateSection("AegisRescueCore Tuning", rescue), 0, 2)
+        page.Controls.Add(CreateSection("Fragile Media Guard", fragile), 0, 1)
+        page.Controls.Add(CreateSection("Contention & Source Mutation", contention), 0, 2)
+        page.Controls.Add(CreateSection("AegisRescueCore Tuning", rescue), 0, 3)
         Return page
     End Function
 
@@ -1276,11 +1315,17 @@ Friend Class SettingsForm
             _defaultBadRangeMapMaxAgeDaysNumeric.Value = ClampNumeric(_defaultBadRangeMapMaxAgeDaysNumeric, _workingSettings.DefaultBadRangeMapMaxAgeDays)
 
             _defaultAdaptiveBufferCheckBox.Checked = _workingSettings.DefaultUseAdaptiveBuffer
+            _defaultFragileModeCheckBox.Checked = _workingSettings.DefaultFragileMediaMode
+            _defaultSkipFileOnFirstReadErrorCheckBox.Checked = _workingSettings.DefaultSkipFileOnFirstReadError
+            _defaultPersistFragileSkipsCheckBox.Checked = _workingSettings.DefaultPersistFragileSkipsAcrossResume
             _defaultBufferMbNumeric.Value = ClampNumeric(_defaultBufferMbNumeric, _workingSettings.DefaultBufferSizeMb)
             _defaultRetriesNumeric.Value = ClampNumeric(_defaultRetriesNumeric, _workingSettings.DefaultMaxRetries)
             _defaultOperationTimeoutNumeric.Value = ClampNumeric(_defaultOperationTimeoutNumeric, _workingSettings.DefaultOperationTimeoutSeconds)
             _defaultPerFileTimeoutNumeric.Value = ClampNumeric(_defaultPerFileTimeoutNumeric, _workingSettings.DefaultPerFileTimeoutSeconds)
             _defaultMaxThroughputNumeric.Value = ClampNumeric(_defaultMaxThroughputNumeric, _workingSettings.DefaultMaxThroughputMbPerSecond)
+            _defaultFragileFailureWindowNumeric.Value = ClampNumeric(_defaultFragileFailureWindowNumeric, _workingSettings.DefaultFragileFailureWindowSeconds)
+            _defaultFragileFailureThresholdNumeric.Value = ClampNumeric(_defaultFragileFailureThresholdNumeric, _workingSettings.DefaultFragileFailureThreshold)
+            _defaultFragileCooldownNumeric.Value = ClampNumeric(_defaultFragileCooldownNumeric, _workingSettings.DefaultFragileCooldownSeconds)
             _defaultLockProbeIntervalNumeric.Value = ClampNumeric(_defaultLockProbeIntervalNumeric, _workingSettings.DefaultLockContentionProbeIntervalMs)
             _rescueFastChunkKbNumeric.Value = ClampNumeric(_rescueFastChunkKbNumeric, _workingSettings.DefaultRescueFastScanChunkKb)
             _rescueTrimChunkKbNumeric.Value = ClampNumeric(_rescueTrimChunkKbNumeric, _workingSettings.DefaultRescueTrimChunkKb)
@@ -1442,6 +1487,7 @@ Friend Class SettingsForm
             UpdateVerificationControlStates()
             UpdateExplorerControlStates()
             UpdateBadRangeMapControlStates()
+            UpdateFragileControlStates()
             If _showDiagnosticsStatusRowCheckBox.Checked <> _uiShowDiagnosticsCheckBox.Checked Then
                 _showDiagnosticsStatusRowCheckBox.Checked = _uiShowDiagnosticsCheckBox.Checked
             End If
@@ -1590,11 +1636,17 @@ Friend Class SettingsForm
         capturedSettings.DefaultUseExperimentalRawDiskScan = _defaultUseRawDiskScanCheckBox.Checked
         capturedSettings.DefaultBadRangeMapMaxAgeDays = CInt(_defaultBadRangeMapMaxAgeDaysNumeric.Value)
         capturedSettings.DefaultUseAdaptiveBuffer = _defaultAdaptiveBufferCheckBox.Checked
+        capturedSettings.DefaultFragileMediaMode = _defaultFragileModeCheckBox.Checked
+        capturedSettings.DefaultSkipFileOnFirstReadError = _defaultSkipFileOnFirstReadErrorCheckBox.Checked
+        capturedSettings.DefaultPersistFragileSkipsAcrossResume = _defaultPersistFragileSkipsCheckBox.Checked
         capturedSettings.DefaultBufferSizeMb = CInt(_defaultBufferMbNumeric.Value)
         capturedSettings.DefaultMaxRetries = CInt(_defaultRetriesNumeric.Value)
         capturedSettings.DefaultOperationTimeoutSeconds = CInt(_defaultOperationTimeoutNumeric.Value)
         capturedSettings.DefaultPerFileTimeoutSeconds = CInt(_defaultPerFileTimeoutNumeric.Value)
         capturedSettings.DefaultMaxThroughputMbPerSecond = CInt(_defaultMaxThroughputNumeric.Value)
+        capturedSettings.DefaultFragileFailureWindowSeconds = CInt(_defaultFragileFailureWindowNumeric.Value)
+        capturedSettings.DefaultFragileFailureThreshold = CInt(_defaultFragileFailureThresholdNumeric.Value)
+        capturedSettings.DefaultFragileCooldownSeconds = CInt(_defaultFragileCooldownNumeric.Value)
         capturedSettings.DefaultLockContentionProbeIntervalMs = CInt(_defaultLockProbeIntervalNumeric.Value)
         capturedSettings.DefaultRescueFastScanChunkKb = CInt(_rescueFastChunkKbNumeric.Value)
         capturedSettings.DefaultRescueTrimChunkKb = CInt(_rescueTrimChunkKbNumeric.Value)
@@ -1771,6 +1823,10 @@ Friend Class SettingsForm
         UpdateBadRangeMapControlStates()
     End Sub
 
+    Private Sub FragileControl_CheckedChanged(sender As Object, e As EventArgs)
+        UpdateFragileControlStates()
+    End Sub
+
     Private Sub DefaultVerifyCheckBox_CheckedChanged(sender As Object, e As EventArgs)
         UpdateVerificationControlStates()
     End Sub
@@ -1832,6 +1888,15 @@ Friend Class SettingsForm
         Dim enabled = _defaultUseBadRangeMapCheckBox.Checked
         _defaultSkipKnownBadRangesCheckBox.Enabled = enabled
         _defaultBadRangeMapMaxAgeDaysNumeric.Enabled = enabled
+    End Sub
+
+    Private Sub UpdateFragileControlStates()
+        Dim enabled = _defaultFragileModeCheckBox.Checked
+        _defaultSkipFileOnFirstReadErrorCheckBox.Enabled = enabled
+        _defaultPersistFragileSkipsCheckBox.Enabled = enabled
+        _defaultFragileFailureWindowNumeric.Enabled = enabled
+        _defaultFragileFailureThresholdNumeric.Enabled = enabled
+        _defaultFragileCooldownNumeric.Enabled = enabled
     End Sub
 
     Private Sub UpdateVerificationControlStates()

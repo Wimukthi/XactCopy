@@ -56,6 +56,12 @@ Namespace Configuration
         Public Property DefaultTreatAccessDeniedAsContention As Boolean = False
         Public Property DefaultLockContentionProbeIntervalMs As Integer = 500
         Public Property DefaultSourceMutationPolicy As String = "fail-file"
+        Public Property DefaultFragileMediaMode As Boolean = False
+        Public Property DefaultSkipFileOnFirstReadError As Boolean = True
+        Public Property DefaultPersistFragileSkipsAcrossResume As Boolean = True
+        Public Property DefaultFragileFailureWindowSeconds As Integer = 20
+        Public Property DefaultFragileFailureThreshold As Integer = 3
+        Public Property DefaultFragileCooldownSeconds As Integer = 6
         Public Property DefaultBufferSizeMb As Integer = 4
         Public Property DefaultMaxRetries As Integer = 12
         Public Property DefaultOperationTimeoutSeconds As Integer = 10

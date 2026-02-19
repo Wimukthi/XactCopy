@@ -135,6 +135,12 @@ Namespace Configuration
                 SettingsValueConverter.ClampInteger(settings.DefaultMaxThroughputMbPerSecond, 0, 4096, 0)
             settings.DefaultLockContentionProbeIntervalMs =
                 SettingsValueConverter.ClampInteger(settings.DefaultLockContentionProbeIntervalMs, 100, 10000, 500)
+            settings.DefaultFragileFailureWindowSeconds =
+                SettingsValueConverter.ClampInteger(settings.DefaultFragileFailureWindowSeconds, 1, 3600, 20)
+            settings.DefaultFragileFailureThreshold =
+                SettingsValueConverter.ClampInteger(settings.DefaultFragileFailureThreshold, 1, 1000, 3)
+            settings.DefaultFragileCooldownSeconds =
+                SettingsValueConverter.ClampInteger(settings.DefaultFragileCooldownSeconds, 0, 600, 6)
             settings.DefaultRescueFastScanChunkKb =
                 SettingsValueConverter.ClampInteger(settings.DefaultRescueFastScanChunkKb, 0, 262144, 0)
             settings.DefaultRescueTrimChunkKb =

@@ -62,6 +62,7 @@ Namespace Services
         Private _badRangeMapReadHintsEnabled As Boolean
         Private _rawDiskScanContext As RawDiskScanContext
         Private ReadOnly _rawScanFallbackLoggedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+        Private ReadOnly _fragileFailureTimestamps As New Queue(Of DateTimeOffset)()
 
         <DllImport("kernel32.dll", CharSet:=CharSet.Unicode, SetLastError:=True)>
         Private Shared Function GetVolumeInformation(
@@ -171,6 +172,7 @@ Namespace Services
 #End If
             Try
                 _rawScanFallbackLoggedPaths.Clear()
+                _fragileFailureTimestamps.Clear()
 
                 Dim scanOnly = (_options.OperationMode = JobOperationMode.ScanOnly)
                 Dim sourceRoot = Path.GetFullPath(_options.SourceRoot)
@@ -292,90 +294,143 @@ Namespace Services
                 End If
 
                     If scanOnly Then
-                    If entry.State = FileCopyState.Failed Then
-                        entry.State = FileCopyState.Pending
-                        entry.LastError = String.Empty
-                    End If
-
-                    Dim scanException As Exception = Nothing
-                    Dim scanDetectedBadRanges = False
-                    Dim scanFileTimeoutCts As CancellationTokenSource = Nothing
-                    Dim scanFileToken = cancellationToken
-
-                    Try
-                        If _options.PerFileTimeout > TimeSpan.Zero Then
-                            scanFileTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-                            scanFileTimeoutCts.CancelAfter(_options.PerFileTimeout)
-                            scanFileToken = scanFileTimeoutCts.Token
+                        If ShouldSkipFailedEntryForFragileResume(entry) Then
+                            progress.SkippedFiles += 1
+                            progress.TotalBytesCopied += Math.Max(0L, descriptor.Length - Math.Max(0L, entry.BytesCopied))
+                            EmitLog($"Skipped scan: {descriptor.RelativePath} (persisted fragile skip).")
+                            EmitProgress(
+                                progress,
+                                descriptor.RelativePath,
+                                descriptor.Length,
+                                descriptor.Length,
+                                lastChunkBytesTransferred:=0,
+                                bufferSizeBytes:=ResolveBufferSizeForFile(descriptor.Length))
+                            Continue For
                         End If
 
-                        entry.State = FileCopyState.InProgress
-                        entry.LastError = String.Empty
-                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
-
-                        scanDetectedBadRanges = Await ScanSingleFileForBadRangesAsync(
-                            descriptor,
-                            entry,
-                            progress,
-                            journal,
-                            journalPath,
-                            scanFileToken).ConfigureAwait(False)
-                    Catch ex As SourceMutationSkippedException
-                        progress.SkippedFiles += 1
-                        entry.State = FileCopyState.Pending
-                        entry.LastError = ex.Message
-                        EmitLog($"Skipped scan: {descriptor.RelativePath} ({ex.Message})")
-                        FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).GetAwaiter().GetResult()
-                        Continue For
-                    Catch ex As OperationCanceledException When cancellationToken.IsCancellationRequested
-                        Throw
-                    Catch ex As OperationCanceledException
-                        scanException = New TimeoutException(
-                            $"Per-file timeout ({CInt(Math.Round(_options.PerFileTimeout.TotalSeconds))} sec) reached while scanning {descriptor.RelativePath}.",
-                            ex)
-                    Catch ex As Exception
-                        scanException = ex
-                    Finally
-                        If scanFileTimeoutCts IsNot Nothing Then
-                            scanFileTimeoutCts.Dispose()
-                        End If
-                    End Try
-
-                    If scanException Is Nothing Then
-                        progress.CompletedFiles += 1
-                        If scanDetectedBadRanges Then
-                            progress.RecoveredFiles += 1
+                        If entry.State = FileCopyState.Failed Then
+                            entry.State = FileCopyState.Pending
+                            entry.LastError = String.Empty
+                            entry.DoNotRetry = False
                         End If
 
-                        entry.State = If(scanDetectedBadRanges, FileCopyState.CompletedWithRecovery, FileCopyState.Completed)
-                        entry.BytesCopied = descriptor.Length
-                        entry.LastError = String.Empty
+                        Dim scanException As Exception = Nothing
+                        Dim fragileScanSkip As FragileReadSkipException = Nothing
+                        Dim scanDetectedBadRanges = False
+                        Dim scanFileTimeoutCts As CancellationTokenSource = Nothing
+                        Dim scanFileToken = cancellationToken
+
+                        Try
+                            If _options.PerFileTimeout > TimeSpan.Zero Then
+                                scanFileTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+                                scanFileTimeoutCts.CancelAfter(_options.PerFileTimeout)
+                                scanFileToken = scanFileTimeoutCts.Token
+                            End If
+
+                            entry.State = FileCopyState.InProgress
+                            entry.LastError = String.Empty
+                            entry.DoNotRetry = False
+                            Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
+
+                            scanDetectedBadRanges = Await ScanSingleFileForBadRangesAsync(
+                                descriptor,
+                                entry,
+                                progress,
+                                journal,
+                                journalPath,
+                                scanFileToken).ConfigureAwait(False)
+                        Catch ex As SourceMutationSkippedException
+                            progress.SkippedFiles += 1
+                            entry.State = FileCopyState.Pending
+                            entry.LastError = ex.Message
+                            entry.DoNotRetry = False
+                            EmitLog($"Skipped scan: {descriptor.RelativePath} ({ex.Message})")
+                            FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).GetAwaiter().GetResult()
+                            Continue For
+                        Catch ex As FragileReadSkipException
+                            fragileScanSkip = ex
+                        Catch ex As OperationCanceledException When cancellationToken.IsCancellationRequested
+                            Throw
+                        Catch ex As OperationCanceledException
+                            scanException = New TimeoutException(
+                                $"Per-file timeout ({CInt(Math.Round(_options.PerFileTimeout.TotalSeconds))} sec) reached while scanning {descriptor.RelativePath}.",
+                                ex)
+                        Catch ex As Exception
+                            scanException = ex
+                        Finally
+                            If scanFileTimeoutCts IsNot Nothing Then
+                                scanFileTimeoutCts.Dispose()
+                            End If
+                        End Try
+
+                        If fragileScanSkip IsNot Nothing Then
+                            Await HandleFragileReadSkipAsync(
+                                "scan",
+                                descriptor,
+                                entry,
+                                progress,
+                                journal,
+                                journalPath,
+                                sourceRoot,
+                                fragileScanSkip,
+                                cancellationToken).ConfigureAwait(False)
+                            Continue For
+                        End If
+
+                        If scanException Is Nothing Then
+                            progress.CompletedFiles += 1
+                            If scanDetectedBadRanges Then
+                                progress.RecoveredFiles += 1
+                            End If
+
+                            entry.State = If(scanDetectedBadRanges, FileCopyState.CompletedWithRecovery, FileCopyState.Completed)
+                            entry.BytesCopied = descriptor.Length
+                            entry.LastError = String.Empty
+                            entry.DoNotRetry = False
+                            Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken, forceSave:=False).ConfigureAwait(False)
+                            Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
+                            Continue For
+                        End If
+
+                        progress.FailedFiles += 1
+                        entry.State = FileCopyState.Failed
+                        entry.LastError = scanException.Message
+                        entry.DoNotRetry = False
+                        EmitLog($"Scan failed: {descriptor.RelativePath} ({scanException.Message})")
+                        Await RegisterFragileFailureAndMaybeCooldownAsync(descriptor.RelativePath, scanException.Message, cancellationToken).ConfigureAwait(False)
                         Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken, forceSave:=False).ConfigureAwait(False)
                         Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
+
+                        If Not _options.ContinueOnFileError Then
+                            Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+                            Return CreateResult(progress, journalPath, succeeded:=False, cancelled:=False, errorMessage:=scanException.Message)
+                        End If
+
                         Continue For
                     End If
 
-                    progress.FailedFiles += 1
-                    entry.State = FileCopyState.Failed
-                    entry.LastError = scanException.Message
-                    EmitLog($"Scan failed: {descriptor.RelativePath} ({scanException.Message})")
-                    Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken, forceSave:=False).ConfigureAwait(False)
-                    Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
-
-                    If Not _options.ContinueOnFileError Then
-                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
-                        Return CreateResult(progress, journalPath, succeeded:=False, cancelled:=False, errorMessage:=scanException.Message)
+                    If ShouldSkipFailedEntryForFragileResume(entry) Then
+                        progress.SkippedFiles += 1
+                        progress.TotalBytesCopied += Math.Max(0L, descriptor.Length - Math.Max(0L, entry.BytesCopied))
+                        EmitLog($"Skipped: {descriptor.RelativePath} (persisted fragile skip).")
+                        EmitProgress(
+                            progress,
+                            descriptor.RelativePath,
+                            descriptor.Length,
+                            descriptor.Length,
+                            lastChunkBytesTransferred:=0,
+                            bufferSizeBytes:=ResolveBufferSizeForFile(descriptor.Length))
+                        Continue For
                     End If
 
-                    Continue For
-                End If
-
                     If entry.State = FileCopyState.Failed Then
-                    entry.State = FileCopyState.Pending
-                    entry.LastError = String.Empty
-                End If
+                        entry.State = FileCopyState.Pending
+                        entry.LastError = String.Empty
+                        entry.DoNotRetry = False
+                    End If
 
                     Dim copyException As Exception = Nothing
+                    Dim fragileCopySkip As FragileReadSkipException = Nothing
                     Dim recovered = False
                     Dim fileTimeoutCts As CancellationTokenSource = Nothing
                     Dim fileToken = cancellationToken
@@ -387,32 +442,36 @@ Namespace Services
                             fileToken = fileTimeoutCts.Token
                         End If
 
-                    entry.State = FileCopyState.InProgress
-                    entry.LastError = String.Empty
-                    Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+                        entry.State = FileCopyState.InProgress
+                        entry.LastError = String.Empty
+                        entry.DoNotRetry = False
+                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
 
-                    recovered = Await CopySingleFileAsync(
-                        descriptor,
-                        entry,
-                        destinationRoot,
-                        progress,
-                        journal,
-                        journalPath,
-                        fileToken).ConfigureAwait(False)
+                        recovered = Await CopySingleFileAsync(
+                            descriptor,
+                            entry,
+                            destinationRoot,
+                            progress,
+                            journal,
+                            journalPath,
+                            fileToken).ConfigureAwait(False)
 
                     Catch ex As SourceMutationSkippedException
-                    progress.SkippedFiles += 1
-                    entry.State = FileCopyState.Pending
-                    entry.LastError = ex.Message
-                    EmitLog($"Skipped: {descriptor.RelativePath} ({ex.Message})")
-                    FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).GetAwaiter().GetResult()
-                    Continue For
+                        progress.SkippedFiles += 1
+                        entry.State = FileCopyState.Pending
+                        entry.LastError = ex.Message
+                        entry.DoNotRetry = False
+                        EmitLog($"Skipped: {descriptor.RelativePath} ({ex.Message})")
+                        FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).GetAwaiter().GetResult()
+                        Continue For
+                    Catch ex As FragileReadSkipException
+                        fragileCopySkip = ex
                     Catch ex As OperationCanceledException When cancellationToken.IsCancellationRequested
                         Throw
                     Catch ex As OperationCanceledException
-                    copyException = New TimeoutException(
-                        $"Per-file timeout ({CInt(Math.Round(_options.PerFileTimeout.TotalSeconds))} sec) reached while copying {descriptor.RelativePath}.",
-                        ex)
+                        copyException = New TimeoutException(
+                            $"Per-file timeout ({CInt(Math.Round(_options.PerFileTimeout.TotalSeconds))} sec) reached while copying {descriptor.RelativePath}.",
+                            ex)
                     Catch ex As Exception
                         copyException = ex
                     Finally
@@ -421,24 +480,41 @@ Namespace Services
                         End If
                     End Try
 
-                    If copyException Is Nothing Then
-                    progress.CompletedFiles += 1
-                    If recovered Then
-                        progress.RecoveredFiles += 1
+                    If fragileCopySkip IsNot Nothing Then
+                        Await HandleFragileReadSkipAsync(
+                            "copy",
+                            descriptor,
+                            entry,
+                            progress,
+                            journal,
+                            journalPath,
+                            sourceRoot,
+                            fragileCopySkip,
+                            cancellationToken).ConfigureAwait(False)
+                        Continue For
                     End If
 
-                    entry.State = If(recovered, FileCopyState.CompletedWithRecovery, FileCopyState.Completed)
-                    entry.BytesCopied = descriptor.Length
-                    entry.LastError = String.Empty
-                    Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken).ConfigureAwait(False)
-                    Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
-                    Continue For
+                    If copyException Is Nothing Then
+                        progress.CompletedFiles += 1
+                        If recovered Then
+                            progress.RecoveredFiles += 1
+                        End If
+
+                        entry.State = If(recovered, FileCopyState.CompletedWithRecovery, FileCopyState.Completed)
+                        entry.BytesCopied = descriptor.Length
+                        entry.LastError = String.Empty
+                        entry.DoNotRetry = False
+                        Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken).ConfigureAwait(False)
+                        Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+                        Continue For
                     End If
 
                     progress.FailedFiles += 1
                     entry.State = FileCopyState.Failed
                     entry.LastError = copyException.Message
+                    entry.DoNotRetry = False
                     EmitLog($"Failed: {descriptor.RelativePath} ({copyException.Message})")
+                    Await RegisterFragileFailureAndMaybeCooldownAsync(descriptor.RelativePath, copyException.Message, cancellationToken).ConfigureAwait(False)
                     Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken).ConfigureAwait(False)
                     Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
 
@@ -541,6 +617,18 @@ Namespace Services
                 Case Else
                     Throw New InvalidOperationException("SourceMutationPolicy is invalid.")
             End Select
+
+            If _options.FragileFailureWindowSeconds <= 0 Then
+                Throw New InvalidOperationException("FragileFailureWindowSeconds must be greater than zero.")
+            End If
+
+            If _options.FragileFailureThreshold <= 0 Then
+                Throw New InvalidOperationException("FragileFailureThreshold must be greater than zero.")
+            End If
+
+            If _options.FragileCooldownSeconds < 0 Then
+                Throw New InvalidOperationException("FragileCooldownSeconds cannot be negative.")
+            End If
         End Sub
 
         Private Sub InitializeRawDiskScanContext(scanOnly As Boolean, sourceRoot As String)
@@ -677,6 +765,7 @@ Namespace Services
                         .BytesCopied = 0,
                         .State = FileCopyState.Pending,
                         .LastError = String.Empty,
+                        .DoNotRetry = False,
                         .RecoveredRanges = New List(Of ByteRange)(),
                         .RescueRanges = New List(Of RescueRange)(),
                         .LastRescuePass = String.Empty
@@ -703,6 +792,7 @@ Namespace Services
                     entry.BytesCopied = 0
                     entry.State = FileCopyState.Pending
                     entry.LastError = String.Empty
+                    entry.DoNotRetry = False
                     entry.RecoveredRanges.Clear()
                     entry.RescueRanges.Clear()
                     entry.LastRescuePass = String.Empty
@@ -743,6 +833,91 @@ Namespace Services
             End If
 
             Return destinationMetadata.Length = descriptor.Length
+        End Function
+
+        Private Function ShouldSkipFailedEntryForFragileResume(entry As JournalFileEntry) As Boolean
+            If entry Is Nothing Then
+                Return False
+            End If
+
+            Return entry.State = FileCopyState.Failed AndAlso
+                entry.DoNotRetry AndAlso
+                _options.PersistFragileSkipAcrossResume
+        End Function
+
+        Private Async Function HandleFragileReadSkipAsync(
+            operationLabel As String,
+            descriptor As SourceFileDescriptor,
+            entry As JournalFileEntry,
+            progress As ProgressAccumulator,
+            journal As JobJournal,
+            journalPath As String,
+            sourceRoot As String,
+            ex As FragileReadSkipException,
+            cancellationToken As CancellationToken) As Task
+
+            If descriptor Is Nothing OrElse entry Is Nothing OrElse progress Is Nothing Then
+                Return
+            End If
+
+            Dim remainingBytes = Math.Max(0L, descriptor.Length - Math.Max(0L, entry.BytesCopied))
+            progress.SkippedFiles += 1
+            progress.TotalBytesCopied += remainingBytes
+
+            entry.State = FileCopyState.Failed
+            entry.LastError = ex.Message
+            entry.DoNotRetry = _options.PersistFragileSkipAcrossResume
+
+            Dim modeText = If(String.IsNullOrWhiteSpace(operationLabel), "copy", operationLabel.Trim().ToLowerInvariant())
+            EmitLog($"Skipped {modeText}: {descriptor.RelativePath} ({ex.Message})")
+            EmitProgress(
+                progress,
+                descriptor.RelativePath,
+                descriptor.Length,
+                descriptor.Length,
+                lastChunkBytesTransferred:=0,
+                bufferSizeBytes:=ResolveBufferSizeForFile(descriptor.Length))
+
+            Await RegisterFragileFailureAndMaybeCooldownAsync(descriptor.RelativePath, ex.Message, cancellationToken).ConfigureAwait(False)
+            Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken, forceSave:=False).ConfigureAwait(False)
+            Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+        End Function
+
+        Private Async Function RegisterFragileFailureAndMaybeCooldownAsync(
+            relativePath As String,
+            reason As String,
+            cancellationToken As CancellationToken) As Task
+
+            If Not _options.FragileMediaMode Then
+                Return
+            End If
+
+            Dim nowUtc = DateTimeOffset.UtcNow
+            Dim windowSeconds = Math.Max(1, _options.FragileFailureWindowSeconds)
+            Dim threshold = Math.Max(1, _options.FragileFailureThreshold)
+            Dim cooldownSeconds = Math.Max(0, _options.FragileCooldownSeconds)
+
+            _fragileFailureTimestamps.Enqueue(nowUtc)
+            Dim cutoffUtc = nowUtc - TimeSpan.FromSeconds(windowSeconds)
+            While _fragileFailureTimestamps.Count > 0 AndAlso _fragileFailureTimestamps.Peek() < cutoffUtc
+                _fragileFailureTimestamps.Dequeue()
+            End While
+
+            If _fragileFailureTimestamps.Count < threshold Then
+                Return
+            End If
+
+            Dim pathLabel = If(String.IsNullOrWhiteSpace(relativePath), "?", relativePath)
+            Dim reasonSuffix = If(String.IsNullOrWhiteSpace(reason), String.Empty, $" ({reason})")
+            EmitLog($"[Fragile] Failure threshold reached after {pathLabel}{reasonSuffix}.")
+            _fragileFailureTimestamps.Clear()
+
+            If cooldownSeconds <= 0 Then
+                Return
+            End If
+
+            EmitLog($"[Fragile] Cooling down for {cooldownSeconds} second(s) to reduce stress on unstable media.")
+            Await Task.Delay(TimeSpan.FromSeconds(cooldownSeconds), cancellationToken).ConfigureAwait(False)
         End Function
 
         Private Function ShouldSkipByOverwritePolicy(
@@ -2870,6 +3045,14 @@ Namespace Services
                 Catch ex As Exception
                     lastError = ex
                 End Try
+
+                If _options.FragileMediaMode AndAlso _options.SkipFileOnFirstReadError Then
+                    transferSession?.InvalidateSource()
+                    Dim errorText = If(lastError Is Nothing, "unknown read error", lastError.Message)
+                    Throw New FragileReadSkipException(
+                        $"Fragile mode: first read failure at {FormatBytes(offset)} ({errorText}).",
+                        lastError)
+                End If
 
                 If IsSourceFileMissingException(lastError) Then
                     Select Case _options.SourceMutationPolicy
@@ -5619,6 +5802,14 @@ Namespace Services
         End Class
 
         Private NotInheritable Class SourceMutationSkippedException
+            Inherits IOException
+
+            Public Sub New(message As String, innerException As Exception)
+                MyBase.New(message, innerException)
+            End Sub
+        End Class
+
+        Private NotInheritable Class FragileReadSkipException
             Inherits IOException
 
             Public Sub New(message As String, innerException As Exception)

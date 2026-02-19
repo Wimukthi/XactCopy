@@ -73,6 +73,7 @@ Public Class MainForm
     Private ReadOnly _useBadRangeMapCheckBox As New CheckBox()
     Private ReadOnly _skipKnownBadRangesCheckBox As New CheckBox()
     Private ReadOnly _waitForMediaCheckBox As New CheckBox()
+    Private ReadOnly _fragileModeCheckBox As New CheckBox()
 
     Private ReadOnly _bufferMbNumeric As New ThemedNumericUpDown()
     Private ReadOnly _retriesNumeric As New ThemedNumericUpDown()
@@ -340,6 +341,10 @@ Public Class MainForm
         _waitForMediaCheckBox.Text = "Wait Forever for Source/Destination"
         _waitForMediaCheckBox.AutoSize = True
         _waitForMediaCheckBox.Checked = False
+
+        _fragileModeCheckBox.Text = "Fragile Media Mode"
+        _fragileModeCheckBox.AutoSize = True
+        _fragileModeCheckBox.Checked = False
 
         _bufferMbNumeric.Minimum = 1D
         _bufferMbNumeric.Maximum = 256D
@@ -690,7 +695,8 @@ Public Class MainForm
             _adaptiveBufferCheckBox,
             _useBadRangeMapCheckBox,
             _skipKnownBadRangesCheckBox,
-            _waitForMediaCheckBox}
+            _waitForMediaCheckBox,
+            _fragileModeCheckBox}
             checkBox.Anchor = AnchorStyles.Left
             checkBox.Margin = New Padding(0, 4, 12, 0)
         Next
@@ -710,6 +716,7 @@ Public Class MainForm
         optionsPanel.Controls.Add(_useBadRangeMapCheckBox)
         optionsPanel.Controls.Add(_skipKnownBadRangesCheckBox)
         optionsPanel.Controls.Add(_waitForMediaCheckBox)
+        optionsPanel.Controls.Add(_fragileModeCheckBox)
 
         optionsPanel.Controls.Add(New Label() With {.Text = "Buffer MB (max):", .AutoSize = True, .Margin = New Padding(12, 7, 4, 0)})
         optionsPanel.Controls.Add(_bufferMbNumeric)
@@ -737,6 +744,7 @@ Public Class MainForm
         _toolTip.SetToolTip(_useBadRangeMapCheckBox, "Use saved unreadable-range map metadata for this source when available.")
         _toolTip.SetToolTip(_skipKnownBadRangesCheckBox, "Skip read attempts for ranges already known unreadable in the bad-range map.")
         _toolTip.SetToolTip(_waitForMediaCheckBox, "Wait indefinitely if source or destination becomes unavailable.")
+        _toolTip.SetToolTip(_fragileModeCheckBox, "Fragile-drive profile: conservative read behavior, immediate file skip on first read error, and failure circuit-breaker cooldown.")
 
         _toolTip.SetToolTip(_bufferMbNumeric, "Maximum transfer buffer in MB (1-256).")
         _toolTip.SetToolTip(_retriesNumeric, "Retry attempts per read/write error (0-1000).")
@@ -1949,6 +1957,10 @@ Public Class MainForm
             AppendLog(If(scanOnly, "Starting bad-block scan through supervisor.", "Starting copy job through supervisor."))
             AppendLog($"Buffer mode: {If(normalizedOptions.UseAdaptiveBufferSizing, "Adaptive (max " & CInt(_bufferMbNumeric.Value) & " MB)", "Fixed (" & CInt(_bufferMbNumeric.Value) & " MB)")}.")
             AppendLog($"Media wait mode: {If(normalizedOptions.WaitForMediaAvailability, "Enabled (wait forever)", "Disabled")}.")
+            If normalizedOptions.FragileMediaMode Then
+                AppendLog("Fragile media mode: Enabled.")
+                AppendLog($"Fragile guard: skip-on-first-read-error={If(normalizedOptions.SkipFileOnFirstReadError, "on", "off")}, window={normalizedOptions.FragileFailureWindowSeconds}s, threshold={normalizedOptions.FragileFailureThreshold}, cooldown={normalizedOptions.FragileCooldownSeconds}s, persist-skips={If(normalizedOptions.PersistFragileSkipAcrossResume, "on", "off")}.")
+            End If
             If scanOnly Then
                 AppendLog($"Scan backend: {If(normalizedOptions.UseExperimentalRawDiskScan, "Raw disk (experimental, auto-fallback enabled)", "Standard file I/O")}.")
             End If
@@ -2026,6 +2038,7 @@ Public Class MainForm
         _useBadRangeMapCheckBox.Checked = _settings.DefaultUseBadRangeMap
         _skipKnownBadRangesCheckBox.Checked = _settings.DefaultSkipKnownBadRanges
         _waitForMediaCheckBox.Checked = _settings.DefaultWaitForMediaAvailability
+        _fragileModeCheckBox.Checked = _settings.DefaultFragileMediaMode
         SetActiveSalvageFillPattern(SettingsValueConverter.ToSalvageFillPattern(_settings.DefaultSalvageFillPattern))
         UpdateBadRangeMapOptionStates()
 
@@ -2068,6 +2081,12 @@ Public Class MainForm
             .TreatAccessDeniedAsContention = safeSettings.DefaultTreatAccessDeniedAsContention,
             .LockContentionProbeInterval = TimeSpan.FromMilliseconds(Math.Max(100, safeSettings.DefaultLockContentionProbeIntervalMs)),
             .SourceMutationPolicy = SettingsValueConverter.ToSourceMutationPolicy(safeSettings.DefaultSourceMutationPolicy),
+            .FragileMediaMode = safeSettings.DefaultFragileMediaMode,
+            .SkipFileOnFirstReadError = safeSettings.DefaultSkipFileOnFirstReadError,
+            .PersistFragileSkipAcrossResume = safeSettings.DefaultPersistFragileSkipsAcrossResume,
+            .FragileFailureWindowSeconds = Math.Max(1, safeSettings.DefaultFragileFailureWindowSeconds),
+            .FragileFailureThreshold = Math.Max(1, safeSettings.DefaultFragileFailureThreshold),
+            .FragileCooldownSeconds = Math.Max(0, safeSettings.DefaultFragileCooldownSeconds),
             .MaxRetries = Math.Max(0, safeSettings.DefaultMaxRetries),
             .OperationTimeout = TimeSpan.FromSeconds(Math.Max(1, safeSettings.DefaultOperationTimeoutSeconds)),
             .PerFileTimeout = TimeSpan.FromSeconds(Math.Max(0, safeSettings.DefaultPerFileTimeoutSeconds)),
@@ -2113,6 +2132,7 @@ Public Class MainForm
         _useBadRangeMapCheckBox.Checked = options.UseBadRangeMap
         _skipKnownBadRangesCheckBox.Checked = options.SkipKnownBadRanges
         _waitForMediaCheckBox.Checked = options.WaitForMediaAvailability
+        _fragileModeCheckBox.Checked = options.FragileMediaMode
         SetActiveSalvageFillPattern(options.SalvageFillPattern)
         UpdateBadRangeMapOptionStates()
 
@@ -2152,6 +2172,7 @@ Public Class MainForm
         candidate.UseBadRangeMap = _useBadRangeMapCheckBox.Checked
         candidate.SkipKnownBadRanges = _skipKnownBadRangesCheckBox.Checked
         candidate.WaitForMediaAvailability = _waitForMediaCheckBox.Checked
+        candidate.FragileMediaMode = _fragileModeCheckBox.Checked
         candidate.MaxRetries = CInt(_retriesNumeric.Value)
         candidate.OperationTimeout = TimeSpan.FromSeconds(CDbl(_timeoutSecondsNumeric.Value))
         candidate.ResumeFromJournal = _resumeCheckBox.Checked
@@ -2189,6 +2210,7 @@ Public Class MainForm
         candidate.UseBadRangeMap = _useBadRangeMapCheckBox.Checked
         candidate.SkipKnownBadRanges = _skipKnownBadRangesCheckBox.Checked
         candidate.WaitForMediaAvailability = _waitForMediaCheckBox.Checked
+        candidate.FragileMediaMode = _fragileModeCheckBox.Checked
         candidate.MaxRetries = CInt(_retriesNumeric.Value)
         candidate.OperationTimeout = TimeSpan.FromSeconds(CDbl(_timeoutSecondsNumeric.Value))
         candidate.ResumeFromJournal = _resumeCheckBox.Checked
@@ -2626,6 +2648,23 @@ Public Class MainForm
                 sourceMutationPolicy = SourceMutationPolicy.FailFile
         End Select
 
+        Dim fragileMode = options.FragileMediaMode
+        Dim normalizedMaxRetries = Math.Max(0, options.MaxRetries)
+        Dim normalizedTimeout = If(options.OperationTimeout <= TimeSpan.Zero, TimeSpan.FromSeconds(10), options.OperationTimeout)
+        Dim useExperimentalRawScan = options.UseExperimentalRawDiskScan
+        Dim skipOnFirstReadError = options.SkipFileOnFirstReadError
+        Dim persistFragileSkips = options.PersistFragileSkipAcrossResume
+        Dim fragileFailureWindow = Math.Max(1, Math.Min(3600, options.FragileFailureWindowSeconds))
+        Dim fragileFailureThreshold = Math.Max(1, Math.Min(1000, options.FragileFailureThreshold))
+        Dim fragileCooldown = Math.Max(0, Math.Min(600, options.FragileCooldownSeconds))
+
+        If fragileMode Then
+            useExperimentalRawScan = False
+            normalizedMaxRetries = 0
+            skipOnFirstReadError = True
+            normalizedTimeout = TimeSpan.FromSeconds(Math.Max(1.0R, Math.Min(5.0R, normalizedTimeout.TotalSeconds)))
+        End If
+
         Return New CopyJobOptions() With {
             .OperationMode = operationMode,
             .SourceRoot = sourceFull,
@@ -2636,7 +2675,7 @@ Public Class MainForm
             .SkipKnownBadRanges = options.SkipKnownBadRanges,
             .UpdateBadRangeMapFromRun = options.UpdateBadRangeMapFromRun,
             .BadRangeMapMaxAgeDays = Math.Max(0, Math.Min(3650, options.BadRangeMapMaxAgeDays)),
-            .UseExperimentalRawDiskScan = options.UseExperimentalRawDiskScan,
+            .UseExperimentalRawDiskScan = useExperimentalRawScan,
             .ResumeJournalPathHint = If(options.ResumeJournalPathHint, String.Empty),
             .AllowJournalRootRemap = options.AllowJournalRootRemap,
             .SelectedRelativePaths = normalizedSelections,
@@ -2653,8 +2692,14 @@ Public Class MainForm
             .TreatAccessDeniedAsContention = options.TreatAccessDeniedAsContention,
             .LockContentionProbeInterval = If(options.LockContentionProbeInterval <= TimeSpan.Zero, TimeSpan.FromMilliseconds(500), options.LockContentionProbeInterval),
             .SourceMutationPolicy = sourceMutationPolicy,
-            .MaxRetries = Math.Max(0, options.MaxRetries),
-            .OperationTimeout = If(options.OperationTimeout <= TimeSpan.Zero, TimeSpan.FromSeconds(10), options.OperationTimeout),
+            .FragileMediaMode = fragileMode,
+            .SkipFileOnFirstReadError = skipOnFirstReadError,
+            .PersistFragileSkipAcrossResume = persistFragileSkips,
+            .FragileFailureWindowSeconds = fragileFailureWindow,
+            .FragileFailureThreshold = fragileFailureThreshold,
+            .FragileCooldownSeconds = fragileCooldown,
+            .MaxRetries = normalizedMaxRetries,
+            .OperationTimeout = normalizedTimeout,
             .PerFileTimeout = If(options.PerFileTimeout < TimeSpan.Zero, TimeSpan.Zero, options.PerFileTimeout),
             .InitialRetryDelay = If(options.InitialRetryDelay <= TimeSpan.Zero, TimeSpan.FromMilliseconds(250), options.InitialRetryDelay),
             .MaxRetryDelay = If(options.MaxRetryDelay <= TimeSpan.Zero, TimeSpan.FromSeconds(8), options.MaxRetryDelay),
@@ -2715,6 +2760,12 @@ Public Class MainForm
             .TreatAccessDeniedAsContention = options.TreatAccessDeniedAsContention,
             .LockContentionProbeInterval = options.LockContentionProbeInterval,
             .SourceMutationPolicy = options.SourceMutationPolicy,
+            .FragileMediaMode = options.FragileMediaMode,
+            .SkipFileOnFirstReadError = options.SkipFileOnFirstReadError,
+            .PersistFragileSkipAcrossResume = options.PersistFragileSkipAcrossResume,
+            .FragileFailureWindowSeconds = options.FragileFailureWindowSeconds,
+            .FragileFailureThreshold = options.FragileFailureThreshold,
+            .FragileCooldownSeconds = options.FragileCooldownSeconds,
             .MaxRetries = options.MaxRetries,
             .OperationTimeout = options.OperationTimeout,
             .PerFileTimeout = options.PerFileTimeout,
@@ -3695,7 +3746,9 @@ Public Class MainForm
         _verifyCheckBox.Enabled = Not isRunning
         _adaptiveBufferCheckBox.Enabled = Not isRunning
         _useBadRangeMapCheckBox.Enabled = Not isRunning
+        _skipKnownBadRangesCheckBox.Enabled = Not isRunning
         _waitForMediaCheckBox.Enabled = Not isRunning
+        _fragileModeCheckBox.Enabled = Not isRunning
         _bufferMbNumeric.Enabled = Not isRunning
         _retriesNumeric.Enabled = Not isRunning
         _timeoutSecondsNumeric.Enabled = Not isRunning

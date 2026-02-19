@@ -6,6 +6,7 @@ Namespace Models
         Public Property BytesCopied As Long
         Public Property State As FileCopyState = FileCopyState.Pending
         Public Property LastError As String = String.Empty
+        Public Property DoNotRetry As Boolean
         Public Property RecoveredRanges As New List(Of ByteRange)()
         Public Property RescueRanges As New List(Of RescueRange)()
         Public Property LastRescuePass As String = String.Empty

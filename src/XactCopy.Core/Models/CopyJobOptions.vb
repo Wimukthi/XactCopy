@@ -42,6 +42,12 @@ Namespace Models
         Public Property TreatAccessDeniedAsContention As Boolean = False
         Public Property LockContentionProbeInterval As TimeSpan = TimeSpan.FromMilliseconds(500)
         Public Property SourceMutationPolicy As SourceMutationPolicy = SourceMutationPolicy.FailFile
+        Public Property FragileMediaMode As Boolean = False
+        Public Property SkipFileOnFirstReadError As Boolean = True
+        Public Property PersistFragileSkipAcrossResume As Boolean = True
+        Public Property FragileFailureWindowSeconds As Integer = 20
+        Public Property FragileFailureThreshold As Integer = 3
+        Public Property FragileCooldownSeconds As Integer = 6
 
         ' Retry/timeout profile.
         Public Property MaxRetries As Integer = 12

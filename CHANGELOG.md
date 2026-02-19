@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.8.2] - 2026-02-19
+
+### Added
+
+- Fragile-media hardening controls:
+  - New `Fragile media mode` run option and defaults.
+  - New `Skip file on first read error` behavior for ultra-unstable media.
+  - New `Persist fragile skips across resume` option using journal-backed `do-not-retry` markers.
+  - New fragile failure circuit-breaker controls (time window, threshold, cooldown).
+
+### Changed
+
+- Fragile mode now applies conservative runtime safety presets automatically:
+  - Disables raw-disk experimental scan backend.
+  - Forces retries to `0`.
+  - Forces skip-on-first-read-error behavior.
+  - Caps timeout to a short bounded range to avoid prolonged lockups on bad media.
+- UI/settings/supervisor/recovery option cloning now carries fragile-mode policies end-to-end across new runs, resumed runs, and queued jobs.
+
+### Fixed
+
+- Repeated re-hammering of known-failing files on fragile disks:
+  - Files that trip fragile first-read failure can be marked non-retry in the journal and skipped on resume.
+  - Circuit-breaker cooldown now throttles repeated failure bursts to keep progression responsive under severe media instability.
+
 ## [1.0.8.1] - 2026-02-19
 
 ### Added

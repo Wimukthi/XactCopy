@@ -74,6 +74,7 @@ dotnet publish src/XactCopy.UI/XactCopy.UI.vbproj -c Release -r win-x64 --self-c
 
 ## Brief Version History
 
+- `v1.0.8.2` Added fragile-media hardening controls (skip-on-first-read-error, persisted do-not-retry resume behavior, and failure circuit-breaker cooldown), plus end-to-end propagation of these policies through settings, supervisor, recovery, and worker execution.
 - `v1.0.8.1` Added severity color-coding for the operations log (with settings toggle), moved destination metadata checks to a Win32 fast path, and hardened cancel/IPC recovery so malformed stream states no longer leave runs stuck waiting for cancellation acknowledgement.
 - `v1.0.7.0` Improved scan performance for tiny-file workloads by adding a dedicated scan small-file fast path and batching bad-range-map writes during scan runs.
 - `v1.0.6.8` Fixed operations log rendering after completing one job and starting another by hard-resetting pending log queues and forcing a safe virtual-list redraw path.
