@@ -26,6 +26,8 @@ Namespace Services
         Private ReadOnly _restartLock As New SemaphoreSlim(1, 1)
         Private ReadOnly _sendLock As New SemaphoreSlim(1, 1)
         Private ReadOnly _disposeLock As New SemaphoreSlim(1, 1)
+        Private ReadOnly _workerPidLock As New Object()
+        Private ReadOnly _launchedWorkerPids As New HashSet(Of Integer)()
 
         Private _workerProcess As Process
         Private _pipeClient As NamedPipeClientStream
@@ -166,7 +168,10 @@ Namespace Services
                 }
                 Await TrySendCommandAsync(IpcMessageTypes.ShutdownCommand, shutdown, CancellationToken.None).ConfigureAwait(False)
 
-                Await ShutdownWorkerAsync(killIfStillRunning:=True).ConfigureAwait(False)
+                Dim shutdownClean = Await ShutdownWorkerAsync(killIfStillRunning:=True).ConfigureAwait(False)
+                If Not shutdownClean Then
+                    RaiseEvent LogMessage(Me, "[Supervisor] One or more worker processes did not terminate during shutdown.")
+                End If
 
                 If _heartbeatTimer IsNot Nothing Then
                     Await _heartbeatTimer.DisposeAsync().ConfigureAwait(False)
@@ -197,6 +202,7 @@ Namespace Services
                 Throw New InvalidOperationException("Failed to start worker process.")
             End If
 
+            TrackWorkerProcess(_workerProcess.Id)
             _workerProcess.EnableRaisingEvents = True
             AddHandler _workerProcess.Exited, AddressOf WorkerProcess_Exited
 
@@ -371,6 +377,11 @@ Namespace Services
         End Sub
 
         Private Sub WorkerProcess_Exited(sender As Object, e As EventArgs)
+            Dim process = TryCast(sender, Process)
+            If process IsNot Nothing Then
+                UntrackWorkerProcess(process.Id)
+            End If
+
             If _isStopping OrElse _isDisposed Then
                 Return
             End If
@@ -406,14 +417,25 @@ Namespace Services
                 End If
 
                 If Not _autoRecoverJob Then
-                    Await ShutdownWorkerAsync(killIfStillRunning:=True).ConfigureAwait(False)
-                    CompleteActiveJobAfterChannelLoss(reason)
+                    Dim shutdownClean = Await ShutdownWorkerAsync(killIfStillRunning:=True).ConfigureAwait(False)
+                    Dim finalReason = If(
+                        shutdownClean,
+                        reason,
+                        $"{reason} Worker process did not terminate cleanly.")
+                    CompleteActiveJobAfterChannelLoss(finalReason)
                     Return
                 End If
 
                 RaiseEvent LogMessage(Me, $"[Supervisor] {reason} Restarting worker and resuming from journal.")
 
-                Await ShutdownWorkerAsync(killIfStillRunning:=True).ConfigureAwait(False)
+                Dim recoveredShutdown = Await ShutdownWorkerAsync(killIfStillRunning:=True).ConfigureAwait(False)
+                If Not recoveredShutdown Then
+                    _autoRecoverJob = False
+                    CompleteActiveJobAfterChannelLoss(
+                        $"{reason} Worker process did not terminate cleanly, so auto-recovery was aborted to prevent duplicate stuck workers.")
+                    Return
+                End If
+
                 Await EnsureWorkerConnectedAsync(CancellationToken.None).ConfigureAwait(False)
                 MarkJobActivity(markProgress:=True)
 
@@ -470,7 +492,9 @@ Namespace Services
             RaiseEvent WorkerStateChanged(Me, If(cancelled, "Job cancelled", "Worker disconnected"))
         End Sub
 
-        Private Async Function ShutdownWorkerAsync(killIfStillRunning As Boolean) As Task
+        Private Async Function ShutdownWorkerAsync(killIfStillRunning As Boolean) As Task(Of Boolean)
+            Dim shutdownClean As Boolean = True
+
             If _pipeCancellation IsNot Nothing Then
                 _pipeCancellation.Cancel()
             End If
@@ -491,7 +515,7 @@ Namespace Services
             End If
 
             If _workerProcess Is Nothing Then
-                Return
+                Return TryTerminateTrackedWorkers(killIfStillRunning, skipPid:=0)
             End If
 
             Try
@@ -530,16 +554,114 @@ Namespace Services
                             End If
 
                             If Not _workerProcess.HasExited Then
+                                shutdownClean = False
                                 RaiseEvent LogMessage(Me, $"[Supervisor] Worker PID {workerPid} did not terminate promptly; continuing with recovery.")
                             End If
                         End If
                     End If
                 End If
             Catch
+                shutdownClean = False
             Finally
+                UntrackWorkerProcess(workerPid)
                 _workerProcess.Dispose()
                 _workerProcess = Nothing
             End Try
+
+            If Not TryTerminateTrackedWorkers(killIfStillRunning, skipPid:=workerPid) Then
+                shutdownClean = False
+            End If
+
+            Return shutdownClean
+        End Function
+
+        Private Sub TrackWorkerProcess(pid As Integer)
+            If pid <= 0 Then
+                Return
+            End If
+
+            SyncLock _workerPidLock
+                _launchedWorkerPids.Add(pid)
+            End SyncLock
+        End Sub
+
+        Private Sub UntrackWorkerProcess(pid As Integer)
+            If pid <= 0 Then
+                Return
+            End If
+
+            SyncLock _workerPidLock
+                _launchedWorkerPids.Remove(pid)
+            End SyncLock
+        End Sub
+
+        Private Function SnapshotTrackedWorkerPids() As List(Of Integer)
+            SyncLock _workerPidLock
+                Return _launchedWorkerPids.ToList()
+            End SyncLock
+        End Function
+
+        Private Function TryTerminateTrackedWorkers(killIfStillRunning As Boolean, skipPid As Integer) As Boolean
+            Dim allTerminated = True
+            Dim trackedPids = SnapshotTrackedWorkerPids()
+            If trackedPids.Count = 0 Then
+                Return True
+            End If
+
+            For Each pid In trackedPids
+                If pid <= 0 OrElse pid = skipPid Then
+                    Continue For
+                End If
+
+                Dim trackedProcess As Process = Nothing
+                Try
+                    trackedProcess = Process.GetProcessById(pid)
+                Catch
+                    UntrackWorkerProcess(pid)
+                    Continue For
+                End Try
+
+                Using trackedProcess
+                    Try
+                        If trackedProcess.HasExited Then
+                            UntrackWorkerProcess(pid)
+                            Continue For
+                        End If
+
+                        If killIfStillRunning Then
+                            Try
+                                trackedProcess.Kill(entireProcessTree:=True)
+                            Catch
+                            End Try
+
+                            If Not trackedProcess.WaitForExit(CInt(TimeSpan.FromSeconds(2).TotalMilliseconds)) Then
+                                Try
+                                    Dim taskKillInfo As New ProcessStartInfo("taskkill.exe", $"/PID {pid} /T /F") With {
+                                        .UseShellExecute = False,
+                                        .CreateNoWindow = True,
+                                        .WindowStyle = ProcessWindowStyle.Hidden
+                                    }
+                                    Using taskKillProcess = Process.Start(taskKillInfo)
+                                        taskKillProcess?.WaitForExit(CInt(TimeSpan.FromSeconds(3).TotalMilliseconds))
+                                    End Using
+                                Catch
+                                End Try
+                            End If
+                        End If
+
+                        If trackedProcess.HasExited Then
+                            UntrackWorkerProcess(pid)
+                        Else
+                            allTerminated = False
+                            RaiseEvent LogMessage(Me, $"[Supervisor] Orphan worker PID {pid} is still alive after shutdown attempt.")
+                        End If
+                    Catch
+                        allTerminated = False
+                    End Try
+                End Using
+            Next
+
+            Return allTerminated
         End Function
 
         Private Sub CheckForJobActivityStall(nowUtc As DateTimeOffset)

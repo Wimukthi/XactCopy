@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.8.4] - 2026-02-19
+
+### Fixed
+
+- Supervisor recovery process containment hardening:
+  - Added launched-worker PID tracking and orphan-worker cleanup on shutdown/recovery.
+  - Recovery now aborts instead of spawning a new worker when the previous stuck worker cannot be terminated cleanly.
+  - Prevents duplicate stuck-worker accumulation and repeated same-file restarts during severe media hangs.
+
 ## [1.0.8.3] - 2026-02-19
 
 ### Fixed
