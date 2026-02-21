@@ -4,6 +4,9 @@ Imports XactCopy.Infrastructure
 Imports XactCopy.Models
 
 Namespace Services
+    ''' <summary>
+    ''' Enum QueueMoveDirection.
+    ''' </summary>
     Friend Enum QueueMoveDirection
         Up = 0
         Down = 1
@@ -11,31 +14,97 @@ Namespace Services
         Bottom = 3
     End Enum
 
+    ''' <summary>
+    ''' Class JobQueueEntryView.
+    ''' </summary>
     Friend NotInheritable Class JobQueueEntryView
+        ''' <summary>
+        ''' Gets or sets QueueEntryId.
+        ''' </summary>
         Public Property QueueEntryId As String = String.Empty
+        ''' <summary>
+        ''' Gets or sets JobId.
+        ''' </summary>
         Public Property JobId As String = String.Empty
+        ''' <summary>
+        ''' Gets or sets Position.
+        ''' </summary>
         Public Property Position As Integer
+        ''' <summary>
+        ''' Gets or sets JobName.
+        ''' </summary>
         Public Property JobName As String = String.Empty
+        ''' <summary>
+        ''' Gets or sets SourceRoot.
+        ''' </summary>
         Public Property SourceRoot As String = String.Empty
+        ''' <summary>
+        ''' Gets or sets DestinationRoot.
+        ''' </summary>
         Public Property DestinationRoot As String = String.Empty
+        ''' <summary>
+        ''' Gets or sets EnqueuedUtc.
+        ''' </summary>
         Public Property EnqueuedUtc As DateTimeOffset = DateTimeOffset.MinValue
+        ''' <summary>
+        ''' Gets or sets LastUpdatedUtc.
+        ''' </summary>
         Public Property LastUpdatedUtc As DateTimeOffset = DateTimeOffset.MinValue
+        ''' <summary>
+        ''' Gets or sets Trigger.
+        ''' </summary>
         Public Property Trigger As String = String.Empty
+        ''' <summary>
+        ''' Gets or sets EnqueuedBy.
+        ''' </summary>
         Public Property EnqueuedBy As String = String.Empty
+        ''' <summary>
+        ''' Gets or sets AttemptCount.
+        ''' </summary>
         Public Property AttemptCount As Integer
+        ''' <summary>
+        ''' Gets or sets LastAttemptUtc.
+        ''' </summary>
         Public Property LastAttemptUtc As DateTimeOffset?
+        ''' <summary>
+        ''' Gets or sets LastErrorMessage.
+        ''' </summary>
         Public Property LastErrorMessage As String = String.Empty
     End Class
 
+    ''' <summary>
+    ''' Class QueuedJobWorkItem.
+    ''' </summary>
     Friend NotInheritable Class QueuedJobWorkItem
+        ''' <summary>
+        ''' Gets or sets QueueEntryId.
+        ''' </summary>
         Public Property QueueEntryId As String = String.Empty
+        ''' <summary>
+        ''' Gets or sets Trigger.
+        ''' </summary>
         Public Property Trigger As String = "queued"
+        ''' <summary>
+        ''' Gets or sets EnqueuedBy.
+        ''' </summary>
         Public Property EnqueuedBy As String = String.Empty
+        ''' <summary>
+        ''' Gets or sets EnqueuedUtc.
+        ''' </summary>
         Public Property EnqueuedUtc As DateTimeOffset = DateTimeOffset.MinValue
+        ''' <summary>
+        ''' Gets or sets Attempt.
+        ''' </summary>
         Public Property Attempt As Integer
+        ''' <summary>
+        ''' Gets or sets Job.
+        ''' </summary>
         Public Property Job As ManagedJob
     End Class
 
+    ''' <summary>
+    ''' Class JobManagerService.
+    ''' </summary>
     Friend Class JobManagerService
         Private Const MaximumRunHistory As Integer = 1000
 
@@ -43,11 +112,17 @@ Namespace Services
         Private ReadOnly _catalogStore As JobCatalogStore
         Private _catalog As JobCatalog
 
+        ''' <summary>
+        ''' Initializes a new instance.
+        ''' </summary>
         Public Sub New(Optional catalogStore As JobCatalogStore = Nothing)
             _catalogStore = If(catalogStore, New JobCatalogStore())
             _catalog = _catalogStore.Load()
         End Sub
 
+        ''' <summary>
+        ''' Computes GetJobs.
+        ''' </summary>
         Public Function GetJobs() As IReadOnlyList(Of ManagedJob)
             SyncLock _syncRoot
                 Dim jobs = _catalog.Jobs.Where(Function(job) job IsNot Nothing).Select(AddressOf CloneJob).ToList()
@@ -56,6 +131,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes GetRecentRuns.
+        ''' </summary>
         Public Function GetRecentRuns(Optional take As Integer = 200) As IReadOnlyList(Of ManagedJobRun)
             SyncLock _syncRoot
                 Dim bounded = Math.Max(1, take)
@@ -67,6 +145,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes GetQueuedJobs.
+        ''' </summary>
         Public Function GetQueuedJobs() As IReadOnlyList(Of ManagedJob)
             SyncLock _syncRoot
                 Dim queued As New List(Of ManagedJob)()
@@ -83,6 +164,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes GetQueueEntries.
+        ''' </summary>
         Public Function GetQueueEntries() As IReadOnlyList(Of JobQueueEntryView)
             SyncLock _syncRoot
                 Dim queueEntries = BuildSanitizedQueueLocked()
@@ -117,6 +201,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes GetJobById.
+        ''' </summary>
         Public Function GetJobById(jobId As String) As ManagedJob
             If String.IsNullOrWhiteSpace(jobId) Then
                 Return Nothing
@@ -128,6 +215,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes SaveJob.
+        ''' </summary>
         Public Function SaveJob(name As String, options As CopyJobOptions, Optional existingJobId As String = Nothing) As ManagedJob
             If String.IsNullOrWhiteSpace(name) Then
                 Throw New ArgumentException("Job name is required.", NameOf(name))
@@ -168,6 +258,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes DeleteJob.
+        ''' </summary>
         Public Function DeleteJob(jobId As String) As Boolean
             If String.IsNullOrWhiteSpace(jobId) Then
                 Return False
@@ -192,6 +285,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes QueueJob.
+        ''' </summary>
         Public Function QueueJob(jobId As String, Optional allowDuplicate As Boolean = False, Optional trigger As String = "manual", Optional enqueuedBy As String = "") As Boolean
             If String.IsNullOrWhiteSpace(jobId) Then
                 Return False
@@ -233,6 +329,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes RemoveQueuedJob.
+        ''' </summary>
         Public Function RemoveQueuedJob(queueEntryIdOrJobId As String) As Boolean
             If String.IsNullOrWhiteSpace(queueEntryIdOrJobId) Then
                 Return False
@@ -259,6 +358,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes MoveQueueEntry.
+        ''' </summary>
         Public Function MoveQueueEntry(queueEntryId As String, direction As QueueMoveDirection) As Boolean
             If String.IsNullOrWhiteSpace(queueEntryId) Then
                 Return False
@@ -302,6 +404,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes ClearQueue.
+        ''' </summary>
         Public Function ClearQueue() As Integer
             SyncLock _syncRoot
                 Dim removedCount = _catalog.QueueEntries.Count
@@ -315,6 +420,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes TryDequeueNextJob.
+        ''' </summary>
         Public Function TryDequeueNextJob(ByRef job As ManagedJob) As Boolean
             Dim workItem As QueuedJobWorkItem = Nothing
             Dim dequeued = TryDequeueNextJob(workItem)
@@ -322,10 +430,16 @@ Namespace Services
             Return dequeued
         End Function
 
+        ''' <summary>
+        ''' Computes TryDequeueNextJob.
+        ''' </summary>
         Public Function TryDequeueNextJob(ByRef workItem As QueuedJobWorkItem) As Boolean
             Return TryDequeueInternal(queueEntryId:=Nothing, workItem:=workItem)
         End Function
 
+        ''' <summary>
+        ''' Computes TryDequeueQueuedEntry.
+        ''' </summary>
         Public Function TryDequeueQueuedEntry(queueEntryId As String, ByRef workItem As QueuedJobWorkItem) As Boolean
             If String.IsNullOrWhiteSpace(queueEntryId) Then
                 workItem = Nothing
@@ -335,6 +449,9 @@ Namespace Services
             Return TryDequeueInternal(queueEntryId.Trim(), workItem)
         End Function
 
+        ''' <summary>
+        ''' Computes CreateRunForJob.
+        ''' </summary>
         Public Function CreateRunForJob(jobId As String, trigger As String, Optional queueEntryId As String = Nothing, Optional queueAttempt As Integer = 0) As ManagedJobRun
             If String.IsNullOrWhiteSpace(jobId) Then
                 Throw New ArgumentException("Job ID is required.", NameOf(jobId))
@@ -359,6 +476,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes CreateAdHocRun.
+        ''' </summary>
         Public Function CreateAdHocRun(options As CopyJobOptions, displayName As String, trigger As String) As ManagedJobRun
             If options Is Nothing Then
                 Throw New ArgumentNullException(NameOf(options))
@@ -383,6 +503,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Executes MarkRunRunning.
+        ''' </summary>
         Public Sub MarkRunRunning(runId As String, journalPath As String)
             If String.IsNullOrWhiteSpace(runId) Then
                 Return
@@ -401,14 +524,23 @@ Namespace Services
             End SyncLock
         End Sub
 
+        ''' <summary>
+        ''' Executes MarkRunPaused.
+        ''' </summary>
         Public Sub MarkRunPaused(runId As String)
             UpdateRunStatus(runId, ManagedJobRunStatus.Paused)
         End Sub
 
+        ''' <summary>
+        ''' Executes MarkRunResumed.
+        ''' </summary>
         Public Sub MarkRunResumed(runId As String)
             UpdateRunStatus(runId, ManagedJobRunStatus.Running)
         End Sub
 
+        ''' <summary>
+        ''' Executes MarkRunCompleted.
+        ''' </summary>
         Public Sub MarkRunCompleted(runId As String, result As CopyJobResult)
             If String.IsNullOrWhiteSpace(runId) Then
                 Return
@@ -445,6 +577,9 @@ Namespace Services
             End SyncLock
         End Sub
 
+        ''' <summary>
+        ''' Computes MarkRunInterrupted.
+        ''' </summary>
         Public Function MarkRunInterrupted(runId As String, reason As String) As Boolean
             If String.IsNullOrWhiteSpace(runId) Then
                 Return False
@@ -475,6 +610,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes MarkAnyRunningRunsInterrupted.
+        ''' </summary>
         Public Function MarkAnyRunningRunsInterrupted(reason As String) As Integer
             SyncLock _syncRoot
                 Dim count = 0
@@ -502,6 +640,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes DeleteRun.
+        ''' </summary>
         Public Function DeleteRun(runId As String) As Boolean
             If String.IsNullOrWhiteSpace(runId) Then
                 Return False
@@ -518,6 +659,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes ClearRunHistory.
+        ''' </summary>
         Public Function ClearRunHistory(Optional keepLatest As Integer = 0) As Integer
             SyncLock _syncRoot
                 Dim safeKeep = Math.Max(0, keepLatest)

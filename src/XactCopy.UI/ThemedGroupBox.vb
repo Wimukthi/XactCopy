@@ -1,13 +1,24 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.UI\ThemedGroupBox.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.ComponentModel
 Imports System.Drawing
 Imports System.Windows.Forms
 
+''' <summary>
+''' Class ThemedGroupBox.
+''' </summary>
 Friend Class ThemedGroupBox
     Inherits GroupBox
 
     Private _borderColor As Color = Color.FromArgb(70, 70, 70)
     Private _titleColor As Color = Color.Gainsboro
 
+    ''' <summary>
+    ''' Initializes a new instance.
+    ''' </summary>
     Public Sub New()
         SetStyle(ControlStyles.UserPaint Or
                  ControlStyles.AllPaintingInWmPaint Or
@@ -17,6 +28,9 @@ Friend Class ThemedGroupBox
         Padding = New Padding(8, 22, 8, 8)
     End Sub
 
+    ''' <summary>
+    ''' Gets or sets BorderColor.
+    ''' </summary>
     <Browsable(False), DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)>
     Public Property BorderColor As Color
         Get
@@ -32,6 +46,9 @@ Friend Class ThemedGroupBox
         End Set
     End Property
 
+    ''' <summary>
+    ''' Gets or sets TitleColor.
+    ''' </summary>
     <Browsable(False), DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)>
     Public Property TitleColor As Color
         Get

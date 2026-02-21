@@ -2,6 +2,9 @@ Imports System.Drawing
 Imports System.IO
 Imports System.Runtime.InteropServices
 
+''' <summary>
+''' Class AboutForm.
+''' </summary>
 Friend Class AboutForm
     Inherits Form
 
@@ -26,6 +29,9 @@ Friend Class AboutForm
         .AutoPopDelay = 24000
     }
 
+    ''' <summary>
+    ''' Initializes a new instance.
+    ''' </summary>
     Public Sub New()
         Text = "About XactCopy"
         StartPosition = FormStartPosition.CenterParent

@@ -57,7 +57,7 @@ XactCopy is a resilient Windows file mover/scanner designed for unstable sources
 
 - Source-to-destination transfer with overwrite policy, verification policy, salvage policy, and retry profile.
 - Existing destination handling (`overwrite/skip/newer/ask`) is applied.
-- Optional `AegisRescueCore` passes recover difficult regions.
+- Optional `Rescue Engine` passes recover difficult regions.
 
 ### `ScanOnly`
 
@@ -105,4 +105,3 @@ XactCopy is a resilient Windows file mover/scanner designed for unstable sources
 - No user-space copier can bypass kernel/storage stack hangs in all scenarios.
 - Salvage mode preserves continuity, not original unreadable bytes.
 - Verification behavior depends on selected mode and salvage outcomes.
-

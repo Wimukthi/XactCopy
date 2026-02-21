@@ -2,6 +2,9 @@ Imports System.IO
 Imports Microsoft.Win32
 
 Namespace Services
+    ''' <summary>
+    ''' Class ExplorerIntegrationService.
+    ''' </summary>
     Friend NotInheritable Class ExplorerIntegrationService
         Private Const ShellClassesRoot As String = "Software\Classes"
         Private Const MenuKeyName As String = "XactCopy"
@@ -15,6 +18,9 @@ Namespace Services
             New RegistrationTarget("Directory\Background", "--from-explorer-folder ""%V""", supportsMultiSelect:=False)
         }
 
+        ''' <summary>
+        ''' Executes Sync.
+        ''' </summary>
         Public Sub Sync(enabled As Boolean, executablePath As String)
             Dim resolvedPath = If(executablePath, String.Empty).Trim()
             If enabled Then
@@ -28,6 +34,9 @@ Namespace Services
             End If
         End Sub
 
+        ''' <summary>
+        ''' Computes IsRegistered.
+        ''' </summary>
         Public Function IsRegistered() As Boolean
             For Each target In _targets
                 Dim keyPath = BuildMenuPath(target.ShellPath)
@@ -83,15 +92,30 @@ Namespace Services
             Return $"{ShellClassesRoot}\{shellPath}\shell\{MenuKeyName}"
         End Function
 
+        ''' <summary>
+        ''' Class RegistrationTarget.
+        ''' </summary>
         Private NotInheritable Class RegistrationTarget
+            ''' <summary>
+            ''' Initializes a new instance.
+            ''' </summary>
             Public Sub New(shellPath As String, commandArguments As String, supportsMultiSelect As Boolean)
                 Me.ShellPath = If(shellPath, String.Empty)
                 Me.CommandArguments = If(commandArguments, String.Empty)
                 Me.SupportsMultiSelect = supportsMultiSelect
             End Sub
 
+            ''' <summary>
+            ''' Gets or sets ShellPath.
+            ''' </summary>
             Public ReadOnly Property ShellPath As String
+            ''' <summary>
+            ''' Gets or sets CommandArguments.
+            ''' </summary>
             Public ReadOnly Property CommandArguments As String
+            ''' <summary>
+            ''' Gets or sets SupportsMultiSelect.
+            ''' </summary>
             Public ReadOnly Property SupportsMultiSelect As Boolean
         End Class
     End Class

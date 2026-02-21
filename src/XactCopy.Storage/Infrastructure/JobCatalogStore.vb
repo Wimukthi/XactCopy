@@ -1,3 +1,8 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.Storage\Infrastructure\JobCatalogStore.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.IO
 Imports System.Linq
 Imports System.Text.Json
@@ -5,12 +10,18 @@ Imports System.Text.Json.Serialization
 Imports XactCopy.Models
 
 Namespace Infrastructure
+    ''' <summary>
+    ''' Class JobCatalogStore.
+    ''' </summary>
     Public Class JobCatalogStore
         Private Const CurrentSchemaVersion As Integer = 2
 
         Private ReadOnly _catalogPath As String
         Private ReadOnly _serializerOptions As JsonSerializerOptions
 
+        ''' <summary>
+        ''' Initializes a new instance.
+        ''' </summary>
         Public Sub New(Optional catalogPath As String = Nothing)
             If String.IsNullOrWhiteSpace(catalogPath) Then
                 Dim root = Path.Combine(
@@ -29,12 +40,18 @@ Namespace Infrastructure
             _serializerOptions.Converters.Add(New JsonStringEnumConverter())
         End Sub
 
+        ''' <summary>
+        ''' Gets or sets CatalogPath.
+        ''' </summary>
         Public ReadOnly Property CatalogPath As String
             Get
                 Return _catalogPath
             End Get
         End Property
 
+        ''' <summary>
+        ''' Computes Load.
+        ''' </summary>
         Public Function Load() As JobCatalog
             If Not File.Exists(_catalogPath) Then
                 Return New JobCatalog()
@@ -49,6 +66,9 @@ Namespace Infrastructure
             End Try
         End Function
 
+        ''' <summary>
+        ''' Executes Save.
+        ''' </summary>
         Public Sub Save(catalog As JobCatalog)
             If catalog Is Nothing Then
                 Throw New ArgumentNullException(NameOf(catalog))

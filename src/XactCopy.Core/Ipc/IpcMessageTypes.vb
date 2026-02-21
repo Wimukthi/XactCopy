@@ -1,4 +1,12 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.Core\Ipc\IpcMessageTypes.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Namespace Ipc
+    ''' <summary>
+    ''' Class IpcMessageTypes.
+    ''' </summary>
     Public NotInheritable Class IpcMessageTypes
         Public Const StartJobCommand As String = "StartJobCommand"
         Public Const CancelJobCommand As String = "CancelJobCommand"

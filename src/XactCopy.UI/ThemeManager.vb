@@ -1,8 +1,19 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.UI\ThemeManager.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.Drawing
 Imports System.Windows.Forms
 Imports XactCopy.Configuration
 
+''' <summary>
+''' Module ThemeManager.
+''' </summary>
 Friend Module ThemeManager
+    ''' <summary>
+    ''' Executes ApplyTheme.
+    ''' </summary>
     Public Sub ApplyTheme(root As Control, mode As SystemColorMode, Optional settings As AppSettings = Nothing)
         If root Is Nothing Then
             Return
@@ -284,16 +295,46 @@ Friend Module ThemeManager
         End If
     End Sub
 
+    ''' <summary>
+    ''' Structure ThemePalette.
+    ''' </summary>
     Private Structure ThemePalette
+        ''' <summary>
+        ''' Gets or sets IsDark.
+        ''' </summary>
         Public Property IsDark As Boolean
+        ''' <summary>
+        ''' Gets or sets Base.
+        ''' </summary>
         Public Property Base As Color
+        ''' <summary>
+        ''' Gets or sets Surface.
+        ''' </summary>
         Public Property Surface As Color
+        ''' <summary>
+        ''' Gets or sets Field.
+        ''' </summary>
         Public Property Field As Color
+        ''' <summary>
+        ''' Gets or sets Border.
+        ''' </summary>
         Public Property Border As Color
+        ''' <summary>
+        ''' Gets or sets FocusBorder.
+        ''' </summary>
         Public Property FocusBorder As Color
+        ''' <summary>
+        ''' Gets or sets Text.
+        ''' </summary>
         Public Property Text As Color
+        ''' <summary>
+        ''' Gets or sets MutedText.
+        ''' </summary>
         Public Property MutedText As Color
 
+        ''' <summary>
+        ''' Computes FromMode.
+        ''' </summary>
         Public Shared Function FromMode(mode As SystemColorMode, accentColor As Color) As ThemePalette
             If mode = SystemColorMode.Dark Then
                 Return New ThemePalette() With {

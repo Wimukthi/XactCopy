@@ -7,7 +7,13 @@ Imports XactCopy.Infrastructure
 Imports XactCopy.Models
 Imports Xunit
 
+''' <summary>
+''' Class JobJournalStoreTests.
+''' </summary>
 Public Class JobJournalStoreTests
+    ''' <summary>
+    ''' Computes SaveAndLoadAsync_RoundTripsJournalData.
+    ''' </summary>
     <Fact>
     Public Async Function SaveAndLoadAsync_RoundTripsJournalData() As Task
         Dim store As New JobJournalStore()
@@ -52,6 +58,9 @@ Public Class JobJournalStoreTests
         End Try
     End Function
 
+    ''' <summary>
+    ''' Computes LoadAsync_LoadsLegacyJsonSnapshotWithoutLedger.
+    ''' </summary>
     <Fact>
     Public Async Function LoadAsync_LoadsLegacyJsonSnapshotWithoutLedger() As Task
         Dim store As New JobJournalStore()
@@ -88,6 +97,9 @@ Public Class JobJournalStoreTests
         End Try
     End Function
 
+    ''' <summary>
+    ''' Computes LoadAsync_UsesBackupWhenPrimarySnapshotIsTampered.
+    ''' </summary>
     <Fact>
     Public Async Function LoadAsync_UsesBackupWhenPrimarySnapshotIsTampered() As Task
         Dim store As New JobJournalStore()
@@ -129,6 +141,9 @@ Public Class JobJournalStoreTests
         End Try
     End Function
 
+    ''' <summary>
+    ''' Computes LoadAsync_UsesMirrorWhenPrimaryFilesAreMissing.
+    ''' </summary>
     <Fact>
     Public Async Function LoadAsync_UsesMirrorWhenPrimaryFilesAreMissing() As Task
         Dim store As New JobJournalStore()
@@ -171,6 +186,9 @@ Public Class JobJournalStoreTests
         End Try
     End Function
 
+    ''' <summary>
+    ''' Computes LoadAsync_UsesMirrorLedgerWhenPrimaryLedgerIsCorrupted.
+    ''' </summary>
     <Fact>
     Public Async Function LoadAsync_UsesMirrorLedgerWhenPrimaryLedgerIsCorrupted() As Task
         Dim store As New JobJournalStore()
@@ -210,6 +228,9 @@ Public Class JobJournalStoreTests
         End Try
     End Function
 
+    ''' <summary>
+    ''' Executes BuildJobId_IsDeterministicAndCaseInsensitive.
+    ''' </summary>
     <Fact>
     Public Sub BuildJobId_IsDeterministicAndCaseInsensitive()
         Dim first = JobJournalStore.BuildJobId("c:\src", "d:\dst")

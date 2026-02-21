@@ -1,8 +1,16 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.UI\WindowChromeManager.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.Runtime.InteropServices
 Imports Microsoft.Win32
 Imports System.Windows.Forms
 Imports XactCopy.Configuration
 
+''' <summary>
+''' Module WindowChromeManager.
+''' </summary>
 Friend Module WindowChromeManager
     Private Const DwmUseImmersiveDarkMode As Integer = 20
     Private Const DwmUseImmersiveDarkModeLegacy As Integer = 19
@@ -11,6 +19,9 @@ Friend Module WindowChromeManager
     Private Function DwmSetWindowAttribute(hwnd As IntPtr, dwAttribute As Integer, ByRef pvAttribute As Integer, cbAttribute As Integer) As Integer
     End Function
 
+    ''' <summary>
+    ''' Executes Apply.
+    ''' </summary>
     Public Sub Apply(form As Form, mode As SystemColorMode, settings As AppSettings)
         If form Is Nothing Then
             Return

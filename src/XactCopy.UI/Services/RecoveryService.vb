@@ -4,13 +4,34 @@ Imports XactCopy.Infrastructure
 Imports XactCopy.Models
 
 Namespace Services
+    ''' <summary>
+    ''' Class RecoveryStartupInfo.
+    ''' </summary>
     Friend NotInheritable Class RecoveryStartupInfo
+        ''' <summary>
+        ''' Gets or sets InterruptedRun.
+        ''' </summary>
         Public Property InterruptedRun As RecoveryActiveRun
+        ''' <summary>
+        ''' Gets or sets InterruptionReason.
+        ''' </summary>
         Public Property InterruptionReason As String = String.Empty
+        ''' <summary>
+        ''' Gets or sets ShouldPrompt.
+        ''' </summary>
         Public Property ShouldPrompt As Boolean
+        ''' <summary>
+        ''' Gets or sets ShouldAutoResume.
+        ''' </summary>
         Public Property ShouldAutoResume As Boolean
+        ''' <summary>
+        ''' Gets or sets WasRecoveryAutostart.
+        ''' </summary>
         Public Property WasRecoveryAutostart As Boolean
 
+        ''' <summary>
+        ''' Gets or sets HasInterruptedRun.
+        ''' </summary>
         Public ReadOnly Property HasInterruptedRun As Boolean
             Get
                 Return InterruptedRun IsNot Nothing
@@ -18,6 +39,9 @@ Namespace Services
         End Property
     End Class
 
+    ''' <summary>
+    ''' Class RecoveryService.
+    ''' </summary>
     Friend Class RecoveryService
         Private ReadOnly _syncRoot As New Object()
         Private ReadOnly _stateStore As RecoveryStateStore
@@ -27,12 +51,18 @@ Namespace Services
         Private _lastTouchUtc As DateTimeOffset = DateTimeOffset.MinValue
         Private _touchInterval As TimeSpan = TimeSpan.FromSeconds(2)
 
+        ''' <summary>
+        ''' Initializes a new instance.
+        ''' </summary>
         Public Sub New(Optional stateStore As RecoveryStateStore = Nothing, Optional startupService As WindowsStartupService = Nothing)
             _stateStore = If(stateStore, New RecoveryStateStore())
             _startupService = If(startupService, New WindowsStartupService())
             _state = _stateStore.Load()
         End Sub
 
+        ''' <summary>
+        ''' Computes InitializeSession.
+        ''' </summary>
         Public Function InitializeSession(settings As AppSettings, launchOptions As LaunchOptions) As RecoveryStartupInfo
             If settings Is Nothing Then
                 settings = New AppSettings()
@@ -79,6 +109,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Computes GetPendingInterruptedRun.
+        ''' </summary>
         Public Function GetPendingInterruptedRun() As RecoveryActiveRun
             SyncLock _syncRoot
                 If _state Is Nothing OrElse _state.ActiveRun Is Nothing Then
@@ -89,6 +122,9 @@ Namespace Services
             End SyncLock
         End Function
 
+        ''' <summary>
+        ''' Executes MarkResumePromptDeferred.
+        ''' </summary>
         Public Sub MarkResumePromptDeferred(settings As AppSettings, suppressForThisRun As Boolean)
             If settings Is Nothing Then
                 settings = New AppSettings()
@@ -109,6 +145,9 @@ Namespace Services
             End SyncLock
         End Sub
 
+        ''' <summary>
+        ''' Executes MarkJobStarted.
+        ''' </summary>
         Public Sub MarkJobStarted(run As ManagedJobRun, options As CopyJobOptions, journalPath As String, settings As AppSettings)
             If run Is Nothing Then
                 Throw New ArgumentNullException(NameOf(run))
@@ -152,6 +191,9 @@ Namespace Services
             End SyncLock
         End Sub
 
+        ''' <summary>
+        ''' Executes TouchActiveRun.
+        ''' </summary>
         Public Sub TouchActiveRun(runId As String)
             If String.IsNullOrWhiteSpace(runId) Then
                 Return
@@ -178,6 +220,9 @@ Namespace Services
             End SyncLock
         End Sub
 
+        ''' <summary>
+        ''' Executes MarkActiveRunPaused.
+        ''' </summary>
         Public Sub MarkActiveRunPaused(runId As String)
             If String.IsNullOrWhiteSpace(runId) Then
                 Return
@@ -197,6 +242,9 @@ Namespace Services
             End SyncLock
         End Sub
 
+        ''' <summary>
+        ''' Executes MarkJobEnded.
+        ''' </summary>
         Public Sub MarkJobEnded(runId As String)
             If String.IsNullOrWhiteSpace(runId) Then
                 Return
@@ -216,6 +264,9 @@ Namespace Services
             End SyncLock
         End Sub
 
+        ''' <summary>
+        ''' Executes MarkRunInterrupted.
+        ''' </summary>
         Public Sub MarkRunInterrupted(reason As String)
             SyncLock _syncRoot
                 If _state Is Nothing OrElse _state.ActiveRun Is Nothing Then
@@ -228,6 +279,9 @@ Namespace Services
             End SyncLock
         End Sub
 
+        ''' <summary>
+        ''' Executes MarkCleanShutdown.
+        ''' </summary>
         Public Sub MarkCleanShutdown()
             SyncLock _syncRoot
                 If _state Is Nothing Then

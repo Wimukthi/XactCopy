@@ -1,42 +1,71 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.UI\Configuration\SettingsValueConverter.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.Drawing
 Imports XactCopy.Models
 
 Namespace Configuration
+    ''' <summary>
+    ''' Enum AccentColorModeChoice.
+    ''' </summary>
     Friend Enum AccentColorModeChoice
         Auto = 0
         System = 1
         Custom = 2
     End Enum
 
+    ''' <summary>
+    ''' Enum UiDensityChoice.
+    ''' </summary>
     Friend Enum UiDensityChoice
         Compact = 0
         Normal = 1
         Comfortable = 2
     End Enum
 
+    ''' <summary>
+    ''' Enum GridHeaderStyleChoice.
+    ''' </summary>
     Friend Enum GridHeaderStyleChoice
         [Default] = 0
         Minimal = 1
         Prominent = 2
     End Enum
 
+    ''' <summary>
+    ''' Enum ProgressBarStyleChoice.
+    ''' </summary>
     Friend Enum ProgressBarStyleChoice
         Thin = 0
         Standard = 1
         Thick = 2
     End Enum
 
+    ''' <summary>
+    ''' Enum WindowChromeModeChoice.
+    ''' </summary>
     Friend Enum WindowChromeModeChoice
         Themed = 0
         Standard = 1
     End Enum
 
+    ''' <summary>
+    ''' Enum ExplorerSelectionMode.
+    ''' </summary>
     Friend Enum ExplorerSelectionMode
         SourceFolder = 0
         SelectedItems = 1
     End Enum
 
+    ''' <summary>
+    ''' Module SettingsValueConverter.
+    ''' </summary>
     Friend Module SettingsValueConverter
+        ''' <summary>
+        ''' Computes NormalizeChoice.
+        ''' </summary>
         Public Function NormalizeChoice(value As String, defaultValue As String, ParamArray allowedValues As String()) As String
             Dim candidate = If(value, String.Empty).Trim()
             If candidate.Length = 0 Then
@@ -52,6 +81,9 @@ Namespace Configuration
             Return defaultValue
         End Function
 
+        ''' <summary>
+        ''' Computes ClampInteger.
+        ''' </summary>
         Public Function ClampInteger(value As Integer, minimum As Integer, maximum As Integer, defaultValue As Integer) As Integer
             If value < minimum OrElse value > maximum Then
                 Return defaultValue
@@ -60,6 +92,9 @@ Namespace Configuration
             Return value
         End Function
 
+        ''' <summary>
+        ''' Computes ToAccentColorModeChoice.
+        ''' </summary>
         Public Function ToAccentColorModeChoice(value As String) As AccentColorModeChoice
             Select Case NormalizeChoice(value, "auto", "auto", "system", "custom")
                 Case "system"
@@ -71,6 +106,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes AccentColorModeChoiceToString.
+        ''' </summary>
         Public Function AccentColorModeChoiceToString(value As AccentColorModeChoice) As String
             Select Case value
                 Case AccentColorModeChoice.System
@@ -82,6 +120,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes ToUiDensityChoice.
+        ''' </summary>
         Public Function ToUiDensityChoice(value As String) As UiDensityChoice
             Select Case NormalizeChoice(value, "normal", "compact", "normal", "comfortable")
                 Case "compact"
@@ -93,6 +134,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes UiDensityChoiceToString.
+        ''' </summary>
         Public Function UiDensityChoiceToString(value As UiDensityChoice) As String
             Select Case value
                 Case UiDensityChoice.Compact
@@ -104,6 +148,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes ToGridHeaderStyleChoice.
+        ''' </summary>
         Public Function ToGridHeaderStyleChoice(value As String) As GridHeaderStyleChoice
             Select Case NormalizeChoice(value, "default", "default", "minimal", "prominent")
                 Case "minimal"
@@ -115,6 +162,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes GridHeaderStyleChoiceToString.
+        ''' </summary>
         Public Function GridHeaderStyleChoiceToString(value As GridHeaderStyleChoice) As String
             Select Case value
                 Case GridHeaderStyleChoice.Minimal
@@ -126,6 +176,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes ToProgressBarStyleChoice.
+        ''' </summary>
         Public Function ToProgressBarStyleChoice(value As String) As ProgressBarStyleChoice
             Select Case NormalizeChoice(value, "standard", "thin", "standard", "thick")
                 Case "thin"
@@ -137,6 +190,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes ProgressBarStyleChoiceToString.
+        ''' </summary>
         Public Function ProgressBarStyleChoiceToString(value As ProgressBarStyleChoice) As String
             Select Case value
                 Case ProgressBarStyleChoice.Thin
@@ -148,6 +204,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes ToWindowChromeModeChoice.
+        ''' </summary>
         Public Function ToWindowChromeModeChoice(value As String) As WindowChromeModeChoice
             Select Case NormalizeChoice(value, "themed", "themed", "standard")
                 Case "standard"
@@ -157,6 +216,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes WindowChromeModeChoiceToString.
+        ''' </summary>
         Public Function WindowChromeModeChoiceToString(value As WindowChromeModeChoice) As String
             If value = WindowChromeModeChoice.Standard Then
                 Return "standard"
@@ -165,6 +227,9 @@ Namespace Configuration
             Return "themed"
         End Function
 
+        ''' <summary>
+        ''' Computes NormalizeColorHex.
+        ''' </summary>
         Public Function NormalizeColorHex(value As String, defaultValue As String) As String
             Dim candidate = If(value, String.Empty).Trim()
             Dim parsed As Color = Nothing
@@ -179,6 +244,9 @@ Namespace Configuration
             Return "#5A78C8"
         End Function
 
+        ''' <summary>
+        ''' Computes TryParseColorHex.
+        ''' </summary>
         Public Function TryParseColorHex(value As String, ByRef parsedColor As Color) As Boolean
             parsedColor = Color.Empty
             Dim candidate = If(value, String.Empty).Trim()
@@ -212,10 +280,16 @@ Namespace Configuration
             Return True
         End Function
 
+        ''' <summary>
+        ''' Computes ColorToHex.
+        ''' </summary>
         Public Function ColorToHex(value As Color) As String
             Return $"#{value.R:X2}{value.G:X2}{value.B:X2}"
         End Function
 
+        ''' <summary>
+        ''' Computes ToOverwritePolicy.
+        ''' </summary>
         Public Function ToOverwritePolicy(value As String) As OverwritePolicy
             Select Case NormalizeChoice(value, "overwrite", "overwrite", "skip-existing", "overwrite-if-newer", "ask")
                 Case "skip-existing"
@@ -229,6 +303,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes OverwritePolicyToString.
+        ''' </summary>
         Public Function OverwritePolicyToString(value As OverwritePolicy) As String
             Select Case value
                 Case OverwritePolicy.SkipExisting
@@ -242,6 +319,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes ToSymlinkHandling.
+        ''' </summary>
         Public Function ToSymlinkHandling(value As String) As SymlinkHandlingMode
             Select Case NormalizeChoice(value, "skip", "skip", "follow")
                 Case "follow"
@@ -251,6 +331,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes SymlinkHandlingToString.
+        ''' </summary>
         Public Function SymlinkHandlingToString(value As SymlinkHandlingMode) As String
             If value = SymlinkHandlingMode.Follow Then
                 Return "follow"
@@ -259,6 +342,9 @@ Namespace Configuration
             Return "skip"
         End Function
 
+        ''' <summary>
+        ''' Computes ToVerificationMode.
+        ''' </summary>
         Public Function ToVerificationMode(value As String) As VerificationMode
             Select Case NormalizeChoice(value, "none", "none", "sampled", "full")
                 Case "sampled"
@@ -270,6 +356,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes VerificationModeToString.
+        ''' </summary>
         Public Function VerificationModeToString(value As VerificationMode) As String
             Select Case value
                 Case VerificationMode.Sampled
@@ -281,6 +370,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes ToVerificationHashAlgorithm.
+        ''' </summary>
         Public Function ToVerificationHashAlgorithm(value As String) As VerificationHashAlgorithm
             Select Case NormalizeChoice(value, "sha256", "sha256", "sha512")
                 Case "sha512"
@@ -290,6 +382,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes VerificationHashAlgorithmToString.
+        ''' </summary>
         Public Function VerificationHashAlgorithmToString(value As VerificationHashAlgorithm) As String
             If value = VerificationHashAlgorithm.Sha512 Then
                 Return "sha512"
@@ -298,6 +393,9 @@ Namespace Configuration
             Return "sha256"
         End Function
 
+        ''' <summary>
+        ''' Computes ToSalvageFillPattern.
+        ''' </summary>
         Public Function ToSalvageFillPattern(value As String) As SalvageFillPattern
             Select Case NormalizeChoice(value, "zero", "zero", "ones", "random")
                 Case "ones"
@@ -309,6 +407,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes SalvageFillPatternToString.
+        ''' </summary>
         Public Function SalvageFillPatternToString(value As SalvageFillPattern) As String
             Select Case value
                 Case SalvageFillPattern.Ones
@@ -320,6 +421,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes ToExplorerSelectionMode.
+        ''' </summary>
         Public Function ToExplorerSelectionMode(value As String) As ExplorerSelectionMode
             Select Case NormalizeChoice(value, "selected-items", "source-folder", "selected-items")
                 Case "source-folder"
@@ -329,6 +433,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes ExplorerSelectionModeToString.
+        ''' </summary>
         Public Function ExplorerSelectionModeToString(value As ExplorerSelectionMode) As String
             If value = ExplorerSelectionMode.SourceFolder Then
                 Return "source-folder"
@@ -337,6 +444,9 @@ Namespace Configuration
             Return "selected-items"
         End Function
 
+        ''' <summary>
+        ''' Computes ToWorkerTelemetryProfile.
+        ''' </summary>
         Public Function ToWorkerTelemetryProfile(value As String) As WorkerTelemetryProfile
             Select Case NormalizeChoice(value, "normal", "normal", "verbose", "debug")
                 Case "verbose"
@@ -348,6 +458,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes WorkerTelemetryProfileToString.
+        ''' </summary>
         Public Function WorkerTelemetryProfileToString(value As WorkerTelemetryProfile) As String
             Select Case value
                 Case WorkerTelemetryProfile.Verbose
@@ -359,6 +472,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes ToSourceMutationPolicy.
+        ''' </summary>
         Public Function ToSourceMutationPolicy(value As String) As SourceMutationPolicy
             Select Case NormalizeChoice(value, "fail-file", "fail-file", "skip-file", "wait-for-reappearance")
                 Case "skip-file"
@@ -370,6 +486,9 @@ Namespace Configuration
             End Select
         End Function
 
+        ''' <summary>
+        ''' Computes SourceMutationPolicyToString.
+        ''' </summary>
         Public Function SourceMutationPolicyToString(value As SourceMutationPolicy) As String
             Select Case value
                 Case SourceMutationPolicy.SkipFile

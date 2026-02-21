@@ -1,20 +1,38 @@
 Imports System.Collections.Generic
 Imports System.IO
 
+''' <summary>
+''' Class LaunchOptions.
+''' </summary>
 Public NotInheritable Class LaunchOptions
+    ''' <summary>
+    ''' Gets or sets IsRecoveryAutostart.
+    ''' </summary>
     Public Property IsRecoveryAutostart As Boolean
+    ''' <summary>
+    ''' Gets or sets ForceResumePrompt.
+    ''' </summary>
     Public Property ForceResumePrompt As Boolean
 
     Private ReadOnly _explorerSourcePaths As New List(Of String)()
 
+    ''' <summary>
+    ''' Gets or sets ExplorerFolderPath.
+    ''' </summary>
     Public Property ExplorerFolderPath As String = String.Empty
 
+    ''' <summary>
+    ''' Gets or sets ExplorerSourcePaths.
+    ''' </summary>
     Public ReadOnly Property ExplorerSourcePaths As IReadOnlyList(Of String)
         Get
             Return _explorerSourcePaths
         End Get
     End Property
 
+    ''' <summary>
+    ''' Gets or sets ExplorerSourcePath.
+    ''' </summary>
     Public ReadOnly Property ExplorerSourcePath As String
         Get
             If _explorerSourcePaths.Count = 0 Then
@@ -25,6 +43,9 @@ Public NotInheritable Class LaunchOptions
         End Get
     End Property
 
+    ''' <summary>
+    ''' Computes Parse.
+    ''' </summary>
     Public Shared Function Parse(args As String()) As LaunchOptions
         Dim options As New LaunchOptions()
         If args Is Nothing Then

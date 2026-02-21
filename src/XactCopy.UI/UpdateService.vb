@@ -1,4 +1,9 @@
-﻿Imports System.Collections.Generic
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.UI\UpdateService.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
+Imports System.Collections.Generic
 Imports System.Net.Http
 Imports System.Text.Json
 Imports System.Threading
@@ -8,27 +13,66 @@ Imports System.IO
 
 Imports XactCopy.Configuration
 
+''' <summary>
+''' Class UpdateAssetInfo.
+''' </summary>
 Friend Class UpdateAssetInfo
+    ''' <summary>
+    ''' Gets or sets Name.
+    ''' </summary>
     Public Property Name As String = String.Empty
+    ''' <summary>
+    ''' Gets or sets DownloadUrl.
+    ''' </summary>
     Public Property DownloadUrl As String = String.Empty
+    ''' <summary>
+    ''' Gets or sets Size.
+    ''' </summary>
     Public Property Size As Long
 End Class
 
+''' <summary>
+''' Class UpdateReleaseInfo.
+''' </summary>
 Friend Class UpdateReleaseInfo
+    ''' <summary>
+    ''' Gets or sets TagName.
+    ''' </summary>
     Public Property TagName As String = String.Empty
+    ''' <summary>
+    ''' Gets or sets Version.
+    ''' </summary>
     Public Property Version As Version = New Version(0, 0)
+    ''' <summary>
+    ''' Gets or sets Title.
+    ''' </summary>
     Public Property Title As String = String.Empty
+    ''' <summary>
+    ''' Gets or sets Notes.
+    ''' </summary>
     Public Property Notes As String = String.Empty
+    ''' <summary>
+    ''' Gets or sets HtmlUrl.
+    ''' </summary>
     Public Property HtmlUrl As String = String.Empty
+    ''' <summary>
+    ''' Gets or sets Assets.
+    ''' </summary>
     Public Property Assets As List(Of UpdateAssetInfo) = New List(Of UpdateAssetInfo)()
 End Class
 
+''' <summary>
+''' Structure DownloadProgressInfo.
+''' </summary>
 Friend Structure DownloadProgressInfo
     Public ReadOnly BytesReceived As Long
     Public ReadOnly TotalBytes As Long
     Public ReadOnly SpeedBytesPerSec As Double
     Public ReadOnly Elapsed As TimeSpan
 
+    ''' <summary>
+    ''' Initializes a new instance.
+    ''' </summary>
     Public Sub New(bytesReceived As Long, totalBytes As Long, speedBytesPerSec As Double, elapsed As TimeSpan)
         Me.BytesReceived = bytesReceived
         Me.TotalBytes = totalBytes
@@ -36,6 +80,9 @@ Friend Structure DownloadProgressInfo
         Me.Elapsed = elapsed
     End Sub
 
+    ''' <summary>
+    ''' Gets or sets Percent.
+    ''' </summary>
     Public ReadOnly Property Percent As Integer
         Get
             If TotalBytes <= 0 Then
@@ -48,9 +95,15 @@ Friend Structure DownloadProgressInfo
     End Property
 End Structure
 
+''' <summary>
+''' Module UpdateService.
+''' </summary>
 Friend Module UpdateService
     Private Const DefaultTimeoutSeconds As Integer = 20
 
+    ''' <summary>
+    ''' Computes GetLatestReleaseAsync.
+    ''' </summary>
     Public Async Function GetLatestReleaseAsync(settings As AppSettings, cancellationToken As CancellationToken) As Task(Of UpdateReleaseInfo)
         If settings Is Nothing Then
             Throw New ArgumentNullException(NameOf(settings))
@@ -110,10 +163,16 @@ Friend Module UpdateService
         End Using
     End Function
 
+    ''' <summary>
+    ''' Computes GetLatestReleaseAsync.
+    ''' </summary>
     Public Async Function GetLatestReleaseAsync(settings As AppSettings) As Task(Of UpdateReleaseInfo)
         Return Await GetLatestReleaseAsync(settings, CancellationToken.None)
     End Function
 
+    ''' <summary>
+    ''' Computes SelectBestAsset.
+    ''' </summary>
     Public Function SelectBestAsset(release As UpdateReleaseInfo) As UpdateAssetInfo
         If release Is Nothing OrElse release.Assets Is Nothing OrElse release.Assets.Count = 0 Then
             Return Nothing
@@ -154,6 +213,9 @@ Friend Module UpdateService
         Return bestAsset
     End Function
 
+    ''' <summary>
+    ''' Computes DownloadAssetAsync.
+    ''' </summary>
     Public Async Function DownloadAssetAsync(
         settings As AppSettings,
         asset As UpdateAssetInfo,
@@ -223,6 +285,9 @@ Friend Module UpdateService
         End Using
     End Function
 
+    ''' <summary>
+    ''' Computes IsUpdateAvailable.
+    ''' </summary>
     Public Function IsUpdateAvailable(currentVersion As Version, latestVersion As Version) As Boolean
         If currentVersion Is Nothing OrElse latestVersion Is Nothing Then
             Return False
@@ -233,6 +298,9 @@ Friend Module UpdateService
         Return normalizedLatest.CompareTo(normalizedCurrent) > 0
     End Function
 
+    ''' <summary>
+    ''' Computes ParseVersionSafe.
+    ''' </summary>
     Public Function ParseVersionSafe(text As String) As Version
         Dim normalized As String = NormalizeVersionText(text)
         If String.IsNullOrWhiteSpace(normalized) Then
@@ -256,12 +324,18 @@ Friend Module UpdateService
         Return New Version(major, minor, build, revision)
     End Function
 
+    ''' <summary>
+    ''' Computes NormalizeVersionForCompare.
+    ''' </summary>
     Public Function NormalizeVersionForCompare(version As Version) As Version
         Dim build As Integer = If(version.Build >= 0, version.Build, 0)
         Dim revision As Integer = If(version.Revision >= 0, version.Revision, 0)
         Return New Version(version.Major, version.Minor, build, revision)
     End Function
 
+    ''' <summary>
+    ''' Computes FormatBytes.
+    ''' </summary>
     Public Function FormatBytes(value As Long) As String
         Dim units = {"B", "KB", "MB", "GB", "TB"}
         Dim size As Double = value

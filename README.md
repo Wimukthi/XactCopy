@@ -15,7 +15,7 @@ GNU GPL v3.0. See `LICENSE`.
 - Salvage mode for unreadable sectors with configurable fill pattern.
 - Retry/backoff timeout controls for degraded disks.
 - Adaptive buffer mode with live speed, ETA, and buffer telemetry.
-- AegisRescueCore multi-pass recovery pipeline with tunable pass parameters.
+- Rescue Engine multi-pass recovery pipeline with tunable pass parameters.
 - Job manager (saved jobs, queue, history).
 - Explorer context menu integration (`Copy with XactCopy`).
 - Dark/system/classic theme support.
@@ -74,6 +74,7 @@ dotnet publish src/XactCopy.UI/XactCopy.UI.vbproj -c Release -r win-x64 --self-c
 
 ## Brief Version History
 
+- `v1.0.8.5` Completed a full source/test comment pass (file headers + XML summaries) and renamed user-facing/runtime `AegisRescueCore` references to `Rescue Engine`.
 - `v1.0.8.4` Hardened supervisor recovery so orphaned/stuck workers are tracked and cleaned up, and auto-recovery aborts (instead of spawning more workers) if the previous worker cannot be terminated cleanly.
 - `v1.0.8.3` Fixed fragile-mode resume behavior so files left `InProgress` after worker stall/recovery are promoted to non-retry skip candidates instead of being re-hammered on the next restart.
 - `v1.0.8.2` Added fragile-media hardening controls (skip-on-first-read-error, persisted do-not-retry resume behavior, and failure circuit-breaker cooldown), plus end-to-end propagation of these policies through settings, supervisor, recovery, and worker execution.

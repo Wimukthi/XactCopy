@@ -8,6 +8,9 @@ Imports System.Threading
 Imports XactCopy.Models
 
 Namespace Infrastructure
+    ''' <summary>
+    ''' Class JobJournalStore.
+    ''' </summary>
     Public Class JobJournalStore
         Private Const BackupGenerationCount As Integer = 3
         Private Const LedgerMagic As UInteger = &H58434A4CUL ' XCJL
@@ -26,6 +29,9 @@ Namespace Infrastructure
         Private ReadOnly _seedStateByPath As New Dictionary(Of String, LedgerSeedState)(StringComparer.OrdinalIgnoreCase)
         Private ReadOnly _serializerOptions As JsonSerializerOptions
 
+        ''' <summary>
+        ''' Initializes a new instance.
+        ''' </summary>
         Public Sub New()
             _serializerOptions = New JsonSerializerOptions() With {
                 .WriteIndented = True
@@ -33,12 +39,18 @@ Namespace Infrastructure
             _serializerOptions.Converters.Add(New JsonStringEnumConverter())
         End Sub
 
+        ''' <summary>
+        ''' Computes BuildJobId.
+        ''' </summary>
         Public Shared Function BuildJobId(sourceRoot As String, destinationRoot As String) As String
             Dim payload = $"{sourceRoot.Trim().ToUpperInvariant()}|{destinationRoot.Trim().ToUpperInvariant()}"
             Dim hash = SHA256.HashData(Encoding.UTF8.GetBytes(payload))
             Return Convert.ToHexString(hash).Substring(0, 20).ToLowerInvariant()
         End Function
 
+        ''' <summary>
+        ''' Computes GetDefaultJournalPath.
+        ''' </summary>
         Public Shared Function GetDefaultJournalPath(jobId As String) As String
             Dim root = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -48,6 +60,9 @@ Namespace Infrastructure
             Return Path.Combine(root, $"job-{jobId}.json")
         End Function
 
+        ''' <summary>
+        ''' Computes LoadAsync.
+        ''' </summary>
         Public Async Function LoadAsync(journalPath As String, cancellationToken As CancellationToken) As Task(Of JobJournal)
             If String.IsNullOrWhiteSpace(journalPath) Then
                 Return Nothing
@@ -101,6 +116,9 @@ Namespace Infrastructure
             Return Nothing
         End Function
 
+        ''' <summary>
+        ''' Computes SaveAsync.
+        ''' </summary>
         Public Async Function SaveAsync(journalPath As String, journal As JobJournal, cancellationToken As CancellationToken) As Task
             If String.IsNullOrWhiteSpace(journalPath) Then
                 Throw New ArgumentException("Journal path is required.", NameOf(journalPath))
@@ -934,35 +952,101 @@ Namespace Infrastructure
             Return journal
         End Function
 
+        ''' <summary>
+        ''' Class JournalSecurityContext.
+        ''' </summary>
         Private NotInheritable Class JournalSecurityContext
+            ''' <summary>
+            ''' Gets or sets PathFingerprint.
+            ''' </summary>
             Public Property PathFingerprint As String = String.Empty
+            ''' <summary>
+            ''' Gets or sets HmacKey.
+            ''' </summary>
             Public Property HmacKey As Byte() = Array.Empty(Of Byte)()
         End Class
 
+        ''' <summary>
+        ''' Class LedgerSeedState.
+        ''' </summary>
         Private NotInheritable Class LedgerSeedState
+            ''' <summary>
+            ''' Gets or sets Sequence.
+            ''' </summary>
             Public Property Sequence As Long
+            ''' <summary>
+            ''' Gets or sets LastRecordHash.
+            ''' </summary>
             Public Property LastRecordHash As String = String.Empty
         End Class
 
+        ''' <summary>
+        ''' Class JournalLedgerRecord.
+        ''' </summary>
         Private NotInheritable Class JournalLedgerRecord
+            ''' <summary>
+            ''' Gets or sets Sequence.
+            ''' </summary>
             Public Property Sequence As Long
+            ''' <summary>
+            ''' Gets or sets UpdatedUtcTicks.
+            ''' </summary>
             Public Property UpdatedUtcTicks As Long
+            ''' <summary>
+            ''' Gets or sets SnapshotHash.
+            ''' </summary>
             Public Property SnapshotHash As String = String.Empty
+            ''' <summary>
+            ''' Gets or sets SnapshotLength.
+            ''' </summary>
             Public Property SnapshotLength As Long
+            ''' <summary>
+            ''' Gets or sets PreviousRecordHash.
+            ''' </summary>
             Public Property PreviousRecordHash As String = String.Empty
+            ''' <summary>
+            ''' Gets or sets RecordHash.
+            ''' </summary>
             Public Property RecordHash As String = String.Empty
+            ''' <summary>
+            ''' Gets or sets Signature.
+            ''' </summary>
             Public Property Signature As String = String.Empty
         End Class
 
+        ''' <summary>
+        ''' Class JournalAnchor.
+        ''' </summary>
         Private NotInheritable Class JournalAnchor
+            ''' <summary>
+            ''' Gets or sets Sequence.
+            ''' </summary>
             Public Property Sequence As Long
+            ''' <summary>
+            ''' Gets or sets LastRecordHash.
+            ''' </summary>
             Public Property LastRecordHash As String = String.Empty
+            ''' <summary>
+            ''' Gets or sets UpdatedUtcTicks.
+            ''' </summary>
             Public Property UpdatedUtcTicks As Long
+            ''' <summary>
+            ''' Gets or sets Signature.
+            ''' </summary>
             Public Property Signature As String = String.Empty
         End Class
 
+        ''' <summary>
+        ''' Class SnapshotReadResult.
+        ''' </summary>
         Private NotInheritable Class SnapshotReadResult
+            ''' <summary>
+            ''' Gets or sets SnapshotHash.
+            ''' </summary>
             Public Property SnapshotHash As String = String.Empty
+            ''' <summary>
+            ''' Gets or sets Journal.
+            ''' </summary>
             Public Property Journal As JobJournal
         End Class
     End Class

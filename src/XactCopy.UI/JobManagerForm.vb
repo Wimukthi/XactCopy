@@ -7,12 +7,18 @@ Imports System.Runtime.InteropServices
 Imports XactCopy.Models
 Imports XactCopy.Services
 
+''' <summary>
+''' Enum JobManagerRequestAction.
+''' </summary>
 Friend Enum JobManagerRequestAction
     None = 0
     RunSavedJob = 1
     RunQueuedEntry = 2
 End Enum
 
+''' <summary>
+''' Class JobManagerForm.
+''' </summary>
 Friend Class JobManagerForm
     Inherits Form
 
@@ -82,6 +88,9 @@ Friend Class JobManagerForm
         lParam As IntPtr) As IntPtr
     End Function
 
+    ''' <summary>
+    ''' Initializes a new instance.
+    ''' </summary>
     Public Sub New(jobManager As JobManagerService)
         If jobManager Is Nothing Then
             Throw New ArgumentNullException(NameOf(jobManager))
@@ -106,18 +115,27 @@ Friend Class JobManagerForm
         AddHandler FormClosing, AddressOf JobManagerForm_FormClosing
     End Sub
 
+    ''' <summary>
+    ''' Gets or sets RequestedAction.
+    ''' </summary>
     Public ReadOnly Property RequestedAction As JobManagerRequestAction
         Get
             Return _requestedAction
         End Get
     End Property
 
+    ''' <summary>
+    ''' Gets or sets RequestedRunJobId.
+    ''' </summary>
     Public ReadOnly Property RequestedRunJobId As String
         Get
             Return _requestedRunJobId
         End Get
     End Property
 
+    ''' <summary>
+    ''' Gets or sets RequestedQueueEntryId.
+    ''' </summary>
     Public ReadOnly Property RequestedQueueEntryId As String
         Get
             Return _requestedQueueEntryId
@@ -1201,6 +1219,9 @@ Friend Class JobManagerForm
         End Select
     End Function
 
+    ''' <summary>
+    ''' Enum JobManagerViewFilter.
+    ''' </summary>
     Private Enum JobManagerViewFilter
         AllItems = 0
         SavedJobs = 1
@@ -1208,6 +1229,9 @@ Friend Class JobManagerForm
         RunHistory = 3
     End Enum
 
+    ''' <summary>
+    ''' Enum RunStatusFilter.
+    ''' </summary>
     Private Enum RunStatusFilter
         Any = 0
         Queued = 1
@@ -1219,13 +1243,22 @@ Friend Class JobManagerForm
         Interrupted = 7
     End Enum
 
+    ''' <summary>
+    ''' Enum RowKind.
+    ''' </summary>
     Private Enum RowKind
         SavedJob = 0
         QueueEntry = 1
         RunHistory = 2
     End Enum
 
+    ''' <summary>
+    ''' Class GridRowModel.
+    ''' </summary>
     Private NotInheritable Class GridRowModel
+        ''' <summary>
+        ''' Initializes a new instance.
+        ''' </summary>
         Public Sub New(
             typeText As String,
             nameText As String,
@@ -1252,40 +1285,103 @@ Friend Class JobManagerForm
             Me.Tag = tag
         End Sub
 
+        ''' <summary>
+        ''' Gets or sets TypeText.
+        ''' </summary>
         Public ReadOnly Property TypeText As String
+        ''' <summary>
+        ''' Gets or sets NameText.
+        ''' </summary>
         Public ReadOnly Property NameText As String
+        ''' <summary>
+        ''' Gets or sets StateText.
+        ''' </summary>
         Public ReadOnly Property StateText As String
+        ''' <summary>
+        ''' Gets or sets QueueText.
+        ''' </summary>
         Public ReadOnly Property QueueText As String
+        ''' <summary>
+        ''' Gets or sets TriggerText.
+        ''' </summary>
         Public ReadOnly Property TriggerText As String
+        ''' <summary>
+        ''' Gets or sets StartedText.
+        ''' </summary>
         Public ReadOnly Property StartedText As String
+        ''' <summary>
+        ''' Gets or sets UpdatedText.
+        ''' </summary>
         Public ReadOnly Property UpdatedText As String
+        ''' <summary>
+        ''' Gets or sets SourceText.
+        ''' </summary>
         Public ReadOnly Property SourceText As String
+        ''' <summary>
+        ''' Gets or sets DestinationText.
+        ''' </summary>
         Public ReadOnly Property DestinationText As String
+        ''' <summary>
+        ''' Gets or sets SummaryText.
+        ''' </summary>
         Public ReadOnly Property SummaryText As String
+        ''' <summary>
+        ''' Gets or sets Tag.
+        ''' </summary>
         Public ReadOnly Property Tag As GridRowTag
     End Class
 
+    ''' <summary>
+    ''' Class GridRowTag.
+    ''' </summary>
     Private NotInheritable Class GridRowTag
+        ''' <summary>
+        ''' Initializes a new instance.
+        ''' </summary>
         Public Sub New(kind As RowKind, primaryId As String, jobId As String)
             Me.Kind = kind
             Me.PrimaryId = If(primaryId, String.Empty)
             Me.JobId = If(jobId, String.Empty)
         End Sub
 
+        ''' <summary>
+        ''' Gets or sets Kind.
+        ''' </summary>
         Public ReadOnly Property Kind As RowKind
+        ''' <summary>
+        ''' Gets or sets PrimaryId.
+        ''' </summary>
         Public ReadOnly Property PrimaryId As String
+        ''' <summary>
+        ''' Gets or sets JobId.
+        ''' </summary>
         Public ReadOnly Property JobId As String
     End Class
 
+    ''' <summary>
+    ''' Class EnumChoice.
+    ''' </summary>
     Private NotInheritable Class EnumChoice(Of T)
+        ''' <summary>
+        ''' Initializes a new instance.
+        ''' </summary>
         Public Sub New(value As T, caption As String)
             Me.Value = value
             Me.Caption = If(caption, String.Empty)
         End Sub
 
+        ''' <summary>
+        ''' Gets or sets Value.
+        ''' </summary>
         Public ReadOnly Property Value As T
+        ''' <summary>
+        ''' Gets or sets Caption.
+        ''' </summary>
         Public ReadOnly Property Caption As String
 
+        ''' <summary>
+        ''' Computes ToString.
+        ''' </summary>
         Public Overrides Function ToString() As String
             Return Caption
         End Function

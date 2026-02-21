@@ -1,5 +1,8 @@
 Imports System.Drawing
 
+''' <summary>
+''' Class WindowIconHelper.
+''' </summary>
 Friend NotInheritable Class WindowIconHelper
     Private Shared ReadOnly SyncRoot As New Object()
     Private Shared _cachedIcon As Icon
@@ -7,6 +10,9 @@ Friend NotInheritable Class WindowIconHelper
     Private Sub New()
     End Sub
 
+    ''' <summary>
+    ''' Executes Apply.
+    ''' </summary>
     Public Shared Sub Apply(form As Form)
         If form Is Nothing Then
             Return

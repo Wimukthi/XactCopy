@@ -1,9 +1,20 @@
+' -----------------------------------------------------------------------------
+' File: tests\XactCopy.Tests\IpcSerializerTests.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports XactCopy.Ipc
 Imports XactCopy.Ipc.Messages
 Imports XactCopy.Models
 Imports Xunit
 
+''' <summary>
+''' Class IpcSerializerTests.
+''' </summary>
 Public Class IpcSerializerTests
+    ''' <summary>
+    ''' Executes SerializeAndDeserializeEnvelope_RoundTripsStartJobCommand.
+    ''' </summary>
     <Fact>
     Public Sub SerializeAndDeserializeEnvelope_RoundTripsStartJobCommand()
         Dim payload As New StartJobCommand() With {
@@ -35,6 +46,9 @@ Public Class IpcSerializerTests
         Assert.Equal(4, envelope.Payload.Options.RescueScrapeRetries)
     End Sub
 
+    ''' <summary>
+    ''' Executes TryReadMessageType_ReturnsFalseForMismatchedProtocolVersion.
+    ''' </summary>
     <Fact>
     Public Sub TryReadMessageType_ReturnsFalseForMismatchedProtocolVersion()
         Dim payload As New PingCommand()
@@ -50,6 +64,9 @@ Public Class IpcSerializerTests
         Assert.True(String.IsNullOrWhiteSpace(parsedType))
     End Sub
 
+    ''' <summary>
+    ''' Executes SerializeAndDeserializeEnvelope_RoundTripsWorkerProgressRescueTelemetry.
+    ''' </summary>
     <Fact>
     Public Sub SerializeAndDeserializeEnvelope_RoundTripsWorkerProgressRescueTelemetry()
         Dim payload As New WorkerProgressEvent() With {

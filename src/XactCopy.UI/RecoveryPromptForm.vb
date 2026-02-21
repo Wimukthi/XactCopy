@@ -1,11 +1,22 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.UI\RecoveryPromptForm.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports XactCopy.Models
 
+''' <summary>
+''' Enum RecoveryPromptAction.
+''' </summary>
 Friend Enum RecoveryPromptAction
     ResumeNow = 0
     OpenJobManager = 1
     Dismiss = 2
 End Enum
 
+''' <summary>
+''' Class RecoveryPromptForm.
+''' </summary>
 Friend Class RecoveryPromptForm
     Inherits Form
 
@@ -25,6 +36,9 @@ Friend Class RecoveryPromptForm
 
     Private _selectedAction As RecoveryPromptAction = RecoveryPromptAction.Dismiss
 
+    ''' <summary>
+    ''' Initializes a new instance.
+    ''' </summary>
     Public Sub New(interruptedRun As RecoveryActiveRun, interruptionReason As String)
         If interruptedRun Is Nothing Then
             Throw New ArgumentNullException(NameOf(interruptedRun))
@@ -45,12 +59,18 @@ Friend Class RecoveryPromptForm
         AddHandler FormClosing, AddressOf RecoveryPromptForm_FormClosing
     End Sub
 
+    ''' <summary>
+    ''' Gets or sets SelectedAction.
+    ''' </summary>
     Public ReadOnly Property SelectedAction As RecoveryPromptAction
         Get
             Return _selectedAction
         End Get
     End Property
 
+    ''' <summary>
+    ''' Gets or sets SuppressPromptForThisRun.
+    ''' </summary>
     Public ReadOnly Property SuppressPromptForThisRun As Boolean
         Get
             Return _suppressPromptCheckBox.Checked

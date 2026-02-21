@@ -1,12 +1,23 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.Storage\Infrastructure\RecoveryStateStore.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.IO
 Imports System.Text.Json
 Imports XactCopy.Models
 
 Namespace Infrastructure
+    ''' <summary>
+    ''' Class RecoveryStateStore.
+    ''' </summary>
     Public Class RecoveryStateStore
         Private ReadOnly _statePath As String
         Private ReadOnly _serializerOptions As JsonSerializerOptions
 
+        ''' <summary>
+        ''' Initializes a new instance.
+        ''' </summary>
         Public Sub New(Optional statePath As String = Nothing)
             If String.IsNullOrWhiteSpace(statePath) Then
                 Dim root = Path.Combine(
@@ -24,12 +35,18 @@ Namespace Infrastructure
             }
         End Sub
 
+        ''' <summary>
+        ''' Gets or sets StatePath.
+        ''' </summary>
         Public ReadOnly Property StatePath As String
             Get
                 Return _statePath
             End Get
         End Property
 
+        ''' <summary>
+        ''' Computes Load.
+        ''' </summary>
         Public Function Load() As RecoveryState
             If Not File.Exists(_statePath) Then
                 Return New RecoveryState()
@@ -44,6 +61,9 @@ Namespace Infrastructure
             End Try
         End Function
 
+        ''' <summary>
+        ''' Executes Save.
+        ''' </summary>
         Public Sub Save(state As RecoveryState)
             If state Is Nothing Then
                 Throw New ArgumentNullException(NameOf(state))

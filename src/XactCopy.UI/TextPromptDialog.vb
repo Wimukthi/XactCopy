@@ -1,7 +1,18 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.UI\TextPromptDialog.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
+''' <summary>
+''' Class TextPromptDialog.
+''' </summary>
 Friend NotInheritable Class TextPromptDialog
     Private Sub New()
     End Sub
 
+    ''' <summary>
+    ''' Computes ShowPrompt.
+    ''' </summary>
     Public Shared Function ShowPrompt(owner As IWin32Window, title As String, prompt As String, defaultValue As String, ByRef value As String) As DialogResult
         Using dialog As New Form()
             dialog.Text = If(String.IsNullOrWhiteSpace(title), "Input", title)

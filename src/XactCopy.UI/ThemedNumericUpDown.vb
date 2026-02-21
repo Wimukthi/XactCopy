@@ -1,16 +1,30 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.UI\ThemedNumericUpDown.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.ComponentModel
 Imports System.Drawing
 Imports System.Windows.Forms
 
+''' <summary>
+''' Class ThemedNumericUpDown.
+''' </summary>
 Friend Class ThemedNumericUpDown
     Inherits NumericUpDown
 
     Private _borderColor As Color = SystemColors.ControlDark
 
+    ''' <summary>
+    ''' Initializes a new instance.
+    ''' </summary>
     Public Sub New()
         BorderStyle = BorderStyle.None
     End Sub
 
+    ''' <summary>
+    ''' Gets or sets BorderColor.
+    ''' </summary>
     <Browsable(False), DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)>
     Public Property BorderColor As Color
         Get
@@ -22,6 +36,9 @@ Friend Class ThemedNumericUpDown
         End Set
     End Property
 
+    ''' <summary>
+    ''' Executes ApplyColors.
+    ''' </summary>
     Public Sub ApplyColors(backColor As Color, foreColor As Color, borderColor As Color)
         Me.BackColor = backColor
         Me.ForeColor = foreColor

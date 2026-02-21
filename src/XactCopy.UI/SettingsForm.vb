@@ -5,6 +5,9 @@ Imports System.Runtime.InteropServices
 Imports XactCopy.Configuration
 Imports XactCopy.Models
 
+''' <summary>
+''' Class SettingsForm.
+''' </summary>
 Friend Class SettingsForm
     Inherits Form
 
@@ -141,6 +144,9 @@ Friend Class SettingsForm
         lParam As IntPtr) As IntPtr
     End Function
 
+    ''' <summary>
+    ''' Initializes a new instance.
+    ''' </summary>
     Public Sub New(settings As AppSettings)
         If settings Is Nothing Then
             Throw New ArgumentNullException(NameOf(settings))
@@ -176,24 +182,36 @@ Friend Class SettingsForm
         ResumeLayout(performLayout:=True)
     End Sub
 
+    ''' <summary>
+    ''' Gets or sets ResultSettings.
+    ''' </summary>
     Public ReadOnly Property ResultSettings As AppSettings
         Get
             Return CloneSettings(_workingSettings)
         End Get
     End Property
 
+    ''' <summary>
+    ''' Gets or sets HasChanges.
+    ''' </summary>
     Public ReadOnly Property HasChanges As Boolean
         Get
             Return _hasChanges
         End Get
     End Property
 
+    ''' <summary>
+    ''' Gets or sets RequiresApplicationRestart.
+    ''' </summary>
     Public ReadOnly Property RequiresApplicationRestart As Boolean
         Get
             Return _requiresRestart
         End Get
     End Property
 
+    ''' <summary>
+    ''' Gets or sets RestartReasonText.
+    ''' </summary>
     Public ReadOnly Property RestartReasonText As String
         Get
             Return _restartReasonText
@@ -338,10 +356,10 @@ Friend Class SettingsForm
         _toolTip.SetToolTip(_defaultFragileCooldownNumeric, "Cooldown delay in seconds once the fragile-mode failure threshold is reached (0 disables cooldown).")
         _toolTip.SetToolTip(_defaultLockProbeIntervalNumeric, "Milliseconds between lock-contention probes while waiting.")
         _toolTip.SetToolTip(_defaultSourceMutationPolicyComboBox, "Behavior when source files disappear during an active copy.")
-        _toolTip.SetToolTip(_rescueFastChunkKbNumeric, "AegisRescueCore FastScan chunk size in KB (0 = auto from buffer).")
-        _toolTip.SetToolTip(_rescueTrimChunkKbNumeric, "AegisRescueCore TrimSweep chunk size in KB (0 = auto).")
-        _toolTip.SetToolTip(_rescueScrapeChunkKbNumeric, "AegisRescueCore Scrape chunk size in KB (0 = auto).")
-        _toolTip.SetToolTip(_rescueRetryChunkKbNumeric, "AegisRescueCore RetryBad chunk size in KB (0 = auto, usually 4 KB).")
+        _toolTip.SetToolTip(_rescueFastChunkKbNumeric, "Rescue Engine FastScan chunk size in KB (0 = auto from buffer).")
+        _toolTip.SetToolTip(_rescueTrimChunkKbNumeric, "Rescue Engine TrimSweep chunk size in KB (0 = auto).")
+        _toolTip.SetToolTip(_rescueScrapeChunkKbNumeric, "Rescue Engine Scrape chunk size in KB (0 = auto).")
+        _toolTip.SetToolTip(_rescueRetryChunkKbNumeric, "Rescue Engine RetryBad chunk size in KB (0 = auto, usually 4 KB).")
         _toolTip.SetToolTip(_rescueSplitMinimumKbNumeric, "Minimum split block size in KB when isolating bad ranges (0 = auto).")
         _toolTip.SetToolTip(_rescueFastRetriesNumeric, "Read retries used by FastScan pass.")
         _toolTip.SetToolTip(_rescueTrimRetriesNumeric, "Read retries used by TrimSweep pass.")
@@ -776,7 +794,7 @@ Friend Class SettingsForm
         page.Controls.Add(CreateSection("Transfer Tuning", body), 0, 0)
         page.Controls.Add(CreateSection("Fragile Media Guard", fragile), 0, 1)
         page.Controls.Add(CreateSection("Contention & Source Mutation", contention), 0, 2)
-        page.Controls.Add(CreateSection("AegisRescueCore Tuning", rescue), 0, 3)
+        page.Controls.Add(CreateSection("Rescue Engine Tuning", rescue), 0, 3)
         Return page
     End Function
 

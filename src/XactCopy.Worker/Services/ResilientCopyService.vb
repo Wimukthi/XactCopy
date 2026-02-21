@@ -12,6 +12,9 @@ Imports XactCopy.Infrastructure
 Imports XactCopy.Models
 
 Namespace Services
+    ''' <summary>
+    ''' Class ResilientCopyService.
+    ''' </summary>
     Public Class ResilientCopyService
         Public Event ProgressChanged As EventHandler(Of CopyProgressSnapshot)
         Public Event LogMessage As EventHandler(Of String)
@@ -19,7 +22,7 @@ Namespace Services
         Private Const JournalFlushIntervalSeconds As Integer = 1
         Private Const BadRangeMapFlushIntervalSeconds As Integer = 2
         Private Const MediaIdentityProbeIntervalMilliseconds As Integer = 1000
-        Private Const RescueCoreName As String = "AegisRescueCore"
+        Private Const RescueCoreName As String = "Rescue Engine"
         Private Const MinimumRescueBlockSize As Integer = 4096
         Private Const MaximumIoBufferSize As Integer = 256 * 1024 * 1024
         Private Const IdentityMismatchLogIntervalSeconds As Integer = 5
@@ -82,6 +85,9 @@ Namespace Services
             lpOverlapped As IntPtr) As Boolean
         End Function
 
+        ''' <summary>
+        ''' Enum CopyFileFlags.
+        ''' </summary>
         <Flags>
         Private Enum CopyFileFlags As UInteger
             None = 0UI
@@ -95,11 +101,17 @@ Namespace Services
             NoOffload = &H40000000UI
         End Enum
 
+        ''' <summary>
+        ''' Enum CopyProgressCallbackReason.
+        ''' </summary>
         Private Enum CopyProgressCallbackReason As UInteger
             ChunkFinished = 0UI
             StreamSwitch = 1UI
         End Enum
 
+        ''' <summary>
+        ''' Enum CopyProgressResult.
+        ''' </summary>
         Private Enum CopyProgressResult As UInteger
             ContinueCopy = 0UI
             CancelCopy = 1UI
@@ -129,10 +141,16 @@ Namespace Services
             dwCopyFlags As CopyFileFlags) As Boolean
         End Function
 
+        ''' <summary>
+        ''' Enum GetFileExInfoLevels.
+        ''' </summary>
         Private Enum GetFileExInfoLevels As Integer
             GetFileExInfoStandard = 0
         End Enum
 
+        ''' <summary>
+        ''' Structure Win32FileAttributeData.
+        ''' </summary>
         <StructLayout(LayoutKind.Sequential)>
         Private Structure Win32FileAttributeData
             Public FileAttributes As UInteger
@@ -153,6 +171,9 @@ Namespace Services
             ByRef lpFileInformation As Win32FileAttributeData) As Boolean
         End Function
 
+        ''' <summary>
+        ''' Initializes a new instance.
+        ''' </summary>
         Public Sub New(options As CopyJobOptions, Optional executionControl As CopyExecutionControl = Nothing)
             _options = options
             _executionControl = If(executionControl, New CopyExecutionControl())
@@ -163,6 +184,9 @@ Namespace Services
 #End If
         End Sub
 
+        ''' <summary>
+        ''' Computes RunAsync.
+        ''' </summary>
         Public Async Function RunAsync(cancellationToken As CancellationToken) As Task(Of CopyJobResult)
             ValidateOptions()
 #If DEBUG Then
@@ -2895,7 +2919,13 @@ Namespace Services
             Return merged
         End Function
 
+        ''' <summary>
+        ''' Class RescuePassDefinition.
+        ''' </summary>
         Private NotInheritable Class RescuePassDefinition
+            ''' <summary>
+            ''' Initializes a new instance.
+            ''' </summary>
             Public Sub New(
                 name As String,
                 targetState As RescueRangeState,
@@ -2914,23 +2944,65 @@ Namespace Services
                 Me.ProcessDescending = processDescending
             End Sub
 
+            ''' <summary>
+            ''' Gets or sets Name.
+            ''' </summary>
             Public ReadOnly Property Name As String
+            ''' <summary>
+            ''' Gets or sets TargetState.
+            ''' </summary>
             Public ReadOnly Property TargetState As RescueRangeState
+            ''' <summary>
+            ''' Gets or sets ChunkSizeBytes.
+            ''' </summary>
             Public ReadOnly Property ChunkSizeBytes As Integer
+            ''' <summary>
+            ''' Gets or sets MaxReadRetries.
+            ''' </summary>
             Public ReadOnly Property MaxReadRetries As Integer
+            ''' <summary>
+            ''' Gets or sets SplitOnFailure.
+            ''' </summary>
             Public ReadOnly Property SplitOnFailure As Boolean
+            ''' <summary>
+            ''' Gets or sets MinimumSplitBytes.
+            ''' </summary>
             Public ReadOnly Property MinimumSplitBytes As Integer
+            ''' <summary>
+            ''' Gets or sets ProcessDescending.
+            ''' </summary>
             Public ReadOnly Property ProcessDescending As Boolean
         End Class
 
+        ''' <summary>
+        ''' Class RescuePassOutcome.
+        ''' </summary>
         Private NotInheritable Class RescuePassOutcome
+            ''' <summary>
+            ''' Gets or sets AttemptedSegments.
+            ''' </summary>
             Public Property AttemptedSegments As Integer
+            ''' <summary>
+            ''' Gets or sets RecoveredBytes.
+            ''' </summary>
             Public Property RecoveredBytes As Long
+            ''' <summary>
+            ''' Gets or sets FailedSegments.
+            ''' </summary>
             Public Property FailedSegments As Integer
         End Class
 
+        ''' <summary>
+        ''' Class ExistingFileMetadata.
+        ''' </summary>
         Private NotInheritable Class ExistingFileMetadata
+            ''' <summary>
+            ''' Gets or sets Length.
+            ''' </summary>
             Public Property Length As Long
+            ''' <summary>
+            ''' Gets or sets LastWriteTimeUtc.
+            ''' </summary>
             Public Property LastWriteTimeUtc As DateTime
         End Class
 
@@ -4764,20 +4836,53 @@ Namespace Services
             }
         End Function
 
+        ''' <summary>
+        ''' Class NativeFastPathAttemptResult.
+        ''' </summary>
         Private NotInheritable Class NativeFastPathAttemptResult
+            ''' <summary>
+            ''' Gets or sets Attempted.
+            ''' </summary>
             Public Property Attempted As Boolean
+            ''' <summary>
+            ''' Gets or sets Succeeded.
+            ''' </summary>
             Public Property Succeeded As Boolean
+            ''' <summary>
+            ''' Gets or sets BytesTransferred.
+            ''' </summary>
             Public Property BytesTransferred As Long
+            ''' <summary>
+            ''' Gets or sets FallbackReason.
+            ''' </summary>
             Public Property FallbackReason As String = String.Empty
         End Class
 
+        ''' <summary>
+        ''' Class RawReadAttemptOutcome.
+        ''' </summary>
         Private NotInheritable Class RawReadAttemptOutcome
+            ''' <summary>
+            ''' Gets or sets Handled.
+            ''' </summary>
             Public Property Handled As Boolean
+            ''' <summary>
+            ''' Gets or sets BytesRead.
+            ''' </summary>
             Public Property BytesRead As Integer
+            ''' <summary>
+            ''' Gets or sets ReadError.
+            ''' </summary>
             Public Property ReadError As Exception
+            ''' <summary>
+            ''' Gets or sets FallbackReason.
+            ''' </summary>
             Public Property FallbackReason As String = String.Empty
         End Class
 
+        ''' <summary>
+        ''' Class RawDiskScanContext.
+        ''' </summary>
         Private NotInheritable Class RawDiskScanContext
             Implements IDisposable
 
@@ -4813,17 +4918,26 @@ Namespace Services
                 lpOverlapped As IntPtr) As Boolean
             End Function
 
+            ''' <summary>
+            ''' Structure StartingVcnInputBuffer.
+            ''' </summary>
             <StructLayout(LayoutKind.Sequential)>
             Private Structure StartingVcnInputBuffer
                 Public StartingVcn As Long
             End Structure
 
+            ''' <summary>
+            ''' Structure RetrievalPointersBufferHeader.
+            ''' </summary>
             <StructLayout(LayoutKind.Sequential)>
             Private Structure RetrievalPointersBufferHeader
                 Public ExtentCount As UInteger
                 Public StartingVcn As Long
             End Structure
 
+            ''' <summary>
+            ''' Structure RetrievalPointersExtent.
+            ''' </summary>
             <StructLayout(LayoutKind.Sequential)>
             Private Structure RetrievalPointersExtent
                 Public NextVcn As Long
@@ -4844,24 +4958,36 @@ Namespace Services
                 _clusterSizeBytes = Math.Max(MinimumRescueBlockSize, clusterSizeBytes)
             End Sub
 
+            ''' <summary>
+            ''' Gets or sets VolumeHandle.
+            ''' </summary>
             Public ReadOnly Property VolumeHandle As SafeFileHandle
                 Get
                     Return _volumeHandle
                 End Get
             End Property
 
+            ''' <summary>
+            ''' Gets or sets ClusterSizeBytes.
+            ''' </summary>
             Public ReadOnly Property ClusterSizeBytes As Integer
                 Get
                     Return _clusterSizeBytes
                 End Get
             End Property
 
+            ''' <summary>
+            ''' Gets or sets SectorSizeBytes.
+            ''' </summary>
             Public ReadOnly Property SectorSizeBytes As Integer
                 Get
                     Return _sectorSizeBytes
                 End Get
             End Property
 
+            ''' <summary>
+            ''' Computes TryCreate.
+            ''' </summary>
             Public Shared Function TryCreate(sourceRoot As String, ByRef context As RawDiskScanContext, ByRef reason As String) As Boolean
                 context = Nothing
                 reason = String.Empty
@@ -4959,6 +5085,9 @@ Namespace Services
                 Return True
             End Function
 
+            ''' <summary>
+            ''' Computes TryCreateReadPlan.
+            ''' </summary>
             Public Function TryCreateReadPlan(
                 sourcePath As String,
                 offset As Long,
@@ -5057,6 +5186,9 @@ Namespace Services
                 Return builtLayout
             End Function
 
+            ''' <summary>
+            ''' Executes MarkPathUnsupported.
+            ''' </summary>
             Public Sub MarkPathUnsupported(sourcePath As String, reason As String)
                 Dim normalizedPath = NormalizePathForCache(sourcePath)
                 If normalizedPath.Length = 0 Then
@@ -5353,6 +5485,9 @@ Namespace Services
                 Return True
             End Function
 
+            ''' <summary>
+            ''' Executes Dispose.
+            ''' </summary>
             Public Sub Dispose() Implements IDisposable.Dispose
                 If _disposed Then
                     Return
@@ -5369,6 +5504,9 @@ Namespace Services
             End Sub
         End Class
 
+        ''' <summary>
+        ''' Class RawDiskFileLayout.
+        ''' </summary>
         Private NotInheritable Class RawDiskFileLayout
             Private Sub New(isSupported As Boolean, fileLength As Long, extents As List(Of RawDiskExtent), unsupportedReason As String)
                 Me.IsSupported = isSupported
@@ -5377,32 +5515,68 @@ Namespace Services
                 Me.UnsupportedReason = If(unsupportedReason, String.Empty).Trim()
             End Sub
 
+            ''' <summary>
+            ''' Gets or sets IsSupported.
+            ''' </summary>
             Public ReadOnly Property IsSupported As Boolean
+            ''' <summary>
+            ''' Gets or sets FileLength.
+            ''' </summary>
             Public ReadOnly Property FileLength As Long
+            ''' <summary>
+            ''' Gets or sets Extents.
+            ''' </summary>
             Public ReadOnly Property Extents As List(Of RawDiskExtent)
+            ''' <summary>
+            ''' Gets or sets UnsupportedReason.
+            ''' </summary>
             Public ReadOnly Property UnsupportedReason As String
 
+            ''' <summary>
+            ''' Computes CreateSupported.
+            ''' </summary>
             Public Shared Function CreateSupported(fileLength As Long, extents As List(Of RawDiskExtent)) As RawDiskFileLayout
                 Return New RawDiskFileLayout(True, fileLength, extents, String.Empty)
             End Function
 
+            ''' <summary>
+            ''' Computes CreateUnsupported.
+            ''' </summary>
             Public Shared Function CreateUnsupported(fileLength As Long, reason As String) As RawDiskFileLayout
                 Return New RawDiskFileLayout(False, fileLength, New List(Of RawDiskExtent)(), reason)
             End Function
         End Class
 
+        ''' <summary>
+        ''' Class RawDiskExtent.
+        ''' </summary>
         Private NotInheritable Class RawDiskExtent
+            ''' <summary>
+            ''' Initializes a new instance.
+            ''' </summary>
             Public Sub New(fileOffsetBytes As Long, volumeOffsetBytes As Long, lengthBytes As Long)
                 Me.FileOffsetBytes = Math.Max(0L, fileOffsetBytes)
                 Me.VolumeOffsetBytes = Math.Max(0L, volumeOffsetBytes)
                 Me.LengthBytes = Math.Max(0L, lengthBytes)
             End Sub
 
+            ''' <summary>
+            ''' Gets or sets FileOffsetBytes.
+            ''' </summary>
             Public ReadOnly Property FileOffsetBytes As Long
+            ''' <summary>
+            ''' Gets or sets VolumeOffsetBytes.
+            ''' </summary>
             Public ReadOnly Property VolumeOffsetBytes As Long
+            ''' <summary>
+            ''' Gets or sets LengthBytes.
+            ''' </summary>
             Public ReadOnly Property LengthBytes As Long
         End Class
 
+        ''' <summary>
+        ''' Class RawDiskReadSegment.
+        ''' </summary>
         Private NotInheritable Class RawDiskReadSegment
             Private Sub New(isSparse As Boolean, volumeOffsetBytes As Long, length As Integer)
                 Me.IsSparse = isSparse
@@ -5410,19 +5584,37 @@ Namespace Services
                 Me.Length = Math.Max(0, length)
             End Sub
 
+            ''' <summary>
+            ''' Gets or sets IsSparse.
+            ''' </summary>
             Public ReadOnly Property IsSparse As Boolean
+            ''' <summary>
+            ''' Gets or sets VolumeOffsetBytes.
+            ''' </summary>
             Public ReadOnly Property VolumeOffsetBytes As Long
+            ''' <summary>
+            ''' Gets or sets Length.
+            ''' </summary>
             Public ReadOnly Property Length As Integer
 
+            ''' <summary>
+            ''' Computes CreateMapped.
+            ''' </summary>
             Public Shared Function CreateMapped(volumeOffsetBytes As Long, length As Integer) As RawDiskReadSegment
                 Return New RawDiskReadSegment(False, volumeOffsetBytes, length)
             End Function
 
+            ''' <summary>
+            ''' Computes CreateSparse.
+            ''' </summary>
             Public Shared Function CreateSparse(length As Integer) As RawDiskReadSegment
                 Return New RawDiskReadSegment(True, 0L, length)
             End Function
         End Class
 
+        ''' <summary>
+        ''' Class FileTransferSession.
+        ''' </summary>
         Private NotInheritable Class FileTransferSession
             Implements IDisposable
 
@@ -5433,12 +5625,18 @@ Namespace Services
             Private _destinationStream As FileStream
             Private _disposed As Boolean
 
+            ''' <summary>
+            ''' Initializes a new instance.
+            ''' </summary>
             Public Sub New(sourcePath As String, destinationPath As String, ioBufferSize As Integer)
                 _sourcePath = sourcePath
                 _destinationPath = destinationPath
                 _ioBufferSize = NormalizeIoBufferSize(ioBufferSize)
             End Sub
 
+            ''' <summary>
+            ''' Computes GetSourceHandle.
+            ''' </summary>
             Public Function GetSourceHandle() As SafeFileHandle
                 ThrowIfDisposed()
                 If _sourceStream Is Nothing Then
@@ -5454,6 +5652,9 @@ Namespace Services
                 Return _sourceStream.SafeFileHandle
             End Function
 
+            ''' <summary>
+            ''' Computes TryGetOpenSourceHandle.
+            ''' </summary>
             Public Function TryGetOpenSourceHandle() As SafeFileHandle
                 ThrowIfDisposed()
                 If _sourceStream Is Nothing Then
@@ -5463,6 +5664,9 @@ Namespace Services
                 Return _sourceStream.SafeFileHandle
             End Function
 
+            ''' <summary>
+            ''' Computes GetDestinationHandle.
+            ''' </summary>
             Public Function GetDestinationHandle() As SafeFileHandle
                 ThrowIfDisposed()
                 If _destinationStream Is Nothing Then
@@ -5478,6 +5682,9 @@ Namespace Services
                 Return _destinationStream.SafeFileHandle
             End Function
 
+            ''' <summary>
+            ''' Computes TryGetOpenDestinationHandle.
+            ''' </summary>
             Public Function TryGetOpenDestinationHandle() As SafeFileHandle
                 ThrowIfDisposed()
                 If _destinationStream Is Nothing Then
@@ -5487,6 +5694,9 @@ Namespace Services
                 Return _destinationStream.SafeFileHandle
             End Function
 
+            ''' <summary>
+            ''' Executes InvalidateSource.
+            ''' </summary>
             Public Sub InvalidateSource()
                 If _sourceStream Is Nothing Then
                     Return
@@ -5500,6 +5710,9 @@ Namespace Services
                 End Try
             End Sub
 
+            ''' <summary>
+            ''' Executes InvalidateDestination.
+            ''' </summary>
             Public Sub InvalidateDestination()
                 If _destinationStream Is Nothing Then
                     Return
@@ -5513,6 +5726,9 @@ Namespace Services
                 End Try
             End Sub
 
+            ''' <summary>
+            ''' Executes Dispose.
+            ''' </summary>
             Public Sub Dispose() Implements IDisposable.Dispose
                 If _disposed Then
                     Return
@@ -5531,6 +5747,9 @@ Namespace Services
         End Class
 
 #If DEBUG Then
+        ''' <summary>
+        ''' Class DevFaultInjector.
+        ''' </summary>
         Private NotInheritable Class DevFaultInjector
             Private Const RulesEnvVar As String = "XACTCOPY_DEV_FAULT_RULES"
             Private Const SeedEnvVar As String = "XACTCOPY_DEV_FAULT_SEED"
@@ -5544,12 +5763,18 @@ Namespace Services
                 _random = New Random(seed)
             End Sub
 
+            ''' <summary>
+            ''' Gets or sets Description.
+            ''' </summary>
             Public ReadOnly Property Description As String
                 Get
                     Return $"{_rules.Count} rule(s) via {RulesEnvVar}"
                 End Get
             End Property
 
+            ''' <summary>
+            ''' Computes TryCreateFromEnvironment.
+            ''' </summary>
             Public Shared Function TryCreateFromEnvironment() As DevFaultInjector
                 Dim rawRules = Environment.GetEnvironmentVariable(RulesEnvVar)
                 If String.IsNullOrWhiteSpace(rawRules) Then
@@ -5585,10 +5810,16 @@ Namespace Services
                 Return New DevFaultInjector(parsedRules, seed)
             End Function
 
+            ''' <summary>
+            ''' Computes CreateReadFault.
+            ''' </summary>
             Public Function CreateReadFault(relativePath As String, offset As Long, length As Integer) As Exception
                 Return CreateFault(DevFaultOperation.ReadOperation, relativePath, offset, length)
             End Function
 
+            ''' <summary>
+            ''' Computes CreateWriteFault.
+            ''' </summary>
             Public Function CreateWriteFault(relativePath As String, offset As Long, length As Integer) As Exception
                 Return CreateFault(DevFaultOperation.WriteOperation, relativePath, offset, length)
             End Function
@@ -5612,11 +5843,17 @@ Namespace Services
             End Function
         End Class
 
+        ''' <summary>
+        ''' Enum DevFaultOperation.
+        ''' </summary>
         Private Enum DevFaultOperation
             ReadOperation = 0
             WriteOperation = 1
         End Enum
 
+        ''' <summary>
+        ''' Enum DevFaultTriggerMode.
+        ''' </summary>
         Private Enum DevFaultTriggerMode
             Once = 0
             Always = 1
@@ -5624,12 +5861,18 @@ Namespace Services
             Every = 3
         End Enum
 
+        ''' <summary>
+        ''' Enum DevFaultErrorKind.
+        ''' </summary>
         Private Enum DevFaultErrorKind
             Io = 0
             Timeout = 1
             Offline = 2
         End Enum
 
+        ''' <summary>
+        ''' Class DevFaultRule.
+        ''' </summary>
         Private NotInheritable Class DevFaultRule
             Private ReadOnly _operation As DevFaultOperation
             Private ReadOnly _offset As Long
@@ -5656,6 +5899,9 @@ Namespace Services
                 _parameter = Math.Max(0, parameter)
             End Sub
 
+            ''' <summary>
+            ''' Computes TryParse.
+            ''' </summary>
             Public Shared Function TryParse(text As String, ByRef rule As DevFaultRule) As Boolean
                 rule = Nothing
                 If String.IsNullOrWhiteSpace(text) Then
@@ -5733,6 +5979,9 @@ Namespace Services
                 Return True
             End Function
 
+            ''' <summary>
+            ''' Computes TryCreateFault.
+            ''' </summary>
             Public Function TryCreateFault(
                 operationType As DevFaultOperation,
                 relativePath As String,
@@ -5807,27 +6056,63 @@ Namespace Services
         End Class
 #End If
 
+        ''' <summary>
+        ''' Class ProgressAccumulator.
+        ''' </summary>
         Private NotInheritable Class ProgressAccumulator
+            ''' <summary>
+            ''' Gets or sets TotalFiles.
+            ''' </summary>
             Public Property TotalFiles As Integer
+            ''' <summary>
+            ''' Gets or sets TotalBytes.
+            ''' </summary>
             Public Property TotalBytes As Long
+            ''' <summary>
+            ''' Gets or sets TotalBytesCopied.
+            ''' </summary>
             Public Property TotalBytesCopied As Long
+            ''' <summary>
+            ''' Gets or sets CompletedFiles.
+            ''' </summary>
             Public Property CompletedFiles As Integer
+            ''' <summary>
+            ''' Gets or sets FailedFiles.
+            ''' </summary>
             Public Property FailedFiles As Integer
+            ''' <summary>
+            ''' Gets or sets RecoveredFiles.
+            ''' </summary>
             Public Property RecoveredFiles As Integer
+            ''' <summary>
+            ''' Gets or sets SkippedFiles.
+            ''' </summary>
             Public Property SkippedFiles As Integer
         End Class
 
+        ''' <summary>
+        ''' Class SourceMutationSkippedException.
+        ''' </summary>
         Private NotInheritable Class SourceMutationSkippedException
             Inherits IOException
 
+            ''' <summary>
+            ''' Initializes a new instance.
+            ''' </summary>
             Public Sub New(message As String, innerException As Exception)
                 MyBase.New(message, innerException)
             End Sub
         End Class
 
+        ''' <summary>
+        ''' Class FragileReadSkipException.
+        ''' </summary>
         Private NotInheritable Class FragileReadSkipException
             Inherits IOException
 
+            ''' <summary>
+            ''' Initializes a new instance.
+            ''' </summary>
             Public Sub New(message As String, innerException As Exception)
                 MyBase.New(message, innerException)
             End Sub

@@ -1,13 +1,24 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.Core\Ipc\IpcSerializer.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.Text.Json
 Imports System.Text.Json.Serialization
 
 Namespace Ipc
+    ''' <summary>
+    ''' Class IpcSerializer.
+    ''' </summary>
     Public NotInheritable Class IpcSerializer
         Private Shared ReadOnly SerializerOptions As JsonSerializerOptions = BuildOptions()
 
         Private Sub New()
         End Sub
 
+        ''' <summary>
+        ''' Computes SerializeEnvelope.
+        ''' </summary>
         Public Shared Function SerializeEnvelope(Of TPayload)(
             messageType As String,
             payload As TPayload,
@@ -24,6 +35,9 @@ Namespace Ipc
             Return JsonSerializer.Serialize(envelope, SerializerOptions)
         End Function
 
+        ''' <summary>
+        ''' Computes DeserializeEnvelope.
+        ''' </summary>
         Public Shared Function DeserializeEnvelope(Of TPayload)(json As String) As IpcEnvelope(Of TPayload)
             Dim envelope = JsonSerializer.Deserialize(Of IpcEnvelope(Of TPayload))(json, SerializerOptions)
             If envelope Is Nothing Then
@@ -38,6 +52,9 @@ Namespace Ipc
             Return envelope
         End Function
 
+        ''' <summary>
+        ''' Computes TryReadMessageType.
+        ''' </summary>
         Public Shared Function TryReadMessageType(json As String, ByRef messageType As String) As Boolean
             messageType = String.Empty
             Try

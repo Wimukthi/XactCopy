@@ -1,4 +1,12 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.Core\Models\ManagedJobRunStatus.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Namespace Models
+    ''' <summary>
+    ''' Enum ManagedJobRunStatus.
+    ''' </summary>
     Public Enum ManagedJobRunStatus
         Queued = 0
         Running = 1

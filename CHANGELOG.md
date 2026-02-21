@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.8.5] - 2026-02-19
+
+### Changed
+
+- Completed a broad codebase documentation pass across hand-written source and tests:
+  - Added consistent file headers and XML summaries for key types and members.
+  - Improved maintainability and code navigation without altering runtime behavior.
+- Recovery/rescue naming polish:
+  - User-facing/runtime references now use `Rescue Engine` instead of `AegisRescueCore`.
+  - Updated related UI tooltips/section labels and architecture/readme wording.
+
 ## [1.0.8.4] - 2026-02-19
 
 ### Fixed

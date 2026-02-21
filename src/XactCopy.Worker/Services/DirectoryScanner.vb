@@ -1,3 +1,8 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.Worker\Services\DirectoryScanner.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.IO
 Imports System.Linq
 Imports System.Runtime.InteropServices
@@ -5,11 +10,23 @@ Imports Microsoft.Win32.SafeHandles
 Imports XactCopy.Models
 
 Namespace Services
+    ''' <summary>
+    ''' Class SourceScanResult.
+    ''' </summary>
     Public NotInheritable Class SourceScanResult
+        ''' <summary>
+        ''' Gets or sets Files.
+        ''' </summary>
         Public Property Files As New List(Of SourceFileDescriptor)()
+        ''' <summary>
+        ''' Gets or sets Directories.
+        ''' </summary>
         Public Property Directories As New List(Of String)()
     End Class
 
+    ''' <summary>
+    ''' Class DirectoryScanner.
+    ''' </summary>
     Public NotInheritable Class DirectoryScanner
         Private Const FindExInfoBasic As Integer = 1
         Private Const FindExSearchNameMatch As Integer = 0
@@ -22,6 +39,9 @@ Namespace Services
         Private Sub New()
         End Sub
 
+        ''' <summary>
+        ''' Computes ScanSource.
+        ''' </summary>
         Public Shared Function ScanSource(
             rootPath As String,
             selectedRelativePaths As IReadOnlyCollection(Of String),
@@ -322,6 +342,9 @@ Namespace Services
             Return text.Trim(Path.DirectorySeparatorChar)
         End Function
 
+        ''' <summary>
+        ''' Class SelectionFilter.
+        ''' </summary>
         Private NotInheritable Class SelectionFilter
             Private ReadOnly _entries As List(Of String)
 
@@ -329,6 +352,9 @@ Namespace Services
                 _entries = entries
             End Sub
 
+            ''' <summary>
+            ''' Computes Create.
+            ''' </summary>
             Public Shared Function Create(rootPath As String, requestedPaths As IReadOnlyCollection(Of String), log As Action(Of String)) As SelectionFilter
                 If requestedPaths Is Nothing OrElse requestedPaths.Count = 0 Then
                     Return New SelectionFilter(New List(Of String)())
@@ -390,6 +416,9 @@ Namespace Services
                 Return New SelectionFilter(validEntries.ToList())
             End Function
 
+            ''' <summary>
+            ''' Computes ShouldTraverseDirectory.
+            ''' </summary>
             Public Function ShouldTraverseDirectory(relativeDirectory As String) As Boolean
                 If _entries.Count = 0 Then
                     Return True
@@ -419,10 +448,16 @@ Namespace Services
                 Return False
             End Function
 
+            ''' <summary>
+            ''' Computes ShouldIncludeDirectory.
+            ''' </summary>
             Public Function ShouldIncludeDirectory(relativeDirectory As String) As Boolean
                 Return ShouldTraverseDirectory(relativeDirectory)
             End Function
 
+            ''' <summary>
+            ''' Computes ShouldIncludeFile.
+            ''' </summary>
             Public Function ShouldIncludeFile(relativeFile As String) As Boolean
                 If _entries.Count = 0 Then
                     Return True
@@ -448,6 +483,9 @@ Namespace Services
             End Function
         End Class
 
+        ''' <summary>
+        ''' Structure Win32FindData.
+        ''' </summary>
         <StructLayout(LayoutKind.Sequential, CharSet:=CharSet.Unicode)>
         Private Structure Win32FindData
             Public FileAttributes As UInteger
@@ -464,23 +502,50 @@ Namespace Services
             Public AlternateFileName As String
         End Structure
 
+        ''' <summary>
+        ''' Structure FileTime.
+        ''' </summary>
         <StructLayout(LayoutKind.Sequential)>
         Private Structure FileTime
             Public LowDateTime As UInteger
             Public HighDateTime As UInteger
         End Structure
 
+        ''' <summary>
+        ''' Class DirectoryEntryInfo.
+        ''' </summary>
         Private NotInheritable Class DirectoryEntryInfo
+            ''' <summary>
+            ''' Gets or sets FullPath.
+            ''' </summary>
             Public Property FullPath As String = String.Empty
+            ''' <summary>
+            ''' Gets or sets IsDirectory.
+            ''' </summary>
             Public Property IsDirectory As Boolean
+            ''' <summary>
+            ''' Gets or sets IsReparsePoint.
+            ''' </summary>
             Public Property IsReparsePoint As Boolean
+            ''' <summary>
+            ''' Gets or sets Length.
+            ''' </summary>
             Public Property Length As Long
+            ''' <summary>
+            ''' Gets or sets LastWriteTimeUtc.
+            ''' </summary>
             Public Property LastWriteTimeUtc As DateTime = DateTime.MinValue
         End Class
 
+        ''' <summary>
+        ''' Class SafeFindHandle.
+        ''' </summary>
         Private NotInheritable Class SafeFindHandle
             Inherits SafeHandleZeroOrMinusOneIsInvalid
 
+            ''' <summary>
+            ''' Initializes a new instance.
+            ''' </summary>
             Public Sub New()
                 MyBase.New(ownsHandle:=True)
             End Sub

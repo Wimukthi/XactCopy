@@ -1,5 +1,13 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.UI\TaskbarProgressController.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.Runtime.InteropServices
 
+''' <summary>
+''' Enum TaskbarProgressState.
+''' </summary>
 Friend Enum TaskbarProgressState
     NoProgress = 0
     Indeterminate = 1
@@ -8,6 +16,9 @@ Friend Enum TaskbarProgressState
     Paused = 8
 End Enum
 
+''' <summary>
+''' Structure TaskbarRect.
+''' </summary>
 <StructLayout(LayoutKind.Sequential)>
 Friend Structure TaskbarRect
     Public Left As Integer
@@ -16,6 +27,9 @@ Friend Structure TaskbarRect
     Public Bottom As Integer
 End Structure
 
+''' <summary>
+''' Interface ITaskbarList.
+''' </summary>
 <ComImport>
 <Guid("56FDF342-FD6D-11d0-958A-006097C9A090")>
 <InterfaceType(ComInterfaceType.InterfaceIsIUnknown)>
@@ -27,6 +41,9 @@ Friend Interface ITaskbarList
     Sub SetActiveAlt(hwnd As IntPtr)
 End Interface
 
+''' <summary>
+''' Interface ITaskbarList2.
+''' </summary>
 <ComImport>
 <Guid("602D4995-B13A-429b-A66E-1935E44F4317")>
 <InterfaceType(ComInterfaceType.InterfaceIsIUnknown)>
@@ -40,6 +57,9 @@ Friend Interface ITaskbarList2
     Sub MarkFullscreenWindow(hwnd As IntPtr, <MarshalAs(UnmanagedType.Bool)> fFullscreen As Boolean)
 End Interface
 
+''' <summary>
+''' Interface ITaskbarList3.
+''' </summary>
 <ComImport>
 <Guid("EA1AFB91-9E28-4B86-90E9-9E9F8A5EEA84")>
 <InterfaceType(ComInterfaceType.InterfaceIsIUnknown)>
@@ -65,10 +85,16 @@ Friend Interface ITaskbarList3
     Sub SetThumbnailClip(hwnd As IntPtr, ByRef clip As TaskbarRect)
 End Interface
 
+''' <summary>
+''' Class TaskbarProgressController.
+''' </summary>
 Friend NotInheritable Class TaskbarProgressController
     Private ReadOnly _taskbar As ITaskbarList3
     Private ReadOnly _supported As Boolean
 
+    ''' <summary>
+    ''' Initializes a new instance.
+    ''' </summary>
     Public Sub New()
         Try
             Dim version = Environment.OSVersion.Version
@@ -96,6 +122,9 @@ Friend NotInheritable Class TaskbarProgressController
         End Try
     End Sub
 
+    ''' <summary>
+    ''' Executes SetState.
+    ''' </summary>
     Public Sub SetState(hwnd As IntPtr, state As TaskbarProgressState)
         If Not CanUse(hwnd) Then
             Return
@@ -107,6 +136,9 @@ Friend NotInheritable Class TaskbarProgressController
         End Try
     End Sub
 
+    ''' <summary>
+    ''' Executes SetProgress.
+    ''' </summary>
     Public Sub SetProgress(hwnd As IntPtr, completed As ULong, total As ULong, state As TaskbarProgressState)
         If Not CanUse(hwnd) Then
             Return
@@ -122,10 +154,16 @@ Friend NotInheritable Class TaskbarProgressController
         End Try
     End Sub
 
+    ''' <summary>
+    ''' Executes Clear.
+    ''' </summary>
     Public Sub Clear(hwnd As IntPtr)
         SetState(hwnd, TaskbarProgressState.NoProgress)
     End Sub
 
+    ''' <summary>
+    ''' Executes SetIndeterminate.
+    ''' </summary>
     Public Sub SetIndeterminate(hwnd As IntPtr)
         SetState(hwnd, TaskbarProgressState.Indeterminate)
     End Sub

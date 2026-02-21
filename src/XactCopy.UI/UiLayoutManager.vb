@@ -7,39 +7,93 @@ Imports System.Linq
 Imports System.Text.Json
 Imports System.Windows.Forms
 
+''' <summary>
+''' Class UiWindowLayout.
+''' </summary>
 Friend NotInheritable Class UiWindowLayout
+    ''' <summary>
+    ''' Gets or sets X.
+    ''' </summary>
     Public Property X As Integer
+    ''' <summary>
+    ''' Gets or sets Y.
+    ''' </summary>
     Public Property Y As Integer
+    ''' <summary>
+    ''' Gets or sets Width.
+    ''' </summary>
     Public Property Width As Integer
+    ''' <summary>
+    ''' Gets or sets Height.
+    ''' </summary>
     Public Property Height As Integer
+    ''' <summary>
+    ''' Gets or sets WindowState.
+    ''' </summary>
     Public Property WindowState As FormWindowState = FormWindowState.Normal
+    ''' <summary>
+    ''' Gets or sets Dpi.
+    ''' </summary>
     Public Property Dpi As Integer = 96
 End Class
 
+''' <summary>
+''' Class UiGridColumnLayout.
+''' </summary>
 Friend NotInheritable Class UiGridColumnLayout
+    ''' <summary>
+    ''' Gets or sets Width.
+    ''' </summary>
     Public Property Width As Integer
+    ''' <summary>
+    ''' Gets or sets DisplayIndex.
+    ''' </summary>
     Public Property DisplayIndex As Integer
 End Class
 
+''' <summary>
+''' Class UiGridLayout.
+''' </summary>
 Friend NotInheritable Class UiGridLayout
+    ''' <summary>
+    ''' Gets or sets Columns.
+    ''' </summary>
     Public Property Columns As Dictionary(Of String, UiGridColumnLayout) =
         New Dictionary(Of String, UiGridColumnLayout)(StringComparer.OrdinalIgnoreCase)
 End Class
 
+''' <summary>
+''' Class UiLayoutState.
+''' </summary>
 Friend NotInheritable Class UiLayoutState
+    ''' <summary>
+    ''' Gets or sets Windows.
+    ''' </summary>
     Public Property Windows As Dictionary(Of String, UiWindowLayout) =
         New Dictionary(Of String, UiWindowLayout)(StringComparer.OrdinalIgnoreCase)
 
+    ''' <summary>
+    ''' Gets or sets Splitters.
+    ''' </summary>
     Public Property Splitters As Dictionary(Of String, Integer) =
         New Dictionary(Of String, Integer)(StringComparer.OrdinalIgnoreCase)
 
+    ''' <summary>
+    ''' Gets or sets Grids.
+    ''' </summary>
     Public Property Grids As Dictionary(Of String, UiGridLayout) =
         New Dictionary(Of String, UiGridLayout)(StringComparer.OrdinalIgnoreCase)
 End Class
 
+''' <summary>
+''' Class UiLayoutStore.
+''' </summary>
 Friend NotInheritable Class UiLayoutStore
     Private ReadOnly _layoutPath As String
 
+    ''' <summary>
+    ''' Initializes a new instance.
+    ''' </summary>
     Public Sub New(Optional layoutPath As String = Nothing)
         If String.IsNullOrWhiteSpace(layoutPath) Then
             Dim root = Path.Combine(
@@ -51,6 +105,9 @@ Friend NotInheritable Class UiLayoutStore
         End If
     End Sub
 
+    ''' <summary>
+    ''' Computes Load.
+    ''' </summary>
     Public Function Load() As UiLayoutState
         If Not File.Exists(_layoutPath) Then
             Return New UiLayoutState()
@@ -73,6 +130,9 @@ Friend NotInheritable Class UiLayoutStore
         End Try
     End Function
 
+    ''' <summary>
+    ''' Executes Save.
+    ''' </summary>
     Public Sub Save(state As UiLayoutState)
         If state Is Nothing Then
             Return
@@ -130,11 +190,17 @@ Friend NotInheritable Class UiLayoutStore
     End Sub
 End Class
 
+''' <summary>
+''' Module UiLayoutManager.
+''' </summary>
 Friend Module UiLayoutManager
     Private ReadOnly _syncRoot As New Object()
     Private ReadOnly _store As New UiLayoutStore()
     Private _state As UiLayoutState
 
+    ''' <summary>
+    ''' Executes ApplyWindow.
+    ''' </summary>
     Public Sub ApplyWindow(target As Form, windowKey As String)
         If target Is Nothing OrElse String.IsNullOrWhiteSpace(windowKey) Then
             Return
@@ -181,6 +247,9 @@ Friend Module UiLayoutManager
         End If
     End Sub
 
+    ''' <summary>
+    ''' Executes CaptureWindow.
+    ''' </summary>
     Public Sub CaptureWindow(target As Form, windowKey As String)
         If target Is Nothing OrElse String.IsNullOrWhiteSpace(windowKey) Then
             Return
@@ -212,6 +281,9 @@ Friend Module UiLayoutManager
         End SyncLock
     End Sub
 
+    ''' <summary>
+    ''' Executes ApplySplitter.
+    ''' </summary>
     Public Sub ApplySplitter(split As SplitContainer, splitterKey As String, defaultDistance As Integer, panel1Min As Integer, panel2Min As Integer)
         If split Is Nothing Then
             Return
@@ -232,6 +304,9 @@ Friend Module UiLayoutManager
         ConfigureSplitterSafe(split, desiredDistance, panel1Min, panel2Min)
     End Sub
 
+    ''' <summary>
+    ''' Executes CaptureSplitter.
+    ''' </summary>
     Public Sub CaptureSplitter(split As SplitContainer, splitterKey As String)
         If split Is Nothing OrElse String.IsNullOrWhiteSpace(splitterKey) Then
             Return
@@ -254,6 +329,9 @@ Friend Module UiLayoutManager
         End SyncLock
     End Sub
 
+    ''' <summary>
+    ''' Executes ApplyGridLayout.
+    ''' </summary>
     Public Sub ApplyGridLayout(grid As DataGridView, gridKey As String)
         If grid Is Nothing OrElse String.IsNullOrWhiteSpace(gridKey) Then
             Return
@@ -300,6 +378,9 @@ Friend Module UiLayoutManager
         Next
     End Sub
 
+    ''' <summary>
+    ''' Executes CaptureGridLayout.
+    ''' </summary>
     Public Sub CaptureGridLayout(grid As DataGridView, gridKey As String)
         If grid Is Nothing OrElse String.IsNullOrWhiteSpace(gridKey) Then
             Return
@@ -324,6 +405,9 @@ Friend Module UiLayoutManager
         End SyncLock
     End Sub
 
+    ''' <summary>
+    ''' Executes ConfigureSplitterSafe.
+    ''' </summary>
     Public Sub ConfigureSplitterSafe(split As SplitContainer, desiredDistance As Integer, panel1Min As Integer, panel2Min As Integer)
         If split Is Nothing Then
             Return

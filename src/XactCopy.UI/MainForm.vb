@@ -11,6 +11,9 @@ Imports XactCopy.Infrastructure
 Imports XactCopy.Models
 Imports XactCopy.Services
 
+''' <summary>
+''' Class MainForm.
+''' </summary>
 Public Class MainForm
     Inherits Form
 
@@ -188,6 +191,9 @@ Public Class MainForm
     Private _logErrorColor As Color = Color.FromArgb(255, 150, 150)
     Private _logCriticalColor As Color = Color.FromArgb(255, 96, 96)
 
+    ''' <summary>
+    ''' Initializes a new instance.
+    ''' </summary>
     Public Sub New(Optional launchOptions As LaunchOptions = Nothing)
         Text = AppTitle
         StartPosition = FormStartPosition.CenterScreen
@@ -765,7 +771,7 @@ Public Class MainForm
         _toolTip.SetToolTip(_throughputLabel, "Instantaneous and smoothed transfer speed.")
         _toolTip.SetToolTip(_etaLabel, "Estimated remaining time based on current average speed.")
         _toolTip.SetToolTip(_bufferUsageLabel, "Recent and average buffer utilization.")
-        _toolTip.SetToolTip(_rescueTelemetryLabel, "AegisRescueCore pass status, unreadable region count, and remaining unrecovered bytes.")
+        _toolTip.SetToolTip(_rescueTelemetryLabel, "Rescue Engine pass status, unreadable region count, and remaining unrecovered bytes.")
         _toolTip.SetToolTip(_diagnosticsLabel, "UI diagnostics: render latency, event counts, queue depth, and dropped/suppressed logs.")
         _toolTip.SetToolTip(_journalLabel, "Active journal file used for resume/recovery.")
         _toolTip.SetToolTip(_logListView, "Operations log")
@@ -4041,6 +4047,9 @@ Public Class MainForm
         Return $"{size:0.##} {units(unitIndex)}"
     End Function
 
+    ''' <summary>
+    ''' Enum LogSeverityLevel.
+    ''' </summary>
     Private Enum LogSeverityLevel
         Info = 0
         Success = 1
@@ -4049,8 +4058,17 @@ Public Class MainForm
         Critical = 4
     End Enum
 
+    ''' <summary>
+    ''' Class LogLineEntry.
+    ''' </summary>
     Private NotInheritable Class LogLineEntry
+        ''' <summary>
+        ''' Gets or sets Text.
+        ''' </summary>
         Public Property Text As String = String.Empty
+        ''' <summary>
+        ''' Gets or sets Severity.
+        ''' </summary>
         Public Property Severity As LogSeverityLevel = LogSeverityLevel.Info
     End Class
 End Class

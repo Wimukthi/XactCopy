@@ -1,9 +1,20 @@
+' -----------------------------------------------------------------------------
+' File: tests\XactCopy.Tests\RecoveryAndJobStoreTests.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.IO
 Imports XactCopy.Infrastructure
 Imports XactCopy.Models
 Imports Xunit
 
+''' <summary>
+''' Class RecoveryAndJobStoreTests.
+''' </summary>
 Public Class RecoveryAndJobStoreTests
+    ''' <summary>
+    ''' Executes JobCatalogStore_SaveAndLoad_RoundTripsJobsRunsAndQueue.
+    ''' </summary>
     <Fact>
     Public Sub JobCatalogStore_SaveAndLoad_RoundTripsJobsRunsAndQueue()
         Dim tempDirectory = Path.Combine(Path.GetTempPath(), "xactcopy-tests-" & Guid.NewGuid().ToString("N"))
@@ -70,6 +81,9 @@ Public Class RecoveryAndJobStoreTests
         End Try
     End Sub
 
+    ''' <summary>
+    ''' Executes JobCatalogStore_Load_MigratesLegacyQueuedJobIdsToQueueEntries.
+    ''' </summary>
     <Fact>
     Public Sub JobCatalogStore_Load_MigratesLegacyQueuedJobIdsToQueueEntries()
         Dim tempDirectory = Path.Combine(Path.GetTempPath(), "xactcopy-tests-" & Guid.NewGuid().ToString("N"))
@@ -108,6 +122,9 @@ Public Class RecoveryAndJobStoreTests
         End Try
     End Sub
 
+    ''' <summary>
+    ''' Executes RecoveryStateStore_SaveAndLoad_RoundTripsActiveRun.
+    ''' </summary>
     <Fact>
     Public Sub RecoveryStateStore_SaveAndLoad_RoundTripsActiveRun()
         Dim tempDirectory = Path.Combine(Path.GetTempPath(), "xactcopy-tests-" & Guid.NewGuid().ToString("N"))

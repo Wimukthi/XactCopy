@@ -23,6 +23,9 @@ Namespace Infrastructure
 
         Private ReadOnly _serializerOptions As JsonSerializerOptions
 
+        ''' <summary>
+        ''' Initializes a new instance.
+        ''' </summary>
         Public Sub New()
             _serializerOptions = New JsonSerializerOptions() With {
                 .WriteIndented = True
@@ -30,6 +33,9 @@ Namespace Infrastructure
             _serializerOptions.Converters.Add(New JsonStringEnumConverter())
         End Sub
 
+        ''' <summary>
+        ''' Computes GetDefaultMapPath.
+        ''' </summary>
         Public Shared Function GetDefaultMapPath(sourceRoot As String) As String
             Dim normalizedSource = NormalizePath(sourceRoot)
             Dim hash = ComputeSha256Hex(Encoding.UTF8.GetBytes(normalizedSource))
@@ -41,6 +47,9 @@ Namespace Infrastructure
             Return Path.Combine(root, $"map-{hash.Substring(0, 20)}.json")
         End Function
 
+        ''' <summary>
+        ''' Computes LoadAsync.
+        ''' </summary>
         Public Async Function LoadAsync(mapPath As String, cancellationToken As CancellationToken) As Task(Of BadRangeMap)
             If String.IsNullOrWhiteSpace(mapPath) Then
                 Return Nothing
@@ -67,6 +76,9 @@ Namespace Infrastructure
             Return Nothing
         End Function
 
+        ''' <summary>
+        ''' Computes SaveAsync.
+        ''' </summary>
         Public Async Function SaveAsync(mapPath As String, map As BadRangeMap, cancellationToken As CancellationToken) As Task
             If String.IsNullOrWhiteSpace(mapPath) Then
                 Throw New ArgumentException("Map path is required.", NameOf(mapPath))
@@ -447,16 +459,43 @@ Namespace Infrastructure
             Return map
         End Function
 
+        ''' <summary>
+        ''' Class MapSecurityContext.
+        ''' </summary>
         Private NotInheritable Class MapSecurityContext
+            ''' <summary>
+            ''' Gets or sets PathFingerprint.
+            ''' </summary>
             Public Property PathFingerprint As String = String.Empty
+            ''' <summary>
+            ''' Gets or sets HmacKey.
+            ''' </summary>
             Public Property HmacKey As Byte() = Array.Empty(Of Byte)()
         End Class
 
+        ''' <summary>
+        ''' Class BadRangeMapEnvelope.
+        ''' </summary>
         Private NotInheritable Class BadRangeMapEnvelope
+            ''' <summary>
+            ''' Gets or sets SchemaVersion.
+            ''' </summary>
             Public Property SchemaVersion As Integer = CurrentEnvelopeSchemaVersion
+            ''' <summary>
+            ''' Gets or sets SavedUtcTicks.
+            ''' </summary>
             Public Property SavedUtcTicks As Long
+            ''' <summary>
+            ''' Gets or sets PayloadSha256.
+            ''' </summary>
             Public Property PayloadSha256 As String = String.Empty
+            ''' <summary>
+            ''' Gets or sets Signature.
+            ''' </summary>
             Public Property Signature As String = String.Empty
+            ''' <summary>
+            ''' Gets or sets Payload.
+            ''' </summary>
             Public Property Payload As BadRangeMap
         End Class
     End Class

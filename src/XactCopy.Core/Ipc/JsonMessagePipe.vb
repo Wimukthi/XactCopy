@@ -1,12 +1,23 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.Core\Ipc\JsonMessagePipe.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.IO
 Imports System.Text
 Imports System.Threading
 
 Namespace Ipc
+    ''' <summary>
+    ''' Class JsonMessagePipe.
+    ''' </summary>
     Public NotInheritable Class JsonMessagePipe
         Private Sub New()
         End Sub
 
+        ''' <summary>
+        ''' Computes WriteMessageAsync.
+        ''' </summary>
         Public Shared Async Function WriteMessageAsync(
             stream As Stream,
             message As String,
@@ -20,6 +31,9 @@ Namespace Ipc
             Await stream.FlushAsync(cancellationToken).ConfigureAwait(False)
         End Function
 
+        ''' <summary>
+        ''' Computes ReadMessageAsync.
+        ''' </summary>
         Public Shared Async Function ReadMessageAsync(
             stream As Stream,
             cancellationToken As CancellationToken) As Task(Of String)

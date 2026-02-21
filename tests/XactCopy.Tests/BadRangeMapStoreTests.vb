@@ -1,3 +1,8 @@
+' -----------------------------------------------------------------------------
+' File: tests\XactCopy.Tests\BadRangeMapStoreTests.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.Collections.Generic
 Imports System.IO
 Imports System.Threading
@@ -6,7 +11,13 @@ Imports XactCopy.Infrastructure
 Imports XactCopy.Models
 Imports Xunit
 
+''' <summary>
+''' Class BadRangeMapStoreTests.
+''' </summary>
 Public Class BadRangeMapStoreTests
+    ''' <summary>
+    ''' Computes SaveAndLoadAsync_RoundTripsBadRangeMapData.
+    ''' </summary>
     <Fact>
     Public Async Function SaveAndLoadAsync_RoundTripsBadRangeMapData() As Task
         Dim store As New BadRangeMapStore()
@@ -46,6 +57,9 @@ Public Class BadRangeMapStoreTests
         End Try
     End Function
 
+    ''' <summary>
+    ''' Computes LoadAsync_UsesBackupWhenPrimarySnapshotIsTampered.
+    ''' </summary>
     <Fact>
     Public Async Function LoadAsync_UsesBackupWhenPrimarySnapshotIsTampered() As Task
         Dim store As New BadRangeMapStore()

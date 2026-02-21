@@ -1,23 +1,49 @@
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.UI\UiAppearanceManager.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.Drawing
 Imports System.Runtime.CompilerServices
 Imports System.Windows.Forms
 Imports XactCopy.Configuration
 
+''' <summary>
+''' Module UiAppearanceManager.
+''' </summary>
 Friend Module UiAppearanceManager
+    ''' <summary>
+    ''' Class FontBaseline.
+    ''' </summary>
     Private NotInheritable Class FontBaseline
+        ''' <summary>
+        ''' Initializes a new instance.
+        ''' </summary>
         Public Sub New(font As Font)
             FamilyName = If(font?.FontFamily?.Name, SystemFonts.MessageBoxFont.FontFamily.Name)
             SizeInPoints = If(font Is Nothing, SystemFonts.MessageBoxFont.SizeInPoints, font.SizeInPoints)
             Style = If(font Is Nothing, FontStyle.Regular, font.Style)
         End Sub
 
+        ''' <summary>
+        ''' Gets or sets FamilyName.
+        ''' </summary>
         Public ReadOnly Property FamilyName As String
+        ''' <summary>
+        ''' Gets or sets SizeInPoints.
+        ''' </summary>
         Public ReadOnly Property SizeInPoints As Single
+        ''' <summary>
+        ''' Gets or sets Style.
+        ''' </summary>
         Public ReadOnly Property Style As FontStyle
     End Class
 
     Private ReadOnly _fontBaselines As New ConditionalWeakTable(Of Control, FontBaseline)()
 
+    ''' <summary>
+    ''' Executes Apply.
+    ''' </summary>
     Public Sub Apply(root As Control, settings As AppSettings)
         If root Is Nothing Then
             Return
@@ -76,6 +102,9 @@ Friend Module UiAppearanceManager
         End Try
     End Sub
 
+    ''' <summary>
+    ''' Computes GetEffectiveFontScale.
+    ''' </summary>
     Public Function GetEffectiveFontScale(settings As AppSettings) As Single
         Dim safeSettings = If(settings, New AppSettings())
         Dim uiScale = Math.Max(0.9F, Math.Min(1.25F, safeSettings.UiScalePercent / 100.0F))

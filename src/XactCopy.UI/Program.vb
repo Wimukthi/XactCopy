@@ -2,6 +2,9 @@ Imports System.IO
 Imports System.Text
 Imports System.Threading
 
+''' <summary>
+''' Module Program.
+''' </summary>
 Friend Module Program
 
     Private ReadOnly CrashLogDirectory As String = Path.Combine(

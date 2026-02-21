@@ -7,6 +7,9 @@ Imports System.Threading
 Imports System.Threading.Tasks
 Imports XactCopy.Configuration
 
+''' <summary>
+''' Class UpdateForm.
+''' </summary>
 Friend Class UpdateForm
     Inherits Form
 
@@ -34,6 +37,9 @@ Friend Class UpdateForm
     Private _isApplying As Boolean
     Private _allowCloseDuringApply As Boolean
 
+    ''' <summary>
+    ''' Initializes a new instance.
+    ''' </summary>
     Public Sub New(release As UpdateReleaseInfo, currentVersion As Version, settings As AppSettings)
         If release Is Nothing Then
             Throw New ArgumentNullException(NameOf(release))

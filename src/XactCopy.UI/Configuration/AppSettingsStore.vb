@@ -8,6 +8,9 @@ Namespace Configuration
     Public NotInheritable Class AppSettingsStore
         Private ReadOnly _settingsPath As String
 
+        ''' <summary>
+        ''' Initializes a new instance.
+        ''' </summary>
         Public Sub New(Optional settingsPath As String = Nothing)
             If String.IsNullOrWhiteSpace(settingsPath) Then
                 Dim root = Path.Combine(
@@ -19,12 +22,18 @@ Namespace Configuration
             End If
         End Sub
 
+        ''' <summary>
+        ''' Gets or sets SettingsPath.
+        ''' </summary>
         Public ReadOnly Property SettingsPath As String
             Get
                 Return _settingsPath
             End Get
         End Property
 
+        ''' <summary>
+        ''' Computes Load.
+        ''' </summary>
         Public Function Load() As AppSettings
             If Not File.Exists(_settingsPath) Then
                 Return New AppSettings()
@@ -48,6 +57,9 @@ Namespace Configuration
             End Try
         End Function
 
+        ''' <summary>
+        ''' Executes Save.
+        ''' </summary>
         Public Sub Save(settings As AppSettings)
             If settings Is Nothing Then
                 Throw New ArgumentNullException(NameOf(settings))

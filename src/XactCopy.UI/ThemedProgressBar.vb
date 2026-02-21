@@ -1,10 +1,18 @@
-﻿Option Strict On
+' -----------------------------------------------------------------------------
+' File: src\XactCopy.UI\ThemedProgressBar.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
+Option Strict On
 Option Explicit On
 
 Imports System.ComponentModel
 Imports System.Drawing
 Imports System.Windows.Forms
 
+''' <summary>
+''' Class ThemedProgressBar.
+''' </summary>
 Friend Class ThemedProgressBar
     Inherits Control
 
@@ -19,6 +27,9 @@ Friend Class ThemedProgressBar
     Private _showPercentageText As Boolean = False
     Private _percentageTextColor As Color = Color.Gainsboro
 
+    ''' <summary>
+    ''' Initializes a new instance.
+    ''' </summary>
     Public Sub New()
         SetStyle(ControlStyles.UserPaint Or
                  ControlStyles.AllPaintingInWmPaint Or
@@ -31,6 +42,9 @@ Friend Class ThemedProgressBar
         ForeColor = _fillColor
     End Sub
 
+    ''' <summary>
+    ''' Gets or sets Minimum.
+    ''' </summary>
     <DefaultValue(0)>
     Public Property Minimum As Integer
         Get
@@ -53,6 +67,9 @@ Friend Class ThemedProgressBar
         End Set
     End Property
 
+    ''' <summary>
+    ''' Gets or sets Maximum.
+    ''' </summary>
     <DefaultValue(100)>
     Public Property Maximum As Integer
         Get
@@ -72,6 +89,9 @@ Friend Class ThemedProgressBar
         End Set
     End Property
 
+    ''' <summary>
+    ''' Gets or sets Value.
+    ''' </summary>
     <DefaultValue(0)>
     Public Property Value As Integer
         Get
@@ -88,6 +108,9 @@ Friend Class ThemedProgressBar
         End Set
     End Property
 
+    ''' <summary>
+    ''' Gets or sets Style.
+    ''' </summary>
     <DefaultValue(GetType(ProgressBarStyle), "Continuous")>
     Public Property Style As ProgressBarStyle
         Get
@@ -103,6 +126,9 @@ Friend Class ThemedProgressBar
         End Set
     End Property
 
+    ''' <summary>
+    ''' Gets or sets TrackColor.
+    ''' </summary>
     <DefaultValue(GetType(Color), "24, 24, 24")>
     Public Property TrackColor As Color
         Get
@@ -118,6 +144,9 @@ Friend Class ThemedProgressBar
         End Set
     End Property
 
+    ''' <summary>
+    ''' Gets or sets FillColor.
+    ''' </summary>
     <DefaultValue(GetType(Color), "90, 120, 200")>
     Public Property FillColor As Color
         Get
@@ -133,6 +162,9 @@ Friend Class ThemedProgressBar
         End Set
     End Property
 
+    ''' <summary>
+    ''' Gets or sets BorderColor.
+    ''' </summary>
     <DefaultValue(GetType(Color), "70, 70, 70")>
     Public Property BorderColor As Color
         Get
@@ -148,6 +180,9 @@ Friend Class ThemedProgressBar
         End Set
     End Property
 
+    ''' <summary>
+    ''' Gets or sets ShowBorder.
+    ''' </summary>
     <DefaultValue(False)>
     Public Property ShowBorder As Boolean
         Get
@@ -163,6 +198,9 @@ Friend Class ThemedProgressBar
         End Set
     End Property
 
+    ''' <summary>
+    ''' Gets or sets ShowPercentageText.
+    ''' </summary>
     <DefaultValue(False)>
     Public Property ShowPercentageText As Boolean
         Get
@@ -178,6 +216,9 @@ Friend Class ThemedProgressBar
         End Set
     End Property
 
+    ''' <summary>
+    ''' Gets or sets PercentageTextColor.
+    ''' </summary>
     <DefaultValue(GetType(Color), "220, 220, 220")>
     Public Property PercentageTextColor As Color
         Get

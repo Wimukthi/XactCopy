@@ -1,3 +1,8 @@
+' -----------------------------------------------------------------------------
+' File: tests\XactCopy.Tests\ResilientCopyServiceIntegrationTests.vb
+' Purpose: Source file for XactCopy runtime behavior.
+' -----------------------------------------------------------------------------
+
 Imports System.IO
 Imports System.Linq
 Imports System.Threading
@@ -7,10 +12,16 @@ Imports XactCopy.Models
 Imports XactCopy.Services
 Imports Xunit
 
+''' <summary>
+''' Class ResilientCopyServiceIntegrationTests.
+''' </summary>
 Public Class ResilientCopyServiceIntegrationTests
     Private Const DevFaultRulesEnvVar As String = "XACTCOPY_DEV_FAULT_RULES"
     Private Shared ReadOnly DevFaultEnvGate As New SemaphoreSlim(1, 1)
 
+    ''' <summary>
+    ''' Computes RunAsync_CopiesFileAndEmitsRescueTelemetry.
+    ''' </summary>
     <Fact>
     Public Async Function RunAsync_CopiesFileAndEmitsRescueTelemetry() As Task
         Dim tempRoot = Path.Combine(Path.GetTempPath(), $"xactcopy-tests-{Guid.NewGuid():N}")
@@ -61,6 +72,9 @@ Public Class ResilientCopyServiceIntegrationTests
         End Try
     End Function
 
+    ''' <summary>
+    ''' Computes RunAsync_ScanOnlyMode_CreatesBadRangeMapWithoutDestination.
+    ''' </summary>
     <Fact>
     Public Async Function RunAsync_ScanOnlyMode_CreatesBadRangeMapWithoutDestination() As Task
         Dim tempRoot = Path.Combine(Path.GetTempPath(), $"xactcopy-tests-scan-{Guid.NewGuid():N}")
@@ -108,6 +122,9 @@ Public Class ResilientCopyServiceIntegrationTests
         End Try
     End Function
 
+    ''' <summary>
+    ''' Computes RunAsync_ScanOnlyMode_UsesSmallFileFastPass.
+    ''' </summary>
     <Fact>
     Public Async Function RunAsync_ScanOnlyMode_UsesSmallFileFastPass() As Task
         Dim tempRoot = Path.Combine(Path.GetTempPath(), $"xactcopy-tests-scan-fast-{Guid.NewGuid():N}")
@@ -161,6 +178,9 @@ Public Class ResilientCopyServiceIntegrationTests
         End Try
     End Function
 
+    ''' <summary>
+    ''' Computes RunAsync_UseBadRangeMap_SkipsMappedUnreadableRangesAndSalvages.
+    ''' </summary>
     <Fact>
     Public Async Function RunAsync_UseBadRangeMap_SkipsMappedUnreadableRangesAndSalvages() As Task
         Dim tempRoot = Path.Combine(Path.GetTempPath(), $"xactcopy-tests-map-{Guid.NewGuid():N}")
@@ -237,6 +257,9 @@ Public Class ResilientCopyServiceIntegrationTests
     End Function
 
 #If DEBUG Then
+    ''' <summary>
+    ''' Computes RunAsync_DebugFaultReadRule_RecoversWithSalvage.
+    ''' </summary>
     <Fact>
     Public Async Function RunAsync_DebugFaultReadRule_RecoversWithSalvage() As Task
         Await DevFaultEnvGate.WaitAsync()
@@ -287,6 +310,9 @@ Public Class ResilientCopyServiceIntegrationTests
         End Try
     End Function
 
+    ''' <summary>
+    ''' Computes RunAsync_DebugFaultWriteRule_FailsWhenContinueDisabled.
+    ''' </summary>
     <Fact>
     Public Async Function RunAsync_DebugFaultWriteRule_FailsWhenContinueDisabled() As Task
         Await DevFaultEnvGate.WaitAsync()

@@ -9,6 +9,9 @@ Imports XactCopy.Ipc.Messages
 Imports XactCopy.Models
 
 Namespace Services
+    ''' <summary>
+    ''' Class WorkerSupervisor.
+    ''' </summary>
     Public Class WorkerSupervisor
         Implements IDisposable
 
@@ -49,18 +52,27 @@ Namespace Services
         Private _recoveryInFlight As Integer
         Private _consecutiveMalformedMessages As Integer
 
+        ''' <summary>
+        ''' Gets or sets IsJobRunning.
+        ''' </summary>
         Public ReadOnly Property IsJobRunning As Boolean
             Get
                 Return _isJobRunning
             End Get
         End Property
 
+        ''' <summary>
+        ''' Gets or sets IsJobPaused.
+        ''' </summary>
         Public ReadOnly Property IsJobPaused As Boolean
             Get
                 Return _isJobPaused
             End Get
         End Property
 
+        ''' <summary>
+        ''' Computes StartJobAsync.
+        ''' </summary>
         Public Async Function StartJobAsync(options As CopyJobOptions, cancellationToken As CancellationToken) As Task
             ThrowIfDisposed()
 
@@ -91,6 +103,9 @@ Namespace Services
             End Try
         End Function
 
+        ''' <summary>
+        ''' Computes CancelJobAsync.
+        ''' </summary>
         Public Async Function CancelJobAsync(reason As String) As Task
             ThrowIfDisposed()
 
@@ -109,6 +124,9 @@ Namespace Services
             Await TrySendCommandAsync(IpcMessageTypes.CancelJobCommand, command, CancellationToken.None).ConfigureAwait(False)
         End Function
 
+        ''' <summary>
+        ''' Computes PauseJobAsync.
+        ''' </summary>
         Public Async Function PauseJobAsync(reason As String) As Task
             ThrowIfDisposed()
 
@@ -126,6 +144,9 @@ Namespace Services
             RaiseEvent WorkerStateChanged(Me, "Job paused")
         End Function
 
+        ''' <summary>
+        ''' Computes ResumeJobAsync.
+        ''' </summary>
         Public Async Function ResumeJobAsync(reason As String) As Task
             ThrowIfDisposed()
 
@@ -143,6 +164,9 @@ Namespace Services
             RaiseEvent WorkerStateChanged(Me, "Job running")
         End Function
 
+        ''' <summary>
+        ''' Computes StopAsync.
+        ''' </summary>
         Public Async Function StopAsync() As Task
             If _isDisposed Then
                 Return
@@ -876,6 +900,9 @@ Namespace Services
             End If
         End Sub
 
+        ''' <summary>
+        ''' Executes Dispose.
+        ''' </summary>
         Public Sub Dispose() Implements IDisposable.Dispose
             StopAsync().GetAwaiter().GetResult()
             _restartLock.Dispose()
@@ -883,13 +910,25 @@ Namespace Services
             _disposeLock.Dispose()
         End Sub
 
+        ''' <summary>
+        ''' Class WorkerLaunch.
+        ''' </summary>
         Private NotInheritable Class WorkerLaunch
+            ''' <summary>
+            ''' Initializes a new instance.
+            ''' </summary>
             Public Sub New(fileName As String, arguments As String)
                 Me.FileName = If(fileName, String.Empty)
                 Me.Arguments = If(arguments, String.Empty)
             End Sub
 
+            ''' <summary>
+            ''' Gets or sets FileName.
+            ''' </summary>
             Public ReadOnly Property FileName As String
+            ''' <summary>
+            ''' Gets or sets Arguments.
+            ''' </summary>
             Public ReadOnly Property Arguments As String
         End Class
     End Class
