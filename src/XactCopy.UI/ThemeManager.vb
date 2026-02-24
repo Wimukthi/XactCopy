@@ -52,7 +52,7 @@ Friend Module ThemeManager
             richTextBox.BorderStyle = If(richTextBox.BorderStyle = BorderStyle.None, BorderStyle.None, BorderStyle.FixedSingle)
         ElseIf TypeOf control Is TextBox Then
             Dim textBox = DirectCast(control, TextBox)
-            EnsureBorderWrapper(textBox, palette)
+            RemoveBorderWrapperIfPresent(textBox)
             textBox.BackColor = palette.Field
             textBox.ForeColor = palette.Text
             textBox.BorderStyle = BorderStyle.None
@@ -159,6 +159,62 @@ Friend Module ThemeManager
         For Each child As Control In control.Controls
             ApplyToControl(child, palette, mode, settings)
         Next
+    End Sub
+
+    Private Sub RemoveBorderWrapperIfPresent(control As Control)
+        If control Is Nothing Then
+            Return
+        End If
+
+        Dim wrapper = TryCast(control.Parent, Panel)
+        If wrapper Is Nothing OrElse Not Object.Equals(wrapper.Tag, "ThemedBorder") Then
+            Return
+        End If
+
+        Dim parent = wrapper.Parent
+        If parent Is Nothing Then
+            Return
+        End If
+
+        Dim preservedMargin = wrapper.Margin
+        Dim preservedDock = wrapper.Dock
+        Dim preservedAnchor = wrapper.Anchor
+        Dim preservedLocation = wrapper.Location
+        Dim preservedSize = wrapper.Size
+        Dim preservedTabIndex = wrapper.TabIndex
+
+        wrapper.Controls.Remove(control)
+
+        control.Margin = preservedMargin
+        control.Dock = preservedDock
+        control.Anchor = preservedAnchor
+        control.Location = preservedLocation
+        control.Size = preservedSize
+        control.TabIndex = preservedTabIndex
+
+        Dim table = TryCast(parent, TableLayoutPanel)
+        If table IsNot Nothing Then
+            Dim row = table.GetRow(wrapper)
+            Dim col = table.GetColumn(wrapper)
+            Dim rowSpan = table.GetRowSpan(wrapper)
+            Dim colSpan = table.GetColumnSpan(wrapper)
+
+            table.Controls.Remove(wrapper)
+            table.Controls.Add(control, col, row)
+            If rowSpan > 1 Then
+                table.SetRowSpan(control, rowSpan)
+            End If
+            If colSpan > 1 Then
+                table.SetColumnSpan(control, colSpan)
+            End If
+        Else
+            Dim index = parent.Controls.GetChildIndex(wrapper)
+            parent.Controls.Remove(wrapper)
+            parent.Controls.Add(control)
+            parent.Controls.SetChildIndex(control, index)
+        End If
+
+        wrapper.Dispose()
     End Sub
 
     Private Sub ApplyGridPresentationSettings(grid As DataGridView, palette As ThemePalette, settings As AppSettings, baseCellStyle As DataGridViewCellStyle)

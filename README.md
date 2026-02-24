@@ -74,6 +74,7 @@ dotnet publish src/XactCopy.UI/XactCopy.UI.vbproj -c Release -r win-x64 --self-c
 
 ## Brief Version History
 
+- `v1.0.8.9` Removed gray textbox underline artifacts globally, and refined main Source/Destination row alignment with taller, cleaner path inputs.
 - `v1.0.8.5` Completed a full source/test comment pass (file headers + XML summaries) and renamed user-facing/runtime `AegisRescueCore` references to `Rescue Engine`.
 - `v1.0.8.4` Hardened supervisor recovery so orphaned/stuck workers are tracked and cleaned up, and auto-recovery aborts (instead of spawning more workers) if the previous worker cannot be terminated cleanly.
 - `v1.0.8.3` Fixed fragile-mode resume behavior so files left `InProgress` after worker stall/recovery are promoted to non-retry skip candidates instead of being re-hammered on the next restart.

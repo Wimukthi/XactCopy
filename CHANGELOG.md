@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.8.9] - 2026-02-24
+
+### Fixed
+
+- Removed dark-mode textbox underline artifacts across XactCopy by stopping themed border-panel wrapping for `TextBox` controls and safely unwrapping legacy wrappers during theme apply.
+
+### Changed
+
+- Main window source/destination path rows now use taller single-line text inputs with tightened margins so labels, textboxes, and browse buttons align cleanly.
+
 ## [1.0.8.5] - 2026-02-19
 
 ### Changed

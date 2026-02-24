@@ -26,6 +26,7 @@ Public Class MainForm
     Private Const TaskbarProgressScale As ULong = 1000UL
     Private Const ProgressRenderIntervalMs As Integer = 50
     Private Const LogRenderIntervalMs As Integer = 80
+    Private Const PathTextBoxHeight As Integer = 24
     Private Const MaxQueuedLogLines As Integer = 20000
     Private Const MaxLogLinesPerRender As Integer = 240
     Private Const DefaultMaxLogLines As Integer = 50000
@@ -654,26 +655,33 @@ Public Class MainForm
         Dim panel As New TableLayoutPanel() With {
             .Dock = DockStyle.Fill,
             .ColumnCount = 3,
-            .AutoSize = True
+            .AutoSize = True,
+            .Margin = New Padding(0)
         }
 
         panel.ColumnStyles.Add(New ColumnStyle(SizeType.AutoSize))
         panel.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100.0F))
         panel.ColumnStyles.Add(New ColumnStyle(SizeType.AutoSize))
+        panel.RowStyles.Add(New RowStyle(SizeType.AutoSize))
 
         Dim labelControl As New Label() With {
             .Text = labelText,
             .AutoSize = True,
             .Anchor = AnchorStyles.Left,
-            .Margin = New Padding(0, 8, 10, 0)
+            .TextAlign = ContentAlignment.MiddleLeft,
+            .Margin = New Padding(0, 6, 10, 0)
         }
 
-        ' Keep single-line text boxes from vertically stretching in the themed border wrapper.
+        ' Keep single-line path text boxes at a consistent, readable height.
         targetTextBox.Dock = DockStyle.None
         targetTextBox.Anchor = AnchorStyles.Left Or AnchorStyles.Right
-        targetTextBox.Margin = New Padding(0, 4, 8, 4)
+        targetTextBox.AutoSize = False
+        targetTextBox.MinimumSize = New Size(0, PathTextBoxHeight)
+        targetTextBox.Height = PathTextBoxHeight
+        targetTextBox.Margin = New Padding(0, 2, 8, 2)
+
         browseButton.Anchor = AnchorStyles.Left
-        browseButton.Margin = New Padding(0, 3, 0, 3)
+        browseButton.Margin = New Padding(0, 2, 0, 2)
 
         panel.Controls.Add(labelControl, 0, 0)
         panel.Controls.Add(targetTextBox, 1, 0)
