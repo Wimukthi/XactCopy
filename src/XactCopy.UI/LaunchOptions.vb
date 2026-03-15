@@ -44,6 +44,23 @@ Public NotInheritable Class LaunchOptions
     End Property
 
     ''' <summary>
+    ''' Creates an immutable copy of launch options for deferred processing.
+    ''' </summary>
+    Public Function Clone() As LaunchOptions
+        Dim copiedOptions As New LaunchOptions() With {
+            .IsRecoveryAutostart = IsRecoveryAutostart,
+            .ForceResumePrompt = ForceResumePrompt,
+            .ExplorerFolderPath = ExplorerFolderPath
+        }
+
+        For Each sourcePath In _explorerSourcePaths
+            copiedOptions.AddExplorerSourcePath(sourcePath)
+        Next
+
+        Return copiedOptions
+    End Function
+
+    ''' <summary>
     ''' Computes Parse.
     ''' </summary>
     Public Shared Function Parse(args As String()) As LaunchOptions

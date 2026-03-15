@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.9.5] - 2026-03-15
+
+### Added
+
+- Update package integrity verification before install:
+  - Updater now resolves and validates SHA-256 for release assets (GitHub `digest` metadata or checksum sidecar assets like `.sha256`/`checksums*.txt`).
+  - Update downloads now require HTTPS URLs.
+- Activation handoff hardening:
+  - Named-pipe activation channel now uses current-user-only server mode, bounded payload size, and argument sanitization before launch-option parsing.
+- Safe deferred Explorer launch handling:
+  - Forwarded Explorer launch requests are queued while a copy is running and applied only after the active run becomes idle.
+
+### Fixed
+
+- Worker cleanup safety under PID reuse:
+  - Supervisor now tracks worker identity (PID + start time + expected process metadata) and avoids terminating mismatched stale PIDs.
+- Settings durability:
+  - Settings writes now use atomic temp-file replace to reduce corruption risk during abrupt interruption.
+- UI responsiveness in filesystem probe paths:
+  - Media identity probing during run start moved to async/timeout-based flow.
+  - Directory existence probes now use background cached probes instead of synchronous UI-thread waits.
+
+### Changed
+
+- Startup compatibility-rendering warnings are now logged as diagnostics (`warn-*`) instead of fatal crash logs.
+
 ## [1.0.8.9] - 2026-02-24
 
 ### Fixed

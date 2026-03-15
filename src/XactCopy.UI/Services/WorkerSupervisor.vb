@@ -30,7 +30,7 @@ Namespace Services
         Private ReadOnly _sendLock As New SemaphoreSlim(1, 1)
         Private ReadOnly _disposeLock As New SemaphoreSlim(1, 1)
         Private ReadOnly _workerPidLock As New Object()
-        Private ReadOnly _launchedWorkerPids As New HashSet(Of Integer)()
+        Private ReadOnly _launchedWorkerProcesses As New Dictionary(Of Integer, TrackedWorkerProcessInfo)()
 
         Private _workerProcess As Process
         Private _pipeClient As NamedPipeClientStream
@@ -226,7 +226,7 @@ Namespace Services
                 Throw New InvalidOperationException("Failed to start worker process.")
             End If
 
-            TrackWorkerProcess(_workerProcess.Id)
+            TrackWorkerProcess(_workerProcess, launch.FileName)
             _workerProcess.EnableRaisingEvents = True
             AddHandler _workerProcess.Exited, AddressOf WorkerProcess_Exited
 
@@ -599,13 +599,36 @@ Namespace Services
             Return shutdownClean
         End Function
 
-        Private Sub TrackWorkerProcess(pid As Integer)
+        Private Sub TrackWorkerProcess(process As Process, launchFileName As String)
+            If process Is Nothing Then
+                Return
+            End If
+
+            Dim pid As Integer
+            Try
+                pid = process.Id
+            Catch
+                Return
+            End Try
+
             If pid <= 0 Then
                 Return
             End If
 
+            Dim startUtc = TryGetProcessStartUtc(process)
+            Dim expectedImagePath = NormalizeExecutablePath(launchFileName)
+            Dim expectedProcessName = If(
+                String.IsNullOrWhiteSpace(expectedImagePath),
+                String.Empty,
+                Path.GetFileNameWithoutExtension(expectedImagePath))
+
             SyncLock _workerPidLock
-                _launchedWorkerPids.Add(pid)
+                _launchedWorkerProcesses(pid) = New TrackedWorkerProcessInfo() With {
+                    .ProcessId = pid,
+                    .ExpectedStartUtc = startUtc,
+                    .ExpectedImagePath = expectedImagePath,
+                    .ExpectedProcessName = If(expectedProcessName, String.Empty)
+                }
             End SyncLock
         End Sub
 
@@ -615,24 +638,35 @@ Namespace Services
             End If
 
             SyncLock _workerPidLock
-                _launchedWorkerPids.Remove(pid)
+                _launchedWorkerProcesses.Remove(pid)
             End SyncLock
         End Sub
 
-        Private Function SnapshotTrackedWorkerPids() As List(Of Integer)
+        Private Function SnapshotTrackedWorkers() As List(Of TrackedWorkerProcessInfo)
             SyncLock _workerPidLock
-                Return _launchedWorkerPids.ToList()
+                Return _launchedWorkerProcesses.Values.
+                    Select(
+                        Function(info)
+                            Return New TrackedWorkerProcessInfo() With {
+                                .ProcessId = info.ProcessId,
+                                .ExpectedStartUtc = info.ExpectedStartUtc,
+                                .ExpectedImagePath = info.ExpectedImagePath,
+                                .ExpectedProcessName = info.ExpectedProcessName
+                            }
+                        End Function).
+                    ToList()
             End SyncLock
         End Function
 
         Private Function TryTerminateTrackedWorkers(killIfStillRunning As Boolean, skipPid As Integer) As Boolean
             Dim allTerminated = True
-            Dim trackedPids = SnapshotTrackedWorkerPids()
-            If trackedPids.Count = 0 Then
+            Dim trackedWorkers = SnapshotTrackedWorkers()
+            If trackedWorkers.Count = 0 Then
                 Return True
             End If
 
-            For Each pid In trackedPids
+            For Each trackedInfo In trackedWorkers
+                Dim pid = trackedInfo.ProcessId
                 If pid <= 0 OrElse pid = skipPid Then
                     Continue For
                 End If
@@ -649,6 +683,12 @@ Namespace Services
                     Try
                         If trackedProcess.HasExited Then
                             UntrackWorkerProcess(pid)
+                            Continue For
+                        End If
+
+                        If Not IsTrackedProcessIdentityMatch(trackedProcess, trackedInfo) Then
+                            UntrackWorkerProcess(pid)
+                            RaiseEvent LogMessage(Me, $"[Supervisor] Skipped stale PID {pid}; identity does not match tracked worker.")
                             Continue For
                         End If
 
@@ -686,6 +726,81 @@ Namespace Services
             Next
 
             Return allTerminated
+        End Function
+
+        Private Shared Function IsTrackedProcessIdentityMatch(process As Process, trackedInfo As TrackedWorkerProcessInfo) As Boolean
+            If process Is Nothing OrElse trackedInfo Is Nothing Then
+                Return False
+            End If
+
+            If process.Id <> trackedInfo.ProcessId Then
+                Return False
+            End If
+
+            If trackedInfo.ExpectedStartUtc <> DateTimeOffset.MinValue Then
+                Dim actualStartUtc = TryGetProcessStartUtc(process)
+                If actualStartUtc = DateTimeOffset.MinValue Then
+                    Return False
+                End If
+
+                Dim delta = (actualStartUtc - trackedInfo.ExpectedStartUtc).Duration()
+                If delta > TimeSpan.FromSeconds(2) Then
+                    Return False
+                End If
+            End If
+
+            If Not String.IsNullOrWhiteSpace(trackedInfo.ExpectedProcessName) Then
+                Dim actualProcessName = String.Empty
+                Try
+                    actualProcessName = process.ProcessName
+                Catch
+                    actualProcessName = String.Empty
+                End Try
+
+                If Not String.Equals(actualProcessName, trackedInfo.ExpectedProcessName, StringComparison.OrdinalIgnoreCase) Then
+                    Return False
+                End If
+            End If
+
+            If Not String.IsNullOrWhiteSpace(trackedInfo.ExpectedImagePath) Then
+                Dim actualImagePath = String.Empty
+                Try
+                    actualImagePath = NormalizeExecutablePath(process.MainModule?.FileName)
+                Catch
+                    actualImagePath = String.Empty
+                End Try
+
+                If actualImagePath.Length > 0 AndAlso
+                    Not String.Equals(actualImagePath, trackedInfo.ExpectedImagePath, StringComparison.OrdinalIgnoreCase) Then
+                    Return False
+                End If
+            End If
+
+            Return True
+        End Function
+
+        Private Shared Function TryGetProcessStartUtc(process As Process) As DateTimeOffset
+            If process Is Nothing Then
+                Return DateTimeOffset.MinValue
+            End If
+
+            Try
+                Return process.StartTime.ToUniversalTime()
+            Catch
+                Return DateTimeOffset.MinValue
+            End Try
+        End Function
+
+        Private Shared Function NormalizeExecutablePath(value As String) As String
+            If String.IsNullOrWhiteSpace(value) Then
+                Return String.Empty
+            End If
+
+            Try
+                Return Path.GetFullPath(value.Trim())
+            Catch
+                Return value.Trim()
+            End Try
         End Function
 
         Private Sub CheckForJobActivityStall(nowUtc As DateTimeOffset)
@@ -909,6 +1024,16 @@ Namespace Services
             _sendLock.Dispose()
             _disposeLock.Dispose()
         End Sub
+
+        ''' <summary>
+        ''' Tracks worker identity to prevent PID-reuse collisions during cleanup.
+        ''' </summary>
+        Private NotInheritable Class TrackedWorkerProcessInfo
+            Public Property ProcessId As Integer
+            Public Property ExpectedStartUtc As DateTimeOffset
+            Public Property ExpectedImagePath As String = String.Empty
+            Public Property ExpectedProcessName As String = String.Empty
+        End Class
 
         ''' <summary>
         ''' Class WorkerLaunch.

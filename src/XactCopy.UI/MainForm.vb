@@ -1,4 +1,5 @@
-Imports System.Diagnostics
+﻿Imports System.Diagnostics
+Imports System.Collections.Concurrent
 Imports System.IO
 Imports System.Collections.Generic
 Imports System.Linq
@@ -35,6 +36,8 @@ Public Class MainForm
     Private Const MinimumDiagnosticsRefreshIntervalMs As Integer = 100
     Private Const FileSystemProbeTimeoutMs As Integer = 350
     Private Const FileSystemProbeWarningCooldownSeconds As Integer = 10
+    Private Const DirectoryProbeCacheTtlSeconds As Integer = 8
+    Private Const MaxQueuedForwardedLaunches As Integer = 16
     Private Const ThinProgressBarHeight As Integer = 10
     Private Const StandardProgressBarHeight As Integer = 17
     Private Const ThickProgressBarHeight As Integer = 24
@@ -191,6 +194,9 @@ Public Class MainForm
     Private _logWarningColor As Color = Color.FromArgb(255, 210, 120)
     Private _logErrorColor As Color = Color.FromArgb(255, 150, 150)
     Private _logCriticalColor As Color = Color.FromArgb(255, 96, 96)
+    Private ReadOnly _queuedForwardedLaunches As New Queue(Of LaunchOptions)()
+    Private ReadOnly _directoryProbeCache As New ConcurrentDictionary(Of String, DirectoryProbeCacheEntry)(StringComparer.OrdinalIgnoreCase)
+    Private ReadOnly _directoryProbeInFlight As New ConcurrentDictionary(Of String, Byte)(StringComparer.OrdinalIgnoreCase)
 
     ''' <summary>
     ''' Initializes a new instance.
@@ -300,6 +306,7 @@ Public Class MainForm
         _sourceTextBox.Dock = DockStyle.Fill
         _destinationTextBox.Dock = DockStyle.Fill
         AddHandler _sourceTextBox.TextChanged, AddressOf SourceTextBox_TextChanged
+        AddHandler _destinationTextBox.TextChanged, AddressOf DestinationTextBox_TextChanged
 
         _browseSourceButton.Text = "Browse..."
         _browseDestinationButton.Text = "Browse..."
@@ -586,21 +593,21 @@ Public Class MainForm
         _exitMenuItem.ShortcutKeys = Keys.Alt Or Keys.F4
         _openJobManagerMenuItem.ShortcutKeys = Keys.Control Or Keys.J
         _scanBadBlocksMenuItem.ShortcutKeys = Keys.Control Or Keys.Shift Or Keys.B
-        _startMenuItem.ToolTipText = "Start a copy run with the current options."
-        _pauseMenuItem.ToolTipText = "Pause the active copy run."
-        _resumeMenuItem.ToolTipText = "Resume a paused copy run."
-        _cancelMenuItem.ToolTipText = "Cancel the active copy run."
-        _openJournalsMenuItem.ToolTipText = "Open the journal folder used for resume/recovery data."
-        _openCrashMenuItem.ToolTipText = "Open captured crash logs."
-        _exitMenuItem.ToolTipText = "Close XactCopy."
-        _scanBadBlocksMenuItem.ToolTipText = "Run a read-only bad-block scan and update the bad-range map."
-        _settingsMenuItem.ToolTipText = "Open application settings."
-        _checkUpdatesMenuItem.ToolTipText = "Check online for a newer release."
-        _saveCurrentAsJobMenuItem.ToolTipText = "Save source, destination, and options as a reusable job."
-        _openJobManagerMenuItem.ToolTipText = "Manage saved jobs, queue entries, and run history."
-        _resumeInterruptedMenuItem.ToolTipText = "Resume the last interrupted run if recovery data exists."
-        _runNextQueuedJobMenuItem.ToolTipText = "Start the next job in queue."
-        _aboutMenuItem.ToolTipText = "Show version and license information."
+        _startMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Start a copy run with the current options.")
+        _pauseMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Pause the active copy run.")
+        _resumeMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Resume a paused copy run.")
+        _cancelMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Cancel the active copy run.")
+        _openJournalsMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Open the journal folder used for resume/recovery data.")
+        _openCrashMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Open captured crash logs.")
+        _exitMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Close XactCopy.")
+        _scanBadBlocksMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Run a read-only bad-block scan and update the bad-range map.")
+        _settingsMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Open application settings.")
+        _checkUpdatesMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Check online for a newer release.")
+        _saveCurrentAsJobMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Save source, destination, and options as a reusable job.")
+        _openJobManagerMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Manage saved jobs, queue entries, and run history.")
+        _resumeInterruptedMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Resume the last interrupted run if recovery data exists.")
+        _runNextQueuedJobMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Start the next job in queue.")
+        _aboutMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Show version and license information.")
 
         AddHandler _startMenuItem.Click, AddressOf StartMenuItem_Click
         AddHandler _pauseMenuItem.Click, AddressOf PauseMenuItem_Click
@@ -745,47 +752,53 @@ Public Class MainForm
     End Function
 
     Private Sub ConfigureToolTips()
-        _toolTip.SetToolTip(_sourceTextBox, "Source folder to copy from.")
-        _toolTip.SetToolTip(_destinationTextBox, "Destination folder to copy into.")
-        _toolTip.SetToolTip(_browseSourceButton, "Browse and select the source folder.")
-        _toolTip.SetToolTip(_browseDestinationButton, "Browse and select the destination folder.")
+        SetDetailedToolTip(_sourceTextBox, "Source folder to copy from.")
+        SetDetailedToolTip(_destinationTextBox, "Destination folder to copy into.")
+        SetDetailedToolTip(_browseSourceButton, "Browse and select the source folder.")
+        SetDetailedToolTip(_browseDestinationButton, "Browse and select the destination folder.")
 
-        _toolTip.SetToolTip(_resumeCheckBox, "Use journal data to resume partially copied files.")
-        _toolTip.SetToolTip(_salvageCheckBox, "Attempt to recover unreadable source regions using the configured fill pattern.")
-        _toolTip.SetToolTip(_continueCheckBox, "Continue with remaining files when a file copy fails.")
-        _toolTip.SetToolTip(_verifyCheckBox, "Verify copied output after each file.")
-        _toolTip.SetToolTip(_adaptiveBufferCheckBox, "Dynamically adjust transfer buffer size by file profile and I/O behavior.")
-        _toolTip.SetToolTip(_useBadRangeMapCheckBox, "Use saved unreadable-range map metadata for this source when available.")
-        _toolTip.SetToolTip(_skipKnownBadRangesCheckBox, "Skip read attempts for ranges already known unreadable in the bad-range map.")
-        _toolTip.SetToolTip(_waitForMediaCheckBox, "Wait indefinitely if source or destination becomes unavailable.")
-        _toolTip.SetToolTip(_fragileModeCheckBox, "Fragile-drive profile: conservative read behavior, immediate file skip on first read error, and failure circuit-breaker cooldown.")
+        SetDetailedToolTip(_resumeCheckBox, "Use journal data to resume partially copied files.")
+        SetDetailedToolTip(_salvageCheckBox, "Attempt to recover unreadable source regions using the configured fill pattern.")
+        SetDetailedToolTip(_continueCheckBox, "Continue with remaining files when a file copy fails.")
+        SetDetailedToolTip(_verifyCheckBox, "Verify copied output after each file.")
+        SetDetailedToolTip(_adaptiveBufferCheckBox, "Dynamically adjust transfer buffer size by file profile and I/O behavior.")
+        SetDetailedToolTip(_useBadRangeMapCheckBox, "Use saved unreadable-range map metadata for this source when available.")
+        SetDetailedToolTip(_skipKnownBadRangesCheckBox, "Skip read attempts for ranges already known unreadable in the bad-range map.")
+        SetDetailedToolTip(_waitForMediaCheckBox, "Wait indefinitely if source or destination becomes unavailable.")
+        SetDetailedToolTip(_fragileModeCheckBox, "Fragile-drive profile: conservative read behavior, immediate file skip on first read error, and failure circuit-breaker cooldown.")
 
-        _toolTip.SetToolTip(_bufferMbNumeric, "Maximum transfer buffer in MB (1-256).")
-        _toolTip.SetToolTip(_retriesNumeric, "Retry attempts per read/write error (0-1000).")
-        _toolTip.SetToolTip(_timeoutSecondsNumeric, "I/O timeout per operation in seconds (1-3600).")
+        SetDetailedToolTip(_bufferMbNumeric, "Maximum transfer buffer in MB (1-256).")
+        SetDetailedToolTip(_retriesNumeric, "Retry attempts per read/write error (0-1000).")
+        SetDetailedToolTip(_timeoutSecondsNumeric, "I/O timeout per operation in seconds (1-3600).")
 
-        _toolTip.SetToolTip(_startButton, "Start copying with current options.")
-        _toolTip.SetToolTip(_scanBadBlocksButton, "Run a read-only bad-block scan and update the bad-range map.")
-        _toolTip.SetToolTip(_pauseButton, "Pause the active copy run.")
-        _toolTip.SetToolTip(_resumeButton, "Resume a paused copy run.")
-        _toolTip.SetToolTip(_cancelButton, "Cancel the active copy run.")
+        SetDetailedToolTip(_startButton, "Start copying with current options.")
+        SetDetailedToolTip(_scanBadBlocksButton, "Run a read-only bad-block scan and update the bad-range map.")
+        SetDetailedToolTip(_pauseButton, "Pause the active copy run.")
+        SetDetailedToolTip(_resumeButton, "Resume a paused copy run.")
+        SetDetailedToolTip(_cancelButton, "Cancel the active copy run.")
 
-        _toolTip.SetToolTip(_overallProgressBar, "Overall run progress.")
-        _toolTip.SetToolTip(_currentProgressBar, "Progress of the current file.")
-        _toolTip.SetToolTip(_jobSummaryLabel, "Current run state.")
-        _toolTip.SetToolTip(_overallStatsLabel, "File counters for completed, failed, recovered, and skipped files.")
-        _toolTip.SetToolTip(_currentFileLabel, "Currently processed file path.")
-        _toolTip.SetToolTip(_bytesLabel, "Transferred bytes versus total bytes.")
-        _toolTip.SetToolTip(_throughputLabel, "Instantaneous and smoothed transfer speed.")
-        _toolTip.SetToolTip(_etaLabel, "Estimated remaining time based on current average speed.")
-        _toolTip.SetToolTip(_bufferUsageLabel, "Recent and average buffer utilization.")
-        _toolTip.SetToolTip(_rescueTelemetryLabel, "Rescue Engine pass status, unreadable region count, and remaining unrecovered bytes.")
-        _toolTip.SetToolTip(_diagnosticsLabel, "UI diagnostics: render latency, event counts, queue depth, and dropped/suppressed logs.")
-        _toolTip.SetToolTip(_journalLabel, "Active journal file used for resume/recovery.")
-        _toolTip.SetToolTip(_logListView, "Operations log")
+        SetDetailedToolTip(_overallProgressBar, "Overall run progress.")
+        SetDetailedToolTip(_currentProgressBar, "Progress of the current file.")
+        SetDetailedToolTip(_jobSummaryLabel, "Current run state.")
+        SetDetailedToolTip(_overallStatsLabel, "File counters for completed, failed, recovered, and skipped files.")
+        SetDetailedToolTip(_currentFileLabel, "Currently processed file path.")
+        SetDetailedToolTip(_bytesLabel, "Transferred bytes versus total bytes.")
+        SetDetailedToolTip(_throughputLabel, "Instantaneous and smoothed transfer speed.")
+        SetDetailedToolTip(_etaLabel, "Estimated remaining time based on current average speed.")
+        SetDetailedToolTip(_bufferUsageLabel, "Recent and average buffer utilization.")
+        SetDetailedToolTip(_rescueTelemetryLabel, "Rescue Engine pass status, unreadable region count, and remaining unrecovered bytes.")
+        SetDetailedToolTip(_diagnosticsLabel, "UI diagnostics: render latency, event counts, queue depth, and dropped/suppressed logs.")
+        SetDetailedToolTip(_journalLabel, "Active journal file used for resume/recovery.")
+        SetDetailedToolTip(_logListView, "Operations log")
+    End Sub
+
+    Private Sub SetDetailedToolTip(control As Control, description As String)
+        _toolTip.SetToolTip(control, TooltipScenarioFormatter.Compose(description))
     End Sub
 
     Private Sub SourceTextBox_TextChanged(sender As Object, e As EventArgs)
+        QueueDirectoryProbeFromText(_sourceTextBox.Text)
+
         If _suspendSourceTextChanged Then
             Return
         End If
@@ -803,6 +816,10 @@ Public Class MainForm
         If Not String.Equals(normalizedSource, _explorerSelectionSourceRoot, StringComparison.OrdinalIgnoreCase) Then
             ClearExplorerSelectionContext(announce:=False)
         End If
+    End Sub
+
+    Private Sub DestinationTextBox_TextChanged(sender As Object, e As EventArgs)
+        QueueDirectoryProbeFromText(_destinationTextBox.Text)
     End Sub
 
     Private Sub BadRangeMapOptionCheckBox_CheckedChanged(sender As Object, e As EventArgs)
@@ -1280,6 +1297,82 @@ Public Class MainForm
         End If
     End Sub
 
+    Public Sub HandleForwardedLaunch(options As LaunchOptions)
+        Dim safeOptions = If(options, New LaunchOptions())
+
+        BringMainWindowToFront()
+        AppendLog("Received launch request from an existing-instance handoff.")
+
+        If _isRunning AndAlso HasExplorerLaunchPayload(safeOptions) Then
+            QueueForwardedLaunchRequest(safeOptions.Clone())
+            AppendLog("Copy is running. Explorer launch request queued and will apply after completion.")
+            Return
+        End If
+
+        Dim explorerSourceApplied = ApplyExplorerLaunchOptions(safeOptions)
+        If explorerSourceApplied Then
+            PromptForDestinationFromExplorerLaunch()
+        End If
+
+        If safeOptions.IsRecoveryAutostart Then
+            AppendLog("Forwarded launch includes recovery-autostart flag.")
+        End If
+
+        If safeOptions.ForceResumePrompt Then
+            Dim ignoredTask = ResumeInterruptedRunAsync()
+        End If
+    End Sub
+
+    Private Shared Function HasExplorerLaunchPayload(options As LaunchOptions) As Boolean
+        If options Is Nothing Then
+            Return False
+        End If
+
+        If Not String.IsNullOrWhiteSpace(options.ExplorerFolderPath) Then
+            Return True
+        End If
+
+        Return options.ExplorerSourcePaths IsNot Nothing AndAlso options.ExplorerSourcePaths.Count > 0
+    End Function
+
+    Private Sub QueueForwardedLaunchRequest(options As LaunchOptions)
+        If options Is Nothing Then
+            Return
+        End If
+
+        If _queuedForwardedLaunches.Count >= MaxQueuedForwardedLaunches Then
+            _queuedForwardedLaunches.Dequeue()
+            AppendLog("Forwarded launch queue is full. Dropped oldest request.")
+        End If
+
+        _queuedForwardedLaunches.Enqueue(options)
+    End Sub
+
+    Private Function ApplyQueuedForwardedLaunchIfIdle() As Boolean
+        If _isRunning OrElse _queuedForwardedLaunches.Count = 0 Then
+            Return False
+        End If
+
+        Dim queued = _queuedForwardedLaunches.Dequeue()
+        AppendLog("Applying queued Explorer launch request.")
+        HandleForwardedLaunch(queued)
+        Return True
+    End Function
+
+    Private Sub BringMainWindowToFront()
+        If IsDisposed Then
+            Return
+        End If
+
+        If WindowState = FormWindowState.Minimized Then
+            WindowState = FormWindowState.Normal
+        End If
+
+        Show()
+        BringToFront()
+        Activate()
+    End Sub
+
     Private Async Function CheckForUpdatesAsync(showUpToDateDialog As Boolean) As Task
         If _isCheckingUpdates Then
             Return
@@ -1421,14 +1514,18 @@ Public Class MainForm
     End Sub
 
     Private Function ApplyExplorerLaunchOptions() As Boolean
-        If _launchOptions Is Nothing Then
+        Return ApplyExplorerLaunchOptions(_launchOptions)
+    End Function
+
+    Private Function ApplyExplorerLaunchOptions(options As LaunchOptions) As Boolean
+        If options Is Nothing Then
             Return False
         End If
 
-        If Not String.IsNullOrWhiteSpace(_launchOptions.ExplorerFolderPath) Then
+        If Not String.IsNullOrWhiteSpace(options.ExplorerFolderPath) Then
             Dim resolvedFolder As String = String.Empty
-            If Not TryResolveExplorerPath(_launchOptions.ExplorerFolderPath, resolvedFolder) Then
-                AppendLog($"Explorer folder path is invalid: {_launchOptions.ExplorerFolderPath}")
+            If Not TryResolveExplorerPath(options.ExplorerFolderPath, resolvedFolder) Then
+                AppendLog($"Explorer folder path is invalid: {options.ExplorerFolderPath}")
                 Return False
             End If
 
@@ -1440,12 +1537,12 @@ Public Class MainForm
             Return ApplyExplorerSourceFolder(resolvedFolder, "Explorer background folder")
         End If
 
-        If _launchOptions.ExplorerSourcePaths Is Nothing OrElse _launchOptions.ExplorerSourcePaths.Count = 0 Then
+        If options.ExplorerSourcePaths Is Nothing OrElse options.ExplorerSourcePaths.Count = 0 Then
             Return False
         End If
 
         Dim resolvedSelections As New List(Of String)()
-        For Each rawPath In _launchOptions.ExplorerSourcePaths
+        For Each rawPath In options.ExplorerSourcePaths
             Dim resolvedPath As String = String.Empty
             If Not TryResolveExplorerPath(rawPath, resolvedPath) Then
                 AppendLog($"Explorer selected an invalid path: {rawPath}")
@@ -1943,7 +2040,7 @@ Public Class MainForm
         End If
         normalizedOptions = resolvedOptions
 
-        AttachMediaIdentityExpectations(normalizedOptions)
+        Await AttachMediaIdentityExpectationsAsync(normalizedOptions)
 
         If run Is Nothing Then
             run = _jobManager.CreateAdHocRun(normalizedOptions, "Manual Copy", "manual")
@@ -2246,7 +2343,7 @@ Public Class MainForm
         Return NormalizeAndValidateOptions(candidate, showDialogs:=True)
     End Function
 
-    Private Sub AttachMediaIdentityExpectations(options As CopyJobOptions)
+    Private Async Function AttachMediaIdentityExpectationsAsync(options As CopyJobOptions) As Task
         If options Is Nothing Then
             Return
         End If
@@ -2254,7 +2351,7 @@ Public Class MainForm
         Dim scanOnly = options.OperationMode = JobOperationMode.ScanOnly
 
         If String.IsNullOrWhiteSpace(options.ExpectedSourceIdentity) Then
-            Dim sourceIdentity = ResolveMediaIdentityWithTimeout(options.SourceRoot)
+            Dim sourceIdentity = Await ResolveMediaIdentityWithTimeoutAsync(options.SourceRoot)
             If sourceIdentity.Length > 0 Then
                 options.ExpectedSourceIdentity = sourceIdentity
                 AppendLog("Source media identity guard armed for this run.")
@@ -2264,7 +2361,7 @@ Public Class MainForm
         End If
 
         If Not scanOnly AndAlso String.IsNullOrWhiteSpace(options.ExpectedDestinationIdentity) Then
-            Dim destinationIdentity = ResolveMediaIdentityWithTimeout(options.DestinationRoot)
+            Dim destinationIdentity = Await ResolveMediaIdentityWithTimeoutAsync(options.DestinationRoot)
             If destinationIdentity.Length > 0 Then
                 options.ExpectedDestinationIdentity = destinationIdentity
                 AppendLog("Destination media identity guard armed for this run.")
@@ -2272,16 +2369,17 @@ Public Class MainForm
                 AppendLog("Destination media identity guard unavailable for this run (path offline or probe timeout).")
             End If
         End If
-    End Sub
+    End Function
 
-    Private Function ResolveMediaIdentityWithTimeout(path As String) As String
+    Private Async Function ResolveMediaIdentityWithTimeoutAsync(path As String) As Task(Of String)
         If String.IsNullOrWhiteSpace(path) Then
             Return String.Empty
         End If
 
         Dim probeTask = Task.Run(Function() ResolveMediaIdentity(path))
         Try
-            If probeTask.Wait(FileSystemProbeTimeoutMs) Then
+            Dim completed = Await Task.WhenAny(probeTask, Task.Delay(FileSystemProbeTimeoutMs)).ConfigureAwait(True)
+            If completed Is probeTask Then
                 Return If(probeTask.Result, String.Empty)
             End If
         Catch
@@ -2506,7 +2604,7 @@ Public Class MainForm
     Private Sub SetActiveSalvageFillPattern(pattern As SalvageFillPattern)
         _activeSalvageFillPattern = pattern
         _salvageCheckBox.Text = $"Salvage unreadable blocks ({DescribeSalvageFillPattern(pattern)})"
-        _toolTip.SetToolTip(_salvageCheckBox, GetSalvageFillPatternTooltip(pattern))
+        SetDetailedToolTip(_salvageCheckBox, GetSalvageFillPatternTooltip(pattern))
     End Sub
 
     Private Shared Function DescribeSalvageFillPattern(pattern As SalvageFillPattern) As String
@@ -2816,26 +2914,73 @@ Public Class MainForm
             Return True
         End If
 
-        Dim probeTask = Task.Run(
-            Function()
-                Try
-                    Return Directory.Exists(path)
-                Catch
-                    Return False
-                End Try
-            End Function)
-
-        Try
-            If probeTask.Wait(FileSystemProbeTimeoutMs) Then
-                exists = probeTask.Result
+        Dim probePath = NormalizeProbePath(path)
+        Dim cachedEntry As DirectoryProbeCacheEntry = Nothing
+        If _directoryProbeCache.TryGetValue(probePath, cachedEntry) AndAlso cachedEntry IsNot Nothing Then
+            Dim ageSeconds = (DateTimeOffset.UtcNow - cachedEntry.CapturedUtc).TotalSeconds
+            If ageSeconds <= DirectoryProbeCacheTtlSeconds Then
+                exists = cachedEntry.Exists
                 Return True
             End If
-        Catch
-            exists = False
-            Return True
-        End Try
+        End If
 
+        QueueDirectoryProbe(probePath)
         Return False
+    End Function
+
+    Private Sub QueueDirectoryProbeFromText(pathText As String)
+        Dim probePath = NormalizeProbePath(pathText)
+        If probePath.Length = 0 Then
+            Return
+        End If
+
+        QueueDirectoryProbe(probePath)
+    End Sub
+
+    Private Sub QueueDirectoryProbe(path As String)
+        If String.IsNullOrWhiteSpace(path) Then
+            Return
+        End If
+
+        If Not _directoryProbeInFlight.TryAdd(path, 0) Then
+            Return
+        End If
+
+        Dim probeTask = Task.Run(
+            Sub()
+                Dim probeExists As Boolean
+                Try
+                    probeExists = Directory.Exists(path)
+                Catch
+                    probeExists = False
+                End Try
+
+                _directoryProbeCache(path) = New DirectoryProbeCacheEntry() With {
+                    .Exists = probeExists,
+                    .CapturedUtc = DateTimeOffset.UtcNow
+                }
+
+                Dim ignored As Byte
+                _directoryProbeInFlight.TryRemove(path, ignored)
+            End Sub)
+        Dim ignoredTask = probeTask
+    End Sub
+
+    Private Shared Function NormalizeProbePath(path As String) As String
+        If String.IsNullOrWhiteSpace(path) Then
+            Return String.Empty
+        End If
+
+        Dim trimmed = path.Trim()
+        If trimmed.Length = 0 Then
+            Return String.Empty
+        End If
+
+        Try
+            Return NormalizeFullPathPreservingRoot(trimmed)
+        Catch
+            Return trimmed
+        End Try
     End Function
 
     Private Sub EmitFileSystemProbeWarning(message As String)
@@ -3148,7 +3293,12 @@ Public Class MainForm
         RefreshDiagnosticsLabel(force:=True)
 
         Dim remapPromptQueued = QueueRemapResumePromptIfNeeded(completedRun, completedOptions, result)
+        Dim forwardedLaunchApplied = False
         If Not remapPromptQueued Then
+            forwardedLaunchApplied = ApplyQueuedForwardedLaunchIfIdle()
+        End If
+
+        If Not remapPromptQueued AndAlso Not forwardedLaunchApplied Then
             QueueAutoQueuedRun()
         End If
     End Sub
@@ -3346,6 +3496,10 @@ Public Class MainForm
             BeginInvoke(New MethodInvoker(
                 Async Sub()
                     Try
+                        If ApplyQueuedForwardedLaunchIfIdle() Then
+                            Return
+                        End If
+
                         Await RunNextQueuedJobAsync(manualTrigger:=False)
                     Catch ex As Exception
                         AppendLog($"Auto-queue dispatch failed: {ex.Message}")
@@ -4055,6 +4209,11 @@ Public Class MainForm
         Return $"{size:0.##} {units(unitIndex)}"
     End Function
 
+    Private NotInheritable Class DirectoryProbeCacheEntry
+        Public Property Exists As Boolean
+        Public Property CapturedUtc As DateTimeOffset
+    End Class
+
     ''' <summary>
     ''' Enum LogSeverityLevel.
     ''' </summary>
@@ -4080,5 +4239,6 @@ Public Class MainForm
         Public Property Severity As LogSeverityLevel = LogSeverityLevel.Info
     End Class
 End Class
+
 
 

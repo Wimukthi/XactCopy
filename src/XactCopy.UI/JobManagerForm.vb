@@ -1,4 +1,4 @@
-Imports System.Diagnostics
+﻿Imports System.Diagnostics
 Imports System.Drawing
 Imports System.IO
 Imports System.Linq
@@ -441,23 +441,27 @@ Friend Class JobManagerForm
     End Sub
 
     Private Sub ConfigureToolTips()
-        _toolTip.SetToolTip(_summaryLabel, "Live counts for saved jobs, queue entries, and run history entries.")
-        _toolTip.SetToolTip(_viewComboBox, "Choose which records are shown in the grid.")
-        _toolTip.SetToolTip(_statusComboBox, "Optional run-status filter when viewing run history.")
-        _toolTip.SetToolTip(_searchTextBox, "Filter grid rows by job name, paths, trigger, or summary text.")
-        _toolTip.SetToolTip(_refreshButton, "Reload records from disk.")
+        SetDetailedToolTip(_summaryLabel, "Live counts for saved jobs, queue entries, and run history entries.")
+        SetDetailedToolTip(_viewComboBox, "Choose which records are shown in the grid.")
+        SetDetailedToolTip(_statusComboBox, "Optional run-status filter when viewing run history.")
+        SetDetailedToolTip(_searchTextBox, "Filter grid rows by job name, paths, trigger, or summary text.")
+        SetDetailedToolTip(_refreshButton, "Reload records from disk.")
 
-        _toolTip.SetToolTip(_runNowButton, "Run the selected saved job now, or run a selected queue entry immediately.")
-        _toolTip.SetToolTip(_queueButton, "Queue the selected saved job.")
-        _toolTip.SetToolTip(_removeQueueButton, "Remove selected queue entry.")
-        _toolTip.SetToolTip(_moveQueueUpButton, "Move selected queue entry one position up.")
-        _toolTip.SetToolTip(_moveQueueDownButton, "Move selected queue entry one position down.")
-        _toolTip.SetToolTip(_deleteJobButton, "Delete selected saved job.")
-        _toolTip.SetToolTip(_deleteRunButton, "Delete selected run history entry.")
-        _toolTip.SetToolTip(_openJournalButton, "Open the journal file for the selected run.")
-        _toolTip.SetToolTip(_clearQueueButton, "Clear all queued entries.")
-        _toolTip.SetToolTip(_clearHistoryButton, "Clear all run-history entries.")
-        _toolTip.SetToolTip(_detailsTextBox, "Detailed metadata for the currently selected row.")
+        SetDetailedToolTip(_runNowButton, "Run the selected saved job now, or run a selected queue entry immediately.")
+        SetDetailedToolTip(_queueButton, "Queue the selected saved job.")
+        SetDetailedToolTip(_removeQueueButton, "Remove selected queue entry.")
+        SetDetailedToolTip(_moveQueueUpButton, "Move selected queue entry one position up.")
+        SetDetailedToolTip(_moveQueueDownButton, "Move selected queue entry one position down.")
+        SetDetailedToolTip(_deleteJobButton, "Delete selected saved job.")
+        SetDetailedToolTip(_deleteRunButton, "Delete selected run history entry.")
+        SetDetailedToolTip(_openJournalButton, "Open the journal file for the selected run.")
+        SetDetailedToolTip(_clearQueueButton, "Clear all queued entries.")
+        SetDetailedToolTip(_clearHistoryButton, "Clear all run-history entries.")
+        SetDetailedToolTip(_detailsTextBox, "Detailed metadata for the currently selected row.")
+    End Sub
+
+    Private Sub SetDetailedToolTip(control As Control, description As String)
+        _toolTip.SetToolTip(control, TooltipScenarioFormatter.Compose(description))
     End Sub
 
     Private Sub JobManagerForm_Shown(sender As Object, e As EventArgs)
@@ -1387,3 +1391,4 @@ Friend Class JobManagerForm
         End Function
     End Class
 End Class
+

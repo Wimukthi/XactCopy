@@ -1,4 +1,4 @@
-Imports System.Drawing
+﻿Imports System.Drawing
 Imports System.IO
 Imports System.Runtime.InteropServices
 
@@ -129,11 +129,15 @@ Friend Class AboutForm
     End Sub
 
     Private Sub ConfigureToolTips()
-        _toolTip.SetToolTip(_closeButton, "Close the About window.")
-        _toolTip.SetToolTip(_licenseRichTextBox, "License and system snapshot information.")
-        _toolTip.SetToolTip(_detailsTextBox, "Author and project details.")
-        _toolTip.SetToolTip(_versionOverlayLabel, "Current application version.")
-        _toolTip.SetToolTip(_logoPictureBox, "XactCopy logo.")
+        SetDetailedToolTip(_closeButton, "Close the About window.")
+        SetDetailedToolTip(_licenseRichTextBox, "License and system snapshot information.")
+        SetDetailedToolTip(_detailsTextBox, "Author and project details.")
+        SetDetailedToolTip(_versionOverlayLabel, "Current application version.")
+        SetDetailedToolTip(_logoPictureBox, "XactCopy logo.")
+    End Sub
+
+    Private Sub SetDetailedToolTip(control As Control, description As String)
+        _toolTip.SetToolTip(control, TooltipScenarioFormatter.Compose(description))
     End Sub
 
     Private Sub PopulateContent()
@@ -201,3 +205,4 @@ Friend Class AboutForm
         End Try
     End Sub
 End Class
+

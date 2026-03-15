@@ -275,6 +275,19 @@ Friend Class UpdateForm
                 Return
             End If
 
+            _statusLabel.Text = "Verifying package integrity..."
+            Dim expectedSha256 = Await UpdateService.ResolveAssetSha256Async(_settings, _release, _asset, _cancellation.Token)
+            If String.IsNullOrWhiteSpace(expectedSha256) Then
+                Throw New InvalidOperationException(
+                    "Update package checksum is unavailable for this release. Publish a SHA-256 digest (asset digest or .sha256 sidecar) before installing.")
+            End If
+
+            Dim actualSha256 = Await UpdateService.ComputeFileSha256Async(_downloadPath, _cancellation.Token)
+            If Not String.Equals(expectedSha256, actualSha256, StringComparison.OrdinalIgnoreCase) Then
+                Throw New InvalidOperationException(
+                    $"Update package integrity check failed (expected {expectedSha256}, got {actualSha256}).")
+            End If
+
             _isDownloading = False
             _isApplying = True
             _closeButton.Enabled = False

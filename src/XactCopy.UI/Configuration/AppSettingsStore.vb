@@ -1,4 +1,5 @@
 Imports System.IO
+Imports System.Text
 Imports System.Text.Json
 
 Namespace Configuration
@@ -75,7 +76,21 @@ Namespace Configuration
                 .WriteIndented = True
             }
             Dim json = JsonSerializer.Serialize(normalized, options)
-            File.WriteAllText(_settingsPath, json)
+
+            Dim tempPath = $"{_settingsPath}.tmp.{Guid.NewGuid():N}"
+            Try
+                File.WriteAllText(tempPath, json, Encoding.UTF8)
+                File.Move(tempPath, _settingsPath, overwrite:=True)
+            Catch
+                If File.Exists(tempPath) Then
+                    Try
+                        File.Delete(tempPath)
+                    Catch
+                    End Try
+                End If
+
+                Throw
+            End Try
         End Sub
 
         Private Shared Function Normalize(settings As AppSettings) As AppSettings

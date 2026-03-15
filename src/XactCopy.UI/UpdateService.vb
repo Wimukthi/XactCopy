@@ -4,7 +4,9 @@
 ' -----------------------------------------------------------------------------
 
 Imports System.Collections.Generic
+Imports System.Linq
 Imports System.Net.Http
+Imports System.Security.Cryptography
 Imports System.Text.Json
 Imports System.Threading
 Imports System.Threading.Tasks
@@ -29,6 +31,10 @@ Friend Class UpdateAssetInfo
     ''' Gets or sets Size.
     ''' </summary>
     Public Property Size As Long
+    ''' <summary>
+    ''' Gets or sets ExpectedSha256Hex.
+    ''' </summary>
+    Public Property ExpectedSha256Hex As String = String.Empty
 End Class
 
 ''' <summary>
@@ -145,12 +151,14 @@ Friend Module UpdateService
                             Dim name As String = GetJsonString(entry, "name")
                             Dim downloadUrl As String = GetJsonString(entry, "browser_download_url")
                             Dim size As Long = GetJsonLong(entry, "size")
+                            Dim digest As String = GetJsonString(entry, "digest")
 
                             If Not String.IsNullOrWhiteSpace(name) AndAlso Not String.IsNullOrWhiteSpace(downloadUrl) Then
                                 assets.Add(New UpdateAssetInfo() With {
                                     .Name = name,
                                     .DownloadUrl = downloadUrl,
-                                    .Size = size
+                                    .Size = size,
+                                    .ExpectedSha256Hex = ParseSha256HexCandidate(digest)
                                 })
                             End If
                         Next
@@ -235,6 +243,12 @@ Friend Module UpdateService
             Throw New ArgumentException("Destination path must be provided.", NameOf(destinationPath))
         End If
 
+        Dim downloadUri As Uri = Nothing
+        If Not Uri.TryCreate(asset.DownloadUrl, UriKind.Absolute, downloadUri) OrElse
+            Not String.Equals(downloadUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) Then
+            Throw New InvalidOperationException("Update download URL must use HTTPS.")
+        End If
+
         Dim destinationDirectory = Path.GetDirectoryName(destinationPath)
         If Not String.IsNullOrWhiteSpace(destinationDirectory) Then
             Directory.CreateDirectory(destinationDirectory)
@@ -281,6 +295,98 @@ Friend Module UpdateService
                     Dim speed = If(elapsed.TotalSeconds > 0, totalRead / elapsed.TotalSeconds, 0.0R)
                     progress.Report(New DownloadProgressInfo(totalRead, totalBytes, speed, elapsed))
                 End If
+            End Using
+        End Using
+    End Function
+
+    ''' <summary>
+    ''' Resolves SHA-256 checksum for a selected release asset. Uses direct digest metadata first,
+    ''' then optional checksum sidecar assets from the same release.
+    ''' </summary>
+    Public Async Function ResolveAssetSha256Async(
+        settings As AppSettings,
+        release As UpdateReleaseInfo,
+        asset As UpdateAssetInfo,
+        cancellationToken As CancellationToken) As Task(Of String)
+
+        If settings Is Nothing Then
+            Throw New ArgumentNullException(NameOf(settings))
+        End If
+
+        If release Is Nothing Then
+            Throw New ArgumentNullException(NameOf(release))
+        End If
+
+        If asset Is Nothing Then
+            Throw New ArgumentNullException(NameOf(asset))
+        End If
+
+        Dim direct = ParseSha256HexCandidate(asset.ExpectedSha256Hex)
+        If direct.Length > 0 Then
+            asset.ExpectedSha256Hex = direct
+            Return direct
+        End If
+
+        If release.Assets Is Nothing OrElse release.Assets.Count = 0 Then
+            Return String.Empty
+        End If
+
+        Dim checksumAssets = release.Assets.
+            Where(Function(candidate) candidate IsNot Nothing AndAlso
+                Not String.IsNullOrWhiteSpace(candidate.DownloadUrl) AndAlso
+                IsChecksumAssetName(candidate.Name)).
+            OrderByDescending(Function(candidate) ScoreChecksumAssetName(candidate.Name, asset.Name)).
+            ToList()
+
+        For Each checksumAsset In checksumAssets
+            cancellationToken.ThrowIfCancellationRequested()
+            Try
+                Dim checksumText = Await DownloadTextAssetAsync(settings, checksumAsset.DownloadUrl, cancellationToken).ConfigureAwait(False)
+                Dim parsed = ParseSha256FromChecksumText(checksumText, asset.Name)
+                If parsed.Length = 0 Then
+                    Continue For
+                End If
+
+                asset.ExpectedSha256Hex = parsed
+                Return parsed
+            Catch ex As OperationCanceledException
+                Throw
+            Catch
+                ' Ignore sidecar parse/download errors and continue with other candidates.
+            End Try
+        Next
+
+        Return String.Empty
+    End Function
+
+    ''' <summary>
+    ''' Computes SHA-256 over a local package file.
+    ''' </summary>
+    Public Async Function ComputeFileSha256Async(filePath As String, cancellationToken As CancellationToken) As Task(Of String)
+        If String.IsNullOrWhiteSpace(filePath) OrElse Not File.Exists(filePath) Then
+            Throw New FileNotFoundException("Package file was not found.", filePath)
+        End If
+
+        Using stream As New FileStream(
+            filePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            bufferSize:=131072,
+            options:=FileOptions.Asynchronous Or FileOptions.SequentialScan)
+
+            Using hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256)
+                Dim buffer(131071) As Byte
+                Do
+                    Dim read = Await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken).ConfigureAwait(False)
+                    If read <= 0 Then
+                        Exit Do
+                    End If
+
+                    hash.AppendData(buffer, 0, read)
+                Loop
+
+                Return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant()
             End Using
         End Using
     End Function
@@ -371,6 +477,171 @@ Friend Module UpdateService
         End If
 
         Return clean
+    End Function
+
+    Private Function ParseSha256HexCandidate(value As String) As String
+        Dim text = If(value, String.Empty).Trim()
+        If text.Length = 0 Then
+            Return String.Empty
+        End If
+
+        If text.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase) Then
+            text = text.Substring("sha256:".Length).Trim()
+        End If
+
+        If text.Length <> 64 Then
+            Return String.Empty
+        End If
+
+        For Each c In text
+            If Not Uri.IsHexDigit(c) Then
+                Return String.Empty
+            End If
+        Next
+
+        Return text.ToLowerInvariant()
+    End Function
+
+    Private Function IsChecksumAssetName(name As String) As Boolean
+        Dim lower = If(name, String.Empty).Trim().ToLowerInvariant()
+        If lower.Length = 0 Then
+            Return False
+        End If
+
+        Return lower.EndsWith(".sha256", StringComparison.OrdinalIgnoreCase) OrElse
+            lower.EndsWith(".sha256sum", StringComparison.OrdinalIgnoreCase) OrElse
+            lower.EndsWith(".sha256.txt", StringComparison.OrdinalIgnoreCase) OrElse
+            lower.EndsWith("checksums.txt", StringComparison.OrdinalIgnoreCase) OrElse
+            lower.EndsWith("checksums.sha256", StringComparison.OrdinalIgnoreCase) OrElse
+            lower.Contains("sha256")
+    End Function
+
+    Private Function ScoreChecksumAssetName(checksumAssetName As String, targetAssetName As String) As Integer
+        Dim checksumName = If(checksumAssetName, String.Empty).Trim().ToLowerInvariant()
+        Dim targetName = If(targetAssetName, String.Empty).Trim().ToLowerInvariant()
+        Dim score As Integer = 0
+
+        If checksumName.Length = 0 Then
+            Return score
+        End If
+
+        If targetName.Length > 0 Then
+            If checksumName = $"{targetName}.sha256" OrElse
+                checksumName = $"{targetName}.sha256sum" OrElse
+                checksumName = $"{targetName}.sha256.txt" Then
+                score += 100
+            End If
+
+            If checksumName.Contains(targetName) Then
+                score += 25
+            End If
+        End If
+
+        If checksumName.Contains("checksums") Then
+            score += 10
+        End If
+
+        If checksumName.EndsWith(".sha256", StringComparison.OrdinalIgnoreCase) OrElse
+            checksumName.EndsWith(".sha256sum", StringComparison.OrdinalIgnoreCase) Then
+            score += 10
+        End If
+
+        Return score
+    End Function
+
+    Private Async Function DownloadTextAssetAsync(settings As AppSettings, url As String, cancellationToken As CancellationToken) As Task(Of String)
+        Dim assetUri As Uri = Nothing
+        If Not Uri.TryCreate(url, UriKind.Absolute, assetUri) OrElse
+            Not String.Equals(assetUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) Then
+            Throw New InvalidOperationException("Checksum download URL must use HTTPS.")
+        End If
+
+        Using client As New HttpClient()
+            client.Timeout = TimeSpan.FromSeconds(DefaultTimeoutSeconds)
+
+            Dim userAgent As String = ResolveUserAgent(settings)
+            If Not String.IsNullOrWhiteSpace(userAgent) Then
+                client.DefaultRequestHeaders.UserAgent.ParseAdd(userAgent)
+            End If
+
+            Using response = Await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(False)
+                response.EnsureSuccessStatusCode()
+                Return Await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(False)
+            End Using
+        End Using
+    End Function
+
+    Private Function ParseSha256FromChecksumText(checksumText As String, targetAssetName As String) As String
+        If String.IsNullOrWhiteSpace(checksumText) Then
+            Return String.Empty
+        End If
+
+        Dim targetFileName = Path.GetFileName(If(targetAssetName, String.Empty))
+        Dim lines = checksumText.Replace(vbCrLf, vbLf).Replace(vbCr, vbLf).Split({vbLf}, StringSplitOptions.RemoveEmptyEntries)
+        Dim fallbackHash As String = String.Empty
+
+        For Each lineRaw In lines
+            Dim line = lineRaw.Trim()
+            If line.Length = 0 Then
+                Continue For
+            End If
+
+            Dim firstToken = line.Split({" "c, vbTab}, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()
+            If String.IsNullOrWhiteSpace(firstToken) Then
+                Continue For
+            End If
+            Dim parsedHash = ParseSha256HexCandidate(firstToken)
+            If parsedHash.Length > 0 Then
+                If targetFileName.Length = 0 Then
+                    If fallbackHash.Length = 0 Then
+                        fallbackHash = parsedHash
+                    End If
+                    Continue For
+                End If
+
+                Dim remainder = line.Substring(line.IndexOf(firstToken, StringComparison.OrdinalIgnoreCase) + firstToken.Length).Trim()
+                remainder = remainder.TrimStart("*"c)
+                remainder = remainder.Trim(""""c)
+                Dim remainderFile = Path.GetFileName(remainder)
+                If remainderFile.Length > 0 AndAlso
+                    String.Equals(remainderFile, targetFileName, StringComparison.OrdinalIgnoreCase) Then
+                    Return parsedHash
+                End If
+
+                If fallbackHash.Length = 0 Then
+                    fallbackHash = parsedHash
+                End If
+            End If
+
+            ' Supports "SHA256 (filename.ext) = <hash>" style entries.
+            Dim marker = "SHA256 ("
+            Dim markerIndex = line.IndexOf(marker, StringComparison.OrdinalIgnoreCase)
+            Dim equalsIndex = line.IndexOf("="c)
+            If markerIndex >= 0 AndAlso equalsIndex > markerIndex Then
+                Dim nameStart = markerIndex + marker.Length
+                Dim nameEnd = line.IndexOf(")", nameStart, StringComparison.OrdinalIgnoreCase)
+                If nameEnd > nameStart Then
+                    Dim candidateName = line.Substring(nameStart, nameEnd - nameStart).Trim()
+                    Dim candidateHash = ParseSha256HexCandidate(line.Substring(equalsIndex + 1).Trim())
+                    If candidateHash.Length > 0 Then
+                        If targetFileName.Length = 0 OrElse
+                            String.Equals(Path.GetFileName(candidateName), targetFileName, StringComparison.OrdinalIgnoreCase) Then
+                            Return candidateHash
+                        End If
+
+                        If fallbackHash.Length = 0 Then
+                            fallbackHash = candidateHash
+                        End If
+                    End If
+                End If
+            End If
+        Next
+
+        If lines.Length = 1 Then
+            Return fallbackHash
+        End If
+
+        Return String.Empty
     End Function
 
     Private Function ToIntSafe(text As String) As Integer
