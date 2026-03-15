@@ -1086,12 +1086,13 @@ Namespace Services
 
                     Dim alreadySatisfiedBytes = GetRescueRangeBytes(entry.RescueRanges, RescueRangeState.Good, RescueRangeState.Recovered)
                     entry.BytesCopied = alreadySatisfiedBytes
+                    Dim initialDisplayBytes = GetDisplayProgressBytes(entry, descriptor.Length, alreadySatisfiedBytes)
 
                     progress.TotalBytesCopied += alreadySatisfiedBytes
                     EmitProgress(
                         progress,
                         descriptor.RelativePath,
-                        alreadySatisfiedBytes,
+                        initialDisplayBytes,
                         descriptor.Length,
                         lastChunkBytesTransferred:=0,
                         bufferSizeBytes:=activeBufferSize,
@@ -1231,7 +1232,7 @@ Namespace Services
                     EmitProgress(
                         progress,
                         descriptor.RelativePath,
-                        entry.BytesCopied,
+                        GetDisplayProgressBytes(entry, descriptor.Length, entry.BytesCopied),
                         descriptor.Length,
                         lastChunkBytesTransferred:=0,
                         bufferSizeBytes:=activeBufferSize,
@@ -1307,7 +1308,7 @@ Namespace Services
                     EmitProgress(
                         progress,
                         descriptor.RelativePath,
-                        entry.BytesCopied,
+                        GetDisplayProgressBytes(entry, descriptor.Length, entry.BytesCopied),
                         descriptor.Length,
                         lastChunkBytesTransferred:=0,
                         bufferSizeBytes:=activeBufferSize,
@@ -1375,7 +1376,7 @@ Namespace Services
                     EmitProgress(
                         progress,
                         descriptor.RelativePath,
-                        entry.BytesCopied,
+                        GetDisplayProgressBytes(entry, descriptor.Length, entry.BytesCopied),
                         descriptor.Length,
                         lastChunkBytesTransferred:=Math.Max(0, bytesRead),
                         bufferSizeBytes:=ioBufferSize,
@@ -1899,7 +1900,7 @@ Namespace Services
                 EmitProgress(
                     progress,
                     descriptor.RelativePath,
-                    entry.BytesCopied,
+                    GetDisplayProgressBytes(entry, descriptor.Length, entry.BytesCopied),
                     descriptor.Length,
                     lastChunkBytesTransferred:=bytesRead,
                     bufferSizeBytes:=ioBufferSize,
@@ -2028,7 +2029,7 @@ Namespace Services
                 EmitProgress(
                     progress,
                     descriptor.RelativePath,
-                    entry.BytesCopied,
+                    GetDisplayProgressBytes(entry, descriptor.Length, entry.BytesCopied),
                     descriptor.Length,
                     lastChunkBytesTransferred:=CInt(Math.Min(CLng(Integer.MaxValue), Math.Max(0L, descriptor.Length - lastTransferred))),
                     bufferSizeBytes:=ResolveBufferSizeForFile(descriptor.Length),
@@ -2470,6 +2471,23 @@ Namespace Services
             Return GetRescueRegionCount(ranges, RescueRangeState.Bad, RescueRangeState.KnownBad)
         End Function
 
+        Private Shared Function GetDisplayProgressBytes(entry As JournalFileEntry, fileLength As Long, fallbackBytes As Long) As Long
+            Dim safeLength = Math.Max(0L, fileLength)
+            Dim displayBytes = Math.Max(0L, fallbackBytes)
+
+            If entry IsNot Nothing AndAlso entry.RescueRanges IsNot Nothing AndAlso entry.RescueRanges.Count > 0 Then
+                Dim accountedBytes = GetRescueRangeBytes(
+                    entry.RescueRanges,
+                    RescueRangeState.Good,
+                    RescueRangeState.Recovered,
+                    RescueRangeState.Bad,
+                    RescueRangeState.KnownBad)
+                displayBytes = Math.Max(displayBytes, accountedBytes)
+            End If
+
+            Return Math.Max(0L, Math.Min(safeLength, displayBytes))
+        End Function
+
         Private Sub SyncEntryBytesCopied(entry As JournalFileEntry)
             If entry Is Nothing Then
                 Return
@@ -2741,7 +2759,7 @@ Namespace Services
                         EmitProgress(
                             progress,
                             descriptor.RelativePath,
-                            entry.BytesCopied,
+                            GetDisplayProgressBytes(entry, descriptor.Length, entry.BytesCopied),
                             descriptor.Length,
                             lastChunkBytesTransferred:=bytesRead,
                             bufferSizeBytes:=passDefinition.ChunkSizeBytes,
@@ -2789,7 +2807,7 @@ Namespace Services
                     EmitProgress(
                         progress,
                         descriptor.RelativePath,
-                        entry.BytesCopied,
+                        GetDisplayProgressBytes(entry, descriptor.Length, entry.BytesCopied),
                         descriptor.Length,
                         lastChunkBytesTransferred:=0,
                         bufferSizeBytes:=passDefinition.ChunkSizeBytes,
@@ -2868,7 +2886,7 @@ Namespace Services
                     EmitProgress(
                         progress,
                         descriptor.RelativePath,
-                        entry.BytesCopied,
+                        GetDisplayProgressBytes(entry, descriptor.Length, entry.BytesCopied),
                         descriptor.Length,
                         lastChunkBytesTransferred:=chunkLength,
                         bufferSizeBytes:=ioBufferSize,

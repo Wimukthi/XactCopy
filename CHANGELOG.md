@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.9.6] - 2026-03-16
+
+### Fixed
+
+- Corrected current-file progress behavior for rescue/map-driven large-file runs:
+  - Worker now reports UI display progress from all accounted ranges (`Good`, `Recovered`, `Bad`, `KnownBad`) instead of only recovered/copy-good bytes.
+  - Prevents the current-file bar from flattening around a partial percentage and then jumping straight to 100% at file completion.
+  - Journal resume semantics remain unchanged (`entry.BytesCopied` still tracks only resumable copy coverage in copy mode).
+
 ## [1.0.9.5] - 2026-03-15
 
 ### Added
