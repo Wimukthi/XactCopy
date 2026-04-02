@@ -12,6 +12,11 @@ Namespace Ipc
     ''' Class JsonMessagePipe.
     ''' </summary>
     Public NotInheritable Class JsonMessagePipe
+        ''' <summary>
+        ''' Hard ceiling for a single IPC frame payload.
+        ''' </summary>
+        Public Const MaximumPayloadBytes As Integer = 16 * 1024 * 1024
+
         Private Sub New()
         End Sub
 
@@ -24,6 +29,11 @@ Namespace Ipc
             cancellationToken As CancellationToken) As Task
 
             Dim messageBytes = Encoding.UTF8.GetBytes(message)
+            If messageBytes.Length > MaximumPayloadBytes Then
+                Throw New InvalidDataException(
+                    $"IPC payload length {messageBytes.Length} exceeds max allowed size {MaximumPayloadBytes}.")
+            End If
+
             Dim lengthBytes = BitConverter.GetBytes(messageBytes.Length)
 
             Await stream.WriteAsync(lengthBytes.AsMemory(0, lengthBytes.Length), cancellationToken).ConfigureAwait(False)
@@ -49,8 +59,9 @@ Namespace Ipc
             End If
 
             Dim payloadLength = BitConverter.ToInt32(lengthBytes, 0)
-            If payloadLength < 0 Then
-                Throw New InvalidDataException($"IPC payload length is invalid: {payloadLength}.")
+            If payloadLength < 0 OrElse payloadLength > MaximumPayloadBytes Then
+                Throw New InvalidDataException(
+                    $"IPC payload length is invalid or exceeds limit: {payloadLength} (max {MaximumPayloadBytes}).")
             End If
 
             If payloadLength = 0 Then

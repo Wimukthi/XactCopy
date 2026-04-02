@@ -464,7 +464,7 @@ Friend Class UpdateForm
         script.AppendLine("start """" /b cmd /c """"%CLEANUP%""""")
         script.AppendLine("endlocal")
 
-        File.WriteAllText(scriptPath, script.ToString(), Encoding.ASCII)
+        File.WriteAllText(scriptPath, script.ToString(), Encoding.Unicode)
 
         Dim startInfo As New ProcessStartInfo(scriptPath) With {
             .WorkingDirectory = tempRoot,

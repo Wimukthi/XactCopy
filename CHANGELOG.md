@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.9.9] - 2026-04-02
+
+### Added
+
+- IPC frame-size guardrails:
+  - Added a strict maximum payload cap for named-pipe JSON frames on both write and read paths, with explicit rejection of oversized frames.
+- Test coverage for IPC safety limits:
+  - Added unit tests for oversized inbound frame rejection and oversized outbound frame rejection.
+
+### Fixed
+
+- Worker named-pipe security hardening:
+  - Worker server pipe now runs in current-user-only mode, aligning with the UI activation-pipe isolation model.
+- Overwrite prompt reliability (`Always ask` policy):
+  - Added a bounded async destination-probe warmup path so overwrite prompts are no longer skipped just because the first cached directory probe had not completed yet.
+- Media identity probe stability:
+  - Media-identity probes are now deduplicated by normalized path, preventing repeated timeout-triggered background probe buildup.
+- Updater script path compatibility:
+  - Update apply script now writes with Unicode encoding so non-ASCII install paths are handled correctly.
+
+### Changed
+
+- Worker binary resolution strategy:
+  - Replaced recursive all-directory worker binary scanning with deterministic bounded candidate lookup near `AppContext.BaseDirectory`, reducing stale/incorrect worker picks and inaccessible-directory failure risk.
+
 ## [1.0.9.6] - 2026-03-16
 
 ### Fixed

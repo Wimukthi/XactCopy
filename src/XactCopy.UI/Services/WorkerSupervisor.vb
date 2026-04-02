@@ -885,50 +885,94 @@ Namespace Services
         End Function
 
         Private Shared Function ResolveWorkerExecutablePath() As String
-            Dim baseDirectory = AppContext.BaseDirectory
-            Dim preferredPath = Path.Combine(baseDirectory, "XactCopyExecutive.exe")
-            If File.Exists(preferredPath) Then
-                Return preferredPath
-            End If
-
-            Dim legacyPath = Path.Combine(baseDirectory, "XactCopy.Worker.exe")
-            If File.Exists(legacyPath) Then
-                Return legacyPath
-            End If
-
-            Dim preferredMatch = Directory.EnumerateFiles(baseDirectory, "XactCopyExecutive.exe", SearchOption.AllDirectories).FirstOrDefault()
-            If Not String.IsNullOrWhiteSpace(preferredMatch) Then
-                Return preferredMatch
-            End If
-
-            Dim legacyMatch = Directory.EnumerateFiles(baseDirectory, "XactCopy.Worker.exe", SearchOption.AllDirectories).FirstOrDefault()
-            Return legacyMatch
+            Return ResolveWorkerBinaryPath("XactCopyExecutive.exe", "XactCopy.Worker.exe")
         End Function
 
         Private Shared Function ResolveWorkerDllPath() As String
-            Dim baseDirectory = AppContext.BaseDirectory
-            Dim preferredPath = Path.Combine(baseDirectory, "XactCopyExecutive.dll")
-            If File.Exists(preferredPath) Then
-                Return preferredPath
-            End If
-
-            Dim legacyPath = Path.Combine(baseDirectory, "XactCopy.Worker.dll")
-            If File.Exists(legacyPath) Then
-                Return legacyPath
-            End If
-
-            Dim preferredMatch = Directory.EnumerateFiles(baseDirectory, "XactCopyExecutive.dll", SearchOption.AllDirectories).FirstOrDefault()
-            If Not String.IsNullOrWhiteSpace(preferredMatch) Then
-                Return preferredMatch
-            End If
-
-            Dim legacyMatch = Directory.EnumerateFiles(baseDirectory, "XactCopy.Worker.dll", SearchOption.AllDirectories).FirstOrDefault()
-            If Not String.IsNullOrWhiteSpace(legacyMatch) Then
-                Return legacyMatch
+            Dim resolved = ResolveWorkerBinaryPath("XactCopyExecutive.dll", "XactCopy.Worker.dll")
+            If Not String.IsNullOrWhiteSpace(resolved) Then
+                Return resolved
             End If
 
             Throw New FileNotFoundException(
                 "Unable to locate worker binary (XactCopyExecutive.exe/.dll). Build the solution so the worker output is available.")
+        End Function
+
+        Private Shared Function ResolveWorkerBinaryPath(preferredFileName As String, legacyFileName As String) As String
+            For Each candidateDirectory In EnumerateWorkerCandidateDirectories()
+                Dim preferredPath = Path.Combine(candidateDirectory, preferredFileName)
+                If File.Exists(preferredPath) Then
+                    Return preferredPath
+                End If
+
+                Dim legacyPath = Path.Combine(candidateDirectory, legacyFileName)
+                If File.Exists(legacyPath) Then
+                    Return legacyPath
+                End If
+            Next
+
+            Return String.Empty
+        End Function
+
+        Private Shared Function EnumerateWorkerCandidateDirectories() As IReadOnlyList(Of String)
+            Dim candidates As New List(Of String)()
+            Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+            Dim addCandidate As Action(Of String) =
+                Sub(pathValue)
+                    Dim normalized = NormalizeDirectoryPath(pathValue)
+                    If normalized.Length = 0 Then
+                        Return
+                    End If
+
+                    If seen.Add(normalized) Then
+                        candidates.Add(normalized)
+                    End If
+                End Sub
+
+            Dim baseDirectory = NormalizeDirectoryPath(AppContext.BaseDirectory)
+            addCandidate(baseDirectory)
+            addCandidate(Path.Combine(baseDirectory, "win-x64"))
+            addCandidate(Path.Combine(baseDirectory, "publish"))
+
+            Dim cursor = baseDirectory
+            For depth = 0 To 4
+                If String.IsNullOrWhiteSpace(cursor) Then
+                    Exit For
+                End If
+
+                Dim parentDirectory As String = String.Empty
+                Try
+                    parentDirectory = Path.GetDirectoryName(
+                        cursor.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+                Catch
+                    parentDirectory = String.Empty
+                End Try
+
+                If String.IsNullOrWhiteSpace(parentDirectory) Then
+                    Exit For
+                End If
+
+                addCandidate(parentDirectory)
+                addCandidate(Path.Combine(parentDirectory, "win-x64"))
+                addCandidate(Path.Combine(parentDirectory, "publish"))
+                cursor = parentDirectory
+            Next
+
+            Return candidates
+        End Function
+
+        Private Shared Function NormalizeDirectoryPath(value As String) As String
+            If String.IsNullOrWhiteSpace(value) Then
+                Return String.Empty
+            End If
+
+            Dim trimmed = value.Trim()
+            Try
+                Return Path.GetFullPath(trimmed)
+            Catch
+                Return trimmed
+            End Try
         End Function
 
         Private Shared Function CloneOptions(options As CopyJobOptions) As CopyJobOptions

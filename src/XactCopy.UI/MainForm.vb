@@ -26,6 +26,9 @@ Public Class MainForm
     Private Const LayoutWindowKey As String = "MainForm"
     Private Const TaskbarProgressScale As ULong = 1000UL
     Private Const ProgressRenderIntervalMs As Integer = 50
+    Private Const ProgressAnimationIntervalMs As Integer = 16
+    Private Const ProgressAnimationBlendFactor As Double = 0.34R
+    Private Const ProgressAnimationMinimumStep As Double = 0.0012R
     Private Const LogRenderIntervalMs As Integer = 80
     Private Const PathTextBoxHeight As Integer = 24
     Private Const MaxQueuedLogLines As Integer = 20000
@@ -35,6 +38,7 @@ Public Class MainForm
     Private Const DefaultDiagnosticsRefreshIntervalMs As Integer = 250
     Private Const MinimumDiagnosticsRefreshIntervalMs As Integer = 100
     Private Const FileSystemProbeTimeoutMs As Integer = 350
+    Private Const OverwriteProbeWarmupTimeoutMs As Integer = 1200
     Private Const FileSystemProbeWarningCooldownSeconds As Integer = 10
     Private Const DirectoryProbeCacheTtlSeconds As Integer = 8
     Private Const MaxQueuedForwardedLaunches As Integer = 16
@@ -127,6 +131,7 @@ Public Class MainForm
 
     Private ReadOnly _helpMenu As New ToolStripMenuItem("&Help")
     Private ReadOnly _aboutMenuItem As New ToolStripMenuItem("&About XactCopy")
+    Private ReadOnly _progressAnimationTimer As New System.Windows.Forms.Timer()
     Private ReadOnly _toolTip As New ToolTip() With {
         .ShowAlways = True,
         .InitialDelay = 350,
@@ -170,6 +175,10 @@ Public Class MainForm
     Private _pendingProgressSnapshot As CopyProgressSnapshot
     Private _progressDispatchQueued As Integer
     Private _lastProgressRenderTick As Long
+    Private _displayedOverallProgress As Double
+    Private _displayedCurrentFileProgress As Double
+    Private _targetOverallProgress As Double
+    Private _targetCurrentFileProgress As Double
     Private ReadOnly _logDispatchLock As New Object()
     Private ReadOnly _pendingLogEntries As New Queue(Of LogLineEntry)()
     Private _logDispatchQueued As Integer
@@ -197,6 +206,7 @@ Public Class MainForm
     Private ReadOnly _queuedForwardedLaunches As New Queue(Of LaunchOptions)()
     Private ReadOnly _directoryProbeCache As New ConcurrentDictionary(Of String, DirectoryProbeCacheEntry)(StringComparer.OrdinalIgnoreCase)
     Private ReadOnly _directoryProbeInFlight As New ConcurrentDictionary(Of String, Byte)(StringComparer.OrdinalIgnoreCase)
+    Private ReadOnly _mediaIdentityProbeTasks As New ConcurrentDictionary(Of String, Task(Of String))(StringComparer.OrdinalIgnoreCase)
 
     ''' <summary>
     ''' Initializes a new instance.
@@ -239,6 +249,8 @@ Public Class MainForm
         ResetCopyTelemetry()
         SetRunningState(isRunning:=False)
         UpdateBadRangeMapOptionStates()
+        _progressAnimationTimer.Interval = ProgressAnimationIntervalMs
+        AddHandler _progressAnimationTimer.Tick, AddressOf ProgressAnimationTimer_Tick
 
         AddHandler Shown, AddressOf MainForm_Shown
     End Sub
@@ -271,6 +283,11 @@ Public Class MainForm
             _settingsStore.Save(_settings)
         Catch
             ' Ignore settings write failures on shutdown.
+        End Try
+
+        Try
+            _progressAnimationTimer.Stop()
+        Catch
         End Try
 
         Try
@@ -2120,8 +2137,8 @@ Public Class MainForm
         End If
 
         ResetPendingProgressState()
-        _overallProgressBar.Value = 0
-        _currentProgressBar.Value = 0
+        ResetProgressAnimationState()
+        RenderAnimatedProgressBars()
         _jobSummaryLabel.Text = "Status: Starting"
         _overallStatsLabel.Text = "Files: 0/0  Failed: 0  Recovered: 0  Skipped: 0"
         _currentFileLabel.Text = "Current: -"
@@ -2376,16 +2393,36 @@ Public Class MainForm
             Return String.Empty
         End If
 
-        Dim probeTask = Task.Run(Function() ResolveMediaIdentity(path))
+        Dim probePath = NormalizeProbePath(path)
+        If probePath.Length = 0 Then
+            Return String.Empty
+        End If
+
+        Dim probeTask = _mediaIdentityProbeTasks.GetOrAdd(probePath, AddressOf StartMediaIdentityProbeTask)
+
         Try
             Dim completed = Await Task.WhenAny(probeTask, Task.Delay(FileSystemProbeTimeoutMs)).ConfigureAwait(True)
             If completed Is probeTask Then
-                Return If(probeTask.Result, String.Empty)
+                Return If(Await probeTask.ConfigureAwait(True), String.Empty)
             End If
         Catch
         End Try
 
         Return String.Empty
+    End Function
+
+    Private Function StartMediaIdentityProbeTask(cacheKey As String) As Task(Of String)
+        Dim probeTask = Task.Run(Function() ResolveMediaIdentity(cacheKey))
+        Dim cleanupTask = probeTask.ContinueWith(
+            Sub(completedTask)
+                Dim ignored As Task(Of String) = Nothing
+                _mediaIdentityProbeTasks.TryRemove(cacheKey, ignored)
+            End Sub,
+            CancellationToken.None,
+            TaskContinuationOptions.None,
+            TaskScheduler.Default)
+        Dim ignoredCleanupTask = cleanupTask
+        Return probeTask
     End Function
 
     Private Shared Function ResolveMediaIdentity(pathValue As String) As String
@@ -2507,15 +2544,17 @@ Public Class MainForm
             destinationRootPath = options.DestinationRoot
         End Try
 
-        Dim destinationRootOnline As Boolean
-        Dim destinationProbeCompleted = TryProbeDirectoryExists(destinationRootPath, destinationRootOnline)
-        If Not destinationProbeCompleted Then
+        Dim destinationProbeResult = Await TryProbeDirectoryExistsWithWarmupAsync(
+            destinationRootPath,
+            OverwriteProbeWarmupTimeoutMs).ConfigureAwait(True)
+        If Not destinationProbeResult.HasValue Then
             EmitFileSystemProbeWarning(
                 $"Destination availability probe timed out for '{destinationRootPath}'. Overwrite prompts were skipped to keep the UI responsive.")
             options.OverwritePolicy = OverwritePolicy.Overwrite
             Return options
         End If
 
+        Dim destinationRootOnline = destinationProbeResult.Value
         If Not destinationRootOnline Then
             AppendLog("Destination is currently offline. Overwrite prompts were skipped for this start attempt.")
             options.OverwritePolicy = OverwritePolicy.Overwrite
@@ -2915,17 +2954,68 @@ Public Class MainForm
         End If
 
         Dim probePath = NormalizeProbePath(path)
-        Dim cachedEntry As DirectoryProbeCacheEntry = Nothing
-        If _directoryProbeCache.TryGetValue(probePath, cachedEntry) AndAlso cachedEntry IsNot Nothing Then
-            Dim ageSeconds = (DateTimeOffset.UtcNow - cachedEntry.CapturedUtc).TotalSeconds
-            If ageSeconds <= DirectoryProbeCacheTtlSeconds Then
-                exists = cachedEntry.Exists
-                Return True
-            End If
+        If probePath.Length = 0 Then
+            Return True
+        End If
+
+        If TryGetCachedDirectoryProbeResult(probePath, exists) Then
+            Return True
         End If
 
         QueueDirectoryProbe(probePath)
         Return False
+    End Function
+
+    Private Async Function TryProbeDirectoryExistsWithWarmupAsync(path As String, timeoutMs As Integer) As Task(Of Boolean?)
+        If String.IsNullOrWhiteSpace(path) Then
+            Return True
+        End If
+
+        Dim probePath = NormalizeProbePath(path)
+        If probePath.Length = 0 Then
+            Return True
+        End If
+
+        Dim exists As Boolean
+        If TryGetCachedDirectoryProbeResult(probePath, exists) Then
+            Return exists
+        End If
+
+        QueueDirectoryProbe(probePath)
+
+        Dim startedTick = Environment.TickCount64
+        Dim waitBudgetMs = Math.Max(0, timeoutMs)
+        While waitBudgetMs > 0
+            Await Task.Delay(Math.Min(40, waitBudgetMs)).ConfigureAwait(True)
+            If TryGetCachedDirectoryProbeResult(probePath, exists) Then
+                Return exists
+            End If
+
+            Dim elapsedMs = CInt(Math.Max(0L, Environment.TickCount64 - startedTick))
+            waitBudgetMs = Math.Max(0, timeoutMs - elapsedMs)
+        End While
+
+        Return Nothing
+    End Function
+
+    Private Function TryGetCachedDirectoryProbeResult(probePath As String, ByRef exists As Boolean) As Boolean
+        exists = False
+        If String.IsNullOrWhiteSpace(probePath) Then
+            Return False
+        End If
+
+        Dim cachedEntry As DirectoryProbeCacheEntry = Nothing
+        If Not _directoryProbeCache.TryGetValue(probePath, cachedEntry) OrElse cachedEntry Is Nothing Then
+            Return False
+        End If
+
+        Dim ageSeconds = (DateTimeOffset.UtcNow - cachedEntry.CapturedUtc).TotalSeconds
+        If ageSeconds > DirectoryProbeCacheTtlSeconds Then
+            Return False
+        End If
+
+        exists = cachedEntry.Exists
+        Return True
     End Function
 
     Private Sub QueueDirectoryProbeFromText(pathText As String)
@@ -3126,6 +3216,91 @@ Public Class MainForm
         _lastProgressRenderTick = 0
     End Sub
 
+    Private Sub ResetProgressAnimationState()
+        _displayedOverallProgress = 0.0R
+        _displayedCurrentFileProgress = 0.0R
+        _targetOverallProgress = 0.0R
+        _targetCurrentFileProgress = 0.0R
+        If _progressAnimationTimer.Enabled Then
+            _progressAnimationTimer.Stop()
+        End If
+    End Sub
+
+    Private Sub UpdateAnimatedProgressTargets(overallProgress As Double, currentFileProgress As Double, animate As Boolean)
+        _targetOverallProgress = Math.Clamp(overallProgress, 0.0R, 1.0R)
+        _targetCurrentFileProgress = Math.Clamp(currentFileProgress, 0.0R, 1.0R)
+
+        If Not animate Then
+            _displayedOverallProgress = _targetOverallProgress
+            _displayedCurrentFileProgress = _targetCurrentFileProgress
+            RenderAnimatedProgressBars()
+            If _progressAnimationTimer.Enabled Then
+                _progressAnimationTimer.Stop()
+            End If
+            Return
+        End If
+
+        If _targetOverallProgress < _displayedOverallProgress Then
+            _displayedOverallProgress = _targetOverallProgress
+        End If
+
+        If _targetCurrentFileProgress < _displayedCurrentFileProgress Then
+            _displayedCurrentFileProgress = _targetCurrentFileProgress
+        End If
+
+        RenderAnimatedProgressBars()
+        If Not _progressAnimationTimer.Enabled Then
+            _progressAnimationTimer.Start()
+        End If
+    End Sub
+
+    Private Sub ProgressAnimationTimer_Tick(sender As Object, e As EventArgs)
+        If IsDisposed OrElse Disposing Then
+            _progressAnimationTimer.Stop()
+            Return
+        End If
+
+        Dim nextOverall = AdvanceProgressValue(_displayedOverallProgress, _targetOverallProgress)
+        Dim nextCurrent = AdvanceProgressValue(_displayedCurrentFileProgress, _targetCurrentFileProgress)
+
+        Dim changed = (Math.Abs(nextOverall - _displayedOverallProgress) > 0.000001R) OrElse
+            (Math.Abs(nextCurrent - _displayedCurrentFileProgress) > 0.000001R)
+
+        _displayedOverallProgress = nextOverall
+        _displayedCurrentFileProgress = nextCurrent
+
+        If changed Then
+            RenderAnimatedProgressBars()
+        End If
+
+        Dim reachedOverallTarget = Math.Abs(_targetOverallProgress - _displayedOverallProgress) <= 0.0005R
+        Dim reachedCurrentTarget = Math.Abs(_targetCurrentFileProgress - _displayedCurrentFileProgress) <= 0.0005R
+        If reachedOverallTarget AndAlso reachedCurrentTarget Then
+            _displayedOverallProgress = _targetOverallProgress
+            _displayedCurrentFileProgress = _targetCurrentFileProgress
+            RenderAnimatedProgressBars()
+            _progressAnimationTimer.Stop()
+        End If
+    End Sub
+
+    Private Shared Function AdvanceProgressValue(currentValue As Double, targetValue As Double) As Double
+        Dim current = Math.Clamp(currentValue, 0.0R, 1.0R)
+        Dim target = Math.Clamp(targetValue, 0.0R, 1.0R)
+
+        If target <= current Then
+            Return target
+        End If
+
+        Dim delta = target - current
+        Dim stepSize = Math.Max(ProgressAnimationMinimumStep, delta * ProgressAnimationBlendFactor)
+        Return Math.Min(target, current + stepSize)
+    End Function
+
+    Private Sub RenderAnimatedProgressBars()
+        _overallProgressBar.Value = ToProgressBarValue(_displayedOverallProgress)
+        _currentProgressBar.Value = ToProgressBarValue(_displayedCurrentFileProgress)
+    End Sub
+
     Private Sub ApplyProgress(progress As CopyProgressSnapshot)
         If progress Is Nothing OrElse Not _isRunning Then
             Return
@@ -3134,8 +3309,7 @@ Public Class MainForm
         Dim renderStopwatch = Stopwatch.StartNew()
 
         _lastProgressSnapshot = progress
-        _overallProgressBar.Value = ToProgressBarValue(progress.OverallProgress)
-        _currentProgressBar.Value = ToProgressBarValue(progress.CurrentFileProgress)
+        UpdateAnimatedProgressTargets(progress.OverallProgress, progress.CurrentFileProgress, animate:=True)
 
         _overallStatsLabel.Text = $"Files: {progress.CompletedFiles}/{progress.TotalFiles}  Failed: {progress.FailedFiles}  Recovered: {progress.RecoveredFiles}  Skipped: {progress.SkippedFiles}"
         _currentFileLabel.Text = $"Current: {progress.CurrentFile}"
@@ -3554,18 +3728,18 @@ Public Class MainForm
             overallProgress = 0.0R
         End If
 
-        _overallProgressBar.Value = ToProgressBarValue(overallProgress)
-
+        Dim currentProgress As Double
         If result.Succeeded AndAlso Not result.Cancelled Then
-            _currentProgressBar.Value = 1000
+            currentProgress = 1.0R
             _currentFileLabel.Text = "Current: -"
             _etaLabel.Text = "ETA: 00:00:00"
         Else
-            _currentProgressBar.Value = If(previousSnapshot IsNot Nothing, ToProgressBarValue(previousSnapshot.CurrentFileProgress), 0)
+            currentProgress = If(previousSnapshot IsNot Nothing, Math.Clamp(previousSnapshot.CurrentFileProgress, 0.0R, 1.0R), 0.0R)
             _currentFileLabel.Text = If(previousSnapshot IsNot Nothing AndAlso Not String.IsNullOrWhiteSpace(previousSnapshot.CurrentFile),
                 $"Current: {previousSnapshot.CurrentFile}",
                 "Current: -")
         End If
+        UpdateAnimatedProgressTargets(overallProgress, currentProgress, animate:=False)
 
         _overallStatsLabel.Text = $"Files: {completedFiles}/{totalFiles}  Failed: {failedFiles}  Recovered: {recoveredFiles}  Skipped: {skippedFiles}"
         _bytesLabel.Text = $"Bytes: {FormatBytes(copiedBytes)} / {FormatBytes(totalBytes)}"
@@ -3939,6 +4113,9 @@ Public Class MainForm
 
         If Not isRunning Then
             _taskbarProgress.Clear(Handle)
+            If _progressAnimationTimer.Enabled Then
+                _progressAnimationTimer.Stop()
+            End If
         End If
 
         UpdatePauseResumeUi()
@@ -3978,6 +4155,7 @@ Public Class MainForm
         _uiLogLinesDropped = 0
         _uiWorkerSuppressedLogLines = 0
         _lastDiagnosticsRenderTick = 0
+        ResetProgressAnimationState()
     End Sub
 
     Private Sub UpdateTransferTelemetry(progress As CopyProgressSnapshot)

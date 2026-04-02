@@ -65,7 +65,7 @@ Module Program
                 PipeDirection.InOut,
                 1,
                 PipeTransmissionMode.Byte,
-                PipeOptions.Asynchronous)
+                PipeOptions.Asynchronous Or PipeOptions.CurrentUserOnly)
 
                 Await server.WaitForConnectionAsync(lifetimeCts.Token).ConfigureAwait(False)
                 Await SendLogAsync(server, String.Empty, "Worker connected to supervisor.", lifetimeCts.Token).ConfigureAwait(False)

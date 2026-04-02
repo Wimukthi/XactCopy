@@ -74,6 +74,7 @@ dotnet publish src/XactCopy.UI/XactCopy.UI.vbproj -c Release -r win-x64 --self-c
 
 ## Brief Version History
 
+- `v1.0.9.9` Hardened IPC and worker security/reliability with strict frame-size limits, current-user-only worker pipe mode, deterministic worker binary resolution, Unicode-safe updater scripts, and safer async probe behavior for overwrite prompts/media identity checks.
 - `v1.0.9.6` Fixed current-file progress flattening on large rescue/map-driven files by reporting UI progress from all accounted ranges (good/recovered/bad/known-bad), removing mid-file stalls followed by end-of-file 100% jumps.
 - `v1.0.9.5` Added updater SHA-256 package verification (digest/sidecar checksum support), hardened single-instance activation pipe and worker PID cleanup safety, made settings saves atomic, and removed remaining UI-thread filesystem probe blocking.
 - `v1.0.8.9` Removed gray textbox underline artifacts globally, and refined main Source/Destination row alignment with taller, cleaner path inputs.
