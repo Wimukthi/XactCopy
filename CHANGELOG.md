@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.1.0.9] - 2026-04-13
+
+### Fixed
+
+- In-app updater not applying downloaded package:
+  - Switched the update script from a Unicode-encoded cmd.exe batch file to a PowerShell script written in UTF-8. The `Encoding.Unicode` (UTF-16 LE) batch file failed silently on some cmd.exe configurations, causing XactCopy to close without the new files ever being copied. The PowerShell script handles all Unicode install paths natively and logs each step to `update.log` in the temp root for diagnosability.
+
+### Changed
+
+- Release notes in the update dialog now render markdown formatting:
+  - Replaced the plain read-only `TextBox` with a `RichTextBox` that parses and renders GitHub-style markdown: `##`/`###` headings appear bold, `- **item**` bullet points show bold item names with unicode bullet characters, and `---` separators collapse to a blank line.
+
 ## [1.1.0.7] - 2026-04-13
 
 ### Added
