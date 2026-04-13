@@ -21,7 +21,7 @@ Friend Class UpdateForm
     Private ReadOnly _currentValueLabel As New Label()
     Private ReadOnly _latestValueLabel As New Label()
     Private ReadOnly _packageValueLabel As New Label()
-    Private ReadOnly _notesTextBox As New TextBox()
+    Private ReadOnly _notesRichTextBox As New RichTextBox()
     Private ReadOnly _progressBar As New ProgressBar()
     Private ReadOnly _progressLabel As New Label()
     Private ReadOnly _speedLabel As New Label()
@@ -78,12 +78,13 @@ Friend Class UpdateForm
 
         root.Controls.Add(BuildSummaryPanel(), 0, 0)
 
-        _notesTextBox.Dock = DockStyle.Fill
-        _notesTextBox.Multiline = True
-        _notesTextBox.ReadOnly = True
-        _notesTextBox.ScrollBars = ScrollBars.Vertical
-        _notesTextBox.WordWrap = True
-        root.Controls.Add(_notesTextBox, 0, 1)
+        _notesRichTextBox.Dock = DockStyle.Fill
+        _notesRichTextBox.ReadOnly = True
+        _notesRichTextBox.ScrollBars = RichTextBoxScrollBars.Vertical
+        _notesRichTextBox.WordWrap = True
+        _notesRichTextBox.BorderStyle = BorderStyle.None
+        _notesRichTextBox.DetectUrls = False
+        root.Controls.Add(_notesRichTextBox, 0, 1)
 
         root.Controls.Add(BuildProgressPanel(), 0, 2)
         root.Controls.Add(BuildButtonsPanel(), 0, 3)
@@ -214,7 +215,7 @@ Friend Class UpdateForm
         _currentValueLabel.Text = FormatVersionDisplay(_currentVersion, Nothing)
         _latestValueLabel.Text = FormatVersionDisplay(_release.Version, _release.TagName)
         _packageValueLabel.Text = If(_asset IsNot Nothing, _asset.Name, "No compatible package found in release assets.")
-        _notesTextBox.Text = If(String.IsNullOrWhiteSpace(_release.Notes), "No release notes provided.", NormalizeReleaseNotes(_release.Notes))
+        RenderMarkdownNotes(_notesRichTextBox, If(String.IsNullOrWhiteSpace(_release.Notes), "No release notes provided.", _release.Notes))
 
         If _asset Is Nothing Then
             _downloadButton.Enabled = False
@@ -407,7 +408,7 @@ Friend Class UpdateForm
     End Function
 
     Private Shared Sub LaunchUpdateScript(sourceDirectory As String, targetDirectory As String, executableName As String, tempRoot As String)
-        Dim scriptPath = Path.Combine(tempRoot, "apply-update.cmd")
+        Dim scriptPath = Path.Combine(tempRoot, "apply-update.ps1")
         Dim processId = Process.GetCurrentProcess().Id
         Dim executablePath = Path.Combine(targetDirectory, executableName)
         Dim backupDirectory = Path.Combine(tempRoot, "backup")
@@ -417,61 +418,64 @@ Friend Class UpdateForm
             normalizedTarget = normalizedTarget.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
         End If
 
+        ' Escape single quotes so the embedded literal strings are safe.
+        Dim q = Function(s As String) s.Replace("'", "''")
+        Dim staleFolder = Path.Combine(normalizedTarget, "win-x64")
+        Dim staleDll = Path.Combine(staleFolder, "XactCopy.dll")
+
         Dim script As New StringBuilder()
-        script.AppendLine("@echo off")
-        script.AppendLine("setlocal enableextensions")
-        script.AppendLine($"set ""PID={processId}""")
-        script.AppendLine($"set ""SOURCE={sourceDirectory}""")
-        script.AppendLine($"set ""TARGET={normalizedTarget}""")
-        script.AppendLine($"set ""BACKUP={backupDirectory}""")
-        script.AppendLine($"set ""LOG={logPath}""")
-        script.AppendLine($"set ""TEMPROOT={tempRoot}""")
-        script.AppendLine(">""%LOG%"" echo XactCopy update log")
-        script.AppendLine(":wait")
-        script.AppendLine("tasklist /FI ""PID eq %PID%"" | find /I ""%PID%"" >nul")
-        script.AppendLine("if not errorlevel 1 (")
-        script.AppendLine("  timeout /t 1 /nobreak >nul")
-        script.AppendLine("  goto wait")
-        script.AppendLine(")")
-        script.AppendLine("if exist ""%BACKUP%"" rd /s /q ""%BACKUP%""")
-        script.AppendLine("mkdir ""%BACKUP%""")
-        script.AppendLine("robocopy ""%TARGET%"" ""%BACKUP%"" /E /COPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >>""%LOG%""")
-        script.AppendLine("set ""RC=%ERRORLEVEL%""")
-        script.AppendLine("if %RC% GEQ 8 (")
-        script.AppendLine("  echo Backup failed with error %RC%. >>""%LOG%""")
-        script.AppendLine("  goto launch")
-        script.AppendLine(")")
-        script.AppendLine("robocopy ""%SOURCE%"" ""%TARGET%"" /E /COPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >>""%LOG%""")
-        script.AppendLine("set ""RC=%ERRORLEVEL%""")
-        script.AppendLine("if %RC% GEQ 8 (")
-        script.AppendLine("  echo Update copy failed with error %RC%. Restoring backup. >>""%LOG%""")
-        script.AppendLine("  robocopy ""%BACKUP%"" ""%TARGET%"" /E /COPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >>""%LOG%""")
-        script.AppendLine(") else (")
-        script.AppendLine("  if exist ""%TARGET%\win-x64\XactCopy.dll"" (")
-        script.AppendLine("    echo Removing stale wrapper folder %TARGET%\win-x64 >>""%LOG%""")
-        script.AppendLine("    rd /s /q ""%TARGET%\win-x64"" >nul 2>&1")
-        script.AppendLine("  )")
-        script.AppendLine(")")
-        script.AppendLine(":launch")
-        script.AppendLine($"start """" ""{executablePath}""")
-        script.AppendLine("set ""CLEANUP=%TEMP%\xactcopy-cleanup-%RANDOM%%RANDOM%%RANDOM%.cmd""")
-        script.AppendLine("( ")
-        script.AppendLine("  echo @echo off")
-        script.AppendLine("  echo timeout /t 8 /nobreak ^>nul")
-        script.AppendLine("  echo rd /s /q ""%TEMPROOT%"" ^>nul 2^>^&1")
-        script.AppendLine("  echo del /f /q ""%%~f0"" ^>nul 2^>^&1")
-        script.AppendLine(") > ""%CLEANUP%""")
-        script.AppendLine("start """" /b cmd /c """"%CLEANUP%""""")
-        script.AppendLine("endlocal")
+        script.AppendLine("$ErrorActionPreference = 'Continue'")
+        script.AppendLine($"$TargetPid  = {processId}")
+        script.AppendLine($"$Source     = '{q(sourceDirectory)}'")
+        script.AppendLine($"$Target     = '{q(normalizedTarget)}'")
+        script.AppendLine($"$Backup     = '{q(backupDirectory)}'")
+        script.AppendLine($"$Log        = '{q(logPath)}'")
+        script.AppendLine($"$TempRoot   = '{q(tempRoot)}'")
+        script.AppendLine($"$Executable = '{q(executablePath)}'")
+        script.AppendLine($"$StaleDll   = '{q(staleDll)}'")
+        script.AppendLine($"$StaleDir   = '{q(staleFolder)}'")
+        script.AppendLine()
+        script.AppendLine("'XactCopy update log' | Out-File -LiteralPath $Log -Encoding UTF8")
+        script.AppendLine()
+        script.AppendLine("# Wait for XactCopy UI process to exit.")
+        script.AppendLine("while ($null -ne (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue)) {")
+        script.AppendLine("    Start-Sleep -Milliseconds 500")
+        script.AppendLine("}")
+        script.AppendLine()
+        script.AppendLine("# Back up current installation.")
+        script.AppendLine("if (Test-Path -LiteralPath $Backup) { Remove-Item -LiteralPath $Backup -Recurse -Force }")
+        script.AppendLine("$null = New-Item -ItemType Directory -Path $Backup -Force")
+        script.AppendLine("robocopy $Target $Backup /E /COPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >> $Log")
+        script.AppendLine()
+        script.AppendLine("# Copy new files to the install directory.")
+        script.AppendLine("robocopy $Source $Target /E /COPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >> $Log")
+        script.AppendLine("$copyRc = $LASTEXITCODE")
+        script.AppendLine()
+        script.AppendLine("if ($copyRc -ge 8) {")
+        script.AppendLine("    'Update copy failed. Restoring backup.' | Out-File -LiteralPath $Log -Append -Encoding UTF8")
+        script.AppendLine("    robocopy $Backup $Target /E /COPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >> $Log")
+        script.AppendLine("} else {")
+        script.AppendLine("    # Remove stale win-x64 subfolder from older zip packages.")
+        script.AppendLine("    if (Test-Path -LiteralPath $StaleDll) {")
+        script.AppendLine("        'Removing stale win-x64 folder.' | Out-File -LiteralPath $Log -Append -Encoding UTF8")
+        script.AppendLine("        Remove-Item -LiteralPath $StaleDir -Recurse -Force -ErrorAction SilentlyContinue")
+        script.AppendLine("    }")
+        script.AppendLine("}")
+        script.AppendLine()
+        script.AppendLine("# Launch the updated XactCopy.")
+        script.AppendLine("Start-Process -FilePath $Executable")
+        script.AppendLine()
+        script.AppendLine("# Deferred cleanup of the temp directory.")
+        script.AppendLine("Start-Sleep -Seconds 10")
+        script.AppendLine("Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction SilentlyContinue")
 
-        File.WriteAllText(scriptPath, script.ToString(), Encoding.Unicode)
+        File.WriteAllText(scriptPath, script.ToString(), Encoding.UTF8)
 
-        Dim startInfo As New ProcessStartInfo(scriptPath) With {
-            .WorkingDirectory = tempRoot,
-            .UseShellExecute = True,
-            .WindowStyle = ProcessWindowStyle.Hidden
+        Dim psArgs = $"-NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{scriptPath}"""
+        Dim startInfo As New ProcessStartInfo("powershell.exe", psArgs) With {
+            .UseShellExecute = False,
+            .CreateNoWindow = True
         }
-
         Process.Start(startInfo)
     End Sub
 
@@ -610,14 +614,87 @@ Friend Class UpdateForm
         End Try
     End Sub
 
-    Private Shared Function NormalizeReleaseNotes(value As String) As String
-        If String.IsNullOrWhiteSpace(value) Then
-            Return String.Empty
-        End If
+    ''' <summary>
+    ''' Renders GitHub-flavoured markdown release notes into a RichTextBox with basic formatting:
+    ''' ## headings as bold, ### subheadings as bold, - bullet items with **bold** spans,
+    ''' and --- separators as a blank line.
+    ''' </summary>
+    Private Shared Sub RenderMarkdownNotes(rtb As RichTextBox, notes As String)
+        rtb.Clear()
+        rtb.SuspendLayout()
+        Try
+            Dim baseFont = rtb.Font
+            Dim boldFont As New Font(baseFont, FontStyle.Bold)
+            Try
+                Dim lines = notes.Replace(vbCrLf, vbLf).Replace(vbCr, vbLf).
+                                  Split({vbLf}, StringSplitOptions.None)
 
-        Dim normalized = value.Replace("\r\n", Environment.NewLine).
-                                Replace("\n", Environment.NewLine).
-                                Replace("\r", Environment.NewLine)
-        Return normalized
-    End Function
+                For Each rawLine In lines
+                    Dim line = rawLine.TrimEnd()
+
+                    If line.StartsWith("## ", StringComparison.Ordinal) Then
+                        ' H2: bold heading with a blank line above (except at start).
+                        If rtb.TextLength > 0 Then AppendRun(rtb, Environment.NewLine, baseFont)
+                        AppendRun(rtb, line.Substring(3) & Environment.NewLine, boldFont)
+
+                    ElseIf line.StartsWith("### ", StringComparison.Ordinal) Then
+                        ' H3: bold subheading.
+                        AppendRun(rtb, line.Substring(4) & Environment.NewLine, boldFont)
+
+                    ElseIf line = "---" Then
+                        ' Horizontal rule: blank line separator.
+                        AppendRun(rtb, Environment.NewLine, baseFont)
+
+                    ElseIf line.StartsWith("- ", StringComparison.Ordinal) Then
+                        ' Bullet point — parse **bold** inline spans.
+                        AppendRun(rtb, "  " & ChrW(&H2022) & " ", baseFont)
+                        AppendInlineMarkdown(rtb, line.Substring(2), baseFont, boldFont)
+                        AppendRun(rtb, Environment.NewLine, baseFont)
+
+                    Else
+                        ' Plain text.
+                        AppendRun(rtb, line & Environment.NewLine, baseFont)
+                    End If
+                Next
+            Finally
+                boldFont.Dispose()
+            End Try
+        Finally
+            rtb.ResumeLayout()
+        End Try
+        rtb.SelectionStart = 0
+        rtb.ScrollToCaret()
+    End Sub
+
+    Private Shared Sub AppendRun(rtb As RichTextBox, text As String, font As Font)
+        rtb.SelectionStart = rtb.TextLength
+        rtb.SelectionLength = 0
+        rtb.SelectionFont = font
+        rtb.AppendText(text)
+    End Sub
+
+    Private Shared Sub AppendInlineMarkdown(rtb As RichTextBox, text As String, baseFont As Font, boldFont As Font)
+        Dim remaining = text
+        While remaining.Length > 0
+            Dim boldOpen = remaining.IndexOf("**", StringComparison.Ordinal)
+            If boldOpen < 0 Then
+                AppendRun(rtb, remaining, baseFont)
+                Return
+            End If
+
+            If boldOpen > 0 Then
+                AppendRun(rtb, remaining.Substring(0, boldOpen), baseFont)
+            End If
+
+            Dim boldClose = remaining.IndexOf("**", boldOpen + 2, StringComparison.Ordinal)
+            If boldClose < 0 Then
+                ' Unmatched marker — treat the rest as plain text.
+                AppendRun(rtb, remaining.Substring(boldOpen), baseFont)
+                Return
+            End If
+
+            AppendRun(rtb, remaining.Substring(boldOpen + 2, boldClose - boldOpen - 2), boldFont)
+            remaining = remaining.Substring(boldClose + 2)
+        End While
+    End Sub
 End Class
