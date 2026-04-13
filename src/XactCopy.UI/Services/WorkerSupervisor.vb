@@ -21,7 +21,10 @@ Namespace Services
         Public Event WorkerStateChanged As EventHandler(Of String)
         Public Event JobPauseStateChanged As EventHandler(Of Boolean)
 
-        Private Shared ReadOnly HeartbeatCheckInterval As TimeSpan = TimeSpan.FromSeconds(2)
+        ' Match the worker's 1-second heartbeat emit rate so worst-case stall detection
+        ' drops from 3 s (2 s poll + 1 s emit) to 2 s (1 s poll + 1 s emit).
+        ' Timer callbacks are lightweight (no I/O) so halving the interval is negligible.
+        Private Shared ReadOnly HeartbeatCheckInterval As TimeSpan = TimeSpan.FromSeconds(1)
         Private Shared ReadOnly HeartbeatTimeout As TimeSpan = TimeSpan.FromSeconds(10)
         Private Shared ReadOnly MinimumJobActivityTimeout As TimeSpan = TimeSpan.FromSeconds(45)
         Private Shared ReadOnly MaximumJobActivityTimeout As TimeSpan = TimeSpan.FromMinutes(10)
@@ -30,6 +33,9 @@ Namespace Services
         Private ReadOnly _sendLock As New SemaphoreSlim(1, 1)
         Private ReadOnly _disposeLock As New SemaphoreSlim(1, 1)
         Private ReadOnly _workerPidLock As New Object()
+        ' Protects DateTimeOffset timestamp fields shared between the receive-loop task and the
+        ' heartbeat timer callback. DateTimeOffset is 16 bytes and is NOT atomically read/written.
+        Private ReadOnly _timestampLock As New Object()
         Private ReadOnly _launchedWorkerProcesses As New Dictionary(Of Integer, TrackedWorkerProcessInfo)()
 
         Private _workerProcess As Process
@@ -57,7 +63,7 @@ Namespace Services
         ''' </summary>
         Public ReadOnly Property IsJobRunning As Boolean
             Get
-                Return _isJobRunning
+                Return Threading.Volatile.Read(_isJobRunning)
             End Get
         End Property
 
@@ -82,13 +88,13 @@ Namespace Services
                     Throw New InvalidOperationException("Supervisor is stopping.")
                 End If
 
-                If _isJobRunning Then
+                If Threading.Volatile.Read(_isJobRunning) Then
                     Throw New InvalidOperationException("A copy job is already running.")
                 End If
 
                 _currentJobOptions = CloneOptions(options)
                 _currentJobId = Guid.NewGuid().ToString("N")
-                _isJobRunning = True
+                Threading.Volatile.Write(_isJobRunning, True)
                 _cancelRequestedByUser = False
                 SetPausedState(False)
                 _autoRecoverJob = True
@@ -109,7 +115,7 @@ Namespace Services
         Public Async Function CancelJobAsync(reason As String) As Task
             ThrowIfDisposed()
 
-            If Not _isJobRunning Then
+            If Not Threading.Volatile.Read(_isJobRunning) Then
                 Return
             End If
 
@@ -130,7 +136,7 @@ Namespace Services
         Public Async Function PauseJobAsync(reason As String) As Task
             ThrowIfDisposed()
 
-            If Not _isJobRunning OrElse _isJobPaused Then
+            If Not Threading.Volatile.Read(_isJobRunning) OrElse _isJobPaused Then
                 Return
             End If
 
@@ -150,7 +156,7 @@ Namespace Services
         Public Async Function ResumeJobAsync(reason As String) As Task
             ThrowIfDisposed()
 
-            If Not _isJobRunning OrElse Not _isJobPaused Then
+            If Not Threading.Volatile.Read(_isJobRunning) OrElse Not _isJobPaused Then
                 Return
             End If
 
@@ -180,7 +186,7 @@ Namespace Services
 
                 _isStopping = True
                 _autoRecoverJob = False
-                _isJobRunning = False
+                Threading.Volatile.Write(_isJobRunning, False)
                 _cancelRequestedByUser = False
                 SetPausedState(False)
                 _currentJobId = String.Empty
@@ -314,16 +320,20 @@ Namespace Services
             Select Case messageType
                 Case IpcMessageTypes.WorkerHeartbeatEvent
                     Dim envelope = IpcSerializer.DeserializeEnvelope(Of WorkerHeartbeatEvent)(rawMessage)
-                    _lastHeartbeatUtc = envelope.Payload.TimestampUtc
-                    SetPausedState(envelope.Payload.IsJobPaused)
                     Dim reportedProgressUtc = NormalizeTimestampOrNow(envelope.Payload.LastProgressUtc, useNowWhenMinValue:=False)
-                    If reportedProgressUtc <> DateTimeOffset.MinValue AndAlso reportedProgressUtc > _lastWorkerProgressUtc Then
-                        _lastWorkerProgressUtc = reportedProgressUtc
-                    End If
+                    SyncLock _timestampLock
+                        _lastHeartbeatUtc = envelope.Payload.TimestampUtc
+                        If reportedProgressUtc <> DateTimeOffset.MinValue AndAlso reportedProgressUtc > _lastWorkerProgressUtc Then
+                            _lastWorkerProgressUtc = reportedProgressUtc
+                        End If
+                    End SyncLock
+                    SetPausedState(envelope.Payload.IsJobPaused)
 
                 Case IpcMessageTypes.WorkerProgressEvent
                     Dim envelope = IpcSerializer.DeserializeEnvelope(Of WorkerProgressEvent)(rawMessage)
-                    _lastHeartbeatUtc = envelope.Payload.TimestampUtc
+                    SyncLock _timestampLock
+                        _lastHeartbeatUtc = envelope.Payload.TimestampUtc
+                    End SyncLock
                     MarkJobActivity(envelope.Payload.TimestampUtc, markProgress:=True)
                     If Not _isJobRunning Then
                         Return Task.CompletedTask
@@ -346,14 +356,16 @@ Namespace Services
 
                 Case IpcMessageTypes.WorkerJobResultEvent
                     Dim envelope = IpcSerializer.DeserializeEnvelope(Of WorkerJobResultEvent)(rawMessage)
-                    _isJobRunning = False
+                    Threading.Volatile.Write(_isJobRunning, False)
                     SetPausedState(False)
                     _autoRecoverJob = False
                     _cancelRequestedByUser = False
                     _currentJobId = String.Empty
                     _currentJobOptions = Nothing
-                    _lastJobActivityUtc = DateTimeOffset.MinValue
-                    _lastWorkerProgressUtc = DateTimeOffset.MinValue
+                    SyncLock _timestampLock
+                        _lastJobActivityUtc = DateTimeOffset.MinValue
+                        _lastWorkerProgressUtc = DateTimeOffset.MinValue
+                    End SyncLock
                     RaiseEvent JobCompleted(Me, envelope.Payload.Result)
                     RaiseEvent WorkerStateChanged(Me, "Job finished")
 
@@ -365,14 +377,16 @@ Namespace Services
                         .ErrorMessage = envelope.Payload.ErrorMessage
                     }
 
-                    _isJobRunning = False
+                    Threading.Volatile.Write(_isJobRunning, False)
                     SetPausedState(False)
                     _autoRecoverJob = False
                     _cancelRequestedByUser = False
                     _currentJobId = String.Empty
                     _currentJobOptions = Nothing
-                    _lastJobActivityUtc = DateTimeOffset.MinValue
-                    _lastWorkerProgressUtc = DateTimeOffset.MinValue
+                    SyncLock _timestampLock
+                        _lastJobActivityUtc = DateTimeOffset.MinValue
+                        _lastWorkerProgressUtc = DateTimeOffset.MinValue
+                    End SyncLock
                     RaiseEvent LogMessage(Me, $"[Worker Fatal] {envelope.Payload.ErrorMessage}")
                     RaiseEvent JobCompleted(Me, failureResult)
                     RaiseEvent WorkerStateChanged(Me, "Worker fatal error")
@@ -391,7 +405,11 @@ Namespace Services
             End If
 
             Dim nowUtc = DateTimeOffset.UtcNow
-            Dim elapsed = nowUtc - _lastHeartbeatUtc
+            Dim lastHeartbeatCopy As DateTimeOffset
+            SyncLock _timestampLock
+                lastHeartbeatCopy = _lastHeartbeatUtc
+            End SyncLock
+            Dim elapsed = nowUtc - lastHeartbeatCopy
             If elapsed <= HeartbeatTimeout Then
                 CheckForJobActivityStall(nowUtc)
                 Return
@@ -430,7 +448,7 @@ Namespace Services
         End Sub
 
         Private Async Function RecoverWorkerAsync(reason As String) As Task
-            If Not _isJobRunning Then
+            If Not Threading.Volatile.Read(_isJobRunning) Then
                 Return
             End If
 
@@ -463,7 +481,7 @@ Namespace Services
                 Await EnsureWorkerConnectedAsync(CancellationToken.None).ConfigureAwait(False)
                 MarkJobActivity(markProgress:=True)
 
-                If _autoRecoverJob AndAlso _isJobRunning AndAlso _currentJobOptions IsNot Nothing Then
+                If _autoRecoverJob AndAlso Threading.Volatile.Read(_isJobRunning) AndAlso _currentJobOptions IsNot Nothing Then
                     If Not _currentJobOptions.ResumeFromJournal Then
                         _currentJobOptions.ResumeFromJournal = True
                         RaiseEvent LogMessage(Me, "[Supervisor] Forced resume-from-journal after worker recovery.")
@@ -484,7 +502,7 @@ Namespace Services
         End Function
 
         Private Sub CompleteActiveJobAfterChannelLoss(reason As String)
-            If Not _isJobRunning Then
+            If Not Threading.Volatile.Read(_isJobRunning) Then
                 Return
             End If
 
@@ -501,14 +519,16 @@ Namespace Services
                 .ErrorMessage = message
             }
 
-            _isJobRunning = False
+            Threading.Volatile.Write(_isJobRunning, False)
             SetPausedState(False)
             _autoRecoverJob = False
             _cancelRequestedByUser = False
             _currentJobId = String.Empty
             _currentJobOptions = Nothing
-            _lastJobActivityUtc = DateTimeOffset.MinValue
-            _lastWorkerProgressUtc = DateTimeOffset.MinValue
+            SyncLock _timestampLock
+                _lastJobActivityUtc = DateTimeOffset.MinValue
+                _lastWorkerProgressUtc = DateTimeOffset.MinValue
+            End SyncLock
             _consecutiveMalformedMessages = 0
 
             RaiseEvent LogMessage(Me, $"[Supervisor] {message}")
@@ -555,33 +575,39 @@ Namespace Services
             End Try
 
             Try
-                If Not _workerProcess.HasExited Then
-                    If killIfStillRunning Then
-                        If Not _workerProcess.WaitForExit(CInt(TimeSpan.FromSeconds(2).TotalMilliseconds)) Then
+                ' Call WaitForExit directly — do not gate on HasExited first.
+                ' The process can exit between the HasExited check and the WaitForExit call,
+                ' which throws InvalidOperationException on some CLR versions.
+                If killIfStillRunning Then
+                    If Not _workerProcess.WaitForExit(CInt(TimeSpan.FromSeconds(2).TotalMilliseconds)) Then
+                        Try
+                            _workerProcess.Kill(entireProcessTree:=True)
+                        Catch
+                        End Try
+
+                        If Not _workerProcess.WaitForExit(CInt(TimeSpan.FromSeconds(3).TotalMilliseconds)) AndAlso workerPid > 0 Then
                             Try
-                                _workerProcess.Kill(entireProcessTree:=True)
+                                Dim taskKillInfo As New ProcessStartInfo("taskkill.exe", $"/PID {workerPid} /T /F") With {
+                                    .UseShellExecute = False,
+                                    .CreateNoWindow = True,
+                                    .WindowStyle = ProcessWindowStyle.Hidden
+                                }
+                                Using taskKillProcess = Process.Start(taskKillInfo)
+                                    taskKillProcess?.WaitForExit(CInt(TimeSpan.FromSeconds(3).TotalMilliseconds))
+                                End Using
                             Catch
                             End Try
+                        End If
 
-                            If Not _workerProcess.WaitForExit(CInt(TimeSpan.FromSeconds(3).TotalMilliseconds)) AndAlso workerPid > 0 Then
-                                Try
-                                    Dim taskKillInfo As New ProcessStartInfo("taskkill.exe", $"/PID {workerPid} /T /F") With {
-                                        .UseShellExecute = False,
-                                        .CreateNoWindow = True,
-                                        .WindowStyle = ProcessWindowStyle.Hidden
-                                    }
-                                    Using taskKillProcess = Process.Start(taskKillInfo)
-                                        taskKillProcess?.WaitForExit(CInt(TimeSpan.FromSeconds(3).TotalMilliseconds))
-                                    End Using
-                                Catch
-                                End Try
-                            End If
-
+                        ' Final check after all termination attempts.
+                        Try
                             If Not _workerProcess.HasExited Then
                                 shutdownClean = False
                                 RaiseEvent LogMessage(Me, $"[Supervisor] Worker PID {workerPid} did not terminate promptly; continuing with recovery.")
                             End If
-                        End If
+                        Catch
+                            shutdownClean = False
+                        End Try
                     End If
                 End If
             Catch
@@ -804,13 +830,19 @@ Namespace Services
         End Function
 
         Private Sub CheckForJobActivityStall(nowUtc As DateTimeOffset)
-            If Not _isJobRunning OrElse _isJobPaused OrElse Not _autoRecoverJob Then
+            If Not Threading.Volatile.Read(_isJobRunning) OrElse _isJobPaused OrElse Not _autoRecoverJob Then
                 Return
             End If
 
-            Dim lastActivityUtc = _lastJobActivityUtc
+            Dim lastActivityUtc As DateTimeOffset
+            Dim lastProgressUtc As DateTimeOffset
+            SyncLock _timestampLock
+                lastActivityUtc = _lastJobActivityUtc
+                lastProgressUtc = _lastWorkerProgressUtc
+            End SyncLock
+
             If lastActivityUtc = DateTimeOffset.MinValue Then
-                lastActivityUtc = _lastWorkerProgressUtc
+                lastActivityUtc = lastProgressUtc
             End If
 
             If lastActivityUtc = DateTimeOffset.MinValue Then
@@ -824,10 +856,10 @@ Namespace Services
             End If
 
             Dim progressElapsed As TimeSpan
-            If _lastWorkerProgressUtc = DateTimeOffset.MinValue Then
+            If lastProgressUtc = DateTimeOffset.MinValue Then
                 progressElapsed = activityElapsed
             Else
-                progressElapsed = nowUtc - _lastWorkerProgressUtc
+                progressElapsed = nowUtc - lastProgressUtc
             End If
 
             QueueRecovery(
@@ -857,10 +889,12 @@ Namespace Services
 
         Private Sub MarkJobActivity(Optional timestampUtc As DateTimeOffset = Nothing, Optional markProgress As Boolean = False)
             Dim effectiveUtc = NormalizeTimestampOrNow(timestampUtc)
-            _lastJobActivityUtc = effectiveUtc
-            If markProgress Then
-                _lastWorkerProgressUtc = effectiveUtc
-            End If
+            SyncLock _timestampLock
+                _lastJobActivityUtc = effectiveUtc
+                If markProgress Then
+                    _lastWorkerProgressUtc = effectiveUtc
+                End If
+            End SyncLock
         End Sub
 
         Private Shared Function NormalizeTimestampOrNow(

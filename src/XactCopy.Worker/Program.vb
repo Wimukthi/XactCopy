@@ -25,6 +25,7 @@ Module Program
     Private _progressDispatchScheduled As Integer
     Private _lastProgressSentTick As Long
     Private _pendingProgressSnapshot As CopyProgressSnapshot
+    Private _fileTransitionSnapshot As CopyProgressSnapshot
     Private _progressReceivedCount As Long
     Private _progressSentCount As Long
     Private _progressCoalescedCount As Long
@@ -357,6 +358,7 @@ Module Program
 
         SyncLock ProgressDispatchLock
             _pendingProgressSnapshot = Nothing
+            _fileTransitionSnapshot = Nothing
         End SyncLock
 
         SyncLock LogRateLock
@@ -401,7 +403,14 @@ Module Program
 
         SyncLock ProgressDispatchLock
             If _pendingProgressSnapshot IsNot Nothing Then
-                Interlocked.Increment(_progressCoalescedCount)
+                ' Detect file transition: if the current file changed, promote the old pending
+                ' snapshot to the transition slot so the drain sends it before the new file's
+                ' events. This ensures the UI always sees the file completion event.
+                If Not String.Equals(_pendingProgressSnapshot.CurrentFile, snapshot.CurrentFile, StringComparison.Ordinal) Then
+                    _fileTransitionSnapshot = _pendingProgressSnapshot
+                Else
+                    Interlocked.Increment(_progressCoalescedCount)
+                End If
             End If
             _pendingProgressSnapshot = snapshot
         End SyncLock
@@ -450,35 +459,54 @@ Module Program
         cancellationToken As CancellationToken) As Task
 
         Do
+            ' File-transition snapshots bypass rate limiting so the UI always sees
+            ' the previous file's completion event before the new file starts.
+            Dim transitionSnapshot As CopyProgressSnapshot = Nothing
+            SyncLock ProgressDispatchLock
+                transitionSnapshot = _fileTransitionSnapshot
+                _fileTransitionSnapshot = Nothing
+            End SyncLock
+
+            If transitionSnapshot IsNot Nothing Then
+                Await SendProgressSnapshotAsync(stream, transitionSnapshot, cancellationToken).ConfigureAwait(False)
+                Threading.Volatile.Write(_lastProgressSentTick, Environment.TickCount64)
+            End If
+
+            ' Read the pending snapshot and measure elapsed time outside any lock so that
+            ' the Task.Delay that follows is never inside a SyncLock block.
             Dim snapshot As CopyProgressSnapshot = Nothing
+            Dim waitMs As Integer = 0
+
             SyncLock ProgressDispatchLock
                 snapshot = _pendingProgressSnapshot
                 _pendingProgressSnapshot = Nothing
-            End SyncLock
 
-            If snapshot Is Nothing Then
-                Exit Do
-            End If
-
-            If _lastProgressSentTick > 0 Then
-                Dim elapsed = Environment.TickCount64 - _lastProgressSentTick
-                If elapsed < _runtimeProgressIntervalMs Then
-                    Dim waitMs = CInt(Math.Max(1L, _runtimeProgressIntervalMs - elapsed))
-                    SyncLock ProgressDispatchLock
+                If snapshot IsNot Nothing AndAlso _lastProgressSentTick > 0 Then
+                    Dim elapsed = Environment.TickCount64 - _lastProgressSentTick
+                    If elapsed < _runtimeProgressIntervalMs Then
+                        ' Not yet time to send — put the snapshot back and record how long to wait.
+                        waitMs = CInt(Math.Max(1L, _runtimeProgressIntervalMs - elapsed))
                         If _pendingProgressSnapshot Is Nothing Then
                             _pendingProgressSnapshot = snapshot
                         Else
                             Interlocked.Increment(_progressCoalescedCount)
                         End If
-                    End SyncLock
+                        snapshot = Nothing
+                    End If
+                End If
+            End SyncLock
 
+            If snapshot Is Nothing Then
+                If waitMs > 0 Then
+                    ' Rate-limit wait — lock is fully released before this await.
                     Await Task.Delay(waitMs, cancellationToken).ConfigureAwait(False)
                     Continue Do
                 End If
+                Exit Do
             End If
 
             Await SendProgressSnapshotAsync(stream, snapshot, cancellationToken).ConfigureAwait(False)
-            _lastProgressSentTick = Environment.TickCount64
+            Threading.Volatile.Write(_lastProgressSentTick, Environment.TickCount64)
         Loop
     End Function
 
@@ -606,10 +634,36 @@ Module Program
         stream As NamedPipeServerStream,
         cancellationToken As CancellationToken) As Task
 
+        ' Snapshot counters for adaptive coalescing interval tuning.
+        Dim lastReceived As Long = 0
+        Dim lastCoalesced As Long = 0
+
         While Not cancellationToken.IsCancellationRequested
             Try
                 Await SendHeartbeatAsync(stream, cancellationToken).ConfigureAwait(False)
                 Await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(False)
+
+                ' Adaptive coalescing: measure how many progress events were dropped in the
+                ' last second versus received. High coalesce ratio (>80%) means the interval
+                ' is too tight — loosen it. Low ratio (<20%) means we can afford to tighten.
+                ' This makes rescue passes (slow progress, bursty events) automatically
+                ' widen their interval while fast bulk copies stay responsive.
+                Dim nowReceived = Interlocked.Read(_progressReceivedCount)
+                Dim nowCoalesced = Interlocked.Read(_progressCoalescedCount)
+                Dim deltaReceived = nowReceived - lastReceived
+                Dim deltaCoalesced = nowCoalesced - lastCoalesced
+                lastReceived = nowReceived
+                lastCoalesced = nowCoalesced
+
+                If deltaReceived > 2 Then
+                    Dim coalesceRatio = deltaCoalesced / CDbl(deltaReceived)
+                    Dim currentInterval = Threading.Volatile.Read(_runtimeProgressIntervalMs)
+                    If coalesceRatio > 0.8R Then
+                        Threading.Volatile.Write(_runtimeProgressIntervalMs, Math.Min(200, currentInterval + 10))
+                    ElseIf coalesceRatio < 0.2R Then
+                        Threading.Volatile.Write(_runtimeProgressIntervalMs, Math.Max(20, currentInterval - 5))
+                    End If
+                End If
             Catch ex As OperationCanceledException
                 Exit While
             Catch

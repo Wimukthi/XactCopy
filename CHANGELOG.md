@@ -4,6 +4,48 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.1.0.7] - 2026-04-13
+
+### Added
+
+- Parallel small file copy phase:
+  - When `ParallelSmallFileWorkers > 1`, small files (below `SmallFileThresholdBytes`) are bulk-copied via `CopyFileEx` in parallel before the main sequential loop. The main loop then skips them as already completed, eliminating redundant per-file overhead on large flat directory copies.
+  - Phase is disabled automatically when fragile-media mode, file-lock wait, throughput throttling, verification, or bad-range skip-hints are active.
+
+### Fixed
+
+- Log listbox blank repaint after second job start:
+  - When the log view was cleared and then immediately populated by a new job, the low-priority `WM_PAINT` message was starved by the `BeginInvoke` flood from the newly started worker process. Items were present but invisible until the user hovered the mouse. Fixed by calling `Refresh()` (invalidate + synchronous update) on the first batch of new items after a clear, instead of the deferred `Invalidate()`.
+- File-transition progress events lost during coalescing:
+  - Worker progress coalescer now detects when the current file changes and promotes the previous file's pending snapshot to a priority slot. The UI always receives the final completion event for a file before the next file's events arrive.
+- SyncLock not held during async wait in progress drain loop:
+  - Progress rate-limit wait (`Task.Delay`) was incorrectly placed inside a `SyncLock` block. Moved outside so the lock is fully released before any async suspension.
+
+### Changed
+
+- Copy engine native fast-path extended to all file sizes:
+  - Removed the 64 MB ceiling that previously forced large files through the managed buffer path. `CopyFileEx` is now used for all clean files regardless of size, allowing the kernel to handle the copy without user-mode buffer round-trips.
+- `FILE_FLAG_NO_BUFFERING` enabled for large file copies:
+  - Files ≥ 16 MB are now copied with the no-buffering flag, bypassing the OS page cache for purely sequential large-file transfers.
+- Directory creation cache added to copy loop:
+  - Destination directories are tracked in a `HashSet` and created at most once per run, eliminating redundant `Directory.CreateDirectory` calls for files sharing the same destination folder.
+- Journal flush rate-limiting:
+  - Forced (mid-copy) journal flushes are throttled to at most one per 500 ms, reducing journal write pressure during high-frequency small-file runs. Critical path flushes (job completion, scan/copy abort) remain unconditional.
+- `CancellationTokenSource` reuse in I/O retry loops:
+  - `ReadChunkWithRetriesAsync` and `WriteChunkWithRetriesAsync` now reuse a single linked `CancellationTokenSource` across retry attempts and recreate it only on timeout, avoiding repeated allocations in hot retry paths.
+- Heartbeat stall detection interval halved (2 s → 1 s):
+  - Supervisor now polls the worker heartbeat every 1 s instead of 2 s, reducing worst-case stall detection latency from ~3 s to ~2 s.
+- Supervisor timestamp fields protected with `SyncLock`:
+  - `DateTimeOffset` timestamp fields (`_lastHeartbeatUtc`, `_lastJobActivityUtc`, `_lastWorkerProgressUtc`) shared between the receive-loop task and the heartbeat timer callback are now guarded by a dedicated lock. `_isJobRunning` uses `Volatile.Read/Write`.
+- Worker process termination sequence hardened:
+  - Shutdown now follows a staged kill sequence: `WaitForExit(2 s)` → `Kill(entireProcessTree:=True)` → `WaitForExit(3 s)` → `taskkill /PID /T /F` fallback, avoiding the race between `HasExited` and `WaitForExit` that could throw on some CLR versions.
+- Taskbar progress COM calls debounced to ≤ 4/sec:
+  - `ITaskbarList3` COM calls are expensive; updates are now rate-limited to one per 250 ms to prevent COM overhead during rapid progress bursts.
+- Journal and bad-range-map backup rotation async and atomic:
+  - Backup rotation is offloaded to `Task.Run` so a single file copy (generation 1) does not block the async call chain on slow media. Intermediate generations now use `File.Move` (atomic O(1) rename on the same volume) instead of copy-then-delete.
+- `TryReadMessageType` fast path avoids DOM allocation:
+  - Implemented direct JSON string scanning for `ProtocolVersion` and `MessageType` fields, removing the `JsonDocument` DOM allocation that occurred for every incoming IPC message.
+
 ## [1.0.9.9] - 2026-04-02
 
 ### Added
