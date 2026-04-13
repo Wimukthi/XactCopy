@@ -3967,8 +3967,9 @@ Public Class MainForm
             Return
         End If
 
+        Dim previousSize = _logListView.VirtualListSize
         Dim targetSize = Math.Max(0, _logEntries.Count)
-        If _logListView.VirtualListSize <> targetSize Then
+        If previousSize <> targetSize Then
             _logListView.VirtualListSize = targetSize
         End If
 
@@ -3980,7 +3981,17 @@ Public Class MainForm
             If targetSize > 0 Then
                 _logListView.RedrawItems(0, targetSize - 1, invalidateOnly:=True)
             End If
-            _logListView.Invalidate()
+
+            ' When transitioning from empty to non-empty (e.g. after ClearLogView
+            ' followed by new log lines), use Refresh (Invalidate + Update) to force
+            ' a synchronous repaint. Without this, the low-priority WM_PAINT message
+            ' gets starved by the flood of BeginInvoke calls from the newly started
+            ' worker process, leaving the list visually blank until the user hovers.
+            If previousSize = 0 AndAlso targetSize > 0 Then
+                _logListView.Refresh()
+            Else
+                _logListView.Invalidate()
+            End If
         Catch
             ' Best-effort refresh only; keep copy loop resilient.
         End Try

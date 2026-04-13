@@ -91,6 +91,8 @@ End Interface
 Friend NotInheritable Class TaskbarProgressController
     Private ReadOnly _taskbar As ITaskbarList3
     Private ReadOnly _supported As Boolean
+    Private _lastTaskbarUpdateTick As Long = 0
+    Private Const TaskbarUpdateIntervalMs As Long = 250 ' ≤4 COM calls/sec
 
     ''' <summary>
     ''' Initializes a new instance.
@@ -144,12 +146,19 @@ Friend NotInheritable Class TaskbarProgressController
             Return
         End If
 
+        ' Debounce: ITaskbarList3 COM calls are expensive; cap at ≤4/sec.
+        Dim nowTick = Environment.TickCount64
+        If nowTick - Threading.Volatile.Read(_lastTaskbarUpdateTick) < TaskbarUpdateIntervalMs Then
+            Return
+        End If
+
         Dim safeTotal = Math.Max(1UL, total)
         Dim safeCompleted = Math.Min(completed, safeTotal)
 
         Try
             _taskbar.SetProgressState(hwnd, state)
             _taskbar.SetProgressValue(hwnd, safeCompleted, safeTotal)
+            Threading.Volatile.Write(_lastTaskbarUpdateTick, nowTick)
         Catch
         End Try
     End Sub

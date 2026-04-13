@@ -274,7 +274,10 @@ Namespace Infrastructure
             cancellationToken As CancellationToken) As Task
 
             EnsureDirectoryForPath(snapshotPath)
-            RotateBackups(snapshotPath)
+            ' Offload backup rotation so that the one File.Copy (gen-1) does not block the
+            ' async call chain on slow media. Intermediate generations use File.Move, which
+            ' is an atomic O(1) rename on the same volume.
+            Await Task.Run(Sub() RotateBackups(snapshotPath), cancellationToken).ConfigureAwait(False)
             Await WriteAtomicBytesAsync(snapshotPath, payload, cancellationToken).ConfigureAwait(False)
         End Function
 
@@ -282,12 +285,22 @@ Namespace Infrastructure
             For generation = BackupGenerationCount To 1 Step -1
                 Dim destinationPath = GetBackupPath(snapshotPath, generation)
                 Dim sourcePath = If(generation = 1, snapshotPath, GetBackupPath(snapshotPath, generation - 1))
-                If File.Exists(destinationPath) Then
-                    File.Delete(destinationPath)
-                End If
 
-                If File.Exists(sourcePath) Then
-                    File.Copy(sourcePath, destinationPath, overwrite:=True)
+                If generation > 1 Then
+                    ' Rename (atomic, O(1) on same volume) replaces the old copy+delete pattern.
+                    If File.Exists(sourcePath) Then
+                        File.Move(sourcePath, destinationPath, overwrite:=True)
+                    ElseIf File.Exists(destinationPath) Then
+                        File.Delete(destinationPath)
+                    End If
+                Else
+                    ' gen-1: must copy the live file to preserve it for the upcoming write.
+                    If File.Exists(destinationPath) Then
+                        File.Delete(destinationPath)
+                    End If
+                    If File.Exists(sourcePath) Then
+                        File.Copy(sourcePath, destinationPath, overwrite:=True)
+                    End If
                 End If
             Next
         End Sub
@@ -297,7 +310,8 @@ Namespace Infrastructure
             Try
                 Using stream = New FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536, FileOptions.Asynchronous Or FileOptions.WriteThrough)
                     Await stream.WriteAsync(payload.AsMemory(0, payload.Length), cancellationToken).ConfigureAwait(False)
-                    Await stream.FlushAsync(cancellationToken).ConfigureAwait(False)
+                    ' FlushAsync is a no-op after WriteThrough (data already bypasses the OS cache).
+                    ' Flush(flushToDisk:=True) calls FlushFileBuffers to push past the disk's write buffer.
                     stream.Flush(flushToDisk:=True)
                 End Using
 
