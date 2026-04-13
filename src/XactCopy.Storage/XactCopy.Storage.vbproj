@@ -4,9 +4,10 @@
     <ProjectReference Include="..\XactCopy.Core\XactCopy.Core.vbproj" />
   </ItemGroup>
 
+
   <PropertyGroup>
     <RootNamespace>XactCopy</RootNamespace>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <OptionStrict>On</OptionStrict>
     <OptionInfer>On</OptionInfer>
     <OptionExplicit>On</OptionExplicit>

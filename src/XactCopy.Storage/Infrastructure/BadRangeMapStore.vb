@@ -1,5 +1,6 @@
 Imports System.IO
 Imports System.Linq
+Imports System.Runtime.InteropServices
 Imports System.Security.Cryptography
 Imports System.Text
 Imports System.Text.Json
@@ -137,6 +138,10 @@ Namespace Infrastructure
                     Return Nothing
                 End If
 
+                ' Re-serializing the deserialized payload is necessary because WriteIndented = True
+                ' means the embedded payload bytes in the envelope differ from the standalone bytes
+                ' that were hashed on save (indentation depth differs). A future schema version
+                ' should store the payload as raw bytes (base64) to avoid this double serialization.
                 Dim payloadBytes = JsonSerializer.SerializeToUtf8Bytes(envelope.Payload, _serializerOptions)
                 Dim payloadSha = ComputeSha256Hex(payloadBytes)
                 If Not SecureEquals(payloadSha, envelope.PayloadSha256) Then
@@ -182,8 +187,10 @@ Namespace Infrastructure
             cancellationToken As CancellationToken) As Task
 
             EnsureDirectoryForPath(snapshotPath)
-            ' Keep the last N known-good states before replacing the live snapshot.
-            RotateBackups(snapshotPath)
+            ' Offload backup rotation so that the one File.Copy (gen-1) does not block the
+            ' async call chain on slow media. Intermediate generations use File.Move, which
+            ' is an atomic O(1) rename on the same volume.
+            Await Task.Run(Sub() RotateBackups(snapshotPath), cancellationToken).ConfigureAwait(False)
             Await WriteAtomicBytesAsync(snapshotPath, payload, cancellationToken).ConfigureAwait(False)
         End Function
 
@@ -192,12 +199,21 @@ Namespace Infrastructure
                 Dim destinationPath = GetBackupPath(snapshotPath, generation)
                 Dim sourcePath = If(generation = 1, snapshotPath, GetBackupPath(snapshotPath, generation - 1))
 
-                If File.Exists(destinationPath) Then
-                    File.Delete(destinationPath)
-                End If
-
-                If File.Exists(sourcePath) Then
-                    File.Copy(sourcePath, destinationPath, overwrite:=True)
+                If generation > 1 Then
+                    ' Rename (atomic, O(1) on same volume) replaces the old copy+delete pattern.
+                    If File.Exists(sourcePath) Then
+                        File.Move(sourcePath, destinationPath, overwrite:=True)
+                    ElseIf File.Exists(destinationPath) Then
+                        File.Delete(destinationPath)
+                    End If
+                Else
+                    ' gen-1: must copy the live file to preserve it for the upcoming write.
+                    If File.Exists(destinationPath) Then
+                        File.Delete(destinationPath)
+                    End If
+                    If File.Exists(sourcePath) Then
+                        File.Copy(sourcePath, destinationPath, overwrite:=True)
+                    End If
                 End If
             Next
         End Sub
@@ -207,7 +223,8 @@ Namespace Infrastructure
             Try
                 Using stream = New FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536, FileOptions.Asynchronous Or FileOptions.WriteThrough)
                     Await stream.WriteAsync(payload.AsMemory(0, payload.Length), cancellationToken).ConfigureAwait(False)
-                    Await stream.FlushAsync(cancellationToken).ConfigureAwait(False)
+                    ' FlushAsync is a no-op after WriteThrough (data already bypasses the OS cache).
+                    ' Flush(flushToDisk:=True) calls FlushFileBuffers to push past the disk's write buffer.
                     stream.Flush(flushToDisk:=True)
                 End Using
 
@@ -358,48 +375,166 @@ Namespace Infrastructure
 
                 Dim keyPath = Path.Combine(securityRoot, SecurityKeyFileName)
                 Dim loadedKey As Byte() = Nothing
+
+                ' The key file stores DPAPI-protected (CurrentUser scope) ciphertext.
+                ' Only the same Windows user account can decrypt it — FileAttributes.Hidden
+                ' alone is not a security boundary.
+                ' Migration: legacy key files stored the 32 raw bytes directly. Detect by size
+                ' (DPAPI output is always larger than 32 bytes) and re-protect in-place.
                 If File.Exists(keyPath) Then
                     Try
-                        loadedKey = File.ReadAllBytes(keyPath)
+                        Dim fileBytes = File.ReadAllBytes(keyPath)
+                        Dim rawKey As Byte() = Nothing
+
+                        If fileBytes.Length = HmacKeySizeBytes Then
+                            ' Legacy format — raw unprotected key. Accept and migrate below.
+                            rawKey = fileBytes
+                        Else
+                            rawKey = DpapiUnprotect(fileBytes)
+                        End If
+
+                        If rawKey IsNot Nothing AndAlso rawKey.Length = HmacKeySizeBytes Then
+                            loadedKey = rawKey
+                            If fileBytes.Length = HmacKeySizeBytes Then
+                                ' Migrate legacy raw key to DPAPI-protected format.
+                                TrySaveKeyWithDpapi(keyPath, rawKey)
+                            End If
+                        End If
                     Catch
                         loadedKey = Nothing
                     End Try
                 End If
 
                 If loadedKey Is Nothing OrElse loadedKey.Length <> HmacKeySizeBytes Then
-                    ' Regenerate key if missing/invalid and persist atomically.
+                    ' Regenerate key if missing/invalid, DPAPI-protect it, and persist atomically.
                     loadedKey = New Byte(HmacKeySizeBytes - 1) {}
                     RandomNumberGenerator.Fill(loadedKey)
-
-                    Dim tempPath = $"{keyPath}.tmp.{Guid.NewGuid():N}"
-                    File.WriteAllBytes(tempPath, loadedKey)
-                    Try
-                        If File.Exists(keyPath) Then
-                            File.Delete(keyPath)
-                        End If
-                        File.Move(tempPath, keyPath)
-                    Catch
-                        If File.Exists(tempPath) Then
-                            Try
-                                File.Delete(tempPath)
-                            Catch
-                            End Try
-                        End If
-
-                        If File.Exists(keyPath) Then
-                            loadedKey = File.ReadAllBytes(keyPath)
-                        End If
-                    End Try
-
-                    Try
-                        File.SetAttributes(keyPath, File.GetAttributes(keyPath) Or FileAttributes.Hidden)
-                    Catch
-                    End Try
+                    TrySaveKeyWithDpapi(keyPath, loadedKey)
                 End If
 
                 CachedHmacKey = loadedKey
                 Return DirectCast(CachedHmacKey.Clone(), Byte())
             End SyncLock
+        End Function
+
+        ''' <summary>
+        ''' Atomically writes the HMAC key to disk as DPAPI-protected (CurrentUser) ciphertext.
+        ''' Silently no-ops if DPAPI is unavailable (e.g. service account with no user profile).
+        ''' </summary>
+        Private Shared Sub TrySaveKeyWithDpapi(keyPath As String, rawKey As Byte())
+            Try
+                Dim encryptedKey = DpapiProtect(rawKey)
+                Dim tempPath = $"{keyPath}.tmp.{Guid.NewGuid():N}"
+                File.WriteAllBytes(tempPath, encryptedKey)
+                Try
+                    If File.Exists(keyPath) Then
+                        File.Delete(keyPath)
+                    End If
+                    File.Move(tempPath, keyPath)
+                Catch
+                    If File.Exists(tempPath) Then
+                        Try
+                            File.Delete(tempPath)
+                        Catch
+                        End Try
+                    End If
+                End Try
+                Try
+                    File.SetAttributes(keyPath, File.GetAttributes(keyPath) Or FileAttributes.Hidden)
+                Catch
+                End Try
+            Catch
+                ' DPAPI unavailable — key remains unprotected on disk this session.
+            End Try
+        End Sub
+
+        ' ── DPAPI P/Invoke ────────────────────────────────────────────────────────
+        ' Using crypt32.dll directly to avoid the System.Security.Cryptography.ProtectedData
+        ' NuGet package, which the .NET SDK suppresses from output when targeting net-windows
+        ' (treated as an inbox assembly), causing FileNotFoundException at runtime.
+
+        <StructLayout(LayoutKind.Sequential, CharSet:=CharSet.Unicode)>
+        Private Structure DpapiBlob
+            Public cbData As Integer
+            Public pbData As IntPtr
+        End Structure
+
+        <DllImport("crypt32.dll", SetLastError:=True, CharSet:=CharSet.Unicode)>
+        Private Shared Function CryptProtectData(
+            ByRef pDataIn As DpapiBlob,
+            szDataDescr As String,
+            pOptionalEntropy As IntPtr,
+            pvReserved As IntPtr,
+            pPromptStruct As IntPtr,
+            dwFlags As Integer,
+            ByRef pDataOut As DpapiBlob) As Boolean
+        End Function
+
+        <DllImport("crypt32.dll", SetLastError:=True, CharSet:=CharSet.Unicode)>
+        Private Shared Function CryptUnprotectData(
+            ByRef pDataIn As DpapiBlob,
+            pszDataDescr As IntPtr,
+            pOptionalEntropy As IntPtr,
+            pvReserved As IntPtr,
+            pPromptStruct As IntPtr,
+            dwFlags As Integer,
+            ByRef pDataOut As DpapiBlob) As Boolean
+        End Function
+
+        <DllImport("kernel32.dll", SetLastError:=True)>
+        Private Shared Function LocalFree(hMem As IntPtr) As IntPtr
+        End Function
+
+        ''' <summary>
+        ''' Encrypts <paramref name="data"/> with DPAPI (CurrentUser scope, no UI).
+        ''' </summary>
+        Private Shared Function DpapiProtect(data As Byte()) As Byte()
+            Dim inBlob As DpapiBlob
+            Dim outBlob As DpapiBlob
+            Dim handle = GCHandle.Alloc(data, GCHandleType.Pinned)
+            Try
+                inBlob.cbData = data.Length
+                inBlob.pbData = handle.AddrOfPinnedObject()
+                ' dwFlags = 1 (CRYPTPROTECT_UI_FORBIDDEN) — CurrentUser scope, no prompts.
+                If Not CryptProtectData(inBlob, Nothing, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 1, outBlob) Then
+                    Throw New InvalidOperationException($"CryptProtectData failed (0x{Marshal.GetLastWin32Error():X8})")
+                End If
+                Try
+                    Dim result(outBlob.cbData - 1) As Byte
+                    Marshal.Copy(outBlob.pbData, result, 0, outBlob.cbData)
+                    Return result
+                Finally
+                    LocalFree(outBlob.pbData)
+                End Try
+            Finally
+                handle.Free()
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Decrypts DPAPI-protected <paramref name="data"/> (CurrentUser scope, no UI).
+        ''' </summary>
+        Private Shared Function DpapiUnprotect(data As Byte()) As Byte()
+            Dim inBlob As DpapiBlob
+            Dim outBlob As DpapiBlob
+            Dim handle = GCHandle.Alloc(data, GCHandleType.Pinned)
+            Try
+                inBlob.cbData = data.Length
+                inBlob.pbData = handle.AddrOfPinnedObject()
+                ' dwFlags = 1 (CRYPTPROTECT_UI_FORBIDDEN) — CurrentUser scope, no prompts.
+                If Not CryptUnprotectData(inBlob, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 1, outBlob) Then
+                    Throw New InvalidOperationException($"CryptUnprotectData failed (0x{Marshal.GetLastWin32Error():X8})")
+                End If
+                Try
+                    Dim result(outBlob.cbData - 1) As Byte
+                    Marshal.Copy(outBlob.pbData, result, 0, outBlob.cbData)
+                    Return result
+                Finally
+                    LocalFree(outBlob.pbData)
+                End Try
+            Finally
+                handle.Free()
+            End Try
         End Function
 
         Private Shared Function NormalizeMap(map As BadRangeMap) As BadRangeMap

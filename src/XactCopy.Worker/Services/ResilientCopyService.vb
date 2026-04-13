@@ -20,6 +20,7 @@ Namespace Services
         Public Event LogMessage As EventHandler(Of String)
 
         Private Const JournalFlushIntervalSeconds As Integer = 1
+        Private Const JournalForcedFlushIntervalMs As Integer = 500
         Private Const BadRangeMapFlushIntervalSeconds As Integer = 2
         Private Const MediaIdentityProbeIntervalMilliseconds As Integer = 1000
         Private Const RescueCoreName As String = "Rescue Engine"
@@ -40,7 +41,8 @@ Namespace Services
         Private Const ErrorInvalidParameter As Integer = 87
         Private Const ErrorDiskFull As Integer = 112
         Private Const ErrorDeviceNotConnected As Integer = 1167
-        Private Const NativeCopyFastPathMaxBytes As Long = 64L * 1024L * 1024L
+        Private Const NativeCopyFastPathMaxBytes As Long = Long.MaxValue
+        Private Const NativeNoBufferingThresholdBytes As Long = 16L * 1024L * 1024L
 
         Private ReadOnly _options As CopyJobOptions
         Private ReadOnly _executionControl As CopyExecutionControl
@@ -65,6 +67,7 @@ Namespace Services
         Private _badRangeMapReadHintsEnabled As Boolean
         Private _rawDiskScanContext As RawDiskScanContext
         Private ReadOnly _rawScanFallbackLoggedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+        Private ReadOnly _createdDirectories As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
         Private ReadOnly _fragileFailureTimestamps As New Queue(Of DateTimeOffset)()
 
         <DllImport("kernel32.dll", CharSet:=CharSet.Unicode, SetLastError:=True)>
@@ -196,6 +199,7 @@ Namespace Services
 #End If
             Try
                 _rawScanFallbackLoggedPaths.Clear()
+                _createdDirectories.Clear()
                 _fragileFailureTimestamps.Clear()
 
                 Dim scanOnly = (_options.OperationMode = JobOperationMode.ScanOnly)
@@ -272,6 +276,51 @@ Namespace Services
                     .TotalFiles = sourceFiles.Count,
                     .TotalBytes = totalBytes
                 }
+
+                ' --- Parallel small file copy phase ---
+                ' When ParallelSmallFileWorkers > 1, eligible small files are bulk-copied via
+                ' CopyFileEx in parallel before the main sequential loop. The main loop then
+                ' sees them as already completed and skips them with minimal overhead.
+                If Not scanOnly AndAlso _options.ParallelSmallFileWorkers > 1 AndAlso
+                    Not _options.FragileMediaMode AndAlso
+                    Not _options.WaitForFileLockRelease AndAlso
+                    _options.MaxThroughputBytesPerSecond <= 0 AndAlso
+                    ResolveVerificationMode() = VerificationMode.None AndAlso
+                    Not (_options.UseBadRangeMap AndAlso _options.SkipKnownBadRanges) Then
+
+                    Dim eligibleSmallFiles As New List(Of SourceFileDescriptor)()
+                    Dim smallFileThreshold = Math.Max(MinimumRescueBlockSize, _options.SmallFileThresholdBytes)
+                    For Each candidateDescriptor In sourceFiles
+                        If candidateDescriptor.Length <= 0 OrElse candidateDescriptor.Length > smallFileThreshold Then
+                            Continue For
+                        End If
+
+                        Dim candidateEntry As JournalFileEntry = Nothing
+                        If Not journal.Files.TryGetValue(candidateDescriptor.RelativePath, candidateEntry) Then
+                            Continue For
+                        End If
+
+                        If IsAlreadyCompleted(candidateEntry, candidateDescriptor, destinationRoot) Then
+                            Continue For
+                        End If
+
+                        If ShouldSkipFailedEntryForFragileResume(candidateEntry) Then
+                            Continue For
+                        End If
+
+                        Dim skipReason As String = String.Empty
+                        If ShouldSkipByOverwritePolicy(candidateDescriptor, destinationRoot, skipReason) Then
+                            Continue For
+                        End If
+
+                        eligibleSmallFiles.Add(candidateDescriptor)
+                    Next
+
+                    If eligibleSmallFiles.Count > 1 Then
+                        Await CopySmallFilesParallelAsync(
+                            eligibleSmallFiles, destinationRoot, journal, journalPath, cancellationToken).ConfigureAwait(False)
+                    End If
+                End If
 
                 For Each descriptor In sourceFiles
                     cancellationToken.ThrowIfCancellationRequested()
@@ -411,6 +460,13 @@ Namespace Services
                             entry.BytesCopied = descriptor.Length
                             entry.LastError = String.Empty
                             entry.DoNotRetry = False
+                            EmitProgress(
+                                progress,
+                                descriptor.RelativePath,
+                                descriptor.Length,
+                                descriptor.Length,
+                                lastChunkBytesTransferred:=0,
+                                bufferSizeBytes:=ResolveBufferSizeForFile(descriptor.Length))
                             Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken, forceSave:=False).ConfigureAwait(False)
                             Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
                             Continue For
@@ -426,7 +482,7 @@ Namespace Services
                         Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=False).ConfigureAwait(False)
 
                         If Not _options.ContinueOnFileError Then
-                            Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+                            Await FlushJournalUnconditionalAsync(journalPath, journal, cancellationToken).ConfigureAwait(False)
                             Return CreateResult(progress, journalPath, succeeded:=False, cancelled:=False, errorMessage:=scanException.Message)
                         End If
 
@@ -528,6 +584,13 @@ Namespace Services
                         entry.BytesCopied = descriptor.Length
                         entry.LastError = String.Empty
                         entry.DoNotRetry = False
+                        EmitProgress(
+                            progress,
+                            descriptor.RelativePath,
+                            descriptor.Length,
+                            descriptor.Length,
+                            lastChunkBytesTransferred:=0,
+                            bufferSizeBytes:=ResolveBufferSizeForFile(descriptor.Length))
                         Await TryPersistBadRangeMapEntryAsync(sourceRoot, descriptor, entry, cancellationToken).ConfigureAwait(False)
                         Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
                         Continue For
@@ -543,12 +606,13 @@ Namespace Services
                     Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
 
                     If Not _options.ContinueOnFileError Then
+                        Await FlushJournalUnconditionalAsync(journalPath, journal, cancellationToken).ConfigureAwait(False)
                         Return CreateResult(progress, journalPath, succeeded:=False, cancelled:=False, errorMessage:=copyException.Message)
                     End If
                 Next
 
                 Await FlushBadRangeMapAsync(cancellationToken).ConfigureAwait(False)
-                Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+                Await FlushJournalUnconditionalAsync(journalPath, journal, cancellationToken).ConfigureAwait(False)
                 Return CreateResult(progress, journalPath, succeeded:=(progress.FailedFiles = 0), cancelled:=False, errorMessage:=String.Empty)
             Finally
                 DisposeRawDiskScanContext()
@@ -1004,7 +1068,7 @@ Namespace Services
 
             Dim destinationPath = Path.Combine(destinationRoot, descriptor.RelativePath)
             Dim destinationDirectory = Path.GetDirectoryName(destinationPath)
-            If Not String.IsNullOrWhiteSpace(destinationDirectory) Then
+            If Not String.IsNullOrWhiteSpace(destinationDirectory) AndAlso _createdDirectories.Add(destinationDirectory) Then
                 Directory.CreateDirectory(destinationDirectory)
             End If
 
@@ -1919,6 +1983,114 @@ Namespace Services
             Return recoveredAny
         End Function
 
+        ''' <summary>
+        ''' Bulk-copies a batch of small files using CopyFileEx in parallel.
+        ''' Files that fail are left in Pending state so the main sequential loop retries them
+        ''' via the managed path. No per-file progress is emitted during this phase; the main loop
+        ''' handles progress accounting when it encounters the already-completed entries.
+        ''' </summary>
+        Private Async Function CopySmallFilesParallelAsync(
+            files As List(Of SourceFileDescriptor),
+            destinationRoot As String,
+            journal As JobJournal,
+            journalPath As String,
+            cancellationToken As CancellationToken) As Task
+
+            If files Is Nothing OrElse files.Count = 0 Then
+                Return
+            End If
+
+            EmitLog($"Parallel small file phase: {files.Count} file(s) using {_options.ParallelSmallFileWorkers} worker(s).")
+
+            ' Pre-create all destination directories sequentially to avoid concurrent CreateDirectory calls.
+            For Each descriptor In files
+                Dim destinationPath = Path.Combine(destinationRoot, descriptor.RelativePath)
+                Dim destinationDirectory = Path.GetDirectoryName(destinationPath)
+                If Not String.IsNullOrWhiteSpace(destinationDirectory) AndAlso _createdDirectories.Add(destinationDirectory) Then
+                    Directory.CreateDirectory(destinationDirectory)
+                End If
+            Next
+
+            Dim concurrency = Math.Max(1, Math.Min(_options.ParallelSmallFileWorkers, files.Count))
+            Dim completedCount = 0
+            Dim failedCount = 0
+
+            Using semaphore As New SemaphoreSlim(concurrency, concurrency)
+                Dim tasks As New List(Of Task)(files.Count)
+
+                For Each descriptor In files
+                    cancellationToken.ThrowIfCancellationRequested()
+                    Await _executionControl.WaitIfPausedAsync(cancellationToken).ConfigureAwait(False)
+                    Await semaphore.WaitAsync(cancellationToken).ConfigureAwait(False)
+
+                    Dim capturedDescriptor = descriptor
+                    tasks.Add(Task.Run(
+                        Sub()
+                            Try
+                                Dim destPath = Path.Combine(destinationRoot, capturedDescriptor.RelativePath)
+
+                                ' Ensure clean destination.
+                                Using resetStream As New FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.Read)
+                                End Using
+
+                                Dim cancelFlag = 0
+                                Dim nativeCopyFlags = CopyFileFlags.AllowDecryptedDestination
+                                If capturedDescriptor.Length >= NativeNoBufferingThresholdBytes Then
+                                    nativeCopyFlags = nativeCopyFlags Or CopyFileFlags.NoBuffering
+                                End If
+
+                                Dim copySucceeded = CopyFileEx(
+                                    capturedDescriptor.FullPath,
+                                    destPath,
+                                    Nothing,
+                                    IntPtr.Zero,
+                                    cancelFlag,
+                                    nativeCopyFlags)
+
+                                If copySucceeded Then
+                                    If _options.PreserveTimestamps Then
+                                        Try
+                                            File.SetLastWriteTimeUtc(destPath, capturedDescriptor.LastWriteTimeUtc)
+                                        Catch
+                                        End Try
+                                    End If
+
+                                    Dim entry = journal.Files(capturedDescriptor.RelativePath)
+                                    entry.State = FileCopyState.Completed
+                                    entry.BytesCopied = capturedDescriptor.Length
+                                    entry.LastError = String.Empty
+                                    entry.DoNotRetry = False
+                                    entry.LastRescuePass = "ParallelNativeFast"
+                                    If entry.RecoveredRanges Is Nothing Then
+                                        entry.RecoveredRanges = New List(Of ByteRange)()
+                                    Else
+                                        entry.RecoveredRanges.Clear()
+                                    End If
+                                    entry.RescueRanges = New List(Of RescueRange)()
+                                    Interlocked.Increment(completedCount)
+                                Else
+                                    Interlocked.Increment(failedCount)
+                                End If
+                            Catch
+                                Interlocked.Increment(failedCount)
+                            Finally
+                                semaphore.Release()
+                            End Try
+                        End Sub))
+                Next
+
+                Await Task.WhenAll(tasks).ConfigureAwait(False)
+            End Using
+
+            Dim finalCompleted = Threading.Volatile.Read(completedCount)
+            Dim finalFailed = Threading.Volatile.Read(failedCount)
+            EmitLog($"Parallel small file phase complete: {finalCompleted} succeeded, {finalFailed} deferred to sequential path.")
+
+            If finalCompleted > 0 Then
+                Await FlushJournalAsync(journalPath, journal, cancellationToken, force:=True).ConfigureAwait(False)
+            End If
+        End Function
+
         Private Async Function TryCopyWithNativeFastPathAsync(
             descriptor As SourceFileDescriptor,
             entry As JournalFileEntry,
@@ -1992,13 +2164,18 @@ Namespace Services
             Dim copySucceeded = False
             Dim lastWin32Error = 0
             Try
+                Dim nativeCopyFlags = CopyFileFlags.AllowDecryptedDestination
+                If descriptor.Length >= NativeNoBufferingThresholdBytes Then
+                    nativeCopyFlags = nativeCopyFlags Or CopyFileFlags.NoBuffering
+                End If
+
                 copySucceeded = CopyFileEx(
                     descriptor.FullPath,
                     destinationPath,
                     progressCallback,
                     IntPtr.Zero,
                     cancelFlag,
-                    CopyFileFlags.AllowDecryptedDestination)
+                    nativeCopyFlags)
                 If Not copySucceeded Then
                     lastWin32Error = Marshal.GetLastWin32Error()
                 End If
@@ -2323,20 +2500,41 @@ Namespace Services
 
             Dim normalizedState = NormalizeRescueRangeState(newState)
 
-            Dim startIndex = 0
+            ' Binary search for the first range whose end (offset + length) exceeds targetStart.
+            ' Ranges are non-overlapping and sorted by offset, so (offset + length) is monotone
+            ' increasing — binary search is correct and reduces this from O(n) to O(log n).
+            Dim startIndex As Integer
+            Dim lo = 0
+            Dim hi = ranges.Count - 1
+            startIndex = ranges.Count   ' default: no candidate found
+            While lo <= hi
+                Dim mid = lo + (hi - lo) \ 2
+                Dim c = ranges(mid)
+                If c Is Nothing OrElse c.Length <= 0 Then
+                    ' Null/empty entry — fall back to linear scan from here.
+                    startIndex = mid
+                    Exit While
+                End If
+                If c.Offset + CLng(c.Length) > targetStart Then
+                    startIndex = mid
+                    hi = mid - 1
+                Else
+                    lo = mid + 1
+                End If
+            End While
+
+            ' Remove any null/empty entries at startIndex before proceeding.
             While startIndex < ranges.Count
                 Dim candidate = ranges(startIndex)
                 If candidate Is Nothing OrElse candidate.Length <= 0 Then
                     ranges.RemoveAt(startIndex)
                     Continue While
                 End If
-
-                Dim candidateEnd = candidate.Offset + CLng(candidate.Length)
-                If candidateEnd > targetStart Then
-                    Exit While
+                If candidate.Offset + CLng(candidate.Length) <= targetStart Then
+                    startIndex += 1
+                    Continue While
                 End If
-
-                startIndex += 1
+                Exit While
             End While
 
             If startIndex >= ranges.Count Then
@@ -2700,26 +2898,39 @@ Namespace Services
 
                     Dim segmentLength = segment.Length
                     If segmentLength > passDefinition.ChunkSizeBytes Then
+                        ' Split off exactly one chunk and push the remainder as a continuation.
+                        ' This keeps the work stack at O(1) depth per segment, avoiding the
+                        ' original O(segmentLength/ChunkSize) pre-expansion that caused
+                        ' unbounded memory growth on large segments with small chunk sizes.
+                        ' Processing order (descending or ascending) is preserved: the current
+                        ' chunk is always pushed AFTER the continuation, so it is popped FIRST
+                        ' (LIFO), matching the original per-direction ordering.
+                        Dim chunkLength = passDefinition.ChunkSizeBytes
                         If passDefinition.ProcessDescending Then
-                            Dim emitted = 0
-                            While emitted < segmentLength
-                                Dim chunkLength = Math.Min(passDefinition.ChunkSizeBytes, segmentLength - emitted)
+                            ' High-to-low: take from the top of the range, continue with the lower part.
+                            Dim chunkOffset = segment.Offset + segmentLength - chunkLength
+                            If segmentLength - chunkLength > 0 Then
                                 work.Push(New ByteRange() With {
-                                    .Offset = segment.Offset + emitted,
-                                    .Length = chunkLength
+                                    .Offset = segment.Offset,
+                                    .Length = segmentLength - chunkLength
                                 })
-                                emitted += chunkLength
-                            End While
+                            End If
+                            work.Push(New ByteRange() With {
+                                .Offset = chunkOffset,
+                                .Length = chunkLength
+                            })
                         Else
-                            Dim remaining = segmentLength
-                            While remaining > 0
-                                Dim chunkLength = Math.Min(passDefinition.ChunkSizeBytes, remaining)
+                            ' Low-to-high: take from the bottom of the range, continue with the upper part.
+                            If segmentLength - chunkLength > 0 Then
                                 work.Push(New ByteRange() With {
-                                    .Offset = segment.Offset + (remaining - chunkLength),
-                                    .Length = chunkLength
+                                    .Offset = segment.Offset + chunkLength,
+                                    .Length = segmentLength - chunkLength
                                 })
-                                remaining -= chunkLength
-                            End While
+                            End If
+                            work.Push(New ByteRange() With {
+                                .Offset = segment.Offset,
+                                .Length = chunkLength
+                            })
                         End If
                         Continue While
                     End If
@@ -3112,7 +3323,9 @@ Namespace Services
             Dim attempt = 0
             Dim lastError As Exception = Nothing
             Dim effectiveMaxRetries = If(maxRetries >= 0, maxRetries, _options.MaxRetries)
+            Dim timeoutCts As CancellationTokenSource = Nothing
 
+            Try
             While attempt <= effectiveMaxRetries
                 cancellationToken.ThrowIfCancellationRequested()
                 ThrowIfMediaIdentityMismatchThrottled(sourcePath, _expectedSourceIdentity, isSource:=True)
@@ -3127,27 +3340,35 @@ Namespace Services
                         Throw injectedReadFault
                     End If
 #End If
-                    Using linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-                        linkedCts.CancelAfter(_options.OperationTimeout)
-                        Dim bytesRead = Await ReadChunkOnceAsync(
-                            sourcePath,
-                            relativePath,
-                            offset,
-                            buffer,
-                            length,
-                            ioBufferSize,
-                            transferSession,
-                            linkedCts.Token).ConfigureAwait(False)
+                    ' Reuse a single linked CTS for the entire retry loop. On timeout the CTS
+                    ' is disposed and re-created; on success this avoids one CTS allocation per
+                    ' chunk on the hot path.
+                    If timeoutCts Is Nothing Then
+                        timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+                    End If
+                    timeoutCts.CancelAfter(_options.OperationTimeout)
 
-                        If bytesRead <> length Then
-                            Throw New IOException($"Short read at offset {offset}. Expected {length}, got {bytesRead}.")
-                        End If
+                    Dim bytesRead = Await ReadChunkOnceAsync(
+                        sourcePath,
+                        relativePath,
+                        offset,
+                        buffer,
+                        length,
+                        ioBufferSize,
+                        transferSession,
+                        timeoutCts.Token).ConfigureAwait(False)
 
-                        Return bytesRead
-                    End Using
+                    If bytesRead <> length Then
+                        Throw New IOException($"Short read at offset {offset}. Expected {length}, got {bytesRead}.")
+                    End If
+
+                    Return bytesRead
                 Catch ex As OperationCanceledException When Not cancellationToken.IsCancellationRequested
                     CancelPendingIo(transferSession, isSource:=True)
                     lastError = New TimeoutException($"Read timeout at offset {offset}.", ex)
+                    ' A timed-out CTS cannot be reused; dispose and null so a fresh one is created.
+                    timeoutCts.Dispose()
+                    timeoutCts = Nothing
                 Catch ex As Exception
                     lastError = ex
                 End Try
@@ -3228,6 +3449,9 @@ Namespace Services
             End If
 
             Return -1
+            Finally
+                timeoutCts?.Dispose()
+            End Try
         End Function
 
         Private Async Function ReadChunkOnceAsync(
@@ -3498,7 +3722,9 @@ Namespace Services
 
             Dim attempt = 0
             Dim lastError As Exception = Nothing
+            Dim timeoutCts As CancellationTokenSource = Nothing
 
+            Try
             While attempt <= _options.MaxRetries
                 cancellationToken.ThrowIfCancellationRequested()
                 ThrowIfMediaIdentityMismatchThrottled(destinationPath, _expectedDestinationIdentity, isSource:=False)
@@ -3513,21 +3739,25 @@ Namespace Services
                         Throw injectedWriteFault
                     End If
 #End If
-                    Using linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-                        linkedCts.CancelAfter(_options.OperationTimeout)
-                        Await WriteChunkOnceAsync(
-                            destinationPath,
-                            offset,
-                            buffer,
-                            count,
-                            ioBufferSize,
-                            transferSession,
-                            linkedCts.Token).ConfigureAwait(False)
-                        Return
-                    End Using
+                    If timeoutCts Is Nothing Then
+                        timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+                    End If
+                    timeoutCts.CancelAfter(_options.OperationTimeout)
+
+                    Await WriteChunkOnceAsync(
+                        destinationPath,
+                        offset,
+                        buffer,
+                        count,
+                        ioBufferSize,
+                        transferSession,
+                        timeoutCts.Token).ConfigureAwait(False)
+                    Return
                 Catch ex As OperationCanceledException When Not cancellationToken.IsCancellationRequested
                     CancelPendingIo(transferSession, isSource:=False)
                     lastError = New TimeoutException($"Write timeout at offset {offset}.", ex)
+                    timeoutCts.Dispose()
+                    timeoutCts = Nothing
                 Catch ex As Exception
                     lastError = ex
                 End Try
@@ -3578,6 +3808,9 @@ Namespace Services
             End While
 
             Throw New IOException($"Write failed on {relativePath} at offset {offset}.", lastError)
+            Finally
+                timeoutCts?.Dispose()
+            End Try
         End Function
 
         Private Async Function WriteChunkOnceAsync(
@@ -3888,7 +4121,12 @@ Namespace Services
         Private Async Function DelayForRetryAsync(attempt As Integer, cancellationToken As CancellationToken) As Task
             Dim boundedAttempt = Math.Min(attempt, 20)
             Dim baseDelayMs = _options.InitialRetryDelay.TotalMilliseconds * Math.Pow(2.0R, boundedAttempt - 1)
-            Dim delayMs = CInt(Math.Min(_options.MaxRetryDelay.TotalMilliseconds, baseDelayMs))
+            Dim cappedDelayMs = Math.Min(_options.MaxRetryDelay.TotalMilliseconds, baseDelayMs)
+            ' Add ±25% random jitter to prevent synchronized retries when multiple files
+            ' stall on the same bad sector region at the same time (thundering-herd).
+            ' Random.Shared is thread-safe in .NET 6+.
+            Dim jitterMs = cappedDelayMs * 0.25R * (Random.Shared.NextDouble() * 2.0R - 1.0R)
+            Dim delayMs = CInt(Math.Max(1.0R, cappedDelayMs + jitterMs))
             Await Task.Delay(delayMs, cancellationToken).ConfigureAwait(False)
         End Function
 
@@ -3979,12 +4217,33 @@ Namespace Services
             force As Boolean) As Task
 
             Dim now = DateTimeOffset.UtcNow
-            If Not force AndAlso (now - _lastJournalFlushUtc).TotalSeconds < JournalFlushIntervalSeconds Then
-                Return
+            If force Then
+                ' Forced flushes use a shorter rate-limit to avoid serializing the full journal
+                ' after every single file completion while still keeping the journal reasonably fresh.
+                If (now - _lastJournalFlushUtc).TotalMilliseconds < JournalForcedFlushIntervalMs Then
+                    Return
+                End If
+            Else
+                If (now - _lastJournalFlushUtc).TotalSeconds < JournalFlushIntervalSeconds Then
+                    Return
+                End If
             End If
 
             Await _journalStore.SaveAsync(journalPath, journal, cancellationToken).ConfigureAwait(False)
             _lastJournalFlushUtc = now
+        End Function
+
+        ''' <summary>
+        ''' Unconditionally flushes the journal, bypassing all rate limiting.
+        ''' Reserved for critical state transitions: job completion, fatal errors, and final cleanup.
+        ''' </summary>
+        Private Async Function FlushJournalUnconditionalAsync(
+            journalPath As String,
+            journal As JobJournal,
+            cancellationToken As CancellationToken) As Task
+
+            Await _journalStore.SaveAsync(journalPath, journal, cancellationToken).ConfigureAwait(False)
+            _lastJournalFlushUtc = DateTimeOffset.UtcNow
         End Function
 
         Private Sub EmitProgress(
