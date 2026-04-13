@@ -441,6 +441,8 @@ Friend Class UpdateForm
         script.AppendLine("while ($null -ne (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue)) {")
         script.AppendLine("    Start-Sleep -Milliseconds 500")
         script.AppendLine("}")
+        script.AppendLine("Start-Sleep -Seconds 1")
+        script.AppendLine("""Process exited. Starting update."" | Out-File -LiteralPath $Log -Append -Encoding UTF8")
         script.AppendLine()
         script.AppendLine("# Back up current installation.")
         script.AppendLine("if (Test-Path -LiteralPath $Backup) { Remove-Item -LiteralPath $Backup -Recurse -Force }")
@@ -469,12 +471,18 @@ Friend Class UpdateForm
         script.AppendLine("Start-Sleep -Seconds 10")
         script.AppendLine("Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction SilentlyContinue")
 
-        File.WriteAllText(scriptPath, script.ToString(), Encoding.UTF8)
+        File.WriteAllText(scriptPath, script.ToString(), New UTF8Encoding(encoderShouldEmitUTF8Identifier:=False))
 
+        ' UseShellExecute = True so the PowerShell process is started via ShellExecuteEx
+        ' and is NOT a child of this process.  With UseShellExecute = False (CreateProcess),
+        ' Windows assigns the child to the same job object as XactCopy — and when XactCopy
+        ' exits, the OS kills all processes in that job before the script can run.
         Dim psArgs = $"-NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{scriptPath}"""
-        Dim startInfo As New ProcessStartInfo("powershell.exe", psArgs) With {
-            .UseShellExecute = False,
-            .CreateNoWindow = True
+        Dim startInfo As New ProcessStartInfo() With {
+            .FileName = "powershell.exe",
+            .Arguments = psArgs,
+            .UseShellExecute = True,
+            .WindowStyle = ProcessWindowStyle.Hidden
         }
         Process.Start(startInfo)
     End Sub

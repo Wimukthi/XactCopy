@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.1.1.1] - 2026-04-13
+
+### Fixed
+
+- In-app updater script killed before it can run:
+  - The PowerShell update script was launched with `UseShellExecute = False` (`CreateProcess`), making it a child process in XactCopy's job object. When XactCopy exited, Windows terminated all child processes in the job before the script could copy any files. Switched to `UseShellExecute = True` (`ShellExecuteEx`) so the script runs as an independent process that survives XactCopy's exit.
+  - Removed UTF-8 BOM from the generated script file and added a 1-second settle delay after the parent process exits so file handles are fully released before robocopy starts.
+
 ## [1.1.0.9] - 2026-04-13
 
 ### Fixed

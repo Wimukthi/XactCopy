@@ -74,6 +74,7 @@ dotnet publish src/XactCopy.UI/XactCopy.UI.vbproj -c Release -r win-x64 --self-c
 
 ## Brief Version History
 
+- `v1.1.1.1` Fixed updater script being killed on exit by launching it as an independent process via `ShellExecuteEx` instead of `CreateProcess`, preventing job-object child termination.
 - `v1.1.0.9` Fixed in-app updater not applying downloaded packages by switching the update script from a Unicode-encoded cmd.exe batch (silent failure) to a UTF-8 PowerShell script; release notes in the update dialog now render markdown formatting (bold headings, bullet points, inline bold) using a `RichTextBox`.
 - `v1.1.0.7` Added parallel small-file copy phase; extended `CopyFileEx` fast-path to all file sizes with `FILE_FLAG_NO_BUFFERING` for large files; added directory-creation cache, journal flush rate-limiting, `CancellationTokenSource` reuse in I/O retry loops, taskbar progress debouncing, and async/atomic backup rotation; fixed log listbox blank repaint after second job start, file-transition progress event coalescing, and `SyncLock` held across async waits.
 - `v1.0.9.9` Hardened IPC and worker security/reliability with strict frame-size limits, current-user-only worker pipe mode, deterministic worker binary resolution, Unicode-safe updater scripts, and safer async probe behavior for overwrite prompts/media identity checks.
