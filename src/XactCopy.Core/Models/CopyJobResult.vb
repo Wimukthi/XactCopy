@@ -45,6 +45,34 @@ Namespace Models
         ''' </summary>
         Public Property CopiedBytes As Long
         ''' <summary>
+        ''' Gets or sets TransferEnginePolicy.
+        ''' </summary>
+        Public Property TransferEnginePolicy As TransferEnginePolicy = TransferEnginePolicy.Auto
+        ''' <summary>
+        ''' Gets or sets ElapsedMilliseconds.
+        ''' </summary>
+        Public Property ElapsedMilliseconds As Long
+        ''' <summary>
+        ''' Gets or sets AverageBytesPerSecond.
+        ''' </summary>
+        Public Property AverageBytesPerSecond As Double
+        ''' <summary>
+        ''' Gets or sets NativeFastPathFiles.
+        ''' </summary>
+        Public Property NativeFastPathFiles As Integer
+        ''' <summary>
+        ''' Gets or sets ParallelNativeFastPathFiles.
+        ''' </summary>
+        Public Property ParallelNativeFastPathFiles As Integer
+        ''' <summary>
+        ''' Gets or sets ManagedCopyFiles.
+        ''' </summary>
+        Public Property ManagedCopyFiles As Integer
+        ''' <summary>
+        ''' Gets or sets NativeFallbackFiles.
+        ''' </summary>
+        Public Property NativeFallbackFiles As Integer
+        ''' <summary>
         ''' Gets or sets JournalPath.
         ''' </summary>
         Public Property JournalPath As String = String.Empty

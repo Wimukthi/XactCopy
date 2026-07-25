@@ -26,6 +26,7 @@ Module Program
     Private _lastProgressSentTick As Long
     Private _pendingProgressSnapshot As CopyProgressSnapshot
     Private _fileTransitionSnapshot As CopyProgressSnapshot
+    Private _lastProgressSnapshot As CopyProgressSnapshot
     Private _progressReceivedCount As Long
     Private _progressSentCount As Long
     Private _progressCoalescedCount As Long
@@ -172,10 +173,19 @@ Module Program
 
         _activeJobId = command.JobId
         _lastProgressUtc = DateTimeOffset.UtcNow
+        SyncLock ProgressDispatchLock
+            _pendingProgressSnapshot = Nothing
+            _fileTransitionSnapshot = Nothing
+            _lastProgressSnapshot = Nothing
+        End SyncLock
         _jobCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
         _jobExecutionControl = New CopyExecutionControl()
         _jobPaused = False
         ConfigureRuntimeTelemetryPolicy(command.Options)
+        Dim priorityMessage = ApplyWorkerProcessPriority(If(command.Options Is Nothing, String.Empty, command.Options.WorkerProcessPriorityClass))
+        If Not String.IsNullOrWhiteSpace(priorityMessage) Then
+            Await SendLogAsync(stream, _activeJobId, priorityMessage, cancellationToken).ConfigureAwait(False)
+        End If
 
         Dim copyService As New ResilientCopyService(command.Options, _jobExecutionControl)
 
@@ -203,6 +213,7 @@ Module Program
                     Dim result = Await copyService.RunAsync(_jobCancellation.Token).ConfigureAwait(False)
                     If _jobCancellation.IsCancellationRequested Then
                         result.Cancelled = True
+                        ApplyLastProgressToResult(result)
                     End If
 
                     shouldFlushTelemetry = True
@@ -213,11 +224,7 @@ Module Program
                         .TimestampUtc = DateTimeOffset.UtcNow
                     }
                 Catch ex As OperationCanceledException
-                    Dim result As New CopyJobResult() With {
-                        .Succeeded = False,
-                        .Cancelled = True,
-                        .ErrorMessage = "Job cancelled by supervisor."
-                    }
+                    Dim result = CreateCancelledResultFromLastProgress(command.Options, "Job cancelled by supervisor.")
 
                     shouldFlushTelemetry = True
 
@@ -258,6 +265,54 @@ Module Program
             End Function)
 
         Await SendLogAsync(stream, _activeJobId, "Job accepted by worker.", cancellationToken).ConfigureAwait(False)
+    End Function
+
+    Private Function ApplyWorkerProcessPriority(requestedPriority As String) As String
+        Dim priority As ProcessPriorityClass
+        If Not TryResolvePriorityClass(requestedPriority, priority) Then
+            Return String.Empty
+        End If
+
+        Try
+            Using current = Process.GetCurrentProcess()
+                If current.PriorityClass = priority Then
+                    Return String.Empty
+                End If
+
+                current.PriorityClass = priority
+            End Using
+
+            Return $"Worker process priority set to {priority}."
+        Catch ex As Exception
+            Return $"Worker process priority '{requestedPriority}' could not be applied: {ex.Message}"
+        End Try
+    End Function
+
+    Private Function TryResolvePriorityClass(requestedPriority As String, ByRef priority As ProcessPriorityClass) As Boolean
+        Dim normalized = If(requestedPriority, String.Empty).Trim()
+        If normalized.Length = 0 Then
+            Return False
+        End If
+
+        Select Case normalized.ToUpperInvariant()
+            Case "IDLE"
+                priority = ProcessPriorityClass.Idle
+                Return True
+            Case "BELOWNORMAL", "BELOW_NORMAL", "BELOW NORMAL"
+                priority = ProcessPriorityClass.BelowNormal
+                Return True
+            Case "NORMAL"
+                priority = ProcessPriorityClass.Normal
+                Return True
+            Case "ABOVENORMAL", "ABOVE_NORMAL", "ABOVE NORMAL"
+                priority = ProcessPriorityClass.AboveNormal
+                Return True
+            Case "HIGH"
+                priority = ProcessPriorityClass.High
+                Return True
+            Case Else
+                Return False
+        End Select
     End Function
 
     Private Async Function CancelJobAsync(
@@ -402,6 +457,7 @@ Module Program
         Interlocked.Increment(_progressReceivedCount)
 
         SyncLock ProgressDispatchLock
+            _lastProgressSnapshot = CloneProgressSnapshot(snapshot)
             If _pendingProgressSnapshot IsNot Nothing Then
                 ' Detect file transition: if the current file changed, promote the old pending
                 ' snapshot to the transition slot so the drain sends it before the new file's
@@ -527,6 +583,81 @@ Module Program
 
         Await SendEnvelopeAsync(stream, IpcMessageTypes.WorkerProgressEvent, progressEventData, cancellationToken).ConfigureAwait(False)
         Interlocked.Increment(_progressSentCount)
+    End Function
+
+    Private Function CreateCancelledResultFromLastProgress(options As CopyJobOptions, errorMessage As String) As CopyJobResult
+        Dim result As New CopyJobResult() With {
+            .Succeeded = False,
+            .Cancelled = True,
+            .ErrorMessage = If(errorMessage, String.Empty)
+        }
+
+        If options IsNot Nothing Then
+            result.TransferEnginePolicy = options.TransferEnginePolicy
+        End If
+
+        ApplyLastProgressToResult(result)
+        Return result
+    End Function
+
+    Private Sub ApplyLastProgressToResult(result As CopyJobResult)
+        If result Is Nothing Then
+            Return
+        End If
+
+        Dim snapshot = SnapshotLastProgress()
+        If snapshot Is Nothing Then
+            Return
+        End If
+
+        result.TotalFiles = Math.Max(result.TotalFiles, snapshot.TotalFiles)
+        result.CompletedFiles = Math.Max(result.CompletedFiles, snapshot.CompletedFiles)
+        result.FailedFiles = Math.Max(result.FailedFiles, snapshot.FailedFiles)
+        result.RecoveredFiles = Math.Max(result.RecoveredFiles, snapshot.RecoveredFiles)
+        result.SkippedFiles = Math.Max(result.SkippedFiles, snapshot.SkippedFiles)
+        result.TotalBytes = Math.Max(result.TotalBytes, snapshot.TotalBytes)
+        result.CopiedBytes = Math.Max(result.CopiedBytes, snapshot.TotalBytesCopied)
+    End Sub
+
+    Private Function SnapshotLastProgress() As CopyProgressSnapshot
+        SyncLock ProgressDispatchLock
+            If _lastProgressSnapshot IsNot Nothing Then
+                Return CloneProgressSnapshot(_lastProgressSnapshot)
+            End If
+
+            If _pendingProgressSnapshot IsNot Nothing Then
+                Return CloneProgressSnapshot(_pendingProgressSnapshot)
+            End If
+        End SyncLock
+
+        Return Nothing
+    End Function
+
+    Private Function CloneProgressSnapshot(snapshot As CopyProgressSnapshot) As CopyProgressSnapshot
+        If snapshot Is Nothing Then
+            Return Nothing
+        End If
+
+        Return New CopyProgressSnapshot() With {
+            .CurrentFile = snapshot.CurrentFile,
+            .CurrentFileBytesCopied = snapshot.CurrentFileBytesCopied,
+            .CurrentFileBytesTotal = snapshot.CurrentFileBytesTotal,
+            .TotalBytesCopied = snapshot.TotalBytesCopied,
+            .TotalBytes = snapshot.TotalBytes,
+            .LastChunkBytesTransferred = snapshot.LastChunkBytesTransferred,
+            .BufferSizeBytes = snapshot.BufferSizeBytes,
+            .CompletedFiles = snapshot.CompletedFiles,
+            .FailedFiles = snapshot.FailedFiles,
+            .RecoveredFiles = snapshot.RecoveredFiles,
+            .SkippedFiles = snapshot.SkippedFiles,
+            .TotalFiles = snapshot.TotalFiles,
+            .RescuePass = snapshot.RescuePass,
+            .RescueBadRegionCount = snapshot.RescueBadRegionCount,
+            .RescueRemainingBytes = snapshot.RescueRemainingBytes,
+            .ActiveFileCount = snapshot.ActiveFileCount,
+            .ScanWorkerCount = snapshot.ScanWorkerCount,
+            .ActiveFiles = If(snapshot.ActiveFiles Is Nothing, New List(Of String)(), New List(Of String)(snapshot.ActiveFiles))
+        }
     End Function
 
     Private Async Function SendRuntimeLogAsync(

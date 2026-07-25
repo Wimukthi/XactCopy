@@ -11,6 +11,7 @@ GNU GPL v3.0. See `LICENSE`.
 - Out-of-process worker process with supervisor restart handling.
 - Journal-based resume and recovery after unexpected exits.
 - Scan-only bad-block detection mode (`Scan Bad Blocks`) with reusable bad-range maps.
+- Fast scan profile with parallel healthy-media reads and precise bad-range fallback.
 - Pause/resume/cancel controls with run-state persistence.
 - Salvage mode for unreadable sectors with configurable fill pattern.
 - Retry/backoff timeout controls for degraded disks.
@@ -38,6 +39,7 @@ GNU GPL v3.0. See `LICENSE`.
 - `src/XactCopy.Core` Shared models, options, protocol contracts.
 - `src/XactCopy.Storage` Journals and persistent state storage.
 - `tests/XactCopy.Tests` Unit tests.
+- `tools/XactCopy.Benchmarks` Local benchmark/report runner.
 
 ## Build
 
@@ -48,6 +50,14 @@ dotnet build XactCopy.slnx
 dotnet test XactCopy.slnx
 dotnet run --project src/XactCopy.UI/XactCopy.UI.vbproj
 ```
+
+## Benchmarks
+
+```powershell
+dotnet run --project tools/XactCopy.Benchmarks -- --mode copy --scenario small,mixed,large --policies auto,managed,native --iterations 3
+```
+
+Benchmark reports are written as JSON and Markdown. See `docs/BENCHMARKING.md`.
 
 ## Publish (Windows x64)
 

@@ -173,6 +173,7 @@ Public Class MainForm
     Private _lastProgressSnapshot As CopyProgressSnapshot
     Private ReadOnly _progressDispatchLock As New Object()
     Private _pendingProgressSnapshot As CopyProgressSnapshot
+    Private _fileTransitionProgressSnapshot As CopyProgressSnapshot
     Private _progressDispatchQueued As Integer
     Private _lastProgressRenderTick As Long
     Private _displayedOverallProgress As Double
@@ -359,6 +360,7 @@ Public Class MainForm
         _adaptiveBufferCheckBox.Text = "Adaptive Buffer (Auto)"
         _adaptiveBufferCheckBox.AutoSize = True
         _adaptiveBufferCheckBox.Checked = False
+        AddHandler _adaptiveBufferCheckBox.CheckedChanged, AddressOf AdaptiveBufferCheckBox_CheckedChanged
 
         _useBadRangeMapCheckBox.Text = "Use bad-range map"
         _useBadRangeMapCheckBox.AutoSize = True
@@ -610,21 +612,21 @@ Public Class MainForm
         _exitMenuItem.ShortcutKeys = Keys.Alt Or Keys.F4
         _openJobManagerMenuItem.ShortcutKeys = Keys.Control Or Keys.J
         _scanBadBlocksMenuItem.ShortcutKeys = Keys.Control Or Keys.Shift Or Keys.B
-        _startMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Start a copy run with the current options.")
-        _pauseMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Pause the active copy run.")
-        _resumeMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Resume a paused copy run.")
-        _cancelMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Cancel the active copy run.")
-        _openJournalsMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Open the journal folder used for resume/recovery data.")
-        _openCrashMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Open captured crash logs.")
+        _startMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Starts a copy using the paths and options currently shown.", "Use Scan for Bad Blocks instead when you only want read-only media checking.")
+        _pauseMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Pauses the active worker after the current safe checkpoint.", "Use this before disconnecting or moving media.")
+        _resumeMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Continues a paused worker run.", "Resume keeps the same journal and progress state.")
+        _cancelMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Requests a clean stop for the active run.", "Already completed files and journal data are kept for later resume.")
+        _openJournalsMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Opens the folder that stores resume and recovery journals.", "Useful when diagnosing interrupted runs or sharing logs.")
+        _openCrashMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Opens captured crash reports for XactCopy.", "Useful when reporting startup, UI, or worker failures.")
         _exitMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Close XactCopy.")
-        _scanBadBlocksMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Run a read-only bad-block scan and update the bad-range map.")
-        _settingsMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Open application settings.")
-        _checkUpdatesMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Check online for a newer release.")
-        _saveCurrentAsJobMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Save source, destination, and options as a reusable job.")
-        _openJobManagerMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Manage saved jobs, queue entries, and run history.")
-        _resumeInterruptedMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Resume the last interrupted run if recovery data exists.")
-        _runNextQueuedJobMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Start the next job in queue.")
-        _aboutMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Show version and license information.")
+        _scanBadBlocksMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Reads source files without writing a destination copy.", "Updates the bad-range map so later copy runs can avoid known bad areas.")
+        _settingsMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Opens defaults, performance, verification, recovery, and integration settings.", "Changes apply to future runs after you save.")
+        _checkUpdatesMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Checks the configured release endpoint for a newer XactCopy build.", "No install happens until you confirm an available update.")
+        _saveCurrentAsJobMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Saves the current paths and options as a reusable job.", "Use this for recurring copy or scan work.")
+        _openJobManagerMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Opens saved jobs, queued jobs, and run history.", "Use it to rerun, reorder, inspect, or clean up jobs.")
+        _resumeInterruptedMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Resumes the last interrupted run if recovery data is available.", "Best after a crash, reboot, power loss, or media disconnect.")
+        _runNextQueuedJobMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Starts the next queued job immediately.", "Queue order can be changed in Job Manager.")
+        _aboutMenuItem.ToolTipText = TooltipScenarioFormatter.Compose("Shows version, runtime, license, and project information.")
 
         AddHandler _startMenuItem.Click, AddressOf StartMenuItem_Click
         AddHandler _pauseMenuItem.Click, AddressOf PauseMenuItem_Click
@@ -756,7 +758,7 @@ Public Class MainForm
         optionsPanel.Controls.Add(_waitForMediaCheckBox)
         optionsPanel.Controls.Add(_fragileModeCheckBox)
 
-        optionsPanel.Controls.Add(New Label() With {.Text = "Buffer MB (max):", .AutoSize = True, .Margin = New Padding(12, 7, 4, 0)})
+        optionsPanel.Controls.Add(New Label() With {.Text = "Manual Buffer MB:", .AutoSize = True, .Margin = New Padding(12, 7, 4, 0)})
         optionsPanel.Controls.Add(_bufferMbNumeric)
 
         optionsPanel.Controls.Add(New Label() With {.Text = "Retries:", .AutoSize = True, .Margin = New Padding(12, 7, 4, 0)})
@@ -769,48 +771,48 @@ Public Class MainForm
     End Function
 
     Private Sub ConfigureToolTips()
-        SetDetailedToolTip(_sourceTextBox, "Source folder to copy from.")
-        SetDetailedToolTip(_destinationTextBox, "Destination folder to copy into.")
-        SetDetailedToolTip(_browseSourceButton, "Browse and select the source folder.")
-        SetDetailedToolTip(_browseDestinationButton, "Browse and select the destination folder.")
+        SetDetailedToolTip(_sourceTextBox, "Folder, drive, or Explorer selection XactCopy will read from.", "For scan-only runs, this is the media being checked.")
+        SetDetailedToolTip(_destinationTextBox, "Folder where copied files will be written.", "Scan-only mode does not require a destination.")
+        SetDetailedToolTip(_browseSourceButton, "Pick the source folder or drive.")
+        SetDetailedToolTip(_browseDestinationButton, "Pick the destination folder for copy runs.")
 
-        SetDetailedToolTip(_resumeCheckBox, "Use journal data to resume partially copied files.")
-        SetDetailedToolTip(_salvageCheckBox, "Attempt to recover unreadable source regions using the configured fill pattern.")
-        SetDetailedToolTip(_continueCheckBox, "Continue with remaining files when a file copy fails.")
-        SetDetailedToolTip(_verifyCheckBox, "Verify copied output after each file.")
-        SetDetailedToolTip(_adaptiveBufferCheckBox, "Dynamically adjust transfer buffer size by file profile and I/O behavior.")
-        SetDetailedToolTip(_useBadRangeMapCheckBox, "Use saved unreadable-range map metadata for this source when available.")
-        SetDetailedToolTip(_skipKnownBadRangesCheckBox, "Skip read attempts for ranges already known unreadable in the bad-range map.")
-        SetDetailedToolTip(_waitForMediaCheckBox, "Wait indefinitely if source or destination becomes unavailable.")
-        SetDetailedToolTip(_fragileModeCheckBox, "Fragile-drive profile: conservative read behavior, immediate file skip on first read error, and failure circuit-breaker cooldown.")
+        SetDetailedToolTip(_resumeCheckBox, "Uses the journal to continue interrupted work.", "Recommended for large copies and removable drives.")
+        SetDetailedToolTip(_salvageCheckBox, "Keeps going when source blocks cannot be read.", "Unreadable blocks are filled with the configured salvage pattern.")
+        SetDetailedToolTip(_continueCheckBox, "Keeps processing later files after one file fails.", "Useful for large batches where one bad file should not stop the job.")
+        SetDetailedToolTip(_verifyCheckBox, "Checks destination data after each copied file.", "Adds read time, but catches copy or storage corruption.")
+        SetDetailedToolTip(_adaptiveBufferCheckBox, "Lets XactCopy choose the transfer buffer automatically.", "When on, the Manual Buffer MB value is ignored during the run.")
+        SetDetailedToolTip(_useBadRangeMapCheckBox, "Loads saved bad-range data for this source.", "Later runs can reuse scan/copy findings.")
+        SetDetailedToolTip(_skipKnownBadRangesCheckBox, "Avoids rereading ranges already marked bad.", "Reduces stress on failing media but leaves those ranges unrecovered.")
+        SetDetailedToolTip(_waitForMediaCheckBox, "Waits if source or destination disappears.", "Useful for USB and network paths that may reconnect.")
+        SetDetailedToolTip(_fragileModeCheckBox, "Uses conservative reads for unstable drives.", "Skips sooner and cools down after repeated failures to reduce drive stress.")
 
-        SetDetailedToolTip(_bufferMbNumeric, "Maximum transfer buffer in MB (1-256).")
-        SetDetailedToolTip(_retriesNumeric, "Retry attempts per read/write error (0-1000).")
-        SetDetailedToolTip(_timeoutSecondsNumeric, "I/O timeout per operation in seconds (1-3600).")
+        SetDetailedToolTip(_bufferMbNumeric, "Buffer size used only when Adaptive Buffer is off.", "Adaptive mode ignores this value and tunes per file from live I/O behavior.")
+        SetDetailedToolTip(_retriesNumeric, "Retry count for failed read/write operations.", "More retries can recover transient errors but slow bad media.")
+        SetDetailedToolTip(_timeoutSecondsNumeric, "Maximum time for one I/O operation.", "Shorter detects stalls faster; longer helps slow devices.")
 
-        SetDetailedToolTip(_startButton, "Start copying with current options.")
-        SetDetailedToolTip(_scanBadBlocksButton, "Run a read-only bad-block scan and update the bad-range map.")
-        SetDetailedToolTip(_pauseButton, "Pause the active copy run.")
-        SetDetailedToolTip(_resumeButton, "Resume a paused copy run.")
-        SetDetailedToolTip(_cancelButton, "Cancel the active copy run.")
+        SetDetailedToolTip(_startButton, "Start a copy with the current paths and options.")
+        SetDetailedToolTip(_scanBadBlocksButton, "Read the source without writing a destination copy.", "Updates the bad-range map for future copy runs.")
+        SetDetailedToolTip(_pauseButton, "Pause the active run at a safe point.")
+        SetDetailedToolTip(_resumeButton, "Continue a paused run.")
+        SetDetailedToolTip(_cancelButton, "Request a clean stop.", "Completed work and journal data remain available for resume.")
 
-        SetDetailedToolTip(_overallProgressBar, "Overall run progress.")
-        SetDetailedToolTip(_currentProgressBar, "Progress of the current file.")
-        SetDetailedToolTip(_jobSummaryLabel, "Current run state.")
-        SetDetailedToolTip(_overallStatsLabel, "File counters for completed, failed, recovered, and skipped files.")
-        SetDetailedToolTip(_currentFileLabel, "Currently processed file path.")
-        SetDetailedToolTip(_bytesLabel, "Transferred bytes versus total bytes.")
-        SetDetailedToolTip(_throughputLabel, "Instantaneous and smoothed transfer speed.")
-        SetDetailedToolTip(_etaLabel, "Estimated remaining time based on current average speed.")
-        SetDetailedToolTip(_bufferUsageLabel, "Recent and average buffer utilization.")
-        SetDetailedToolTip(_rescueTelemetryLabel, "Rescue Engine pass status, unreadable region count, and remaining unrecovered bytes.")
-        SetDetailedToolTip(_diagnosticsLabel, "UI diagnostics: render latency, event counts, queue depth, and dropped/suppressed logs.")
-        SetDetailedToolTip(_journalLabel, "Active journal file used for resume/recovery.")
-        SetDetailedToolTip(_logListView, "Operations log")
+        SetDetailedToolTip(_overallProgressBar, "Shows total completed bytes across the whole run.")
+        SetDetailedToolTip(_currentProgressBar, "Shows byte progress for the active file.", "During scan-only runs this includes accounted good and bad ranges.")
+        SetDetailedToolTip(_jobSummaryLabel, "Shows the current run mode and high-level state.")
+        SetDetailedToolTip(_overallStatsLabel, "Shows completed files and active scans.", "Large files can keep this count steady while byte progress continues.")
+        SetDetailedToolTip(_currentFileLabel, "Shows the worker file currently reporting progress.", "The percent is that file's progress; last chunk is the most recent read or write size.")
+        SetDetailedToolTip(_bytesLabel, "Shows completed bytes versus total bytes.")
+        SetDetailedToolTip(_throughputLabel, "Shows current and smoothed transfer speed.")
+        SetDetailedToolTip(_etaLabel, "Estimates remaining time from recent speed.", "ETA can move around when files vary in size or media slows down.")
+        SetDetailedToolTip(_bufferUsageLabel, "Shows recent buffer fill and average buffer use.", "Useful when tuning adaptive buffer or throughput.")
+        SetDetailedToolTip(_rescueTelemetryLabel, "Shows rescue pass, bad-region count, and remaining unreadable bytes.")
+        SetDetailedToolTip(_diagnosticsLabel, "Shows UI event/render counters and suppressed log counts.", "Useful for troubleshooting UI responsiveness.")
+        SetDetailedToolTip(_journalLabel, "Shows the active journal used for resume and recovery.")
+        SetDetailedToolTip(_logListView, "Shows timestamped copy, scan, warning, and error events.")
     End Sub
 
-    Private Sub SetDetailedToolTip(control As Control, description As String)
-        _toolTip.SetToolTip(control, TooltipScenarioFormatter.Compose(description))
+    Private Sub SetDetailedToolTip(control As Control, ParamArray lines() As String)
+        _toolTip.SetToolTip(control, TooltipScenarioFormatter.Compose(lines))
     End Sub
 
     Private Sub SourceTextBox_TextChanged(sender As Object, e As EventArgs)
@@ -841,6 +843,14 @@ Public Class MainForm
 
     Private Sub BadRangeMapOptionCheckBox_CheckedChanged(sender As Object, e As EventArgs)
         UpdateBadRangeMapOptionStates()
+    End Sub
+
+    Private Sub AdaptiveBufferCheckBox_CheckedChanged(sender As Object, e As EventArgs)
+        UpdateBufferOptionStates()
+    End Sub
+
+    Private Sub UpdateBufferOptionStates()
+        _bufferMbNumeric.Enabled = Not _isRunning AndAlso Not _adaptiveBufferCheckBox.Checked
     End Sub
 
     Private Sub UpdateBadRangeMapOptionStates()
@@ -934,7 +944,6 @@ Public Class MainForm
 
     Private Sub ShowSettingsDialog()
         Using dialog As New SettingsForm(_settings)
-            PrepareDialogFirstPaint(dialog)
 
             If dialog.ShowDialog(Me) <> DialogResult.OK Then
                 Return
@@ -1271,6 +1280,10 @@ Public Class MainForm
 
     Private Async Sub MainForm_Shown(sender As Object, e As EventArgs)
         UiLayoutManager.ApplyWindow(Me, LayoutWindowKey)
+
+        ' Pre-warm the system font cache on a background thread so
+        ' the Settings dialog doesn't block on GDI+ font enumeration.
+        Call Task.Run(Sub() SettingsForm.WarmFontCache())
 
         If _settings Is Nothing Then
             Return
@@ -2083,7 +2096,8 @@ Public Class MainForm
             Dim scanOnly = normalizedOptions.OperationMode = JobOperationMode.ScanOnly
             AppendLog($"Starting run: {_activeRun.DisplayName}")
             AppendLog(If(scanOnly, "Starting bad-block scan through supervisor.", "Starting copy job through supervisor."))
-            AppendLog($"Buffer mode: {If(normalizedOptions.UseAdaptiveBufferSizing, "Adaptive (max " & CInt(_bufferMbNumeric.Value) & " MB)", "Fixed (" & CInt(_bufferMbNumeric.Value) & " MB)")}.")
+            AppendLog($"Buffer mode: {If(normalizedOptions.UseAdaptiveBufferSizing, "Adaptive automatic (manual buffer ignored)", "Manual fixed (" & CInt(_bufferMbNumeric.Value) & " MB)")}.")
+            AppendLog($"Transfer engine: {normalizedOptions.TransferEnginePolicy}; small-file workers={normalizedOptions.ParallelSmallFileWorkers}, threshold={FormatBytes(normalizedOptions.SmallFileThresholdBytes)}.")
             AppendLog($"Media wait mode: {If(normalizedOptions.WaitForMediaAvailability, "Enabled (wait forever)", "Disabled")}.")
             If normalizedOptions.FragileMediaMode Then
                 AppendLog("Fragile media mode: Enabled.")
@@ -2091,6 +2105,7 @@ Public Class MainForm
             End If
             If scanOnly Then
                 AppendLog($"Scan backend: {If(normalizedOptions.UseExperimentalRawDiskScan, "Raw disk (experimental, auto-fallback enabled)", "Standard file I/O")}.")
+                AppendLog($"Scan profile: {normalizedOptions.ScanPerformanceProfile}; workers={normalizedOptions.ParallelScanWorkers}.")
             End If
             If normalizedOptions.UseBadRangeMap Then
                 AppendLog($"Bad-range map: Enabled ({If(normalizedOptions.SkipKnownBadRanges, "skip known bad ranges", "read all ranges")}).")
@@ -2145,7 +2160,10 @@ Public Class MainForm
         _bytesLabel.Text = "Bytes: 0 B / 0 B"
         _throughputLabel.Text = "Speed: 0 B/s (avg 0 B/s)"
         _etaLabel.Text = "ETA: -"
-        _bufferUsageLabel.Text = $"Buffer Use: last - / {FormatBytes(CLng(_bufferMbNumeric.Value) * 1024L * 1024L)}  avg -"
+        _bufferUsageLabel.Text = If(
+            options.UseAdaptiveBufferSizing,
+            "Buffer Use: last - / auto  avg -",
+            $"Buffer Use: last - / {FormatBytes(CLng(_bufferMbNumeric.Value) * 1024L * 1024L)}  avg -")
         _rescueTelemetryLabel.Text = "Rescue: -"
         _diagnosticsLabel.Text = "Diagnostics: -"
         _journalLabel.Text = "Journal: -"
@@ -2169,6 +2187,7 @@ Public Class MainForm
         _fragileModeCheckBox.Checked = _settings.DefaultFragileMediaMode
         SetActiveSalvageFillPattern(SettingsValueConverter.ToSalvageFillPattern(_settings.DefaultSalvageFillPattern))
         UpdateBadRangeMapOptionStates()
+        UpdateBufferOptionStates()
 
         Dim bufferMb = Math.Max(CInt(_bufferMbNumeric.Minimum), Math.Min(CInt(_bufferMbNumeric.Maximum), _settings.DefaultBufferSizeMb))
         _bufferMbNumeric.Value = bufferMb
@@ -2196,14 +2215,17 @@ Public Class MainForm
             .UpdateBadRangeMapFromRun = safeSettings.DefaultUpdateBadRangeMapFromRun,
             .BadRangeMapMaxAgeDays = Math.Max(0, safeSettings.DefaultBadRangeMapMaxAgeDays),
             .UseExperimentalRawDiskScan = safeSettings.DefaultUseExperimentalRawDiskScan,
+            .ScanPerformanceProfile = SettingsValueConverter.ToScanPerformanceProfile(safeSettings.DefaultScanPerformanceProfile),
             .OverwritePolicy = SettingsValueConverter.ToOverwritePolicy(safeSettings.DefaultOverwritePolicy),
             .SymlinkHandling = SettingsValueConverter.ToSymlinkHandling(safeSettings.DefaultSymlinkHandling),
             .CopyEmptyDirectories = safeSettings.DefaultCopyEmptyDirectories,
             .BufferSizeBytes = Math.Max(4096, safeSettings.DefaultBufferSizeMb * 1024 * 1024),
             .UseAdaptiveBufferSizing = safeSettings.DefaultUseAdaptiveBuffer,
+            .TransferEnginePolicy = SettingsValueConverter.ToTransferEnginePolicy(safeSettings.DefaultTransferEnginePolicy),
             .MaxThroughputBytesPerSecond = Math.Max(0L, CLng(safeSettings.DefaultMaxThroughputMbPerSecond) * 1024L * 1024L),
-            .ParallelSmallFileWorkers = 1,
-            .SmallFileThresholdBytes = 256 * 1024,
+            .ParallelSmallFileWorkers = ResolveParallelSmallFileWorkers(safeSettings.DefaultParallelSmallFileWorkers),
+            .SmallFileThresholdBytes = Math.Max(4 * 1024, safeSettings.DefaultSmallFileThresholdKb * 1024),
+            .ParallelScanWorkers = ResolveParallelScanWorkers(safeSettings.DefaultParallelScanWorkers),
             .WaitForMediaAvailability = safeSettings.DefaultWaitForMediaAvailability,
             .WaitForFileLockRelease = safeSettings.DefaultWaitForFileLockRelease,
             .TreatAccessDeniedAsContention = safeSettings.DefaultTreatAccessDeniedAsContention,
@@ -2230,7 +2252,7 @@ Public Class MainForm
             .SalvageFillPattern = SettingsValueConverter.ToSalvageFillPattern(safeSettings.DefaultSalvageFillPattern),
             .ContinueOnFileError = safeSettings.DefaultContinueOnFileError,
             .PreserveTimestamps = safeSettings.DefaultPreserveTimestamps,
-            .WorkerProcessPriorityClass = "Normal",
+            .WorkerProcessPriorityClass = SettingsValueConverter.NormalizeWorkerProcessPriorityClass(safeSettings.DefaultWorkerProcessPriorityClass),
             .WorkerTelemetryProfile = SettingsValueConverter.ToWorkerTelemetryProfile(safeSettings.WorkerTelemetryProfile),
             .WorkerProgressEmitIntervalMs = Math.Max(20, safeSettings.WorkerProgressIntervalMs),
             .WorkerMaxLogsPerSecond = Math.Max(0, safeSettings.WorkerMaxLogsPerSecond),
@@ -2263,6 +2285,7 @@ Public Class MainForm
         _fragileModeCheckBox.Checked = options.FragileMediaMode
         SetActiveSalvageFillPattern(options.SalvageFillPattern)
         UpdateBadRangeMapOptionStates()
+        UpdateBufferOptionStates()
 
         Dim bufferMb = Math.Ceiling(CDbl(Math.Max(4096, options.BufferSizeBytes)) / (1024.0R * 1024.0R))
         bufferMb = Math.Max(CDbl(_bufferMbNumeric.Minimum), Math.Min(CDbl(_bufferMbNumeric.Maximum), bufferMb))
@@ -2660,11 +2683,17 @@ Public Class MainForm
     Private Shared Function GetSalvageFillPatternTooltip(pattern As SalvageFillPattern) As String
         Select Case pattern
             Case SalvageFillPattern.Ones
-                Return "Attempt to recover unreadable source regions and fill missing bytes with 0xFF."
+                Return "Keeps going when source blocks cannot be read." &
+                    Environment.NewLine &
+                    "Unreadable bytes are filled with 0xFF so damaged areas are visible."
             Case SalvageFillPattern.Random
-                Return "Attempt to recover unreadable source regions and fill missing bytes with random data."
+                Return "Keeps going when source blocks cannot be read." &
+                    Environment.NewLine &
+                    "Unreadable bytes are filled with random data. Use only when that is intentional."
             Case Else
-                Return "Attempt to recover unreadable source regions and fill missing bytes with 0x00."
+                Return "Keeps going when source blocks cannot be read." &
+                    Environment.NewLine &
+                    "Unreadable bytes are zero-filled, which is predictable and easy to inspect."
         End Select
     End Function
 
@@ -2688,6 +2717,42 @@ Public Class MainForm
 
     Private Shared Function ClampRescueRetries(value As Integer) As Integer
         Return Math.Max(0, Math.Min(1000, value))
+    End Function
+
+    Private Shared Function ResolveParallelSmallFileWorkers(configuredValue As Integer) As Integer
+        If configuredValue > 0 Then
+            Return Math.Max(1, Math.Min(64, configuredValue))
+        End If
+
+        Dim processorCount = Math.Max(1, Environment.ProcessorCount)
+        Return Math.Max(1, Math.Min(8, processorCount))
+    End Function
+
+    Private Shared Function ResolveParallelScanWorkers(configuredValue As Integer) As Integer
+        If configuredValue > 0 Then
+            Return Math.Max(1, Math.Min(64, configuredValue))
+        End If
+
+        Dim processorCount = Math.Max(1, Environment.ProcessorCount)
+        Return Math.Max(1, Math.Min(8, processorCount))
+    End Function
+
+    Private Shared Function NormalizeTransferEnginePolicy(value As TransferEnginePolicy) As TransferEnginePolicy
+        Select Case value
+            Case TransferEnginePolicy.Auto, TransferEnginePolicy.ManagedRescue, TransferEnginePolicy.NativeFast
+                Return value
+            Case Else
+                Return TransferEnginePolicy.Auto
+        End Select
+    End Function
+
+    Private Shared Function NormalizeScanPerformanceProfile(value As ScanPerformanceProfile) As ScanPerformanceProfile
+        Select Case value
+            Case ScanPerformanceProfile.Auto, ScanPerformanceProfile.Fast, ScanPerformanceProfile.Precise
+                Return value
+            Case Else
+                Return ScanPerformanceProfile.Auto
+        End Select
     End Function
 
     Private Function NormalizeAndValidateOptions(
@@ -2808,9 +2873,11 @@ Public Class MainForm
         Dim fragileFailureWindow = Math.Max(1, Math.Min(3600, options.FragileFailureWindowSeconds))
         Dim fragileFailureThreshold = Math.Max(1, Math.Min(1000, options.FragileFailureThreshold))
         Dim fragileCooldown = Math.Max(0, Math.Min(600, options.FragileCooldownSeconds))
+        Dim scanPerformanceProfile = NormalizeScanPerformanceProfile(options.ScanPerformanceProfile)
 
         If fragileMode Then
             useExperimentalRawScan = False
+            scanPerformanceProfile = ScanPerformanceProfile.Precise
             normalizedMaxRetries = 0
             skipOnFirstReadError = True
             normalizedTimeout = TimeSpan.FromSeconds(Math.Max(1.0R, Math.Min(5.0R, normalizedTimeout.TotalSeconds)))
@@ -2827,6 +2894,7 @@ Public Class MainForm
             .UpdateBadRangeMapFromRun = options.UpdateBadRangeMapFromRun,
             .BadRangeMapMaxAgeDays = Math.Max(0, Math.Min(3650, options.BadRangeMapMaxAgeDays)),
             .UseExperimentalRawDiskScan = useExperimentalRawScan,
+            .ScanPerformanceProfile = scanPerformanceProfile,
             .ResumeJournalPathHint = If(options.ResumeJournalPathHint, String.Empty),
             .AllowJournalRootRemap = options.AllowJournalRootRemap,
             .SelectedRelativePaths = normalizedSelections,
@@ -2835,9 +2903,11 @@ Public Class MainForm
             .CopyEmptyDirectories = options.CopyEmptyDirectories,
             .BufferSizeBytes = Math.Max(4096, options.BufferSizeBytes),
             .UseAdaptiveBufferSizing = options.UseAdaptiveBufferSizing,
+            .TransferEnginePolicy = NormalizeTransferEnginePolicy(options.TransferEnginePolicy),
             .MaxThroughputBytesPerSecond = Math.Max(0L, options.MaxThroughputBytesPerSecond),
             .ParallelSmallFileWorkers = Math.Max(1, options.ParallelSmallFileWorkers),
             .SmallFileThresholdBytes = Math.Max(4096, options.SmallFileThresholdBytes),
+            .ParallelScanWorkers = Math.Max(0, Math.Min(64, options.ParallelScanWorkers)),
             .WaitForMediaAvailability = options.WaitForMediaAvailability,
             .WaitForFileLockRelease = options.WaitForFileLockRelease,
             .TreatAccessDeniedAsContention = options.TreatAccessDeniedAsContention,
@@ -2864,7 +2934,7 @@ Public Class MainForm
             .SalvageFillPattern = options.SalvageFillPattern,
             .ContinueOnFileError = options.ContinueOnFileError,
             .PreserveTimestamps = options.PreserveTimestamps,
-            .WorkerProcessPriorityClass = If(options.WorkerProcessPriorityClass, "Normal"),
+            .WorkerProcessPriorityClass = SettingsValueConverter.NormalizeWorkerProcessPriorityClass(options.WorkerProcessPriorityClass),
             .WorkerTelemetryProfile = options.WorkerTelemetryProfile,
             .WorkerProgressEmitIntervalMs = Math.Max(20, Math.Min(1000, options.WorkerProgressEmitIntervalMs)),
             .WorkerMaxLogsPerSecond = Math.Max(0, Math.Min(5000, options.WorkerMaxLogsPerSecond)),
@@ -2895,6 +2965,7 @@ Public Class MainForm
             .UpdateBadRangeMapFromRun = options.UpdateBadRangeMapFromRun,
             .BadRangeMapMaxAgeDays = options.BadRangeMapMaxAgeDays,
             .UseExperimentalRawDiskScan = options.UseExperimentalRawDiskScan,
+            .ScanPerformanceProfile = options.ScanPerformanceProfile,
             .ResumeJournalPathHint = options.ResumeJournalPathHint,
             .AllowJournalRootRemap = options.AllowJournalRootRemap,
             .SelectedRelativePaths = New List(Of String)(If(options.SelectedRelativePaths, New List(Of String)())),
@@ -2903,9 +2974,11 @@ Public Class MainForm
             .CopyEmptyDirectories = options.CopyEmptyDirectories,
             .BufferSizeBytes = options.BufferSizeBytes,
             .UseAdaptiveBufferSizing = options.UseAdaptiveBufferSizing,
+            .TransferEnginePolicy = options.TransferEnginePolicy,
             .MaxThroughputBytesPerSecond = options.MaxThroughputBytesPerSecond,
             .ParallelSmallFileWorkers = options.ParallelSmallFileWorkers,
             .SmallFileThresholdBytes = options.SmallFileThresholdBytes,
+            .ParallelScanWorkers = options.ParallelScanWorkers,
             .WaitForMediaAvailability = options.WaitForMediaAvailability,
             .WaitForFileLockRelease = options.WaitForFileLockRelease,
             .TreatAccessDeniedAsContention = options.TreatAccessDeniedAsContention,
@@ -3104,8 +3177,13 @@ Public Class MainForm
 
         SyncLock _progressDispatchLock
             If _pendingProgressSnapshot IsNot Nothing Then
-                _uiProgressEventsCoalesced += 1
+                If Not String.Equals(_pendingProgressSnapshot.CurrentFile, progress.CurrentFile, StringComparison.Ordinal) Then
+                    _fileTransitionProgressSnapshot = _pendingProgressSnapshot
+                Else
+                    _uiProgressEventsCoalesced += 1
+                End If
             End If
+
             _pendingProgressSnapshot = progress
         End SyncLock
 
@@ -3144,6 +3222,17 @@ Public Class MainForm
         Dim deferredSnapshot As CopyProgressSnapshot = Nothing
 
         Do
+            Dim transitionSnapshot As CopyProgressSnapshot = Nothing
+            SyncLock _progressDispatchLock
+                transitionSnapshot = _fileTransitionProgressSnapshot
+                _fileTransitionProgressSnapshot = Nothing
+            End SyncLock
+
+            If transitionSnapshot IsNot Nothing Then
+                ApplyProgress(transitionSnapshot)
+                _lastProgressRenderTick = Environment.TickCount64
+            End If
+
             Dim snapshot As CopyProgressSnapshot = Nothing
             SyncLock _progressDispatchLock
                 snapshot = _pendingProgressSnapshot
@@ -3182,7 +3271,7 @@ Public Class MainForm
 
         Dim hasPendingSnapshot As Boolean
         SyncLock _progressDispatchLock
-            hasPendingSnapshot = _pendingProgressSnapshot IsNot Nothing
+            hasPendingSnapshot = _pendingProgressSnapshot IsNot Nothing OrElse _fileTransitionProgressSnapshot IsNot Nothing
         End SyncLock
 
         If hasPendingSnapshot AndAlso Interlocked.CompareExchange(_progressDispatchQueued, 1, 0) = 0 Then
@@ -3211,6 +3300,7 @@ Public Class MainForm
     Private Sub ResetPendingProgressState()
         SyncLock _progressDispatchLock
             _pendingProgressSnapshot = Nothing
+            _fileTransitionProgressSnapshot = Nothing
         End SyncLock
         Interlocked.Exchange(_progressDispatchQueued, 0)
         _lastProgressRenderTick = 0
@@ -3309,10 +3399,10 @@ Public Class MainForm
         Dim renderStopwatch = Stopwatch.StartNew()
 
         _lastProgressSnapshot = progress
-        UpdateAnimatedProgressTargets(progress.OverallProgress, progress.CurrentFileProgress, animate:=True)
+        UpdateAnimatedProgressTargets(progress.OverallProgress, progress.CurrentFileProgress, animate:=False)
 
-        _overallStatsLabel.Text = $"Files: {progress.CompletedFiles}/{progress.TotalFiles}  Failed: {progress.FailedFiles}  Recovered: {progress.RecoveredFiles}  Skipped: {progress.SkippedFiles}"
-        _currentFileLabel.Text = $"Current: {progress.CurrentFile}"
+        _overallStatsLabel.Text = BuildFileStatsText(progress)
+        _currentFileLabel.Text = BuildCurrentFileText(progress)
         _bytesLabel.Text = $"Bytes: {FormatBytes(progress.TotalBytesCopied)} / {FormatBytes(progress.TotalBytes)}"
         UpdateTransferTelemetry(progress)
         UpdateRescueTelemetry(progress)
@@ -3459,6 +3549,15 @@ Public Class MainForm
         End If
 
         AppendLog($"Finished. Completed={result.CompletedFiles}, Failed={result.FailedFiles}, Recovered={result.RecoveredFiles}, Skipped={result.SkippedFiles}")
+        If result.ElapsedMilliseconds > 0 Then
+            AppendLog($"Throughput: {FormatBytes(CLng(Math.Max(0.0R, result.AverageBytesPerSecond)))}/s average over {TimeSpan.FromMilliseconds(result.ElapsedMilliseconds):hh\:mm\:ss}.")
+        End If
+        If result.NativeFastPathFiles > 0 OrElse
+            result.ParallelNativeFastPathFiles > 0 OrElse
+            result.ManagedCopyFiles > 0 OrElse
+            result.NativeFallbackFiles > 0 Then
+            AppendLog($"Engine summary: native={result.NativeFastPathFiles}, parallel-native={result.ParallelNativeFastPathFiles}, managed={result.ManagedCopyFiles}, native-fallback={result.NativeFallbackFiles}.")
+        End If
         If Not String.IsNullOrWhiteSpace(result.ErrorMessage) Then
             AppendLog($"Result message: {result.ErrorMessage}")
         End If
@@ -3699,6 +3798,12 @@ Public Class MainForm
         Dim failedFiles = Math.Max(0, result.FailedFiles)
         Dim recoveredFiles = Math.Max(0, result.RecoveredFiles)
         Dim skippedFiles = Math.Max(0, result.SkippedFiles)
+        If result.Cancelled AndAlso previousSnapshot IsNot Nothing Then
+            completedFiles = Math.Max(completedFiles, previousSnapshot.CompletedFiles)
+            failedFiles = Math.Max(failedFiles, previousSnapshot.FailedFiles)
+            recoveredFiles = Math.Max(recoveredFiles, previousSnapshot.RecoveredFiles)
+            skippedFiles = Math.Max(skippedFiles, previousSnapshot.SkippedFiles)
+        End If
 
         Dim totalBytes = Math.Max(0L, result.TotalBytes)
         If totalBytes <= 0 AndAlso previousSnapshot IsNot Nothing Then
@@ -3735,13 +3840,10 @@ Public Class MainForm
             _etaLabel.Text = "ETA: 00:00:00"
         Else
             currentProgress = If(previousSnapshot IsNot Nothing, Math.Clamp(previousSnapshot.CurrentFileProgress, 0.0R, 1.0R), 0.0R)
-            _currentFileLabel.Text = If(previousSnapshot IsNot Nothing AndAlso Not String.IsNullOrWhiteSpace(previousSnapshot.CurrentFile),
-                $"Current: {previousSnapshot.CurrentFile}",
-                "Current: -")
+            _currentFileLabel.Text = BuildCurrentFileText(previousSnapshot)
         End If
         UpdateAnimatedProgressTargets(overallProgress, currentProgress, animate:=False)
 
-        _overallStatsLabel.Text = $"Files: {completedFiles}/{totalFiles}  Failed: {failedFiles}  Recovered: {recoveredFiles}  Skipped: {skippedFiles}"
         _bytesLabel.Text = $"Bytes: {FormatBytes(copiedBytes)} / {FormatBytes(totalBytes)}"
 
         Dim finalRescuePass = If(result.Succeeded AndAlso Not result.Cancelled, "Complete", If(previousSnapshot IsNot Nothing, previousSnapshot.RescuePass, String.Empty))
@@ -3763,9 +3865,13 @@ Public Class MainForm
             .TotalFiles = totalFiles,
             .RescuePass = If(finalRescuePass, String.Empty),
             .RescueBadRegionCount = Math.Max(0, finalRescueBadRegions),
-            .RescueRemainingBytes = Math.Max(0L, finalRescueRemainingBytes)
+            .RescueRemainingBytes = Math.Max(0L, finalRescueRemainingBytes),
+            .ActiveFileCount = If(result.Succeeded AndAlso Not result.Cancelled, 0, If(previousSnapshot IsNot Nothing, previousSnapshot.ActiveFileCount, 0)),
+            .ScanWorkerCount = If(previousSnapshot IsNot Nothing, previousSnapshot.ScanWorkerCount, 0),
+            .ActiveFiles = If(previousSnapshot Is Nothing OrElse previousSnapshot.ActiveFiles Is Nothing, New List(Of String)(), New List(Of String)(previousSnapshot.ActiveFiles))
         }
 
+        _overallStatsLabel.Text = BuildFileStatsText(_lastProgressSnapshot)
         UpdateRescueTelemetry(_lastProgressSnapshot)
     End Sub
 
@@ -4102,7 +4208,7 @@ Public Class MainForm
         _skipKnownBadRangesCheckBox.Enabled = Not isRunning
         _waitForMediaCheckBox.Enabled = Not isRunning
         _fragileModeCheckBox.Enabled = Not isRunning
-        _bufferMbNumeric.Enabled = Not isRunning
+        _bufferMbNumeric.Enabled = Not isRunning AndAlso Not _adaptiveBufferCheckBox.Checked
         _retriesNumeric.Enabled = Not isRunning
         _timeoutSecondsNumeric.Enabled = Not isRunning
 
@@ -4344,7 +4450,60 @@ Public Class MainForm
             rescueText = $" - {progress.RescuePass} [{badRegions} bad, {remainingText} rem]"
         End If
 
-        Return $"{AppTitle} - {statusText} {percent:0.0}% ({completedFiles}/{totalFiles} files) - {speedText} - ETA {etaText}{rescueText}"
+        Dim activeFiles = GetVisibleActiveFileCount(progress)
+        Dim fileText = If(
+            activeFiles > 0,
+            $"{completedFiles} done + {activeFiles} active/{totalFiles} files",
+            $"{completedFiles}/{totalFiles} files")
+
+        Return $"{AppTitle} - {statusText} {percent:0.0}% ({fileText}) - {speedText} - ETA {etaText}{rescueText}"
+    End Function
+
+    Private Shared Function BuildFileStatsText(progress As CopyProgressSnapshot) As String
+        If progress Is Nothing Then
+            Return "Files: 0/0  Failed: 0  Recovered: 0  Skipped: 0"
+        End If
+
+        Dim completedFiles = Math.Max(0, progress.CompletedFiles)
+        Dim totalFiles = Math.Max(0, progress.TotalFiles)
+        Dim activeFiles = GetVisibleActiveFileCount(progress)
+        Dim filesText = If(
+            activeFiles > 0,
+            $"{completedFiles} done + {activeFiles} active/{totalFiles}",
+            $"{completedFiles}/{totalFiles}")
+
+        Return $"Files: {filesText}  Failed: {Math.Max(0, progress.FailedFiles)}  Recovered: {Math.Max(0, progress.RecoveredFiles)}  Skipped: {Math.Max(0, progress.SkippedFiles)}"
+    End Function
+
+    Private Shared Function BuildCurrentFileText(progress As CopyProgressSnapshot) As String
+        If progress Is Nothing OrElse String.IsNullOrWhiteSpace(progress.CurrentFile) Then
+            Return "Current: -"
+        End If
+
+        Dim filePercent = Math.Clamp(progress.CurrentFileProgress, 0.0R, 1.0R) * 100.0R
+        Dim chunkText = If(
+            progress.LastChunkBytesTransferred > 0,
+            $"last chunk {FormatBytes(progress.LastChunkBytesTransferred)}",
+            "last chunk -")
+
+        Dim workerText = String.Empty
+        If progress.ScanWorkerCount > 1 Then
+            workerText = $"  active {Math.Max(0, progress.ActiveFileCount)}/{Math.Max(1, progress.ScanWorkerCount)}"
+        End If
+
+        Return $"Current: {progress.CurrentFile}  file {filePercent:0.0}%  {chunkText}{workerText}"
+    End Function
+
+    Private Shared Function GetVisibleActiveFileCount(progress As CopyProgressSnapshot) As Integer
+        If progress Is Nothing Then
+            Return 0
+        End If
+
+        Dim processedFiles = Math.Max(0, progress.CompletedFiles) +
+            Math.Max(0, progress.FailedFiles) +
+            Math.Max(0, progress.SkippedFiles)
+        Dim pendingFiles = Math.Max(0, Math.Max(0, progress.TotalFiles) - processedFiles)
+        Return Math.Min(Math.Max(0, progress.ActiveFileCount), pendingFiles)
     End Function
 
     Private Function EstimateEtaText(progress As CopyProgressSnapshot) As String

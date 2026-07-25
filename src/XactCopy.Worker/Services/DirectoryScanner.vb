@@ -51,6 +51,7 @@ Namespace Services
 
             Dim normalizedRoot = Path.GetFullPath(rootPath)
             Dim discoveredFiles As New List(Of SourceFileDescriptor)()
+            Dim discoveredFilePaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
             Dim discoveredDirectories As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
             Dim filter = SelectionFilter.Create(normalizedRoot, selectedRelativePaths, log)
@@ -110,6 +111,11 @@ Namespace Services
 
                     If entry.IsReparsePoint AndAlso symlinkHandling = SymlinkHandlingMode.Skip Then
                         log?.Invoke($"Skipping symbolic-link file: {entry.FullPath}")
+                        Continue For
+                    End If
+
+                    If Not discoveredFilePaths.Add(relativePath) Then
+                        log?.Invoke($"Skipping duplicate file entry: {relativePath}")
                         Continue For
                     End If
 

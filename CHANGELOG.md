@@ -4,6 +4,34 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Transfer engine policy:
+  - Added an explicit `Auto` / `ManagedRescue` / `NativeFast` policy that flows through settings, IPC, job manager snapshots, recovery state, and the worker.
+  - Native acceleration is disabled when managed-rescue is forced or debug fault injection is active.
+- Benchmark harness:
+  - Added `tools/XactCopy.Benchmarks` for repeatable small, mixed, and large dataset copy/scan comparisons with Markdown and JSON reports.
+  - Reports include policy, iteration, throughput, elapsed time, progress/log event counts, and observed transfer passes.
+- Run-level engine telemetry:
+  - Worker results now include elapsed time, average throughput, transfer policy, native fast-path count, parallel-native count, managed count, and native fallback count.
+  - UI logs and job history summaries now surface final throughput and engine mix.
+- Fast scan engine:
+  - Added scan performance profiles (`Auto`, `Fast`, `Precise`) with parallel healthy-media scan workers and precise bad-range fallback.
+  - Fast scan progress includes active scan worker telemetry while preserving exact total and per-file byte bounds.
+
+### Changed
+
+- Parallel small-file phase now uses bounded worker loops over a shared queue instead of creating one task per file.
+- Settings expose transfer-engine policy plus small-file worker and threshold defaults.
+- Scan-only mode uses the fast health-scan profile by default unless fragile-media protection forces precise scanning.
+- Rewrote Settings, main window, recovery prompt, and Job Manager tooltips with explicit plain-language guidance and tradeoffs instead of generic inferred "Useful when" text.
+
+### Fixed
+
+- Large-file scan progress:
+  - Rescue and bad-range ledger lengths now use 64-bit accounting, including merge/update paths and bad-range map hints, so per-file scan progress remains exact past the 2 GB boundary on files such as 40 GB media images.
+- Completion progress snapshots preserve the final rescue/native pass telemetry instead of overwriting it with an empty pass.
+
 ## [1.1.1.1] - 2026-04-13
 
 ### Fixed

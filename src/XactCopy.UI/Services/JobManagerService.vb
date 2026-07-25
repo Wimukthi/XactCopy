@@ -111,6 +111,8 @@ Namespace Services
         Private ReadOnly _syncRoot As New Object()
         Private ReadOnly _catalogStore As JobCatalogStore
         Private _catalog As JobCatalog
+        Private _jobIndex As New Dictionary(Of String, ManagedJob)(StringComparer.OrdinalIgnoreCase)
+        Private _runIndex As New Dictionary(Of String, ManagedJobRun)(StringComparer.OrdinalIgnoreCase)
 
         ''' <summary>
         ''' Initializes a new instance.
@@ -118,6 +120,7 @@ Namespace Services
         Public Sub New(Optional catalogStore As JobCatalogStore = Nothing)
             _catalogStore = If(catalogStore, New JobCatalogStore())
             _catalog = _catalogStore.Load()
+            RebuildIndexesLocked()
         End Sub
 
         ''' <summary>
@@ -255,6 +258,56 @@ Namespace Services
 
                 SaveCatalogLocked()
                 Return CloneJob(job)
+            End SyncLock
+        End Function
+
+        ''' <summary>
+        ''' Renames an existing saved job.
+        ''' </summary>
+        Public Function RenameJob(jobId As String, newName As String) As Boolean
+            If String.IsNullOrWhiteSpace(jobId) OrElse String.IsNullOrWhiteSpace(newName) Then
+                Return False
+            End If
+
+            SyncLock _syncRoot
+                Dim job = FindJobByIdLocked(jobId)
+                If job Is Nothing Then
+                    Return False
+                End If
+
+                job.Name = newName.Trim()
+                job.UpdatedUtc = DateTimeOffset.UtcNow
+                SaveCatalogLocked()
+                Return True
+            End SyncLock
+        End Function
+
+        ''' <summary>
+        ''' Duplicates an existing saved job with a new name.
+        ''' </summary>
+        Public Function DuplicateJob(jobId As String, newName As String) As ManagedJob
+            If String.IsNullOrWhiteSpace(jobId) OrElse String.IsNullOrWhiteSpace(newName) Then
+                Return Nothing
+            End If
+
+            SyncLock _syncRoot
+                Dim sourceJob = FindJobByIdLocked(jobId)
+                If sourceJob Is Nothing Then
+                    Return Nothing
+                End If
+
+                Dim nowUtc = DateTimeOffset.UtcNow
+                Dim duplicate As New ManagedJob() With {
+                    .JobId = Guid.NewGuid().ToString("N"),
+                    .Name = newName.Trim(),
+                    .Options = CloneOptions(sourceJob.Options),
+                    .CreatedUtc = nowUtc,
+                    .UpdatedUtc = nowUtc
+                }
+
+                _catalog.Jobs.Add(duplicate)
+                SaveCatalogLocked()
+                Return CloneJob(duplicate)
             End SyncLock
         End Function
 
@@ -567,10 +620,10 @@ Namespace Services
                     run.Summary = "Cancelled by user."
                 ElseIf result.Succeeded Then
                     run.Status = ManagedJobRunStatus.Completed
-                    run.Summary = $"Completed: {result.CompletedFiles}/{result.TotalFiles} files."
+                    run.Summary = $"Completed: {result.CompletedFiles}/{result.TotalFiles} files{FormatResultSpeedSuffix(result)}."
                 Else
                     run.Status = ManagedJobRunStatus.Failed
-                    run.Summary = $"Completed with failures: failed {result.FailedFiles}, recovered {result.RecoveredFiles}."
+                    run.Summary = $"Completed with failures: failed {result.FailedFiles}, recovered {result.RecoveredFiles}{FormatResultSpeedSuffix(result)}."
                 End If
 
                 SaveCatalogLocked()
@@ -784,14 +837,40 @@ Namespace Services
         End Sub
 
         Private Function FindJobByIdLocked(jobId As String) As ManagedJob
-            Return _catalog.Jobs.FirstOrDefault(
-                Function(job) job IsNot Nothing AndAlso String.Equals(job.JobId, jobId, StringComparison.OrdinalIgnoreCase))
+            If String.IsNullOrWhiteSpace(jobId) Then
+                Return Nothing
+            End If
+
+            Dim job As ManagedJob = Nothing
+            _jobIndex.TryGetValue(jobId, job)
+            Return job
         End Function
 
         Private Function FindRunByIdLocked(runId As String) As ManagedJobRun
-            Return _catalog.Runs.FirstOrDefault(
-                Function(run) run IsNot Nothing AndAlso String.Equals(run.RunId, runId, StringComparison.OrdinalIgnoreCase))
+            If String.IsNullOrWhiteSpace(runId) Then
+                Return Nothing
+            End If
+
+            Dim run As ManagedJobRun = Nothing
+            _runIndex.TryGetValue(runId, run)
+            Return run
         End Function
+
+        Private Sub RebuildIndexesLocked()
+            _jobIndex.Clear()
+            For Each job In _catalog.Jobs
+                If job IsNot Nothing AndAlso Not String.IsNullOrWhiteSpace(job.JobId) Then
+                    _jobIndex(job.JobId) = job
+                End If
+            Next
+
+            _runIndex.Clear()
+            For Each run In _catalog.Runs
+                If run IsNot Nothing AndAlso Not String.IsNullOrWhiteSpace(run.RunId) Then
+                    _runIndex(run.RunId) = run
+                End If
+            Next
+        End Sub
 
         Private Function BuildSanitizedQueueLocked() As List(Of ManagedJobQueueEntry)
             Dim sanitized As New List(Of ManagedJobQueueEntry)()
@@ -833,6 +912,7 @@ Namespace Services
 
         Private Sub SaveCatalogLocked()
             _catalogStore.Save(_catalog)
+            RebuildIndexesLocked()
         End Sub
 
         Private Shared Function CloneJob(job As ManagedJob) As ManagedJob
@@ -889,9 +969,40 @@ Namespace Services
                 .SkippedFiles = result.SkippedFiles,
                 .TotalBytes = result.TotalBytes,
                 .CopiedBytes = result.CopiedBytes,
+                .TransferEnginePolicy = result.TransferEnginePolicy,
+                .ElapsedMilliseconds = result.ElapsedMilliseconds,
+                .AverageBytesPerSecond = result.AverageBytesPerSecond,
+                .NativeFastPathFiles = result.NativeFastPathFiles,
+                .ParallelNativeFastPathFiles = result.ParallelNativeFastPathFiles,
+                .ManagedCopyFiles = result.ManagedCopyFiles,
+                .NativeFallbackFiles = result.NativeFallbackFiles,
                 .JournalPath = result.JournalPath,
                 .ErrorMessage = result.ErrorMessage
             }
+        End Function
+
+        Private Shared Function FormatResultSpeedSuffix(result As CopyJobResult) As String
+            If result Is Nothing OrElse result.AverageBytesPerSecond <= 0 Then
+                Return String.Empty
+            End If
+
+            Return $" at {FormatBytes(CLng(result.AverageBytesPerSecond))}/s"
+        End Function
+
+        Private Shared Function FormatBytes(value As Long) As String
+            If value < 1024 Then
+                Return $"{value} B"
+            End If
+
+            Dim units = {"KB", "MB", "GB", "TB"}
+            Dim size = CDbl(value)
+            Dim unitIndex = -1
+            Do
+                size /= 1024.0R
+                unitIndex += 1
+            Loop While size >= 1024.0R AndAlso unitIndex < units.Length - 1
+
+            Return $"{size:0.##} {units(unitIndex)}"
         End Function
 
         Private Shared Function CloneOptions(options As CopyJobOptions) As CopyJobOptions
@@ -911,6 +1022,7 @@ Namespace Services
                 .UpdateBadRangeMapFromRun = options.UpdateBadRangeMapFromRun,
                 .BadRangeMapMaxAgeDays = options.BadRangeMapMaxAgeDays,
                 .UseExperimentalRawDiskScan = options.UseExperimentalRawDiskScan,
+                .ScanPerformanceProfile = options.ScanPerformanceProfile,
                 .ResumeJournalPathHint = options.ResumeJournalPathHint,
                 .AllowJournalRootRemap = options.AllowJournalRootRemap,
                 .SelectedRelativePaths = New List(Of String)(If(options.SelectedRelativePaths, New List(Of String)())),
@@ -919,9 +1031,11 @@ Namespace Services
                 .CopyEmptyDirectories = options.CopyEmptyDirectories,
                 .BufferSizeBytes = options.BufferSizeBytes,
                 .UseAdaptiveBufferSizing = options.UseAdaptiveBufferSizing,
+                .TransferEnginePolicy = options.TransferEnginePolicy,
                 .MaxThroughputBytesPerSecond = options.MaxThroughputBytesPerSecond,
                 .ParallelSmallFileWorkers = options.ParallelSmallFileWorkers,
                 .SmallFileThresholdBytes = options.SmallFileThresholdBytes,
+                .ParallelScanWorkers = options.ParallelScanWorkers,
                 .WaitForMediaAvailability = options.WaitForMediaAvailability,
                 .WaitForFileLockRelease = options.WaitForFileLockRelease,
                 .TreatAccessDeniedAsContention = options.TreatAccessDeniedAsContention,

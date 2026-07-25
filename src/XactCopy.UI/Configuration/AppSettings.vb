@@ -159,9 +159,17 @@ Namespace Configuration
         ''' </summary>
         Public Property DefaultUseExperimentalRawDiskScan As Boolean = False
         ''' <summary>
+        ''' Gets or sets DefaultScanPerformanceProfile.
+        ''' </summary>
+        Public Property DefaultScanPerformanceProfile As String = "auto"
+        ''' <summary>
         ''' Gets or sets DefaultUseAdaptiveBuffer.
         ''' </summary>
         Public Property DefaultUseAdaptiveBuffer As Boolean = False
+        ''' <summary>
+        ''' Gets or sets DefaultTransferEnginePolicy.
+        ''' </summary>
+        Public Property DefaultTransferEnginePolicy As String = "auto"
         ''' <summary>
         ''' Gets or sets DefaultWaitForMediaAvailability.
         ''' </summary>
@@ -226,6 +234,22 @@ Namespace Configuration
         ''' Gets or sets DefaultMaxThroughputMbPerSecond.
         ''' </summary>
         Public Property DefaultMaxThroughputMbPerSecond As Integer = 0
+        ''' <summary>
+        ''' Gets or sets DefaultParallelSmallFileWorkers.
+        ''' </summary>
+        Public Property DefaultParallelSmallFileWorkers As Integer = 0
+        ''' <summary>
+        ''' Gets or sets DefaultParallelScanWorkers.
+        ''' </summary>
+        Public Property DefaultParallelScanWorkers As Integer = 0
+        ''' <summary>
+        ''' Gets or sets DefaultSmallFileThresholdKb.
+        ''' </summary>
+        Public Property DefaultSmallFileThresholdKb As Integer = 256
+        ''' <summary>
+        ''' Gets or sets DefaultWorkerProcessPriorityClass.
+        ''' </summary>
+        Public Property DefaultWorkerProcessPriorityClass As String = "Normal"
         ''' <summary>
         ''' Gets or sets DefaultPreserveTimestamps.
         ''' </summary>

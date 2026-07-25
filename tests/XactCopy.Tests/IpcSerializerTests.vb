@@ -23,6 +23,9 @@ Public Class IpcSerializerTests
                 .SourceRoot = "C:\src",
                 .DestinationRoot = "D:\dst",
                 .UseAdaptiveBufferSizing = True,
+                .TransferEnginePolicy = TransferEnginePolicy.ManagedRescue,
+                .ScanPerformanceProfile = ScanPerformanceProfile.Fast,
+                .ParallelScanWorkers = 4,
                 .WaitForMediaAvailability = True,
                 .MaxRetries = 5,
                 .RescueTrimChunkBytes = 64 * 1024,
@@ -40,6 +43,9 @@ Public Class IpcSerializerTests
         Assert.Equal("C:\src", envelope.Payload.Options.SourceRoot)
         Assert.Equal("D:\dst", envelope.Payload.Options.DestinationRoot)
         Assert.True(envelope.Payload.Options.UseAdaptiveBufferSizing)
+        Assert.Equal(TransferEnginePolicy.ManagedRescue, envelope.Payload.Options.TransferEnginePolicy)
+        Assert.Equal(ScanPerformanceProfile.Fast, envelope.Payload.Options.ScanPerformanceProfile)
+        Assert.Equal(4, envelope.Payload.Options.ParallelScanWorkers)
         Assert.True(envelope.Payload.Options.WaitForMediaAvailability)
         Assert.Equal(5, envelope.Payload.Options.MaxRetries)
         Assert.Equal(64 * 1024, envelope.Payload.Options.RescueTrimChunkBytes)
@@ -79,7 +85,10 @@ Public Class IpcSerializerTests
                 .TotalBytes = 4096,
                 .RescuePass = "Scrape",
                 .RescueBadRegionCount = 3,
-                .RescueRemainingBytes = 8192
+                .RescueRemainingBytes = 8192,
+                .ActiveFileCount = 2,
+                .ScanWorkerCount = 4,
+                .ActiveFiles = New List(Of String) From {"a.bin", "b.bin"}
             }
         }
 
@@ -90,5 +99,45 @@ Public Class IpcSerializerTests
         Assert.Equal("Scrape", envelope.Payload.Snapshot.RescuePass)
         Assert.Equal(3, envelope.Payload.Snapshot.RescueBadRegionCount)
         Assert.Equal(8192, envelope.Payload.Snapshot.RescueRemainingBytes)
+        Assert.Equal(2, envelope.Payload.Snapshot.ActiveFileCount)
+        Assert.Equal(4, envelope.Payload.Snapshot.ScanWorkerCount)
+        Assert.Equal(2, envelope.Payload.Snapshot.ActiveFiles.Count)
+    End Sub
+
+    ''' <summary>
+    ''' Executes SerializeAndDeserializeEnvelope_RoundTripsWorkerResultEngineTelemetry.
+    ''' </summary>
+    <Fact>
+    Public Sub SerializeAndDeserializeEnvelope_RoundTripsWorkerResultEngineTelemetry()
+        Dim payload As New WorkerJobResultEvent() With {
+            .JobId = "job-789",
+            .Result = New CopyJobResult() With {
+                .Succeeded = True,
+                .TotalFiles = 5,
+                .CompletedFiles = 5,
+                .TotalBytes = 40960,
+                .CopiedBytes = 40960,
+                .TransferEnginePolicy = TransferEnginePolicy.NativeFast,
+                .ElapsedMilliseconds = 250,
+                .AverageBytesPerSecond = 163840,
+                .NativeFastPathFiles = 2,
+                .ParallelNativeFastPathFiles = 3,
+                .ManagedCopyFiles = 0,
+                .NativeFallbackFiles = 1
+            }
+        }
+
+        Dim json = IpcSerializer.SerializeEnvelope(IpcMessageTypes.WorkerJobResultEvent, payload)
+        Dim envelope = IpcSerializer.DeserializeEnvelope(Of WorkerJobResultEvent)(json)
+
+        Assert.Equal("job-789", envelope.Payload.JobId)
+        Assert.True(envelope.Payload.Result.Succeeded)
+        Assert.Equal(TransferEnginePolicy.NativeFast, envelope.Payload.Result.TransferEnginePolicy)
+        Assert.Equal(250, envelope.Payload.Result.ElapsedMilliseconds)
+        Assert.Equal(163840, envelope.Payload.Result.AverageBytesPerSecond)
+        Assert.Equal(2, envelope.Payload.Result.NativeFastPathFiles)
+        Assert.Equal(3, envelope.Payload.Result.ParallelNativeFastPathFiles)
+        Assert.Equal(0, envelope.Payload.Result.ManagedCopyFiles)
+        Assert.Equal(1, envelope.Payload.Result.NativeFallbackFiles)
     End Sub
 End Class

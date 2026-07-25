@@ -68,6 +68,18 @@ Namespace Models
         ''' Gets or sets RescueRemainingBytes.
         ''' </summary>
         Public Property RescueRemainingBytes As Long
+        ''' <summary>
+        ''' Gets or sets ActiveFileCount.
+        ''' </summary>
+        Public Property ActiveFileCount As Integer
+        ''' <summary>
+        ''' Gets or sets ScanWorkerCount.
+        ''' </summary>
+        Public Property ScanWorkerCount As Integer
+        ''' <summary>
+        ''' Gets or sets ActiveFiles.
+        ''' </summary>
+        Public Property ActiveFiles As New List(Of String)()
 
         ''' <summary>
         ''' Gets or sets OverallProgress.

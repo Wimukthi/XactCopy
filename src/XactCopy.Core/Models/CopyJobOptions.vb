@@ -46,6 +46,10 @@ Namespace Models
         ''' Gets or sets UseExperimentalRawDiskScan.
         ''' </summary>
         Public Property UseExperimentalRawDiskScan As Boolean = False
+        ''' <summary>
+        ''' Gets or sets ScanPerformanceProfile.
+        ''' </summary>
+        Public Property ScanPerformanceProfile As ScanPerformanceProfile = ScanPerformanceProfile.Auto
 
         ' Resume/remap state used by recovery paths.
         ''' <summary>
@@ -87,6 +91,10 @@ Namespace Models
         ''' </summary>
         Public Property UseAdaptiveBufferSizing As Boolean = False
         ''' <summary>
+        ''' Gets or sets TransferEnginePolicy.
+        ''' </summary>
+        Public Property TransferEnginePolicy As TransferEnginePolicy = TransferEnginePolicy.Auto
+        ''' <summary>
         ''' Gets or sets MaxThroughputBytesPerSecond.
         ''' </summary>
         Public Property MaxThroughputBytesPerSecond As Long = 0
@@ -98,6 +106,10 @@ Namespace Models
         ''' Gets or sets SmallFileThresholdBytes.
         ''' </summary>
         Public Property SmallFileThresholdBytes As Integer = 256 * 1024
+        ''' <summary>
+        ''' Gets or sets ParallelScanWorkers.
+        ''' </summary>
+        Public Property ParallelScanWorkers As Integer = 0
 
         ' Availability/contention behavior.
         ''' <summary>

@@ -113,11 +113,11 @@ Friend Class RecoveryPromptForm
             $"Reason: {If(String.IsNullOrWhiteSpace(interruptionReason), "Unexpected exit", interruptionReason)}{Environment.NewLine}{Environment.NewLine}" &
             "Choose Resume Now to continue from the journal."
 
-        _toolTip.SetToolTip(_detailsBox, "Details of the interrupted run and recovery journal path.")
-        _toolTip.SetToolTip(_suppressPromptCheckBox, "Hide this prompt for this specific interrupted run.")
-        _toolTip.SetToolTip(_resumeButton, "Resume the interrupted run now.")
-        _toolTip.SetToolTip(_manageButton, "Open Job Manager to inspect or run jobs manually.")
-        _toolTip.SetToolTip(_dismissButton, "Close this prompt and decide later.")
+        _toolTip.SetToolTip(_detailsBox, TooltipScenarioFormatter.Compose("Shows the interrupted run, paths, journal, and reason.", "Use this to confirm the run before resuming."))
+        _toolTip.SetToolTip(_suppressPromptCheckBox, TooltipScenarioFormatter.Compose("Stops this specific interrupted run from prompting again.", "Use only when you know you do not want to resume it."))
+        _toolTip.SetToolTip(_resumeButton, TooltipScenarioFormatter.Compose("Continues the interrupted run from its journal.", "Best after a crash, reboot, or media reconnect."))
+        _toolTip.SetToolTip(_manageButton, TooltipScenarioFormatter.Compose("Opens Job Manager instead of resuming immediately.", "Use when you want to inspect history or choose a different job."))
+        _toolTip.SetToolTip(_dismissButton, TooltipScenarioFormatter.Compose("Closes this prompt without resuming now.", "Recovery data remains available unless you suppress this prompt."))
 
         _suppressPromptCheckBox.AutoSize = True
         _suppressPromptCheckBox.Text = "Do not prompt again for this interrupted run"

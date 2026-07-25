@@ -143,6 +143,9 @@ Namespace Configuration
                 SettingsValueConverter.ClampInteger(settings.WorkerProgressIntervalMs, 20, 1000, 75)
             settings.WorkerMaxLogsPerSecond =
                 SettingsValueConverter.ClampInteger(settings.WorkerMaxLogsPerSecond, 0, 5000, 100)
+            settings.DefaultScanPerformanceProfile =
+                SettingsValueConverter.ScanPerformanceProfileToString(
+                    SettingsValueConverter.ToScanPerformanceProfile(settings.DefaultScanPerformanceProfile))
             settings.UiDiagnosticsRefreshMs =
                 SettingsValueConverter.ClampInteger(settings.UiDiagnosticsRefreshMs, 100, 5000, 250)
             settings.UiMaxLogLines =
@@ -160,6 +163,12 @@ Namespace Configuration
                 SettingsValueConverter.ClampInteger(settings.DefaultPerFileTimeoutSeconds, 0, 86400, 0)
             settings.DefaultMaxThroughputMbPerSecond =
                 SettingsValueConverter.ClampInteger(settings.DefaultMaxThroughputMbPerSecond, 0, 4096, 0)
+            settings.DefaultParallelSmallFileWorkers =
+                SettingsValueConverter.ClampInteger(settings.DefaultParallelSmallFileWorkers, 0, 64, 0)
+            settings.DefaultParallelScanWorkers =
+                SettingsValueConverter.ClampInteger(settings.DefaultParallelScanWorkers, 0, 64, 0)
+            settings.DefaultSmallFileThresholdKb =
+                SettingsValueConverter.ClampInteger(settings.DefaultSmallFileThresholdKb, 4, 1048576, 256)
             settings.DefaultLockContentionProbeIntervalMs =
                 SettingsValueConverter.ClampInteger(settings.DefaultLockContentionProbeIntervalMs, 100, 10000, 500)
             settings.DefaultFragileFailureWindowSeconds =
@@ -192,6 +201,11 @@ Namespace Configuration
             settings.DefaultOverwritePolicy =
                 SettingsValueConverter.OverwritePolicyToString(
                     SettingsValueConverter.ToOverwritePolicy(settings.DefaultOverwritePolicy))
+            settings.DefaultTransferEnginePolicy =
+                SettingsValueConverter.TransferEnginePolicyToString(
+                    SettingsValueConverter.ToTransferEnginePolicy(settings.DefaultTransferEnginePolicy))
+            settings.DefaultWorkerProcessPriorityClass =
+                SettingsValueConverter.NormalizeWorkerProcessPriorityClass(settings.DefaultWorkerProcessPriorityClass)
             settings.DefaultSymlinkHandling =
                 SettingsValueConverter.SymlinkHandlingToString(
                     SettingsValueConverter.ToSymlinkHandling(settings.DefaultSymlinkHandling))

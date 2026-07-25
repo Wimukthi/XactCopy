@@ -51,10 +51,17 @@ Friend Class JobManagerForm
     Private ReadOnly _moveQueueDownButton As New Button()
     Private ReadOnly _deleteJobButton As New Button()
     Private ReadOnly _deleteRunButton As New Button()
+    Private ReadOnly _renameJobButton As New Button()
+    Private ReadOnly _duplicateJobButton As New Button()
     Private ReadOnly _openJournalButton As New Button()
+    Private ReadOnly _moveQueueTopButton As New Button()
+    Private ReadOnly _moveQueueBottomButton As New Button()
     Private ReadOnly _clearQueueButton As New Button()
     Private ReadOnly _clearHistoryButton As New Button()
     Private ReadOnly _closeButton As New Button()
+
+    Private ReadOnly _gridContextMenu As New ContextMenuStrip()
+    Private ReadOnly _autoRefreshTimer As New Timer() With {.Interval = 3000}
 
     Private ReadOnly _toolTip As New ToolTip() With {
         .ShowAlways = True,
@@ -109,7 +116,9 @@ Friend Class JobManagerForm
         BuildUi()
         EnableDoubleBufferingForContainers(Me)
         ConfigureToolTips()
+        ConfigureContextMenu()
         AddHandler _filterDebounceTimer.Tick, AddressOf FilterDebounceTimer_Tick
+        AddHandler _autoRefreshTimer.Tick, AddressOf AutoRefreshTimer_Tick
 
         AddHandler Shown, AddressOf JobManagerForm_Shown
         AddHandler FormClosing, AddressOf JobManagerForm_FormClosing
@@ -350,22 +359,30 @@ Friend Class JobManagerForm
             .Margin = New Padding(0)
         }
 
-        ConfigureActionButton(_runNowButton, "Run Now", AddressOf RunNowButton_Click)
-        ConfigureActionButton(_queueButton, "Queue", AddressOf QueueButton_Click)
-        ConfigureActionButton(_removeQueueButton, "Remove Queue", AddressOf RemoveQueueButton_Click)
-        ConfigureActionButton(_moveQueueUpButton, "Move Up", AddressOf MoveQueueUpButton_Click)
-        ConfigureActionButton(_moveQueueDownButton, "Move Down", AddressOf MoveQueueDownButton_Click)
-        ConfigureActionButton(_deleteJobButton, "Delete Job", AddressOf DeleteJobButton_Click)
-        ConfigureActionButton(_deleteRunButton, "Delete Run", AddressOf DeleteRunButton_Click)
-        ConfigureActionButton(_openJournalButton, "Open Journal", AddressOf OpenJournalButton_Click)
+        ConfigureActionButton(_runNowButton, "&Run Now", AddressOf RunNowButton_Click)
+        ConfigureActionButton(_queueButton, "&Queue", AddressOf QueueButton_Click)
+        ConfigureActionButton(_removeQueueButton, "Rem&ove Queue", AddressOf RemoveQueueButton_Click)
+        ConfigureActionButton(_moveQueueTopButton, "Top", AddressOf MoveQueueTopButton_Click)
+        ConfigureActionButton(_moveQueueUpButton, "Up", AddressOf MoveQueueUpButton_Click)
+        ConfigureActionButton(_moveQueueDownButton, "Down", AddressOf MoveQueueDownButton_Click)
+        ConfigureActionButton(_moveQueueBottomButton, "Bottom", AddressOf MoveQueueBottomButton_Click)
+        ConfigureActionButton(_renameJobButton, "Re&name", AddressOf RenameJobButton_Click)
+        ConfigureActionButton(_duplicateJobButton, "&Duplicate", AddressOf DuplicateJobButton_Click)
+        ConfigureActionButton(_deleteJobButton, "Delete &Job", AddressOf DeleteJobButton_Click)
+        ConfigureActionButton(_deleteRunButton, "Delete Ru&n", AddressOf DeleteRunButton_Click)
+        ConfigureActionButton(_openJournalButton, "Open &Journal", AddressOf OpenJournalButton_Click)
         ConfigureActionButton(_clearQueueButton, "Clear Queue", AddressOf ClearQueueButton_Click)
         ConfigureActionButton(_clearHistoryButton, "Clear History", AddressOf ClearHistoryButton_Click)
 
         actionsPanel.Controls.Add(_runNowButton)
         actionsPanel.Controls.Add(_queueButton)
         actionsPanel.Controls.Add(_removeQueueButton)
+        actionsPanel.Controls.Add(_moveQueueTopButton)
         actionsPanel.Controls.Add(_moveQueueUpButton)
         actionsPanel.Controls.Add(_moveQueueDownButton)
+        actionsPanel.Controls.Add(_moveQueueBottomButton)
+        actionsPanel.Controls.Add(_renameJobButton)
+        actionsPanel.Controls.Add(_duplicateJobButton)
         actionsPanel.Controls.Add(_deleteJobButton)
         actionsPanel.Controls.Add(_deleteRunButton)
         actionsPanel.Controls.Add(_openJournalButton)
@@ -436,32 +453,38 @@ Friend Class JobManagerForm
         _mainGrid.Columns("Summary").Width = 380
 
         AddHandler _mainGrid.CellValueNeeded, AddressOf MainGrid_CellValueNeeded
+        AddHandler _mainGrid.CellFormatting, AddressOf MainGrid_CellFormatting
         AddHandler _mainGrid.SelectionChanged, AddressOf MainGrid_SelectionChanged
         AddHandler _mainGrid.CellDoubleClick, AddressOf MainGrid_CellDoubleClick
+        AddHandler _mainGrid.KeyDown, AddressOf MainGrid_KeyDown
     End Sub
 
     Private Sub ConfigureToolTips()
-        SetDetailedToolTip(_summaryLabel, "Live counts for saved jobs, queue entries, and run history entries.")
-        SetDetailedToolTip(_viewComboBox, "Choose which records are shown in the grid.")
-        SetDetailedToolTip(_statusComboBox, "Optional run-status filter when viewing run history.")
-        SetDetailedToolTip(_searchTextBox, "Filter grid rows by job name, paths, trigger, or summary text.")
-        SetDetailedToolTip(_refreshButton, "Reload records from disk.")
+        SetDetailedToolTip(_summaryLabel, "Shows counts for saved jobs, queued jobs, and run history.", "Use it as a quick sanity check after filtering.")
+        SetDetailedToolTip(_viewComboBox, "Chooses whether the grid shows saved jobs, queue entries, or run history.", "The action buttons change based on this view.")
+        SetDetailedToolTip(_statusComboBox, "Filters run history by final status.", "Only affects the Run History view.")
+        SetDetailedToolTip(_searchTextBox, "Filters rows by job name, paths, trigger, or summary text.", "Useful when history gets large.")
+        SetDetailedToolTip(_refreshButton, "Reloads jobs, queue, and history from disk.", "Use after another window or process changes job data.")
 
-        SetDetailedToolTip(_runNowButton, "Run the selected saved job now, or run a selected queue entry immediately.")
-        SetDetailedToolTip(_queueButton, "Queue the selected saved job.")
-        SetDetailedToolTip(_removeQueueButton, "Remove selected queue entry.")
-        SetDetailedToolTip(_moveQueueUpButton, "Move selected queue entry one position up.")
-        SetDetailedToolTip(_moveQueueDownButton, "Move selected queue entry one position down.")
-        SetDetailedToolTip(_deleteJobButton, "Delete selected saved job.")
-        SetDetailedToolTip(_deleteRunButton, "Delete selected run history entry.")
-        SetDetailedToolTip(_openJournalButton, "Open the journal file for the selected run.")
-        SetDetailedToolTip(_clearQueueButton, "Clear all queued entries.")
-        SetDetailedToolTip(_clearHistoryButton, "Clear all run-history entries.")
-        SetDetailedToolTip(_detailsTextBox, "Detailed metadata for the currently selected row.")
+        SetDetailedToolTip(_runNowButton, "Runs the selected saved job or queue entry immediately.", "Shortcut: Enter.")
+        SetDetailedToolTip(_queueButton, "Adds the selected saved job to the end of the queue.", "Queued jobs can run later or at startup if that setting is enabled.")
+        SetDetailedToolTip(_removeQueueButton, "Removes the selected entry from the queue.", "The saved job itself is not deleted.")
+        SetDetailedToolTip(_moveQueueTopButton, "Moves the selected queued job to the front.", "Use when a job should run next.")
+        SetDetailedToolTip(_moveQueueUpButton, "Moves the selected queued job one slot earlier.")
+        SetDetailedToolTip(_moveQueueDownButton, "Moves the selected queued job one slot later.")
+        SetDetailedToolTip(_moveQueueBottomButton, "Moves the selected queued job to the end.", "Use when lower priority work can wait.")
+        SetDetailedToolTip(_renameJobButton, "Renames the selected saved job.", "Shortcut: F2. Paths and options are unchanged.")
+        SetDetailedToolTip(_duplicateJobButton, "Creates a new saved job from the selected job.", "Useful for making a variant without rebuilding options.")
+        SetDetailedToolTip(_deleteJobButton, "Deletes the selected saved job.", "Shortcut: Delete. Run history is not removed.")
+        SetDetailedToolTip(_deleteRunButton, "Deletes the selected run history entry.", "Shortcut: Delete. Saved jobs and journals are not changed.")
+        SetDetailedToolTip(_openJournalButton, "Opens the journal file for the selected run.", "Useful for troubleshooting resume, recovery, and file status.")
+        SetDetailedToolTip(_clearQueueButton, "Removes every queued entry.", "Saved jobs remain available.")
+        SetDetailedToolTip(_clearHistoryButton, "Deletes all run history entries.", "This does not delete saved jobs.")
+        SetDetailedToolTip(_detailsTextBox, "Shows details for the selected row.", "Includes paths, options, run result, and journal data when available.")
     End Sub
 
-    Private Sub SetDetailedToolTip(control As Control, description As String)
-        _toolTip.SetToolTip(control, TooltipScenarioFormatter.Compose(description))
+    Private Sub SetDetailedToolTip(control As Control, ParamArray lines() As String)
+        _toolTip.SetToolTip(control, TooltipScenarioFormatter.Compose(lines))
     End Sub
 
     Private Sub JobManagerForm_Shown(sender As Object, e As EventArgs)
@@ -473,6 +496,7 @@ Friend Class JobManagerForm
         _filterDebounceTimer.Stop()
 
         RefreshData()
+        _autoRefreshTimer.Start()
 
         ' Apply splitter after initial layout pass so persisted distance/min sizes are honored.
         BeginInvoke(New Action(
@@ -488,6 +512,7 @@ Friend Class JobManagerForm
 
     Private Sub JobManagerForm_FormClosing(sender As Object, e As FormClosingEventArgs)
         _filterDebounceTimer.Stop()
+        _autoRefreshTimer.Stop()
         UiLayoutManager.CaptureGridLayout(_mainGrid, GridLayoutKey)
         UiLayoutManager.CaptureSplitter(_contentSplit, SplitterKey)
         UiLayoutManager.CaptureWindow(Me, LayoutWindowKey)
@@ -618,7 +643,7 @@ Friend Class JobManagerForm
             Return "Saved job definition"
         End If
 
-        Dim mode = If(job.Options.UseAdaptiveBufferSizing, "Adaptive buffer", "Fixed buffer")
+        Dim mode = If(job.Options.UseAdaptiveBufferSizing, "Adaptive auto buffer", "Manual buffer")
         Dim verify = If(job.Options.VerifyAfterCopy, "Verify", "No verify")
         Return $"{mode}; retries {Math.Max(0, job.Options.MaxRetries)}; {verify}."
     End Function
@@ -732,7 +757,97 @@ Friend Class JobManagerForm
             Return
         End If
 
-        RunNowSelected()
+        Dim selectedTag = GetSelectedTag()
+        If selectedTag Is Nothing Then
+            Return
+        End If
+
+        Select Case selectedTag.Kind
+            Case RowKind.SavedJob, RowKind.QueueEntry
+                RunNowSelected()
+            Case RowKind.RunHistory
+                OpenJournalForSelected()
+        End Select
+    End Sub
+
+    Private Sub MainGrid_CellFormatting(sender As Object, e As DataGridViewCellFormattingEventArgs)
+        If e.RowIndex < 0 OrElse e.RowIndex >= _visibleRows.Count Then
+            Return
+        End If
+
+        Dim row = _visibleRows(e.RowIndex)
+        Dim state = row.StateText
+
+        Select Case state
+            Case "Failed"
+                e.CellStyle.ForeColor = Color.FromArgb(200, 40, 40)
+            Case "Running"
+                e.CellStyle.ForeColor = Color.FromArgb(20, 140, 60)
+            Case "Completed"
+                e.CellStyle.ForeColor = Color.FromArgb(30, 100, 180)
+            Case "Cancelled", "Interrupted"
+                e.CellStyle.ForeColor = Color.FromArgb(160, 120, 20)
+            Case "Paused"
+                e.CellStyle.ForeColor = Color.FromArgb(140, 80, 180)
+            Case "Queued", "Retry queued"
+                e.CellStyle.ForeColor = Color.FromArgb(100, 100, 100)
+        End Select
+    End Sub
+
+    Private Sub MainGrid_KeyDown(sender As Object, e As KeyEventArgs)
+        Select Case e.KeyCode
+            Case Keys.Enter
+                e.Handled = True
+                e.SuppressKeyPress = True
+                Dim selectedTag = GetSelectedTag()
+                If selectedTag IsNot Nothing Then
+                    Select Case selectedTag.Kind
+                        Case RowKind.SavedJob, RowKind.QueueEntry
+                            RunNowSelected()
+                        Case RowKind.RunHistory
+                            OpenJournalForSelected()
+                    End Select
+                End If
+
+            Case Keys.Delete
+                e.Handled = True
+                e.SuppressKeyPress = True
+                Dim selectedTag = GetSelectedTag()
+                If selectedTag IsNot Nothing Then
+                    Select Case selectedTag.Kind
+                        Case RowKind.SavedJob
+                            DeleteJobButton_Click(sender, EventArgs.Empty)
+                        Case RowKind.QueueEntry
+                            RemoveQueueButton_Click(sender, EventArgs.Empty)
+                        Case RowKind.RunHistory
+                            DeleteRunButton_Click(sender, EventArgs.Empty)
+                    End Select
+                End If
+
+            Case Keys.F5
+                e.Handled = True
+                e.SuppressKeyPress = True
+                RefreshData()
+
+            Case Keys.F2
+                e.Handled = True
+                e.SuppressKeyPress = True
+                RenameJobButton_Click(sender, EventArgs.Empty)
+        End Select
+    End Sub
+
+    Private Sub AutoRefreshTimer_Tick(sender As Object, e As EventArgs)
+        Dim hasActiveRuns = False
+        For Each run In _runs
+            If run IsNot Nothing AndAlso (run.Status = ManagedJobRunStatus.Running OrElse run.Status = ManagedJobRunStatus.Paused OrElse run.Status = ManagedJobRunStatus.Queued) Then
+                hasActiveRuns = True
+                Exit For
+            End If
+        Next
+
+        If hasActiveRuns Then
+            RefreshData()
+        End If
     End Sub
 
     Private Sub RunNowButton_Click(sender As Object, e As EventArgs)
@@ -896,49 +1011,7 @@ Friend Class JobManagerForm
     End Sub
 
     Private Sub OpenJournalButton_Click(sender As Object, e As EventArgs)
-        Dim selectedTag = GetSelectedTag()
-        If selectedTag Is Nothing OrElse selectedTag.Kind <> RowKind.RunHistory Then
-            MessageBox.Show(Me,
-                            "Select a run history row first.",
-                            "Job Manager",
-                            MessageBoxButtons.OK,
-                            MessageBoxIcon.Information)
-            Return
-        End If
-
-        Dim runEntry As ManagedJobRun = Nothing
-        _runsById.TryGetValue(selectedTag.PrimaryId, runEntry)
-        If runEntry Is Nothing OrElse String.IsNullOrWhiteSpace(runEntry.JournalPath) Then
-            MessageBox.Show(Me,
-                            "Selected run does not have a journal path.",
-                            "Job Manager",
-                            MessageBoxButtons.OK,
-                            MessageBoxIcon.Information)
-            Return
-        End If
-
-        Dim journalPath = runEntry.JournalPath
-        If Not File.Exists(journalPath) Then
-            MessageBox.Show(Me,
-                            "Journal file no longer exists.",
-                            "Job Manager",
-                            MessageBoxButtons.OK,
-                            MessageBoxIcon.Information)
-            Return
-        End If
-
-        Try
-            Process.Start(New ProcessStartInfo() With {
-                .FileName = journalPath,
-                .UseShellExecute = True
-            })
-        Catch ex As Exception
-            MessageBox.Show(Me,
-                            ex.Message,
-                            "Job Manager",
-                            MessageBoxButtons.OK,
-                            MessageBoxIcon.Error)
-        End Try
+        OpenJournalForSelected()
     End Sub
 
     Private Sub ClearQueueButton_Click(sender As Object, e As EventArgs)
@@ -977,6 +1050,215 @@ Friend Class JobManagerForm
         RefreshData()
     End Sub
 
+    Private Sub MoveQueueTopButton_Click(sender As Object, e As EventArgs)
+        MoveQueueEntry(QueueMoveDirection.Top)
+    End Sub
+
+    Private Sub MoveQueueBottomButton_Click(sender As Object, e As EventArgs)
+        MoveQueueEntry(QueueMoveDirection.Bottom)
+    End Sub
+
+    Private Sub RenameJobButton_Click(sender As Object, e As EventArgs)
+        Dim selectedTag = GetSelectedTag()
+        If selectedTag Is Nothing OrElse selectedTag.Kind <> RowKind.SavedJob Then
+            Return
+        End If
+
+        Dim currentJob As ManagedJob = Nothing
+        _savedJobsById.TryGetValue(selectedTag.JobId, currentJob)
+        If currentJob Is Nothing Then
+            Return
+        End If
+
+        Dim newName = PromptForInput("Rename Job", "Enter new name:", currentJob.Name)
+        If newName Is Nothing OrElse newName.Trim() = currentJob.Name Then
+            Return
+        End If
+
+        _jobManager.RenameJob(selectedTag.JobId, newName)
+        RefreshData()
+    End Sub
+
+    Private Sub DuplicateJobButton_Click(sender As Object, e As EventArgs)
+        Dim selectedTag = GetSelectedTag()
+        If selectedTag Is Nothing OrElse selectedTag.Kind <> RowKind.SavedJob Then
+            Return
+        End If
+
+        Dim currentJob As ManagedJob = Nothing
+        _savedJobsById.TryGetValue(selectedTag.JobId, currentJob)
+        If currentJob Is Nothing Then
+            Return
+        End If
+
+        Dim suggestedName = currentJob.Name & " (Copy)"
+        Dim newName = PromptForInput("Duplicate Job", "Enter name for the copy:", suggestedName)
+        If newName Is Nothing Then
+            Return
+        End If
+
+        Dim duplicated = _jobManager.DuplicateJob(selectedTag.JobId, newName)
+        If duplicated Is Nothing Then
+            MessageBox.Show(Me,
+                            "Failed to duplicate job.",
+                            "Job Manager",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Error)
+            Return
+        End If
+
+        RefreshData()
+    End Sub
+
+    Private Sub OpenJournalForSelected()
+        Dim selectedTag = GetSelectedTag()
+        If selectedTag Is Nothing OrElse selectedTag.Kind <> RowKind.RunHistory Then
+            Return
+        End If
+
+        Dim runEntry As ManagedJobRun = Nothing
+        _runsById.TryGetValue(selectedTag.PrimaryId, runEntry)
+        If runEntry Is Nothing OrElse String.IsNullOrWhiteSpace(runEntry.JournalPath) Then
+            MessageBox.Show(Me,
+                            "Selected run does not have a journal path.",
+                            "Job Manager",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information)
+            Return
+        End If
+
+        Dim journalPath = runEntry.JournalPath
+        If Not File.Exists(journalPath) Then
+            MessageBox.Show(Me,
+                            "Journal file no longer exists.",
+                            "Job Manager",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information)
+            Return
+        End If
+
+        Try
+            Process.Start(New ProcessStartInfo() With {
+                .FileName = journalPath,
+                .UseShellExecute = True
+            })
+        Catch ex As Exception
+            MessageBox.Show(Me,
+                            ex.Message,
+                            "Job Manager",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Error)
+        End Try
+    End Sub
+
+    Private Sub ConfigureContextMenu()
+        _gridContextMenu.ShowImageMargin = False
+        AddHandler _gridContextMenu.Opening, AddressOf GridContextMenu_Opening
+        _mainGrid.ContextMenuStrip = _gridContextMenu
+    End Sub
+
+    Private Sub GridContextMenu_Opening(sender As Object, e As System.ComponentModel.CancelEventArgs)
+        _gridContextMenu.Items.Clear()
+
+        Dim hitTest = _mainGrid.HitTest(
+            _mainGrid.PointToClient(Cursor.Position).X,
+            _mainGrid.PointToClient(Cursor.Position).Y)
+        If hitTest.RowIndex < 0 Then
+            e.Cancel = True
+            Return
+        End If
+
+        _mainGrid.ClearSelection()
+        _mainGrid.CurrentCell = _mainGrid.Rows(hitTest.RowIndex).Cells(0)
+        _mainGrid.Rows(hitTest.RowIndex).Selected = True
+
+        Dim selectedTag = GetSelectedTag()
+        If selectedTag Is Nothing Then
+            e.Cancel = True
+            Return
+        End If
+
+        Select Case selectedTag.Kind
+            Case RowKind.SavedJob
+                _gridContextMenu.Items.Add("Run Now", Nothing, AddressOf RunNowButton_Click)
+                _gridContextMenu.Items.Add("Queue", Nothing, AddressOf QueueButton_Click)
+                _gridContextMenu.Items.Add(New ToolStripSeparator())
+                _gridContextMenu.Items.Add("Rename", Nothing, AddressOf RenameJobButton_Click)
+                _gridContextMenu.Items.Add("Duplicate", Nothing, AddressOf DuplicateJobButton_Click)
+                _gridContextMenu.Items.Add(New ToolStripSeparator())
+                _gridContextMenu.Items.Add("Delete Job", Nothing, AddressOf DeleteJobButton_Click)
+
+            Case RowKind.QueueEntry
+                _gridContextMenu.Items.Add("Run Now", Nothing, AddressOf RunNowButton_Click)
+                _gridContextMenu.Items.Add(New ToolStripSeparator())
+                _gridContextMenu.Items.Add("Move to Top", Nothing, AddressOf MoveQueueTopButton_Click)
+                _gridContextMenu.Items.Add("Move Up", Nothing, AddressOf MoveQueueUpButton_Click)
+                _gridContextMenu.Items.Add("Move Down", Nothing, AddressOf MoveQueueDownButton_Click)
+                _gridContextMenu.Items.Add("Move to Bottom", Nothing, AddressOf MoveQueueBottomButton_Click)
+                _gridContextMenu.Items.Add(New ToolStripSeparator())
+                _gridContextMenu.Items.Add("Remove from Queue", Nothing, AddressOf RemoveQueueButton_Click)
+
+            Case RowKind.RunHistory
+                _gridContextMenu.Items.Add("Open Journal", Nothing, AddressOf OpenJournalButton_Click)
+                If Not String.IsNullOrWhiteSpace(selectedTag.JobId) Then
+                    _gridContextMenu.Items.Add("Re-queue Job", Nothing, AddressOf QueueButton_Click)
+                End If
+                _gridContextMenu.Items.Add(New ToolStripSeparator())
+                _gridContextMenu.Items.Add("Delete Run", Nothing, AddressOf DeleteRunButton_Click)
+        End Select
+    End Sub
+
+    Private Function PromptForInput(title As String, prompt As String, defaultValue As String) As String
+        Using dialog As New Form()
+            dialog.Text = title
+            dialog.StartPosition = FormStartPosition.CenterParent
+            dialog.FormBorderStyle = FormBorderStyle.FixedDialog
+            dialog.MinimizeBox = False
+            dialog.MaximizeBox = False
+            dialog.ShowInTaskbar = False
+            dialog.Size = New Size(420, 160)
+            WindowIconHelper.Apply(dialog)
+
+            Dim promptLabel As New Label() With {
+                .AutoSize = True,
+                .Location = New Point(12, 16),
+                .Text = prompt
+            }
+
+            Dim inputBox As New TextBox() With {
+                .Location = New Point(12, 40),
+                .Width = 380,
+                .Text = If(defaultValue, String.Empty)
+            }
+
+            Dim okButton As New Button() With {
+                .Text = "OK",
+                .DialogResult = DialogResult.OK,
+                .Location = New Point(236, 80),
+                .Width = 75
+            }
+
+            Dim cancelButton As New Button() With {
+                .Text = "Cancel",
+                .DialogResult = DialogResult.Cancel,
+                .Location = New Point(317, 80),
+                .Width = 75
+            }
+
+            dialog.AcceptButton = okButton
+            dialog.CancelButton = cancelButton
+            dialog.Controls.AddRange({promptLabel, inputBox, okButton, cancelButton})
+
+            inputBox.SelectAll()
+
+            If dialog.ShowDialog(Me) = DialogResult.OK AndAlso Not String.IsNullOrWhiteSpace(inputBox.Text) Then
+                Return inputBox.Text.Trim()
+            End If
+
+            Return Nothing
+        End Using
+    End Function
+
     Private Sub UpdateActionStates()
         Dim selectedTag = GetSelectedTag()
         Dim hasSelection = selectedTag IsNot Nothing
@@ -989,8 +1271,12 @@ Friend Class JobManagerForm
         _runNowButton.Enabled = isSaved OrElse isQueue
         _queueButton.Enabled = isSaved OrElse isRunWithSavedJob
         _removeQueueButton.Enabled = isQueue
+        _moveQueueTopButton.Enabled = isQueue
         _moveQueueUpButton.Enabled = isQueue
         _moveQueueDownButton.Enabled = isQueue
+        _moveQueueBottomButton.Enabled = isQueue
+        _renameJobButton.Enabled = isSaved
+        _duplicateJobButton.Enabled = isSaved
         _deleteJobButton.Enabled = isSaved
         _deleteRunButton.Enabled = isRun
         _openJournalButton.Enabled = isRun
@@ -1048,7 +1334,7 @@ Friend Class JobManagerForm
         lines.Add($"Overwrite: {options.OverwritePolicy}")
         lines.Add($"Verify: {options.VerifyAfterCopy}")
         lines.Add($"Adaptive Buffer: {options.UseAdaptiveBufferSizing}")
-        lines.Add($"Buffer MB: {Math.Max(1, CInt(Math.Round(options.BufferSizeBytes / 1024.0R / 1024.0R)))}")
+        lines.Add($"Manual Buffer MB: {Math.Max(1, CInt(Math.Round(options.BufferSizeBytes / 1024.0R / 1024.0R)))}")
         lines.Add($"Retries: {Math.Max(0, options.MaxRetries)}")
         lines.Add($"Timeout: {Math.Max(0, CInt(options.OperationTimeout.TotalSeconds))} sec")
         Return String.Join(Environment.NewLine, lines)

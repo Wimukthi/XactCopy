@@ -27,6 +27,7 @@ Friend Class SettingsForm
     Private ReadOnly _categoryTreeView As New TreeView()
     Private ReadOnly _pageHostPanel As New Panel()
     Private ReadOnly _pageLookup As New Dictionary(Of String, Control)(StringComparer.OrdinalIgnoreCase)
+    Private ReadOnly _pageBuilders As New Dictionary(Of String, Func(Of Control))(StringComparer.OrdinalIgnoreCase)
     Private ReadOnly _pageTitleLabel As New Label()
     Private ReadOnly _mainSplit As New SplitContainer()
 
@@ -80,6 +81,12 @@ Friend Class SettingsForm
     Private ReadOnly _defaultFragileCooldownNumeric As New ThemedNumericUpDown()
     Private ReadOnly _defaultLockProbeIntervalNumeric As New ThemedNumericUpDown()
     Private ReadOnly _defaultSourceMutationPolicyComboBox As New ComboBox()
+    Private ReadOnly _transferEnginePolicyComboBox As New ComboBox()
+    Private ReadOnly _scanPerformanceProfileComboBox As New ComboBox()
+    Private ReadOnly _workerProcessPriorityComboBox As New ComboBox()
+    Private ReadOnly _parallelSmallFileWorkersNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _parallelScanWorkersNumeric As New ThemedNumericUpDown()
+    Private ReadOnly _smallFileThresholdKbNumeric As New ThemedNumericUpDown()
     Private ReadOnly _rescueFastChunkKbNumeric As New ThemedNumericUpDown()
     Private ReadOnly _rescueTrimChunkKbNumeric As New ThemedNumericUpDown()
     Private ReadOnly _rescueScrapeChunkKbNumeric As New ThemedNumericUpDown()
@@ -304,99 +311,109 @@ Friend Class SettingsForm
     End Sub
 
     Private Sub ConfigureToolTips()
-        SetDetailedToolTip(_categoryTreeView, "Select a category to edit related settings.")
-        SetDetailedToolTip(_themeComboBox, "Choose the color mode used by XactCopy windows.")
-        SetDetailedToolTip(_accentModeComboBox, "Accent source used for focus highlights and progress fills.")
-        SetDetailedToolTip(_accentColorTextBox, "Custom accent color in #RRGGBB format.")
-        SetDetailedToolTip(_accentColorPickButton, "Pick a custom accent color.")
-        SetDetailedToolTip(_windowChromeModeComboBox, "Choose themed or standard Windows title bar behavior.")
-        SetDetailedToolTip(_uiDensityComboBox, "Control density preset for spacing and compactness.")
-        SetDetailedToolTip(_uiScaleComboBox, "Global UI text/control scale.")
-        SetDetailedToolTip(_logFontFamilyComboBox, "Font family used by the operations log.")
-        SetDetailedToolTip(_logFontSizeNumeric, "Font size for the operations log in points.")
-        SetDetailedToolTip(_logColorizeBySeverityCheckBox, "Color-code operations log lines by severity level.")
-        SetDetailedToolTip(_gridAlternatingRowsCheckBox, "Use alternating row colors in data grids.")
-        SetDetailedToolTip(_gridRowHeightNumeric, "Default data-grid row height.")
-        SetDetailedToolTip(_gridHeaderStyleComboBox, "Header style used by data grids.")
-        SetDetailedToolTip(_showBufferStatusRowCheckBox, "Show or hide the Buffer Use status row on main window.")
-        SetDetailedToolTip(_showRescueStatusRowCheckBox, "Show or hide the Rescue telemetry status row on main window.")
-        SetDetailedToolTip(_showDiagnosticsStatusRowCheckBox, "Show or hide the diagnostics status strip on main window.")
-        SetDetailedToolTip(_progressBarStyleComboBox, "Progress bar thickness style.")
-        SetDetailedToolTip(_progressBarShowPercentageCheckBox, "Overlay percentage text inside progress bars.")
+        SetDetailedToolTip(
+            _categoryTreeView,
+            "Pick the settings page to edit.",
+            "Changes stay in this dialog until you press Save.")
 
-        SetDetailedToolTip(_defaultResumeCheckBox, "Enable journal-based resume for new runs by default.")
-        SetDetailedToolTip(_defaultSalvageCheckBox, "Enable salvage mode for unreadable source regions by default.")
-        SetDetailedToolTip(_defaultContinueOnErrorCheckBox, "Continue processing remaining files after a file error.")
-        SetDetailedToolTip(_defaultPreserveTimestampsCheckBox, "Preserve source timestamps on copied files and folders.")
-        SetDetailedToolTip(_defaultCopyEmptyDirectoriesCheckBox, "Create empty directories in destination even when they contain no files.")
-        SetDetailedToolTip(_defaultWaitForMediaCheckBox, "Wait indefinitely for source/destination media to become available.")
-        SetDetailedToolTip(_defaultWaitForLockReleaseCheckBox, "When file locks are detected, wait for the lock to clear instead of only doing bounded retries.")
-        SetDetailedToolTip(_defaultTreatAccessDeniedContentionCheckBox, "Treat transient Access Denied errors as contention (for AV/EDR/indexer interference).")
-        SetDetailedToolTip(_defaultUseBadRangeMapCheckBox, "Load saved bad-range maps for matching sources.")
-        SetDetailedToolTip(_defaultSkipKnownBadRangesCheckBox, "Skip read attempts for ranges already known unreadable from previous scans/copies.")
-        SetDetailedToolTip(_defaultUpdateBadRangeMapCheckBox, "Update bad-range maps from new scans/copies.")
-        SetDetailedToolTip(_defaultUseRawDiskScanCheckBox, "Experimental scan backend that reads local NTFS extents from raw disk for faster bad-block scanning; auto-falls back to standard scan when unsupported.")
-        SetDetailedToolTip(_defaultBadRangeMapMaxAgeDaysNumeric, "Maximum map age in days before map data is ignored (0 = never expire).")
+        SetDetailedToolTip(_themeComboBox, "Changes the color mode for XactCopy windows.", "Use System if you want XactCopy to follow Windows theme changes.")
+        SetDetailedToolTip(_accentModeComboBox, "Controls where highlight and progress colors come from.", "Auto is the safest default; Custom uses the color box below.")
+        SetDetailedToolTip(_accentColorTextBox, "Enter a custom accent color as #RRGGBB.", "Example: #5A78C8. Used only when Accent source is Custom.")
+        SetDetailedToolTip(_accentColorPickButton, "Open a color picker for the custom accent color.", "This updates the #RRGGBB value for you.")
+        SetDetailedToolTip(_windowChromeModeComboBox, "Chooses whether XactCopy draws its own title bar styling.", "Use Standard if themed window borders look wrong on this PC.")
+        SetDetailedToolTip(_uiDensityComboBox, "Changes spacing between controls.", "Compact fits more on screen; Comfortable is easier to read.")
+        SetDetailedToolTip(_uiScaleComboBox, "Scales UI text and controls inside XactCopy.", "Use this when the app feels too small or too large for your display.")
+        SetDetailedToolTip(_logFontFamilyComboBox, "Chooses the font used by the operations log.", "Monospace fonts make paths, byte counts, and timings easier to scan.")
+        SetDetailedToolTip(_logFontSizeNumeric, "Sets the operations log font size in points.", "Increase this for readability; decrease it to fit more log lines.")
+        SetDetailedToolTip(_logColorizeBySeverityCheckBox, "Colors log lines by severity.", "Warnings and errors stand out faster during long runs.")
+        SetDetailedToolTip(_gridAlternatingRowsCheckBox, "Adds alternating row shading in grids.", "Useful when scanning job history or queue rows.")
+        SetDetailedToolTip(_gridRowHeightNumeric, "Sets the default row height for data grids.", "Raise it if text feels cramped; lower it to fit more rows.")
+        SetDetailedToolTip(_gridHeaderStyleComboBox, "Chooses how strongly grid column headers are styled.", "Minimal is quiet; Prominent is easier to see.")
+        SetDetailedToolTip(_showBufferStatusRowCheckBox, "Shows the buffer usage row on the main window.", "Useful when tuning transfer speed or checking adaptive buffer behavior.")
+        SetDetailedToolTip(_showRescueStatusRowCheckBox, "Shows rescue pass and bad-range status on the main window.", "Keep this on when scanning or copying from questionable media.")
+        SetDetailedToolTip(_showDiagnosticsStatusRowCheckBox, "Shows UI event and rendering diagnostics on the main window.", "Useful for troubleshooting UI lag; otherwise it is visual noise.")
+        SetDetailedToolTip(_progressBarStyleComboBox, "Changes progress bar thickness.", "Thick is easiest to read; Thin leaves more room for logs.")
+        SetDetailedToolTip(_progressBarShowPercentageCheckBox, "Shows percentage text inside progress bars.", "Turn off if you prefer a cleaner progress display.")
 
-        SetDetailedToolTip(_overwritePolicyComboBox, "Default conflict behavior when destination files already exist. 'Always ask' prompts Yes/No/Cancel for each conflict.")
-        SetDetailedToolTip(_symlinkHandlingComboBox, "Choose whether symbolic links are skipped or followed during scans.")
-        SetDetailedToolTip(_salvageFillPatternComboBox, "Fill pattern used for unreadable blocks when salvage mode is enabled.")
+        SetDetailedToolTip(_defaultResumeCheckBox, "Uses the journal to continue interrupted runs.", "Recommended for large jobs, removable drives, and any copy that may be stopped.")
+        SetDetailedToolTip(_defaultSalvageCheckBox, "Writes placeholder data for unreadable source blocks instead of failing the whole file.", "Use for best-effort recovery from damaged media. Leave off for exact-only copies.")
+        SetDetailedToolTip(_defaultContinueOnErrorCheckBox, "Keeps processing other files after one file fails.", "Useful for large batches where one bad file should not stop the run.")
+        SetDetailedToolTip(_defaultPreserveTimestampsCheckBox, "Copies source file and folder timestamps to the destination.", "Keep this on for backups and archive migrations.")
+        SetDetailedToolTip(_defaultCopyEmptyDirectoriesCheckBox, "Creates empty source folders at the destination.", "Turn on when the folder structure matters even if some folders contain no files.")
+        SetDetailedToolTip(_defaultWaitForMediaCheckBox, "Waits when source or destination disappears instead of failing immediately.", "Use for USB disks, network paths, and drives that reconnect.")
+        SetDetailedToolTip(_defaultWaitForLockReleaseCheckBox, "Waits for locked files to become readable or writable.", "Useful when antivirus, indexing, or another app temporarily holds a file.")
+        SetDetailedToolTip(_defaultTreatAccessDeniedContentionCheckBox, "Treats some Access Denied errors as temporary lock contention.", "Use when security software or sync tools briefly block files.")
+        SetDetailedToolTip(_defaultUseBadRangeMapCheckBox, "Loads saved bad-range information for the same source.", "This lets later scans and copies reuse what XactCopy already learned.")
+        SetDetailedToolTip(_defaultSkipKnownBadRangesCheckBox, "Avoids rereading ranges already marked unreadable.", "Reduces stress on failing drives, but keeps those ranges as known bad.")
+        SetDetailedToolTip(_defaultUpdateBadRangeMapCheckBox, "Saves newly found unreadable ranges after scan or copy runs.", "Keep this on if you want future runs to get faster and gentler.")
+        SetDetailedToolTip(_defaultUseRawDiskScanCheckBox, "Uses the experimental raw-disk scan backend for local NTFS files.", "Can scan healthy files faster when running as administrator. Falls back when unsupported.")
+        SetDetailedToolTip(_defaultBadRangeMapMaxAgeDaysNumeric, "Controls how old a bad-range map can be before it is ignored.", "0 means never expire. Use a limit if media contents change often.")
 
-        SetDetailedToolTip(_defaultAdaptiveBufferCheckBox, "Enable adaptive transfer buffer sizing by default.")
-        SetDetailedToolTip(_defaultFragileModeCheckBox, "Enable fragile-media protections by default. This uses conservative behavior to avoid drive lockups.")
-        SetDetailedToolTip(_defaultSkipFileOnFirstReadErrorCheckBox, "When fragile mode is enabled, stop reading a file after the first read failure and continue with the next file.")
-        SetDetailedToolTip(_defaultPersistFragileSkipsCheckBox, "Persist fragile-mode skipped files in the journal so resume/recovery does not hammer them again.")
-        SetDetailedToolTip(_defaultBufferMbNumeric, "Maximum transfer buffer for new runs (1-256 MB).")
-        SetDetailedToolTip(_defaultRetriesNumeric, "Default per-operation retry attempts for I/O failures (0-1000).")
-        SetDetailedToolTip(_defaultOperationTimeoutNumeric, "Default operation timeout in seconds (1-3600).")
-        SetDetailedToolTip(_defaultPerFileTimeoutNumeric, "Default per-file timeout in seconds (0 disables per-file timeout).")
-        SetDetailedToolTip(_defaultMaxThroughputNumeric, "Optional throughput cap in MB/s (0 means unlimited).")
-        SetDetailedToolTip(_defaultFragileFailureWindowNumeric, "Rolling window size used by the fragile-mode failure circuit breaker.")
-        SetDetailedToolTip(_defaultFragileFailureThresholdNumeric, "Number of failed files in the rolling window before fragile-mode cooldown is applied.")
-        SetDetailedToolTip(_defaultFragileCooldownNumeric, "Cooldown delay in seconds once the fragile-mode failure threshold is reached (0 disables cooldown).")
-        SetDetailedToolTip(_defaultLockProbeIntervalNumeric, "Milliseconds between lock-contention probes while waiting.")
-        SetDetailedToolTip(_defaultSourceMutationPolicyComboBox, "Behavior when source files disappear during an active copy.")
-        SetDetailedToolTip(_rescueFastChunkKbNumeric, "Rescue Engine FastScan chunk size in KB (0 = auto from buffer).")
-        SetDetailedToolTip(_rescueTrimChunkKbNumeric, "Rescue Engine TrimSweep chunk size in KB (0 = auto).")
-        SetDetailedToolTip(_rescueScrapeChunkKbNumeric, "Rescue Engine Scrape chunk size in KB (0 = auto).")
-        SetDetailedToolTip(_rescueRetryChunkKbNumeric, "Rescue Engine RetryBad chunk size in KB (0 = auto, usually 4 KB).")
-        SetDetailedToolTip(_rescueSplitMinimumKbNumeric, "Minimum split block size in KB when isolating bad ranges (0 = auto).")
-        SetDetailedToolTip(_rescueFastRetriesNumeric, "Read retries used by FastScan pass.")
-        SetDetailedToolTip(_rescueTrimRetriesNumeric, "Read retries used by TrimSweep pass.")
-        SetDetailedToolTip(_rescueScrapeRetriesNumeric, "Read retries used by Scrape pass.")
-        SetDetailedToolTip(_workerTelemetryProfileComboBox, "Worker telemetry profile: Normal, Verbose, or Debug.")
-        SetDetailedToolTip(_workerProgressIntervalNumeric, "Minimum milliseconds between worker progress events.")
-        SetDetailedToolTip(_workerMaxLogsPerSecondNumeric, "Maximum worker log events per second (0 means unlimited).")
-        SetDetailedToolTip(_uiShowDiagnosticsCheckBox, "Show live UI diagnostics counters on the main window.")
-        SetDetailedToolTip(_uiDiagnosticsRefreshNumeric, "Main-window diagnostics refresh interval in milliseconds.")
-        SetDetailedToolTip(_uiMaxLogLinesNumeric, "Maximum runtime log lines kept in memory before trimming.")
+        SetDetailedToolTip(_overwritePolicyComboBox, "Chooses what happens when a destination file already exists.", "Ask is safest for manual runs; Skip or Newer is better for repeatable jobs.")
+        SetDetailedToolTip(_symlinkHandlingComboBox, "Controls symbolic links in the source tree.", "Skip avoids loops and surprises. Follow copies the linked target content.")
+        SetDetailedToolTip(_salvageFillPatternComboBox, "Chooses bytes written where source data cannot be read.", "Zero-fill is predictable. Random-fill avoids repeated blank blocks but is less readable.")
 
-        SetDetailedToolTip(_defaultVerifyCheckBox, "Enable post-copy verification by default.")
-        SetDetailedToolTip(_defaultVerificationModeComboBox, "Verification strategy for new runs.")
-        SetDetailedToolTip(_defaultHashAlgorithmComboBox, "Hash algorithm used by verification.")
-        SetDetailedToolTip(_sampleChunkKbNumeric, "Chunk size used in sampled verification mode.")
-        SetDetailedToolTip(_sampleChunkCountNumeric, "Number of chunks to sample per file in sampled mode.")
+        SetDetailedToolTip(_defaultAdaptiveBufferCheckBox, "Lets XactCopy choose buffer size automatically for each file.", "When on, the manual buffer setting is ignored and live I/O behavior controls sizing.")
+        SetDetailedToolTip(_defaultFragileModeCheckBox, "Uses conservative behavior for unstable drives.", "Turn this on for disks that disconnect, stall, click, or get worse under heavy reads.")
+        SetDetailedToolTip(_defaultSkipFileOnFirstReadErrorCheckBox, "Stops scanning a file after the first read failure in fragile mode.", "This protects weak media, but may recover less data from that file.")
+        SetDetailedToolTip(_defaultPersistFragileSkipsCheckBox, "Remembers fragile-mode skipped files in the journal.", "Prevents resume/recovery from repeatedly hitting the same failing files.")
+        SetDetailedToolTip(_defaultBufferMbNumeric, "Sets the buffer size used when adaptive buffering is off.", "Adaptive runs ignore this value and tune themselves automatically.")
+        SetDetailedToolTip(_defaultRetriesNumeric, "Sets how many times each failed I/O operation is retried.", "More retries can recover transient errors but can slow or stress bad media.")
+        SetDetailedToolTip(_defaultOperationTimeoutNumeric, "Limits how long one read or write operation may stall.", "Shorter detects stuck devices faster. Longer helps slow network or USB storage.")
+        SetDetailedToolTip(_defaultPerFileTimeoutNumeric, "Limits total time spent on one file.", "0 disables the limit. Use this to keep a job moving past files that hang.")
+        SetDetailedToolTip(_defaultMaxThroughputNumeric, "Caps transfer speed in MB/s.", "0 means unlimited. Use a cap to keep the PC, network, or external disk responsive.")
+        SetDetailedToolTip(_transferEnginePolicyComboBox, "Chooses the copy engine used for new copy runs.", "Auto is recommended. Managed rescue favors resilience; Native fast favors speed on clean files.")
+        SetDetailedToolTip(_scanPerformanceProfileComboBox, "Chooses how scan-only runs read files.", "Auto fast scan is recommended. Precise scan is slower but maps bad ranges carefully from the start.")
+        SetDetailedToolTip(_workerProcessPriorityComboBox, "Sets CPU scheduling priority for the background worker.", "Normal is best for most jobs. High can make the desktop less responsive.")
+        SetDetailedToolTip(_parallelSmallFileWorkersNumeric, "Controls how many small files can be copied in parallel.", "0 lets XactCopy choose. 1 disables the parallel small-file phase.")
+        SetDetailedToolTip(_parallelScanWorkersNumeric, "Controls how many files fast scan reads at the same time.", "0 lets XactCopy choose. Use 1 for weak drives; higher values suit SSDs.")
+        SetDetailedToolTip(_smallFileThresholdKbNumeric, "Files at or below this size can use the parallel small-file phase.", "Raise for many tiny files. Lower if the destination becomes overloaded.")
+        SetDetailedToolTip(_defaultFragileFailureWindowNumeric, "Sets the time window used to count repeated fragile-mode failures.", "Shorter reacts to bursts quickly; longer catches slower failure patterns.")
+        SetDetailedToolTip(_defaultFragileFailureThresholdNumeric, "Sets how many failed files trigger fragile-mode cooldown.", "Lower protects weak drives sooner. Higher keeps the job moving longer.")
+        SetDetailedToolTip(_defaultFragileCooldownNumeric, "Pauses after the fragile failure threshold is reached.", "0 disables cooldown. Use a delay when a drive needs time to recover.")
+        SetDetailedToolTip(_defaultLockProbeIntervalNumeric, "Sets how often XactCopy checks whether a locked file is available.", "Lower is more responsive. Higher reduces repeated filesystem probes.")
+        SetDetailedToolTip(_defaultSourceMutationPolicyComboBox, "Chooses what to do if a source file disappears mid-run.", "Fail is strict. Skip keeps batches moving. Wait is best for unstable network paths.")
+        SetDetailedToolTip(_rescueFastChunkKbNumeric, "Chunk size for the first rescue pass.", "0 = auto. Larger chunks scan faster; smaller chunks localize failures sooner.")
+        SetDetailedToolTip(_rescueTrimChunkKbNumeric, "Chunk size used to narrow bad areas after a failure.", "0 = auto. Tune only when you know the media behavior.")
+        SetDetailedToolTip(_rescueScrapeChunkKbNumeric, "Chunk size for deeper recovery attempts around bad areas.", "0 = auto. Smaller values can recover more but take longer.")
+        SetDetailedToolTip(_rescueRetryChunkKbNumeric, "Chunk size for final retry attempts on bad ranges.", "0 = auto, usually 4 KB. Smaller is slower but more precise.")
+        SetDetailedToolTip(_rescueSplitMinimumKbNumeric, "Smallest block size used when splitting failing ranges.", "0 = auto. Lower can isolate damage more closely but increases work.")
+        SetDetailedToolTip(_rescueFastRetriesNumeric, "Retries used during the first rescue scan pass.", "Keep low for fragile drives so bad areas are found quickly.")
+        SetDetailedToolTip(_rescueTrimRetriesNumeric, "Retries used while trimming bad regions.", "More retries can recover intermittent sectors but increases scan time.")
+        SetDetailedToolTip(_rescueScrapeRetriesNumeric, "Retries used during the deeper scrape pass.", "Increase only when recovery quality matters more than drive stress or time.")
+        SetDetailedToolTip(_workerTelemetryProfileComboBox, "Controls how much detail the worker reports.", "Normal is best for everyday use. Debug is noisy and intended for troubleshooting.")
+        SetDetailedToolTip(_workerProgressIntervalNumeric, "Minimum time between worker progress events.", "Lower feels more live but costs more UI/IPC overhead.")
+        SetDetailedToolTip(_workerMaxLogsPerSecondNumeric, "Caps how many log events the worker sends each second.", "0 disables the cap. Use a cap to keep the UI smooth during noisy failures.")
+        SetDetailedToolTip(_uiShowDiagnosticsCheckBox, "Shows live UI counters on the main window.", "Useful while tuning performance or investigating UI lag.")
+        SetDetailedToolTip(_uiDiagnosticsRefreshNumeric, "Sets how often the UI diagnostics strip refreshes.", "Lower updates more often; higher reduces repaint work.")
+        SetDetailedToolTip(_uiMaxLogLinesNumeric, "Limits how many runtime log lines stay in memory.", "Higher preserves more history. Lower uses less memory on very long jobs.")
 
-        SetDetailedToolTip(_checkUpdatesOnLaunchCheckBox, "Check for application updates automatically on startup.")
-        SetDetailedToolTip(_updateUrlTextBox, "Release metadata endpoint (HTTP/HTTPS).")
-        SetDetailedToolTip(_userAgentTextBox, "HTTP User-Agent header used for update checks.")
+        SetDetailedToolTip(_defaultVerifyCheckBox, "Verifies destination files after copying.", "Use when integrity matters and extra read time is acceptable.")
+        SetDetailedToolTip(_defaultVerificationModeComboBox, "Chooses full-file or sampled verification.", "Full hash is strongest. Sampled hash is faster but cannot prove every byte.")
+        SetDetailedToolTip(_defaultHashAlgorithmComboBox, "Chooses the hash used for verification.", "SHA-256 is fast and strong. SHA-512 is available for stricter policies.")
+        SetDetailedToolTip(_sampleChunkKbNumeric, "Sets how much data each sampled verification read checks.", "Larger samples improve coverage but take longer.")
+        SetDetailedToolTip(_sampleChunkCountNumeric, "Sets how many sample locations are checked per file.", "More samples increase confidence and verification time.")
 
-        SetDetailedToolTip(_enableRecoveryAutostartCheckBox, "Register startup recovery if a run ends unexpectedly.")
-        SetDetailedToolTip(_autoRunQueuedOnStartupCheckBox, "Automatically start queued jobs after launching XactCopy.")
-        SetDetailedToolTip(_promptResumeAfterCrashCheckBox, "Show a prompt to resume interrupted runs.")
-        SetDetailedToolTip(_autoResumeAfterCrashCheckBox, "Automatically resume interrupted runs without prompting.")
-        SetDetailedToolTip(_keepResumePromptCheckBox, "Keep prompting to resume until the interrupted run is handled.")
-        SetDetailedToolTip(_recoveryTouchIntervalNumeric, "Seconds between recovery heartbeat writes (1-60).")
+        SetDetailedToolTip(_checkUpdatesOnLaunchCheckBox, "Checks for new XactCopy releases when the app starts.", "Turn off for offline or locked-down machines.")
+        SetDetailedToolTip(_updateUrlTextBox, "Release metadata endpoint used for update checks.", "Use the default unless you host releases from a private endpoint.")
+        SetDetailedToolTip(_userAgentTextBox, "HTTP User-Agent sent during update checks.", "Change only if your proxy or release server requires a specific value.")
 
-        SetDetailedToolTip(_enableExplorerContextMenuCheckBox, "Add 'Copy with XactCopy' to Windows Explorer context menus.")
-        SetDetailedToolTip(_explorerSelectionModeComboBox, "Choose whether Explorer launches copy selected items or whole source folder.")
+        SetDetailedToolTip(_enableRecoveryAutostartCheckBox, "Registers startup recovery after an interrupted run.", "Helps resume work after a crash, reboot, or power loss.")
+        SetDetailedToolTip(_autoRunQueuedOnStartupCheckBox, "Starts queued jobs automatically when XactCopy launches.", "Use only when the queue is trusted and destinations are expected to be available.")
+        SetDetailedToolTip(_promptResumeAfterCrashCheckBox, "Shows a prompt when an interrupted run is found.", "Best default when you want to choose resume, inspect, or dismiss manually.")
+        SetDetailedToolTip(_autoResumeAfterCrashCheckBox, "Automatically resumes interrupted runs without asking.", "Use for unattended systems where continuing is always preferred.")
+        SetDetailedToolTip(_keepResumePromptCheckBox, "Keeps showing the resume prompt until the interrupted run is handled.", "Prevents forgotten recovery data from being silently ignored.")
+        SetDetailedToolTip(_recoveryTouchIntervalNumeric, "Sets how often recovery heartbeat data is written.", "Shorter detects interruptions sooner. Longer reduces small background writes.")
 
-        SetDetailedToolTip(_okButton, "Save all changes and close settings.")
-        SetDetailedToolTip(_cancelButton, "Discard changes and close settings.")
+        SetDetailedToolTip(_enableExplorerContextMenuCheckBox, "Adds Copy with XactCopy to Windows Explorer menus.", "Useful when you often start jobs from selected files, folders, or drives.")
+        SetDetailedToolTip(_explorerSelectionModeComboBox, "Chooses what Explorer-launched jobs treat as the source.", "Selected items copies only the selection. Full source folder copies the containing folder.")
+
+        SetDetailedToolTip(_okButton, "Saves these settings and closes the dialog.", "Some appearance and integration changes may require restart.")
+        SetDetailedToolTip(_cancelButton, "Closes the dialog without saving changes.", "Any edits made since opening Settings are discarded.")
     End Sub
 
-    Private Sub SetDetailedToolTip(control As Control, description As String)
-        _toolTip.SetToolTip(control, TooltipScenarioFormatter.Compose(description))
+    Private Sub SetDetailedToolTip(control As Control, ParamArray lines() As String)
+        _toolTip.SetToolTip(control, TooltipScenarioFormatter.Compose(lines))
     End Sub
 
     Private Function BuildCategoryPane() As Control
@@ -461,21 +478,21 @@ Friend Class SettingsForm
         _pageHostPanel.Dock = DockStyle.Fill
         _pageHostPanel.AutoScroll = True
 
-        _pageLookup("appearance") = BuildAppearancePage()
-        _pageLookup("copy") = BuildCopyDefaultsPage()
-        _pageLookup("performance") = BuildPerformancePage()
-        _pageLookup("diagnostics") = BuildDiagnosticsPage()
-        _pageLookup("verification") = BuildVerificationPage()
-        _pageLookup("updates") = BuildUpdatesPage()
-        _pageLookup("recovery") = BuildRecoveryPage()
-        _pageLookup("explorer") = BuildExplorerPage()
+        ' Only build the default page now; other pages are built on first navigation.
+        _pageBuilders("copy") = AddressOf BuildCopyDefaultsPage
+        _pageBuilders("performance") = AddressOf BuildPerformancePage
+        _pageBuilders("diagnostics") = AddressOf BuildDiagnosticsPage
+        _pageBuilders("verification") = AddressOf BuildVerificationPage
+        _pageBuilders("updates") = AddressOf BuildUpdatesPage
+        _pageBuilders("recovery") = AddressOf BuildRecoveryPage
+        _pageBuilders("explorer") = AddressOf BuildExplorerPage
 
-        For Each pageControl In _pageLookup.Values
-            pageControl.Dock = DockStyle.Top
-            pageControl.AutoSize = True
-            pageControl.Visible = False
-            _pageHostPanel.Controls.Add(pageControl)
-        Next
+        Dim appearancePage = BuildAppearancePage()
+        appearancePage.Dock = DockStyle.Top
+        appearancePage.AutoSize = True
+        appearancePage.Visible = False
+        _pageHostPanel.Controls.Add(appearancePage)
+        _pageLookup("appearance") = appearancePage
 
         layout.Controls.Add(_pageTitleLabel, 0, 0)
         layout.Controls.Add(_pageHostPanel, 0, 1)
@@ -702,29 +719,57 @@ Friend Class SettingsForm
     Private Function BuildPerformancePage() As Control
         Dim page = CreatePageContainer(4)
 
-        Dim body = CreateFieldGrid(6)
+        Dim body = CreateFieldGrid(12)
 
         _defaultAdaptiveBufferCheckBox.Text = "Enable adaptive buffer by default"
         ConfigureCheckBox(_defaultAdaptiveBufferCheckBox)
+        AddHandler _defaultAdaptiveBufferCheckBox.CheckedChanged, AddressOf DefaultAdaptiveBufferCheckBox_CheckedChanged
+
+        _transferEnginePolicyComboBox.DropDownStyle = ComboBoxStyle.DropDownList
+        _transferEnginePolicyComboBox.Items.AddRange(New Object() {"Auto", "Managed rescue", "Native fast"})
+        ConfigureComboBoxControl(_transferEnginePolicyComboBox, width:=240)
+
+        _scanPerformanceProfileComboBox.DropDownStyle = ComboBoxStyle.DropDownList
+        _scanPerformanceProfileComboBox.Items.AddRange(New Object() {"Auto fast scan", "Fast health scan", "Precise bad-range scan"})
+        ConfigureComboBoxControl(_scanPerformanceProfileComboBox, width:=240)
+
+        _workerProcessPriorityComboBox.DropDownStyle = ComboBoxStyle.DropDownList
+        _workerProcessPriorityComboBox.Items.AddRange(New Object() {"Idle", "Below normal", "Normal", "Above normal", "High"})
+        ConfigureComboBoxControl(_workerProcessPriorityComboBox, width:=240)
 
         ConfigureNumeric(_defaultBufferMbNumeric, 1D, 256D, 4D)
         ConfigureNumeric(_defaultRetriesNumeric, 0D, 1000D, 12D)
         ConfigureNumeric(_defaultOperationTimeoutNumeric, 1D, 3600D, 10D)
         ConfigureNumeric(_defaultPerFileTimeoutNumeric, 0D, 86400D, 0D)
         ConfigureNumeric(_defaultMaxThroughputNumeric, 0D, 4096D, 0D)
+        ConfigureNumeric(_parallelSmallFileWorkersNumeric, 0D, 64D, 0D)
+        ConfigureNumeric(_parallelScanWorkersNumeric, 0D, 64D, 0D)
+        ConfigureNumeric(_smallFileThresholdKbNumeric, 4D, 1048576D, 256D)
 
         body.Controls.Add(_defaultAdaptiveBufferCheckBox, 0, 0)
         body.SetColumnSpan(_defaultAdaptiveBufferCheckBox, 3)
-        body.Controls.Add(CreateFieldLabel("Buffer MB (max)"), 0, 1)
-        body.Controls.Add(_defaultBufferMbNumeric, 1, 1)
-        body.Controls.Add(CreateFieldLabel("Max retries"), 0, 2)
-        body.Controls.Add(_defaultRetriesNumeric, 1, 2)
-        body.Controls.Add(CreateFieldLabel("Operation timeout (sec)"), 0, 3)
-        body.Controls.Add(_defaultOperationTimeoutNumeric, 1, 3)
-        body.Controls.Add(CreateFieldLabel("Per-file timeout (sec, 0=disabled)"), 0, 4)
-        body.Controls.Add(_defaultPerFileTimeoutNumeric, 1, 4)
-        body.Controls.Add(CreateFieldLabel("Max throughput (MB/s, 0=unlimited)"), 0, 5)
-        body.Controls.Add(_defaultMaxThroughputNumeric, 1, 5)
+        body.Controls.Add(CreateFieldLabel("Transfer engine"), 0, 1)
+        body.Controls.Add(_transferEnginePolicyComboBox, 1, 1)
+        body.Controls.Add(CreateFieldLabel("Scan profile"), 0, 2)
+        body.Controls.Add(_scanPerformanceProfileComboBox, 1, 2)
+        body.Controls.Add(CreateFieldLabel("Worker priority"), 0, 3)
+        body.Controls.Add(_workerProcessPriorityComboBox, 1, 3)
+        body.Controls.Add(CreateFieldLabel("Manual buffer MB"), 0, 4)
+        body.Controls.Add(_defaultBufferMbNumeric, 1, 4)
+        body.Controls.Add(CreateFieldLabel("Max retries"), 0, 5)
+        body.Controls.Add(_defaultRetriesNumeric, 1, 5)
+        body.Controls.Add(CreateFieldLabel("Operation timeout (sec)"), 0, 6)
+        body.Controls.Add(_defaultOperationTimeoutNumeric, 1, 6)
+        body.Controls.Add(CreateFieldLabel("Per-file timeout (sec, 0=disabled)"), 0, 7)
+        body.Controls.Add(_defaultPerFileTimeoutNumeric, 1, 7)
+        body.Controls.Add(CreateFieldLabel("Max throughput (MB/s, 0=unlimited)"), 0, 8)
+        body.Controls.Add(_defaultMaxThroughputNumeric, 1, 8)
+        body.Controls.Add(CreateFieldLabel("Small-file workers (0=auto, 1=off)"), 0, 9)
+        body.Controls.Add(_parallelSmallFileWorkersNumeric, 1, 9)
+        body.Controls.Add(CreateFieldLabel("Scan workers (0=auto, 1=off)"), 0, 10)
+        body.Controls.Add(_parallelScanWorkersNumeric, 1, 10)
+        body.Controls.Add(CreateFieldLabel("Small-file threshold KB"), 0, 11)
+        body.Controls.Add(_smallFileThresholdKbNumeric, 1, 11)
 
         Dim fragile = CreateFieldGrid(6)
         _defaultFragileModeCheckBox.Text = "Enable fragile media mode by default"
@@ -1030,9 +1075,20 @@ Friend Class SettingsForm
             Return
         End If
 
-        For Each fontName In GetLogFontNameCache()
-            _logFontFamilyComboBox.Items.Add(fontName)
+        Dim names = GetLogFontNameCache()
+        Dim items(names.Count - 1) As Object
+        For i = 0 To names.Count - 1
+            items(i) = names(i)
         Next
+        _logFontFamilyComboBox.Items.AddRange(items)
+    End Sub
+
+    ''' <summary>
+    ''' Pre-populates the system font name cache on a background thread so the
+    ''' first Settings dialog open does not block on GDI+ font enumeration.
+    ''' </summary>
+    Friend Shared Sub WarmFontCache()
+        GetLogFontNameCache()
     End Sub
 
     Private Shared Function GetLogFontNameCache() As IReadOnlyList(Of String)
@@ -1185,17 +1241,10 @@ Friend Class SettingsForm
         End If
 
         _initialRevealPending = False
-        BeginInvoke(New Action(
-            Sub()
-                If IsDisposed Then
-                    Return
-                End If
-
-                ResumeNativeRedraw()
-                Opacity = 1.0R
-                Invalidate(invalidateChildren:=True)
-                Update()
-            End Sub))
+        ResumeNativeRedraw()
+        Opacity = 1.0R
+        Invalidate(invalidateChildren:=True)
+        Update()
     End Sub
 
     Private Shared Sub EnableDoubleBufferingForContainers(root As Control)
@@ -1234,10 +1283,10 @@ Friend Class SettingsForm
 
         _pageHostPanel.SuspendLayout()
         Try
-            Dim selectedPage As Control = Nothing
-            If Not _pageLookup.TryGetValue(normalizedPageKey, selectedPage) OrElse selectedPage Is Nothing Then
+            Dim selectedPage = EnsurePage(normalizedPageKey)
+            If selectedPage Is Nothing Then
                 normalizedPageKey = "appearance"
-                _pageLookup.TryGetValue(normalizedPageKey, selectedPage)
+                selectedPage = EnsurePage(normalizedPageKey)
             End If
 
             If _activePageControl IsNot Nothing AndAlso Not Object.ReferenceEquals(_activePageControl, selectedPage) Then
@@ -1257,6 +1306,31 @@ Friend Class SettingsForm
 
         UpdatePageTitle(normalizedPageKey)
     End Sub
+
+    Private Function EnsurePage(pageKey As String) As Control
+        Dim page As Control = Nothing
+        If _pageLookup.TryGetValue(pageKey, page) Then
+            Return page
+        End If
+
+        Dim builder As Func(Of Control) = Nothing
+        If Not _pageBuilders.TryGetValue(pageKey, builder) Then
+            Return Nothing
+        End If
+
+        page = builder()
+        page.Dock = DockStyle.Top
+        page.AutoSize = True
+        page.Visible = False
+        _pageHostPanel.Controls.Add(page)
+        _pageLookup(pageKey) = page
+        _pageBuilders.Remove(pageKey)
+        EnableDoubleBufferingForContainers(page)
+        WireDirtyTracking(page.Controls)
+        ApplySettingsToControls()
+        ThemeManager.ApplyTheme(page, ThemeSettings.GetPreferredColorMode(_workingSettings), _workingSettings)
+        Return page
+    End Function
 
     Private Shared Function NormalizePageKey(pageKey As String) As String
         If String.IsNullOrWhiteSpace(pageKey) Then
@@ -1345,6 +1419,9 @@ Friend Class SettingsForm
             _defaultOperationTimeoutNumeric.Value = ClampNumeric(_defaultOperationTimeoutNumeric, _workingSettings.DefaultOperationTimeoutSeconds)
             _defaultPerFileTimeoutNumeric.Value = ClampNumeric(_defaultPerFileTimeoutNumeric, _workingSettings.DefaultPerFileTimeoutSeconds)
             _defaultMaxThroughputNumeric.Value = ClampNumeric(_defaultMaxThroughputNumeric, _workingSettings.DefaultMaxThroughputMbPerSecond)
+            _parallelSmallFileWorkersNumeric.Value = ClampNumeric(_parallelSmallFileWorkersNumeric, _workingSettings.DefaultParallelSmallFileWorkers)
+            _parallelScanWorkersNumeric.Value = ClampNumeric(_parallelScanWorkersNumeric, _workingSettings.DefaultParallelScanWorkers)
+            _smallFileThresholdKbNumeric.Value = ClampNumeric(_smallFileThresholdKbNumeric, _workingSettings.DefaultSmallFileThresholdKb)
             _defaultFragileFailureWindowNumeric.Value = ClampNumeric(_defaultFragileFailureWindowNumeric, _workingSettings.DefaultFragileFailureWindowSeconds)
             _defaultFragileFailureThresholdNumeric.Value = ClampNumeric(_defaultFragileFailureThresholdNumeric, _workingSettings.DefaultFragileFailureThreshold)
             _defaultFragileCooldownNumeric.Value = ClampNumeric(_defaultFragileCooldownNumeric, _workingSettings.DefaultFragileCooldownSeconds)
@@ -1414,68 +1491,99 @@ Friend Class SettingsForm
 
             Select Case SettingsValueConverter.ToOverwritePolicy(_workingSettings.DefaultOverwritePolicy)
                 Case OverwritePolicy.SkipExisting
-                    _overwritePolicyComboBox.SelectedIndex = 1
+                    SafeSelectIndex(_overwritePolicyComboBox, 1)
                 Case OverwritePolicy.OverwriteIfSourceNewer
-                    _overwritePolicyComboBox.SelectedIndex = 2
+                    SafeSelectIndex(_overwritePolicyComboBox, 2)
                 Case OverwritePolicy.Ask
-                    _overwritePolicyComboBox.SelectedIndex = 3
+                    SafeSelectIndex(_overwritePolicyComboBox, 3)
                 Case Else
-                    _overwritePolicyComboBox.SelectedIndex = 0
+                    SafeSelectIndex(_overwritePolicyComboBox, 0)
             End Select
 
             Select Case SettingsValueConverter.ToSymlinkHandling(_workingSettings.DefaultSymlinkHandling)
                 Case SymlinkHandlingMode.Follow
-                    _symlinkHandlingComboBox.SelectedIndex = 1
+                    SafeSelectIndex(_symlinkHandlingComboBox, 1)
                 Case Else
-                    _symlinkHandlingComboBox.SelectedIndex = 0
+                    SafeSelectIndex(_symlinkHandlingComboBox, 0)
             End Select
 
             Select Case SettingsValueConverter.ToSalvageFillPattern(_workingSettings.DefaultSalvageFillPattern)
                 Case SalvageFillPattern.Ones
-                    _salvageFillPatternComboBox.SelectedIndex = 1
+                    SafeSelectIndex(_salvageFillPatternComboBox, 1)
                 Case SalvageFillPattern.Random
-                    _salvageFillPatternComboBox.SelectedIndex = 2
+                    SafeSelectIndex(_salvageFillPatternComboBox, 2)
                 Case Else
-                    _salvageFillPatternComboBox.SelectedIndex = 0
+                    SafeSelectIndex(_salvageFillPatternComboBox, 0)
             End Select
 
             Select Case SettingsValueConverter.ToVerificationMode(_workingSettings.DefaultVerificationMode)
                 Case VerificationMode.Sampled
-                    _defaultVerificationModeComboBox.SelectedIndex = 1
+                    SafeSelectIndex(_defaultVerificationModeComboBox, 1)
                 Case Else
-                    _defaultVerificationModeComboBox.SelectedIndex = 0
+                    SafeSelectIndex(_defaultVerificationModeComboBox, 0)
             End Select
 
             Select Case SettingsValueConverter.ToSourceMutationPolicy(_workingSettings.DefaultSourceMutationPolicy)
                 Case SourceMutationPolicy.SkipFile
-                    _defaultSourceMutationPolicyComboBox.SelectedIndex = 1
+                    SafeSelectIndex(_defaultSourceMutationPolicyComboBox, 1)
                 Case SourceMutationPolicy.WaitForReappearance
-                    _defaultSourceMutationPolicyComboBox.SelectedIndex = 2
+                    SafeSelectIndex(_defaultSourceMutationPolicyComboBox, 2)
                 Case Else
-                    _defaultSourceMutationPolicyComboBox.SelectedIndex = 0
+                    SafeSelectIndex(_defaultSourceMutationPolicyComboBox, 0)
+            End Select
+
+            Select Case SettingsValueConverter.ToTransferEnginePolicy(_workingSettings.DefaultTransferEnginePolicy)
+                Case TransferEnginePolicy.ManagedRescue
+                    SafeSelectIndex(_transferEnginePolicyComboBox, 1)
+                Case TransferEnginePolicy.NativeFast
+                    SafeSelectIndex(_transferEnginePolicyComboBox, 2)
+                Case Else
+                    SafeSelectIndex(_transferEnginePolicyComboBox, 0)
+            End Select
+
+            Select Case SettingsValueConverter.ToScanPerformanceProfile(_workingSettings.DefaultScanPerformanceProfile)
+                Case ScanPerformanceProfile.Fast
+                    SafeSelectIndex(_scanPerformanceProfileComboBox, 1)
+                Case ScanPerformanceProfile.Precise
+                    SafeSelectIndex(_scanPerformanceProfileComboBox, 2)
+                Case Else
+                    SafeSelectIndex(_scanPerformanceProfileComboBox, 0)
+            End Select
+
+            Select Case SettingsValueConverter.NormalizeWorkerProcessPriorityClass(_workingSettings.DefaultWorkerProcessPriorityClass)
+                Case "Idle"
+                    SafeSelectIndex(_workerProcessPriorityComboBox, 0)
+                Case "BelowNormal"
+                    SafeSelectIndex(_workerProcessPriorityComboBox, 1)
+                Case "AboveNormal"
+                    SafeSelectIndex(_workerProcessPriorityComboBox, 3)
+                Case "High"
+                    SafeSelectIndex(_workerProcessPriorityComboBox, 4)
+                Case Else
+                    SafeSelectIndex(_workerProcessPriorityComboBox, 2)
             End Select
 
             Select Case SettingsValueConverter.ToVerificationHashAlgorithm(_workingSettings.DefaultVerificationHashAlgorithm)
                 Case VerificationHashAlgorithm.Sha512
-                    _defaultHashAlgorithmComboBox.SelectedIndex = 1
+                    SafeSelectIndex(_defaultHashAlgorithmComboBox, 1)
                 Case Else
-                    _defaultHashAlgorithmComboBox.SelectedIndex = 0
+                    SafeSelectIndex(_defaultHashAlgorithmComboBox, 0)
             End Select
 
             Select Case SettingsValueConverter.ToExplorerSelectionMode(_workingSettings.ExplorerSelectionMode)
                 Case ExplorerSelectionMode.SourceFolder
-                    _explorerSelectionModeComboBox.SelectedIndex = 1
+                    SafeSelectIndex(_explorerSelectionModeComboBox, 1)
                 Case Else
-                    _explorerSelectionModeComboBox.SelectedIndex = 0
+                    SafeSelectIndex(_explorerSelectionModeComboBox, 0)
             End Select
 
             Select Case SettingsValueConverter.ToWorkerTelemetryProfile(_workingSettings.WorkerTelemetryProfile)
                 Case WorkerTelemetryProfile.Verbose
-                    _workerTelemetryProfileComboBox.SelectedIndex = 1
+                    SafeSelectIndex(_workerTelemetryProfileComboBox, 1)
                 Case WorkerTelemetryProfile.Debug
-                    _workerTelemetryProfileComboBox.SelectedIndex = 2
+                    SafeSelectIndex(_workerTelemetryProfileComboBox, 2)
                 Case Else
-                    _workerTelemetryProfileComboBox.SelectedIndex = 0
+                    SafeSelectIndex(_workerTelemetryProfileComboBox, 0)
             End Select
 
             EnsureSelection(_themeComboBox)
@@ -1491,6 +1599,8 @@ Friend Class SettingsForm
             EnsureSelection(_defaultVerificationModeComboBox)
             EnsureSelection(_defaultHashAlgorithmComboBox)
             EnsureSelection(_defaultSourceMutationPolicyComboBox)
+            EnsureSelection(_transferEnginePolicyComboBox)
+            EnsureSelection(_workerProcessPriorityComboBox)
             EnsureSelection(_explorerSelectionModeComboBox)
             EnsureSelection(_workerTelemetryProfileComboBox)
 
@@ -1510,6 +1620,7 @@ Friend Class SettingsForm
             UpdateExplorerControlStates()
             UpdateBadRangeMapControlStates()
             UpdateFragileControlStates()
+            UpdatePerformanceControlStates()
             If _showDiagnosticsStatusRowCheckBox.Checked <> _uiShowDiagnosticsCheckBox.Checked Then
                 _showDiagnosticsStatusRowCheckBox.Checked = _uiShowDiagnosticsCheckBox.Checked
             End If
@@ -1576,6 +1687,9 @@ Friend Class SettingsForm
         Dim verificationModeIndex = If(_defaultVerificationModeComboBox.SelectedIndex >= 0, _defaultVerificationModeComboBox.SelectedIndex, 0)
         Dim hashAlgorithmIndex = If(_defaultHashAlgorithmComboBox.SelectedIndex >= 0, _defaultHashAlgorithmComboBox.SelectedIndex, 0)
         Dim sourceMutationPolicyIndex = If(_defaultSourceMutationPolicyComboBox.SelectedIndex >= 0, _defaultSourceMutationPolicyComboBox.SelectedIndex, 0)
+        Dim transferEnginePolicyIndex = If(_transferEnginePolicyComboBox.SelectedIndex >= 0, _transferEnginePolicyComboBox.SelectedIndex, 0)
+        Dim scanPerformanceProfileIndex = If(_scanPerformanceProfileComboBox.SelectedIndex >= 0, _scanPerformanceProfileComboBox.SelectedIndex, 0)
+        Dim workerProcessPriorityIndex = If(_workerProcessPriorityComboBox.SelectedIndex >= 0, _workerProcessPriorityComboBox.SelectedIndex, 2)
         Dim explorerSelectionModeIndex = If(_explorerSelectionModeComboBox.SelectedIndex >= 0, _explorerSelectionModeComboBox.SelectedIndex, 0)
         Dim telemetryProfileIndex = If(_workerTelemetryProfileComboBox.SelectedIndex >= 0, _workerTelemetryProfileComboBox.SelectedIndex, 0)
         Dim accentModeIndex = If(_accentModeComboBox.SelectedIndex >= 0, _accentModeComboBox.SelectedIndex, 0)
@@ -1666,6 +1780,9 @@ Friend Class SettingsForm
         capturedSettings.DefaultOperationTimeoutSeconds = CInt(_defaultOperationTimeoutNumeric.Value)
         capturedSettings.DefaultPerFileTimeoutSeconds = CInt(_defaultPerFileTimeoutNumeric.Value)
         capturedSettings.DefaultMaxThroughputMbPerSecond = CInt(_defaultMaxThroughputNumeric.Value)
+        capturedSettings.DefaultParallelSmallFileWorkers = CInt(_parallelSmallFileWorkersNumeric.Value)
+        capturedSettings.DefaultParallelScanWorkers = CInt(_parallelScanWorkersNumeric.Value)
+        capturedSettings.DefaultSmallFileThresholdKb = CInt(_smallFileThresholdKbNumeric.Value)
         capturedSettings.DefaultFragileFailureWindowSeconds = CInt(_defaultFragileFailureWindowNumeric.Value)
         capturedSettings.DefaultFragileFailureThreshold = CInt(_defaultFragileFailureThresholdNumeric.Value)
         capturedSettings.DefaultFragileCooldownSeconds = CInt(_defaultFragileCooldownNumeric.Value)
@@ -1721,10 +1838,35 @@ Friend Class SettingsForm
         capturedSettings.DefaultSampleVerificationChunkKb = CInt(_sampleChunkKbNumeric.Value)
         capturedSettings.DefaultSampleVerificationChunkCount = CInt(_sampleChunkCountNumeric.Value)
         capturedSettings.DefaultSourceMutationPolicy = If(sourceMutationPolicyIndex = 1,
-                                                          SettingsValueConverter.SourceMutationPolicyToString(SourceMutationPolicy.SkipFile),
-                                                          If(sourceMutationPolicyIndex = 2,
-                                                             SettingsValueConverter.SourceMutationPolicyToString(SourceMutationPolicy.WaitForReappearance),
-                                                             SettingsValueConverter.SourceMutationPolicyToString(SourceMutationPolicy.FailFile)))
+                                                           SettingsValueConverter.SourceMutationPolicyToString(SourceMutationPolicy.SkipFile),
+                                                           If(sourceMutationPolicyIndex = 2,
+                                                              SettingsValueConverter.SourceMutationPolicyToString(SourceMutationPolicy.WaitForReappearance),
+                                                              SettingsValueConverter.SourceMutationPolicyToString(SourceMutationPolicy.FailFile)))
+
+        capturedSettings.DefaultTransferEnginePolicy = If(transferEnginePolicyIndex = 1,
+                                                           SettingsValueConverter.TransferEnginePolicyToString(TransferEnginePolicy.ManagedRescue),
+                                                           If(transferEnginePolicyIndex = 2,
+                                                              SettingsValueConverter.TransferEnginePolicyToString(TransferEnginePolicy.NativeFast),
+                                                              SettingsValueConverter.TransferEnginePolicyToString(TransferEnginePolicy.Auto)))
+
+        capturedSettings.DefaultScanPerformanceProfile = If(scanPerformanceProfileIndex = 1,
+                                                             SettingsValueConverter.ScanPerformanceProfileToString(ScanPerformanceProfile.Fast),
+                                                             If(scanPerformanceProfileIndex = 2,
+                                                                SettingsValueConverter.ScanPerformanceProfileToString(ScanPerformanceProfile.Precise),
+                                                                SettingsValueConverter.ScanPerformanceProfileToString(ScanPerformanceProfile.Auto)))
+
+        Select Case workerProcessPriorityIndex
+            Case 0
+                capturedSettings.DefaultWorkerProcessPriorityClass = "Idle"
+            Case 1
+                capturedSettings.DefaultWorkerProcessPriorityClass = "BelowNormal"
+            Case 3
+                capturedSettings.DefaultWorkerProcessPriorityClass = "AboveNormal"
+            Case 4
+                capturedSettings.DefaultWorkerProcessPriorityClass = "High"
+            Case Else
+                capturedSettings.DefaultWorkerProcessPriorityClass = "Normal"
+        End Select
 
         Select Case telemetryProfileIndex
             Case 1
@@ -1837,6 +1979,16 @@ Friend Class SettingsForm
         End If
     End Sub
 
+    ''' <summary>
+    ''' Sets SelectedIndex only when the ComboBox has items, preventing
+    ''' ArgumentOutOfRangeException on controls whose page has not been built yet.
+    ''' </summary>
+    Private Shared Sub SafeSelectIndex(comboBox As ComboBox, index As Integer)
+        If comboBox.Items.Count > index Then
+            comboBox.SelectedIndex = index
+        End If
+    End Sub
+
     Private Sub RecoveryControl_CheckedChanged(sender As Object, e As EventArgs)
         UpdateRecoveryControlStates()
     End Sub
@@ -1847,6 +1999,10 @@ Friend Class SettingsForm
 
     Private Sub FragileControl_CheckedChanged(sender As Object, e As EventArgs)
         UpdateFragileControlStates()
+    End Sub
+
+    Private Sub DefaultAdaptiveBufferCheckBox_CheckedChanged(sender As Object, e As EventArgs)
+        UpdatePerformanceControlStates()
     End Sub
 
     Private Sub DefaultVerifyCheckBox_CheckedChanged(sender As Object, e As EventArgs)
@@ -1919,6 +2075,10 @@ Friend Class SettingsForm
         _defaultFragileFailureWindowNumeric.Enabled = enabled
         _defaultFragileFailureThresholdNumeric.Enabled = enabled
         _defaultFragileCooldownNumeric.Enabled = enabled
+    End Sub
+
+    Private Sub UpdatePerformanceControlStates()
+        _defaultBufferMbNumeric.Enabled = Not _defaultAdaptiveBufferCheckBox.Checked
     End Sub
 
     Private Sub UpdateVerificationControlStates()

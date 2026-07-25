@@ -15,6 +15,6 @@ Namespace Models
         ''' <summary>
         ''' Gets or sets Length.
         ''' </summary>
-        Public Property Length As Integer
+        Public Property Length As Long
     End Class
 End Namespace

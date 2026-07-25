@@ -320,6 +320,52 @@ Namespace Configuration
         End Function
 
         ''' <summary>
+        ''' Computes ToTransferEnginePolicy.
+        ''' </summary>
+        Public Function ToTransferEnginePolicy(value As String) As TransferEnginePolicy
+            Select Case NormalizeChoice(value, "auto", "auto", "managed", "native")
+                Case "managed"
+                    Return TransferEnginePolicy.ManagedRescue
+                Case "native"
+                    Return TransferEnginePolicy.NativeFast
+                Case Else
+                    Return TransferEnginePolicy.Auto
+            End Select
+        End Function
+
+        ''' <summary>
+        ''' Computes TransferEnginePolicyToString.
+        ''' </summary>
+        Public Function TransferEnginePolicyToString(value As TransferEnginePolicy) As String
+            Select Case value
+                Case TransferEnginePolicy.ManagedRescue
+                    Return "managed"
+                Case TransferEnginePolicy.NativeFast
+                    Return "native"
+                Case Else
+                    Return "auto"
+            End Select
+        End Function
+
+        ''' <summary>
+        ''' Computes NormalizeWorkerProcessPriorityClass.
+        ''' </summary>
+        Public Function NormalizeWorkerProcessPriorityClass(value As String) As String
+            Select Case If(value, String.Empty).Trim().ToUpperInvariant()
+                Case "IDLE"
+                    Return "Idle"
+                Case "BELOWNORMAL", "BELOW-NORMAL", "BELOW_NORMAL", "BELOW NORMAL"
+                    Return "BelowNormal"
+                Case "ABOVENORMAL", "ABOVE-NORMAL", "ABOVE_NORMAL", "ABOVE NORMAL"
+                    Return "AboveNormal"
+                Case "HIGH"
+                    Return "High"
+                Case Else
+                    Return "Normal"
+            End Select
+        End Function
+
+        ''' <summary>
         ''' Computes ToSymlinkHandling.
         ''' </summary>
         Public Function ToSymlinkHandling(value As String) As SymlinkHandlingMode
@@ -469,6 +515,34 @@ Namespace Configuration
                     Return "debug"
                 Case Else
                     Return "normal"
+            End Select
+        End Function
+
+        ''' <summary>
+        ''' Computes ToScanPerformanceProfile.
+        ''' </summary>
+        Public Function ToScanPerformanceProfile(value As String) As ScanPerformanceProfile
+            Select Case NormalizeChoice(value, "auto", "auto", "fast", "precise")
+                Case "fast"
+                    Return ScanPerformanceProfile.Fast
+                Case "precise"
+                    Return ScanPerformanceProfile.Precise
+                Case Else
+                    Return ScanPerformanceProfile.Auto
+            End Select
+        End Function
+
+        ''' <summary>
+        ''' Computes ScanPerformanceProfileToString.
+        ''' </summary>
+        Public Function ScanPerformanceProfileToString(value As ScanPerformanceProfile) As String
+            Select Case value
+                Case ScanPerformanceProfile.Fast
+                    Return "fast"
+                Case ScanPerformanceProfile.Precise
+                    Return "precise"
+                Case Else
+                    Return "auto"
             End Select
         End Function
 
