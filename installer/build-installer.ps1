@@ -80,7 +80,7 @@ Write-Host "[installer] packaging XactCopy $Version ..."
 & $iscc "/DAppVersion=$Version" "/O$OutputDir" $issFile
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed" }
 
-$installer = Join-Path $OutputDir "XactCopySetup-$Version-win-x64.exe"
+$installer = Join-Path $OutputDir "XactCopySetup-v$Version-win-x64.exe"
 if (-not (Test-Path -LiteralPath $installer)) {
     throw "Installer was not produced: $installer"
 }
