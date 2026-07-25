@@ -3,7 +3,7 @@
 ; names and Windows uninstall metadata stay aligned with the binary.
 
 #ifndef AppVersion
-#define AppVersion "2.0.0.1"
+#define AppVersion "2.0.0.2"
 #endif
 
 #ifndef SourceBuildDir
@@ -32,7 +32,8 @@ UninstallDisplayName=XactCopy
 VersionInfoVersion={#AppVersion}
 Compression=lzma2
 SolidCompression=yes
-WizardStyle=modern
+; "dynamic" follows the user's Windows light/dark setting (Inno Setup 6.6+).
+WizardStyle=modern dynamic
 MinVersion=10.0
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible

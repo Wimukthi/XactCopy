@@ -4,6 +4,30 @@ All notable changes to XactCopy are documented in this file. The format is based
 on [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped
 releases.
 
+## [2.0.0.2]
+
+### Fixed
+
+- **Copying several selected items now works.** Windows Explorer runs a
+  context-menu command once per selected item, so picking three files started
+  three copies of XactCopy and stacked up a destination prompt for each — and
+  only the last item survived. Selections are now gathered into a single job with
+  one source folder and one destination prompt, whether you pick files, folders,
+  or a mix.
+
+### Added
+
+- **Add Files…** next to the source box opens a multi-select picker, and files or
+  folders can be **dragged onto the window**. Both add to the current selection.
+- A summary under the source box shows what is queued — e.g. *"3 items selected
+  (2 files, 1 folder) — only these will be copied"* — with a **Clear** button.
+  Choosing a source folder with Browse clears the selection and copies the whole
+  folder again.
+
+### Changed
+
+- The installer follows your Windows light/dark setting.
+
 ## [2.0.0.1]
 
 ### Fixed

@@ -37,6 +37,7 @@
 #include "job_manager.h"
 #include "job_manager_dialog.h"
 #include "recovery.h"
+#include "selection.h"
 #include "settings.h"
 #include "supervisor.h"
 #include "taskbar_progress.h"
@@ -61,6 +62,7 @@ constexpr UINT WM_APP_STATE = WM_APP + 4;
 constexpr UINT WM_APP_PAUSE = WM_APP + 5;
 constexpr UINT WM_APP_START_DONE = WM_APP + 6; // wParam: 1 ok / 0 error; lParam: new std::string*
 constexpr UINT WM_APP_UPDATE_DONE = WM_APP + 7; // lParam: new ui::UpdateReleaseInfo*
+constexpr UINT WM_APP_APPLY_LAUNCH = WM_APP + 8; // deferred apply_explorer_launch_options()
 
 constexpr int IdSourceEdit = 1001;
 constexpr int IdSourceBrowse = 1002;
@@ -106,6 +108,15 @@ constexpr int IdMenuJobManager = 1112;
 constexpr int IdMenuResumeInterrupted = 1113;
 constexpr int IdMenuRunNextQueued = 1114;
 constexpr int IdMenuAbout = 1115;
+
+constexpr int IdSourceAddFiles = 1040;
+constexpr int IdClearSelection = 1041;
+
+// Explorer invokes a context-menu verb once per selected item, so a multi-select
+// arrives as a burst of launches. Selections are accumulated and applied once
+// this quiet period elapses, giving one source root and one destination prompt.
+constexpr UINT IdSelectionTimer = 1;
+constexpr UINT SelectionCoalesceMs = 700;
 
 constexpr const wchar_t* WindowClassName = L"XactCopyNativeMain";
 
@@ -165,6 +176,7 @@ public:
 
         ui::apply_window_icons(hwnd_);
         ui::set_dark_title_bar(hwnd_, theme_.dark);
+        DragAcceptFiles(hwnd_, TRUE); // dropped items join the selection
         restore_window_placement();
         ShowWindow(hwnd_, restore_maximized_ ? SW_SHOWMAXIMIZED : SW_SHOW);
         UpdateWindow(hwnd_);
@@ -270,6 +282,15 @@ private:
     std::thread update_thread_;
     std::string explorer_selection_root_;         // normalized source root, if any
     std::vector<std::string> explorer_selected_paths_; // relative paths for selected-items mode
+
+    // Multi-item selection: accumulated across a burst of arrivals, then applied
+    // once by the coalescing timer (see queue_selection/commit_selection).
+    ui::SelectionModel selection_;
+    bool selection_timer_active_ = false;
+    bool selection_wants_destination_ = false;
+    HWND selection_label_ = nullptr;
+    HWND source_add_files_ = nullptr;
+    HWND clear_selection_ = nullptr;
     std::map<int, bool> check_states_;
 
     // Async job start (spawn + pipe connect must not block the UI thread).
@@ -450,15 +471,48 @@ private:
                     ui_is_blank(forwarded.explorer_folder_path)) {
                     return TRUE; // nothing actionable; just surfacing the window
                 }
-                if (supervisor_.is_job_running()) {
-                    append_log("Ignored an Explorer selection: a job is already running.");
+                // Queue only. The sender is blocked inside SendMessage until we
+                // return, so this must never open a dialog — the destination
+                // prompt happens later, from the coalescing timer.
+                if (!ui_is_blank(forwarded.explorer_folder_path)) {
+                    launch_.explorer_folder_path = forwarded.explorer_folder_path;
+                    launch_.explorer_scan_mode = forwarded.explorer_scan_mode;
+                    PostMessageW(hwnd_, WM_APP_APPLY_LAUNCH, 0, 0);
                     return TRUE;
                 }
-                launch_.explorer_folder_path = forwarded.explorer_folder_path;
-                launch_.explorer_source_paths = forwarded.explorer_source_paths;
-                launch_.explorer_scan_mode = forwarded.explorer_scan_mode;
-                apply_explorer_launch_options();
+                std::vector<std::wstring> paths;
+                paths.reserve(forwarded.explorer_source_paths.size());
+                for (const auto& raw : forwarded.explorer_source_paths) {
+                    paths.push_back(resolve_full_path(raw));
+                }
+                queue_selection(paths, forwarded.explorer_scan_mode, /*want_destination*/ true);
                 return TRUE;
+            }
+            case WM_APP_APPLY_LAUNCH:
+                apply_explorer_launch_options();
+                return 0;
+            case WM_TIMER:
+                if (wparam == IdSelectionTimer) {
+                    commit_selection();
+                    return 0;
+                }
+                return DefWindowProcW(hwnd_, message, wparam, lparam);
+            case WM_DROPFILES: {
+                // Files/folders dropped on the window join the same selection.
+                HDROP drop = reinterpret_cast<HDROP>(wparam);
+                UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+                std::vector<std::wstring> paths;
+                for (UINT i = 0; i < count; ++i) {
+                    UINT length = DragQueryFileW(drop, i, nullptr, 0);
+                    std::wstring path(length + 1, L'\0');
+                    if (DragQueryFileW(drop, i, path.data(), length + 1) > 0) {
+                        path.resize(length);
+                        paths.push_back(std::move(path));
+                    }
+                }
+                DragFinish(drop);
+                queue_selection(paths, /*scan_mode*/ false, /*want_destination*/ false);
+                return 0;
             }
             case WM_CLOSE:
                 if (supervisor_.is_job_running()) {
@@ -536,7 +590,8 @@ private:
         // their font via WM_GETFONT, so they need it set too.
         HWND ui_controls[] = {
             source_label_,     destination_label_,   source_edit_,      destination_edit_,
-            source_browse_,    destination_browse_,  mode_combo_,       engine_combo_,
+            source_browse_,    destination_browse_,  source_add_files_, selection_label_,
+            clear_selection_,  mode_combo_,          engine_combo_,
             overwrite_combo_,  verify_combo_,        salvage_check_,    resume_check_,
             map_check_,        adaptive_check_,      continue_check_,   skip_known_bad_check_,
             wait_media_check_, fragile_check_,       buffer_label_,     buffer_edit_,
@@ -570,6 +625,13 @@ private:
         source_label_ = create(L"STATIC", L"Source:", 0, 0);
         source_edit_ = create(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, IdSourceEdit);
         source_browse_ = create(L"BUTTON", L"Browse...", WS_TABSTOP | BS_OWNERDRAW, IdSourceBrowse);
+        source_add_files_ =
+            create(L"BUTTON", L"Add Files...", WS_TABSTOP | BS_OWNERDRAW, IdSourceAddFiles);
+        selection_label_ = create(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS | SS_NOPREFIX, 0);
+        clear_selection_ =
+            create(L"BUTTON", L"Clear", WS_TABSTOP | BS_OWNERDRAW, IdClearSelection);
+        ShowWindow(selection_label_, SW_HIDE);
+        ShowWindow(clear_selection_, SW_HIDE);
         destination_label_ = create(L"STATIC", L"Destination:", 0, 0);
         destination_edit_ =
             create(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, IdDestinationEdit);
@@ -831,7 +893,7 @@ private:
     static bool is_button_id(int id) {
         return id == IdSourceBrowse || id == IdDestinationBrowse || id == IdStartButton ||
                id == IdPauseButton || id == IdCancelButton || id == IdSettingsButton ||
-               id == IdAboutButton;
+               id == IdAboutButton || id == IdSourceAddFiles || id == IdClearSelection;
     }
 
     bool on_draw_item(const DRAWITEMSTRUCT& draw) {
@@ -948,6 +1010,7 @@ private:
     void set_inputs_enabled(bool enabled) {
         HWND inputs[] = {
             source_edit_,      destination_edit_,   source_browse_,   destination_browse_,
+            source_add_files_, clear_selection_,
             mode_combo_,       engine_combo_,       overwrite_combo_, verify_combo_,
             salvage_check_,    resume_check_,       map_check_,       adaptive_check_,
             continue_check_,   skip_known_bad_check_, wait_media_check_, fragile_check_,
@@ -1010,12 +1073,26 @@ private:
 
         int label_width = scale(84);
         int browse_width = scale(84);
+        int add_width = scale(96);
+        // The source row carries an extra "Add Files..." button.
+        int source_edit_width = width - label_width - browse_width - add_width - gap * 3;
         int edit_width = width - label_width - browse_width - gap * 2;
 
         place(source_label_, 0, label_width);
-        place(source_edit_, label_width + gap, edit_width);
-        place(source_browse_, label_width + gap + edit_width + gap, browse_width);
+        place(source_edit_, label_width + gap, source_edit_width);
+        place(source_add_files_, label_width + gap + source_edit_width + gap, add_width);
+        place(source_browse_, label_width + gap + source_edit_width + gap + add_width + gap,
+              browse_width);
         y += row_height + gap;
+
+        // Selection summary row, shown only while a subset of the source is queued.
+        if (IsWindowVisible(selection_label_)) {
+            const int clear_width = scale(64);
+            place(selection_label_, label_width + gap,
+                  width - label_width - clear_width - gap * 2, scale(20));
+            place(clear_selection_, width - clear_width, clear_width, scale(20));
+            y += scale(20) + gap;
+        }
 
         place(destination_label_, 0, label_width);
         place(destination_edit_, label_width + gap, edit_width);
@@ -1125,7 +1202,15 @@ private:
         }
         switch (id) {
             case IdSourceBrowse:
+                // Choosing a source folder replaces any queued item selection.
                 browse_folder(source_edit_);
+                if (!selection_.empty()) clear_selection();
+                break;
+            case IdSourceAddFiles:
+                add_files_to_selection();
+                break;
+            case IdClearSelection:
+                clear_selection();
                 break;
             case IdDestinationBrowse:
                 browse_folder(destination_edit_);
@@ -1314,6 +1399,140 @@ private:
                                        ui::MessageButtons::YesNo) == IDYES;
     }
 
+    // ---- Multi-item selection ----------------------------------------------
+
+    // Single entry point for every source of items: launch arguments, a second
+    // instance's forwarded command line, the Add-Files dialog, and drag-and-drop.
+    // Nothing is applied immediately — a burst of arrivals (Explorer invoking the
+    // verb once per selected item) is coalesced into one selection, so the user
+    // gets a single source root and a single destination prompt.
+    void queue_selection(const std::vector<std::wstring>& paths, bool scan_mode,
+                         bool want_destination) {
+        if (paths.empty()) return;
+        if (supervisor_.is_job_running()) {
+            append_log("Ignored a selection: a job is already running.");
+            return;
+        }
+        int added = 0;
+        for (const auto& path : paths) {
+            if (selection_.add(path)) ++added;
+        }
+        if (added == 0 && !selection_timer_active_) return;
+        if (scan_mode) launch_.explorer_scan_mode = true;
+        if (want_destination) selection_wants_destination_ = true;
+
+        // Restart the quiet period so late arrivals join the same selection.
+        SetTimer(hwnd_, IdSelectionTimer, SelectionCoalesceMs, nullptr);
+        selection_timer_active_ = true;
+    }
+
+    void commit_selection() {
+        KillTimer(hwnd_, IdSelectionTimer);
+        selection_timer_active_ = false;
+        const bool want_destination = selection_wants_destination_;
+        selection_wants_destination_ = false;
+
+        explorer_selection_root_.clear();
+        explorer_selected_paths_.clear();
+        if (selection_.empty()) {
+            update_selection_ui();
+            return;
+        }
+
+        std::wstring root = selection_.common_root();
+        if (root.empty() || !directory_exists(root)) {
+            append_log("Selected items do not share a common source folder.");
+            selection_.clear();
+            update_selection_ui();
+            return;
+        }
+        SetWindowTextW(source_edit_, root.c_str());
+
+        std::vector<std::string> relative = selection_.relative_paths(root);
+        const bool whole_folder =
+            relative.empty() ||
+            settings_.get_string("ExplorerSelectionMode", "selected-items") == "source-folder";
+        if (!whole_folder) {
+            explorer_selection_root_ = storage::fsutil::wide_to_utf8(root);
+            explorer_selected_paths_ = std::move(relative);
+        }
+
+        if (launch_.explorer_scan_mode) {
+            SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0); // Scan Bad Blocks
+        }
+        append_log("Source set to " + storage::fsutil::wide_to_utf8(root) + " (" +
+                   std::to_string(selection_.size()) + " item(s) selected).");
+        update_selection_ui();
+
+        if (want_destination) prompt_destination_from_explorer();
+    }
+
+    void clear_selection() {
+        selection_.clear();
+        explorer_selection_root_.clear();
+        explorer_selected_paths_.clear();
+        update_selection_ui();
+        append_log("Selection cleared; the whole source folder will be copied.");
+    }
+
+    // The source box only shows the common root, so surface what is actually
+    // queued underneath it.
+    void update_selection_ui() {
+        const bool active = !explorer_selected_paths_.empty();
+        const bool was_visible = selection_label_ != nullptr &&
+                                 IsWindowVisible(selection_label_) != FALSE;
+        if (selection_label_ != nullptr) {
+            std::wstring text =
+                active ? selection_.summary() + L" \x2014 only these will be copied" : L"";
+            SetWindowTextW(selection_label_, text.c_str());
+            ShowWindow(selection_label_, active ? SW_SHOW : SW_HIDE);
+        }
+        if (clear_selection_ != nullptr) ShowWindow(clear_selection_, active ? SW_SHOW : SW_HIDE);
+        // The row only occupies space when shown, so re-run the layout when its
+        // visibility changes to open/close the gap beneath the source box.
+        if (was_visible != active) layout();
+    }
+
+    // Multi-select file picker; folders come in via Browse or drag-and-drop.
+    void add_files_to_selection() {
+        if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) {
+            return;
+        }
+        std::vector<std::wstring> picked;
+        IFileOpenDialog* dialog = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                       IID_PPV_ARGS(&dialog)))) {
+            DWORD options = 0;
+            dialog->GetOptions(&options);
+            dialog->SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM |
+                               FOS_FILEMUSTEXIST);
+            dialog->SetTitle(L"Add files to copy");
+            if (SUCCEEDED(dialog->Show(hwnd_))) {
+                IShellItemArray* items = nullptr;
+                if (SUCCEEDED(dialog->GetResults(&items))) {
+                    DWORD count = 0;
+                    items->GetCount(&count);
+                    for (DWORD i = 0; i < count; ++i) {
+                        IShellItem* item = nullptr;
+                        if (SUCCEEDED(items->GetItemAt(i, &item))) {
+                            PWSTR path = nullptr;
+                            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                                picked.emplace_back(path);
+                                CoTaskMemFree(path);
+                            }
+                            item->Release();
+                        }
+                    }
+                    items->Release();
+                }
+            }
+            dialog->Release();
+        }
+        CoUninitialize();
+        // Already-chosen items stay; the picker adds to the set.
+        queue_selection(picked, /*scan_mode*/ false, /*want_destination*/ false);
+    }
+
     // ---- Explorer launch application (--from-explorer[-folder]) ------------
 
     static std::wstring resolve_full_path(const std::string& raw) {
@@ -1328,86 +1547,25 @@ private:
                (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     }
 
-    static bool path_exists(const std::wstring& path) {
-        return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
-    }
+    // Root/relative-path resolution now lives in ui::SelectionModel (selection.h).
 
-    static std::wstring parent_directory(const std::wstring& path) {
-        return storage::fsutil::get_directory_name(path);
-    }
-
-    // Longest shared directory prefix of two normalized full paths (component-wise).
-    static std::wstring reduce_common(const std::wstring& left, const std::wstring& right) {
-        std::wstring candidate = left;
-        while (!candidate.empty()) {
-            if (_wcsicmp(candidate.c_str(), right.c_str()) == 0) return candidate;
-            std::wstring prefix = candidate + L"\\";
-            if (right.size() >= prefix.size() &&
-                _wcsnicmp(right.c_str(), prefix.c_str(), prefix.size()) == 0) {
-                return candidate;
-            }
-            std::wstring parent = parent_directory(candidate);
-            if (parent == candidate) break;
-            candidate = parent;
-        }
-        return std::wstring();
-    }
-
-    std::wstring determine_selection_root(const std::vector<std::wstring>& paths) {
-        if (paths.empty()) return std::wstring();
-        if (paths.size() == 1 && directory_exists(paths[0])) {
-            std::wstring parent = parent_directory(paths[0]);
-            return parent.empty() ? paths[0] : parent;
-        }
-        std::wstring common = paths[0];
-        for (std::size_t i = 1; i < paths.size(); ++i) {
-            common = reduce_common(common, paths[i]);
-            if (common.empty()) return std::wstring();
-        }
-        if (common.empty()) return std::wstring();
-        if (!directory_exists(common) && path_exists(common)) {
-            return parent_directory(common);
-        }
-        return common;
-    }
-
-    static std::string normalize_relative_path(const std::wstring& root, const std::wstring& item) {
-        // item is under root; strip the root prefix and separators.
-        if (item.size() <= root.size()) return std::string();
-        std::wstring relative = item.substr(root.size());
-        while (!relative.empty() && (relative.front() == L'\\' || relative.front() == L'/')) {
-            relative.erase(relative.begin());
-        }
-        while (!relative.empty() && (relative.back() == L'\\' || relative.back() == L'/')) {
-            relative.pop_back();
-        }
-        for (auto& c : relative) {
-            if (c == L'/') c = L'\\';
-        }
-        return storage::fsutil::wide_to_utf8(relative);
-    }
-
-    // Mirrors MainForm.ApplyExplorerLaunchOptions: background folder -> source
-    // box; selections -> source folder (SourceFolder mode) or relative-path
-    // selection set (SelectedItems mode).
+    // Feeds launch arguments into the selection model. A folder-background
+    // launch is a whole-folder copy and applies immediately; item selections go
+    // through the coalescing queue so Explorer's one-launch-per-item burst
+    // becomes a single job.
     void apply_explorer_launch_options() {
-        explorer_selection_root_.clear();
-        explorer_selected_paths_.clear();
-
-        // Launched via the "Scan for Bad Blocks" verb: switch to scan mode (no
-        // destination is needed, so prompt_destination_from_explorer no-ops).
-        if (launch_.explorer_scan_mode) {
-            SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0);
-            append_log("Launched from Explorer in bad-block scan mode.");
-        }
-
         if (!ui_is_blank(launch_.explorer_folder_path)) {
             std::wstring folder = resolve_full_path(launch_.explorer_folder_path);
             if (folder.empty() || !directory_exists(folder)) {
                 append_log("Explorer folder path was not found: " + launch_.explorer_folder_path);
                 return;
             }
+            selection_.clear();
+            explorer_selection_root_.clear();
+            explorer_selected_paths_.clear();
+            update_selection_ui();
             SetWindowTextW(source_edit_, folder.c_str());
+            if (launch_.explorer_scan_mode) SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0);
             append_log("Source set from Explorer background folder: " +
                        storage::fsutil::wide_to_utf8(folder));
             prompt_destination_from_explorer();
@@ -1415,61 +1573,12 @@ private:
         }
 
         if (launch_.explorer_source_paths.empty()) return;
-
-        std::vector<std::wstring> resolved;
+        std::vector<std::wstring> paths;
+        paths.reserve(launch_.explorer_source_paths.size());
         for (const auto& raw : launch_.explorer_source_paths) {
-            std::wstring full = resolve_full_path(raw);
-            if (full.empty() || !path_exists(full)) {
-                append_log("Explorer selection was not found: " + raw);
-                continue;
-            }
-            bool duplicate = false;
-            for (const auto& existing : resolved) {
-                if (_wcsicmp(existing.c_str(), full.c_str()) == 0) { duplicate = true; break; }
-            }
-            if (!duplicate) resolved.push_back(full);
+            paths.push_back(resolve_full_path(raw));
         }
-        if (resolved.empty()) return;
-
-        bool source_folder_mode =
-            settings_.get_string("ExplorerSelectionMode", "selected-items") == "source-folder";
-        if (source_folder_mode) {
-            std::wstring first = resolved[0];
-            std::wstring source_folder = directory_exists(first) ? first : parent_directory(first);
-            if (source_folder.empty()) return;
-            SetWindowTextW(source_edit_, source_folder.c_str());
-            append_log("Source set from Explorer selection: " +
-                       storage::fsutil::wide_to_utf8(source_folder));
-            prompt_destination_from_explorer();
-            return;
-        }
-
-        std::wstring root = determine_selection_root(resolved);
-        if (root.empty() || !directory_exists(root)) {
-            append_log("Explorer selected items do not share a common source root.");
-            return;
-        }
-        std::vector<std::string> relative;
-        for (const auto& item : resolved) {
-            std::string rel = normalize_relative_path(root, item);
-            if (rel.empty()) continue;
-            bool duplicate = false;
-            for (const auto& existing : relative) {
-                if (models::detail::equals_ignore_case(existing, rel)) { duplicate = true; break; }
-            }
-            if (!duplicate) relative.push_back(rel);
-        }
-        SetWindowTextW(source_edit_, root.c_str());
-        if (relative.empty()) {
-            append_log("Source set from Explorer selection: " + storage::fsutil::wide_to_utf8(root));
-        } else {
-            explorer_selection_root_ = storage::fsutil::wide_to_utf8(root);
-            explorer_selected_paths_ = std::move(relative);
-            append_log("Source set from Explorer selection: " + storage::fsutil::wide_to_utf8(root));
-            append_log("Explorer selected-items mode active (" +
-                       std::to_string(explorer_selected_paths_.size()) + " item(s) queued).");
-        }
-        prompt_destination_from_explorer();
+        queue_selection(paths, launch_.explorer_scan_mode, /*want_destination*/ true);
     }
 
     void prompt_destination_from_explorer() {
