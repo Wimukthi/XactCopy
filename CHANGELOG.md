@@ -4,7 +4,10 @@ All notable changes to XactCopy are documented in this file. The format is based
 on [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped
 releases.
 
-## [0.4.0] — Native application
+## [2.0.0] — Native application
+
+The application has been rewritten as a native C++/Win32 program. The `2.0.0`
+version marks this rewrite and supersedes the `1.x` VB.NET releases.
 
 XactCopy is now a native C++/Win32 application: a themed desktop UI that
 supervises a separate copy/scan worker over a versioned named-pipe protocol. No

@@ -54,10 +54,10 @@ if ([string]::IsNullOrWhiteSpace($OutputDir)) {
 }
 
 if (-not $SkipBuild) {
-    $buildArgs = @("-Compiler", $Compiler)
-    if (-not $SkipTests) { $buildArgs += "-RunTests" }
+    $buildParams = @{ Compiler = $Compiler }
+    if (-not $SkipTests) { $buildParams["RunTests"] = $true }
     Write-Host "[installer] building binaries ($Compiler)..."
-    & (Join-Path $script:RepoRoot "build.ps1") @buildArgs
+    & (Join-Path $script:RepoRoot "build.ps1") @buildParams
     if ($LASTEXITCODE -ne 0) { throw "binary build failed" }
 }
 
