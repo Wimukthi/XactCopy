@@ -1,0 +1,1 @@
+{"ProtocolVersion":1,"MessageType":"WorkerLogEvent","CorrelationId":"corr-9","SentUtc":"2026-07-23T01:02:03+00:00","Payload":{"JobId":"8f2c1f6f2ab84a1f9d3e5b7c9a1d2e3f","Message":"Copy failed for \u003CD:\\data\\file\u002Bname\u0027s.bin\u003E \u0026 retried \u0022twice\u0022 \u2014 done.","TimestampUtc":"2026-07-23T01:02:03.0040005+00:00"}}

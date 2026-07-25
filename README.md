@@ -1,117 +1,233 @@
 # XactCopy
 
-XactCopy is a VB.NET WinForms copier built for resilient transfers on unstable storage media.
+Resilient file mover and bad-block scanner for unstable media — a native C++20
+Win32 application. A supervised named-pipe worker (`XactCopyExecutive.exe`) runs
+the resumable copy engine, rescue passes, and bad-block scan behind a versioned
+JSON IPC boundary; the themed dark UI (`XactCopy.exe`) drives it, with a Job
+Manager, an in-app updater, Explorer shell integration, and an Inno Setup
+installer.
 
-## License
+> The previous VB.NET implementation is preserved on the **`vbnet-legacy`**
+> branch and the **`vbnet-final`** tag. The `-CrossTests` suite validates the
+> native storage/IPC against that .NET code when both trees are checked out
+> side by side.
 
-GNU GPL v3.0. See `LICENSE`.
+Build output is written in-tree to `build\`.
 
-## Highlights
+## Status
 
-- Out-of-process worker process with supervisor restart handling.
-- Journal-based resume and recovery after unexpected exits.
-- Scan-only bad-block detection mode (`Scan Bad Blocks`) with reusable bad-range maps.
-- Pause/resume/cancel controls with run-state persistence.
-- Salvage mode for unreadable sectors with configurable fill pattern.
-- Retry/backoff timeout controls for degraded disks.
-- Adaptive buffer mode with live speed, ETA, and buffer telemetry.
-- Rescue Engine multi-pass recovery pipeline with tunable pass parameters.
-- Job manager (saved jobs, queue, history).
-- Explorer context menu integration (`Copy with XactCopy`).
-- Dark/system/classic theme support.
-- Built-in updater with download and in-place apply flow.
+- [x] **Phase 0** — foundation: JSON module, .NET time formats, build scripts
+      (g++ + MSVC, no CMake), golden-file harness.
+- [x] **Phase 1** — Core + IPC: all models/enums/messages, framed pipe
+      transport with current-user-only security, protocol worker
+      (`XactCopyExecutive.exe`) that completes the full IPC conversation with
+      the real .NET supervisor stack. Job execution reports "not implemented".
+- [x] **Phase 2** — Storage: `JobJournalStore` + `BadRangeMapStore` with the
+      full hardening pipeline (atomic write-through snapshots, rotating
+      backups, mirror snapshots, HMAC-signed envelopes, hash-chained ledger +
+      anchors, DPAPI-protected map key, legacy fallback). Bidirectional
+      cross-compat proven: each side reads the other's artifacts, verifies the
+      other's signatures/ledgers, and honors trust fallback after tampering
+      (`build.ps1 -CrossTests`).
+- [x] **Phase 3a** — Worker copy engine: DirectoryScanner, journal-merged
+      resumable copies, the full rescue-pass pipeline (FastScan / TrimSweep /
+      TrimSweepReverse / Scrape / RetryBad with failure splitting and density
+      adaptation), salvage fill, retry/backoff with contention + availability +
+      source-mutation policies, fragile-media mode, media identity guard,
+      native CopyFileEx fast path, small-file fast path, throughput throttle,
+      SHA-256/512 full + sampled verification, and the env-driven fault
+      injector (`XACTCOPY_DEV_FAULT_RULES`). Proven end-to-end by InteropProbe
+      scenarios A–D (clean native copy, managed+verified copy, fault-injected
+      rescue/salvage with byte-exact destination + journal validation, and
+      salvage-disabled failure).
+- [x] **Phase 3b** — Worker remainder: ScanOnly mode (precise + fast profile
+      with parallel scan workers and precise fallback), bad-range-map
+      integration (load/freshness/source-match, KnownBad seeding that skips
+      re-reading mapped ranges, per-file persistence + final flush), parallel
+      small-file CopyFileEx phase, and adaptive buffer sizing (EWMA throughput
+      + latency guards). InteropProbe scenarios E–I prove: precise scan
+      journal states, fast-scan fault detection writing a map the real .NET
+      `BadRangeMapStore` loads with the exact bad block, map-hinted copies
+      that never read known-bad ranges (asserted via zero read-retries),
+      parallel-phase counters, and adaptive-buffer byte-exact copies.
+      Remaining niche: experimental raw-disk scan backend (degrades to
+      standard file reads with an explicit log, matching the .NET
+      non-elevated fallback).
+- [x] **Phase 4a** — UI core: `WorkerSupervisor` port (spawn/connect, receive
+      loop, 1 Hz heartbeat monitor with 10 s staleness + activity-stall
+      formula, auto-recovery kill/restart/forced-journal-resume, channel-loss
+      completion), `RecoveryService` + `RecoveryStateStore`
+      (.NET-compatible `runtime\recovery-state.json`, RunOnce autostart),
+      DOM-preserving `AppSettings` over the .NET `settings.json` (unknown keys
+      survive native saves), and a functional dark-themed Win32 main window
+      (`XactCopyNative.exe`): folder pickers, mode/engine/overwrite/verify
+      selections, start/pause/resume/cancel, dual progress, live log,
+      crash-resume prompt (the UI binary is `XactCopy.exe`). Headless tests
+      (`xactcopy_supervisor_tests`) cover
+      settings preservation, recovery state round-trip, a clean supervised
+      job, and kill-mid-job auto-recovery with byte-exact resume.
+- [x] **Phase 4b (theming)** — shared theme layer (`src/ui/theme.h`, adapted
+      from the AxiomCompress gui components): dark/light palettes with accent
+      blending and readable-selection math, system dark-mode + high-contrast
+      detection with live `ImmersiveColorSet` tracking, dark title bar +
+      `DarkMode_Explorer`/`DarkMode_CFD` control theming with the uxtheme
+      ordinal-135 app opt-in, owner-drawn buttons/checkboxes/combo items with
+      hot/pressed/focus states, accent-tinted progress bars, severity-colored
+      log rendering (error/warning/success/supervisor classes honoring
+      `UiColorizeLogBySeverity` + `LogFontFamily`/`LogFontSizePoints`), and a
+      single-instance guard that surfaces the existing window. DPI: process is
+      Per-Monitor-V2 aware; `WM_DPICHANGED` adopts the suggested bounds,
+      rebuilds fonts for the new monitor's DPI, and relayouts (no MFC needed —
+      MFC has no dark-mode support and notoriously weak PMv2 dialog scaling;
+      plain Win32 with explicit DPI handling is the recommended path and keeps
+      the dual g++/MSVC toolchain). Known cosmetic gap: classic combo dropdown
+      arrows (same limitation AxiomCompress accepted; needs fully custom combo
+      chrome).
+- [x] **Phase 4c (manifest + dialogs)** — embedded application manifest
+      (ComCtl32 v6 + PerMonitorV2, `src/ui/app.manifest` via windres/rc.exe on
+      both toolchains) which also completes the dark combo chrome (arrows now
+      themed via v6 + `DarkMode_CFD`); progress bars keep accent colors by
+      stripping visual styles per-control. Themed modal **Settings dialog**
+      (appearance: theme/accent/log colorize/log font; job defaults: engine,
+      verification, overwrite, buffer, retries, salvage/resume/map/adaptive/
+      timestamps) with DOM-preserving save and live theme re-apply, and a
+      themed **About dialog** — both on a shared `ModalHost` (`src/ui/
+      dialogs.h`) that disables the owner and never leaks `WM_QUIT`.
+- [x] **Phase 4d (menus + full settings)** — dark **menu bar** with the
+      complete .NET MainForm structure (File: start/pause/resume/cancel, open
+      journal/crash folders, exit; Tools: scan, settings, updates; Jobs: save
+      as job, job manager, resume interrupted, run queued; Help: about) using
+      ForceDark popups + UAH menubar owner-painting, with job-state-aware
+      enable/disable (unported commands are greyed). The **Settings dialog**
+      now mirrors the full .NET SettingsForm: 8 navigation pages (Appearance,
+      Copy Defaults, Performance, Diagnostics, Verification, Updates,
+      Recovery & Startup, Explorer Integration) generated from a declarative
+      ~65-field table with staged edits across pages and DOM-preserving save.
+- [x] **Phase 4e** — UI parity remainder. `JobCatalogStore` + `ManagedJob*`
+      models (`src/storage/job_catalog.h`) with plain-STJ indented persistence,
+      normalization/legacy-queue migration/dedup, and bidirectional
+      cross-compat (`-CrossTests` catalog round-trip both ways). `JobManagerService`
+      (`src/ui/job_manager.h`): saved jobs, run queue (enqueue/remove/move/
+      clear/dequeue), run lifecycle marks, and history — headless-tested. Job
+      Manager dialog + `TextPromptDialog` (`src/ui/job_manager_dialog.h`): a
+      dark ListView console (custom-draw state colors + dark header) with view/
+      status/search filters, details pane, the full action set, and 3 s
+      auto-refresh. Main-window wiring: Save-As-Job / Job-Manager /
+      Run-Next-Queued menu items un-greyed and functional; every copy/scan
+      records a managed run (running/paused/resumed/completed/interrupted);
+      queue auto-drains after each run and on startup
+      (`AutoRunQueuedJobsOnStartup`); leftover Running/Paused runs are marked
+      interrupted at startup. `ExplorerIntegrationService`
+      (`src/ui/explorer_integration.h`) registers the HKCU shell verbs
+      byte-identically to .NET, synced from `EnableExplorerContextMenu`, with
+      `--from-explorer[-folder]` launch args feeding source-folder or
+      selected-items (`SelectedRelativePaths`) mode. Missing main-window
+      controls added: continue-on-error / skip-known-bad / wait-for-media /
+      fragile checks, buffer / retries / timeout numerics, and the telemetry
+      strip (EWMA throughput + running avg, smoothed-speed ETA, buffer
+      utilization, rescue pass/regions/remaining, job summary, journal path,
+      and a `UiShowDiagnostics`-gated diagnostics line).
+- [x] **Phase 5** — updater + packaging + polish. In-app updater
+      (`update_service.h` + `update_dialog.h`): GitHub-release check, download,
+      SHA-256 verify, and in-place apply (exe → run; zip → wait/backup/robocopy/
+      relaunch script). Taskbar progress (ITaskbarList3). App icon on the exe +
+      every title bar (`app.rc` IDI_XACTCOPY + VERSIONINFO, `app_icon.h`); the
+      UI binary is `XactCopy.exe`. Axiom-style About dialog + beautified
+      Settings nav rail. Comprehensive Explorer shell integration
+      (`explorer_integration.h`): copy verbs, a "Scan for Bad Blocks" verb
+      (`--scan-from-explorer`), Applications\XactCopy.exe (Open-with/drag-drop),
+      App Paths, and a Send-To shortcut. Inno Setup release pipeline
+      (`installer\XactCopy.iss` + `installer\build-installer.ps1`). Remaining
+      cosmetic-only: scan marquee, themed recovery prompt, single-instance arg
+      forwarding, a few stored-but-unapplied appearance settings. See
+      `PARITY.md`.
 
-## Screenshots
+## Layout
 
-### Main Window
+- `src/core/` — header-only core: `json.h` (STJ-compatible DOM/writer/parser,
+  compact + indented), `dotnet_time.h` (DateTimeOffset/TimeSpan wire formats),
+  `models.h` (XactCopy.Core models), `ipc.h` (envelope + messages), `pipe.h`
+  (framed named-pipe transport), `crypto.h` (BCrypt SHA-256/HMAC, DPAPI,
+  base64, constant-time compare).
+- `src/storage/` — `storage_models.h` (journal/map models), `stores.h`
+  (JobJournalStore + BadRangeMapStore), and `job_catalog.h`
+  (JobCatalog models + JobCatalogStore).
+- `src/worker/` — `XactCopyExecutive` native worker: `engine_support.h`
+  (errors/cancellation, scanner, fault injector, timed positional I/O,
+  transfer session), `engine.h` (ResilientCopyEngine), `main.cpp` (IPC host
+  with telemetry throttling).
+- `src/ui/` — native UI: `supervisor.h` (WorkerSupervisor), `recovery.h`
+  (RecoveryService/StateStore + RunOnce + LaunchOptions), `settings.h`
+  (DOM-preserving settings), `theme.h` (shared dark/light theme layer),
+  `dialogs.h` (Settings + About on a shared ModalHost), `job_manager.h`
+  (JobManagerService), `job_manager_dialog.h` (Job Manager + TextPromptDialog),
+  `explorer_integration.h` (comprehensive shell integration), `update_service.h`
+  + `update_dialog.h` (in-app updater), `taskbar_progress.h`, `app_icon.h`,
+  `main_window.cpp` (`XactCopy.exe` Win32 shell).
+- `installer/` — Inno Setup script (`XactCopy.iss`) + `build-installer.ps1`
+  wrapper that builds the binaries and produces `XactCopySetup-<ver>-win-x64.exe`.
+- `tests/` — unit tests + golden files generated by the .NET serializer.
+- `tools/GoldenGen/` — .NET console app that regenerates `tests/golden/` with
+  the real System.Text.Json output (run after changing serialized shapes).
+- `tools/InteropProbe/` — .NET console app that drives the native worker
+  through the genuine XactCopy.Core IPC stack and asserts the conversation.
+- `tools/StorageProbe/` — .NET console app that writes/verifies storage
+  artifacts with the real .NET stores for the `-CrossTests` suite.
 
-![XactCopy Main Window](docs/screenshots/main-window.png)
-
-### Settings (Appearance)
-
-![XactCopy Settings Appearance](docs/screenshots/settings-appearance.png)
-
-## Repository Layout
-
-- `src/XactCopy.UI` WinForms GUI, theme, settings, shell integration.
-- `src/XactCopy.Worker` Copy execution worker process.
-- `src/XactCopy.Core` Shared models, options, protocol contracts.
-- `src/XactCopy.Storage` Journals and persistent state storage.
-- `tests/XactCopy.Tests` Unit tests.
-
-## Build
-
-Requires .NET 10 SDK.
+## Build and test
 
 ```powershell
-dotnet build XactCopy.slnx
-dotnet test XactCopy.slnx
-dotnet run --project src/XactCopy.UI/XactCopy.UI.vbproj
+# g++ (default; MSYS2 mingw64) — builds worker + tests, runs tests incl. goldens
+.\build.ps1 -RunTests
+
+# MSVC (VS18 Insiders)
+.\build.ps1 -Compiler msvc -RunTests
+
+# Bidirectional storage compatibility (.NET stores <-> native stores)
+.\build.ps1 -CrossTests
 ```
 
-## Publish (Windows x64)
+Binaries land in the project's own `build\` folder.
+
+Regenerate goldens and run the end-to-end interop probe:
 
 ```powershell
-dotnet publish src/XactCopy.UI/XactCopy.UI.vbproj -c Release -r win-x64 --self-contained false -o artifacts/publish/win-x64
+cd tools\GoldenGen; dotnet run -c Release -- ..\..\tests\golden
+cd ..\InteropProbe; dotnet run -c Release -- ..\..\build\XactCopyExecutive.exe
 ```
 
-## Versioning
+## Wire-format compatibility notes (validated by goldens)
 
-- A monotonic build counter is stored in `src/XactCopy.UI/BuildVersion.txt`.
-- Each build increments the counter.
-- Version is computed as `Major.Minor.Patch.Revision`:
-- `Major` increments every 1000 builds (base major starts at `1`).
-- `Minor` increments every 100 builds.
-- `Patch` increments every 10 builds.
-- `Revision` is the last digit of the build counter.
-
-## Release
-
-- Changelog entries: `CHANGELOG.md`
-- Release process notes: `docs/RELEASE_PROCESS.md`
-- Architecture overview: `ARCHITECTURE.md`
-- Contribution guide: `CONTRIBUTING.md`
-
-## Brief Version History
-
-- `v1.1.1.1` Fixed updater script being killed on exit by launching it as an independent process via `ShellExecuteEx` instead of `CreateProcess`, preventing job-object child termination.
-- `v1.1.0.9` Fixed in-app updater not applying downloaded packages by switching the update script from a Unicode-encoded cmd.exe batch (silent failure) to a UTF-8 PowerShell script; release notes in the update dialog now render markdown formatting (bold headings, bullet points, inline bold) using a `RichTextBox`.
-- `v1.1.0.7` Added parallel small-file copy phase; extended `CopyFileEx` fast-path to all file sizes with `FILE_FLAG_NO_BUFFERING` for large files; added directory-creation cache, journal flush rate-limiting, `CancellationTokenSource` reuse in I/O retry loops, taskbar progress debouncing, and async/atomic backup rotation; fixed log listbox blank repaint after second job start, file-transition progress event coalescing, and `SyncLock` held across async waits.
-- `v1.0.9.9` Hardened IPC and worker security/reliability with strict frame-size limits, current-user-only worker pipe mode, deterministic worker binary resolution, Unicode-safe updater scripts, and safer async probe behavior for overwrite prompts/media identity checks.
-- `v1.0.9.6` Fixed current-file progress flattening on large rescue/map-driven files by reporting UI progress from all accounted ranges (good/recovered/bad/known-bad), removing mid-file stalls followed by end-of-file 100% jumps.
-- `v1.0.9.5` Added updater SHA-256 package verification (digest/sidecar checksum support), hardened single-instance activation pipe and worker PID cleanup safety, made settings saves atomic, and removed remaining UI-thread filesystem probe blocking.
-- `v1.0.8.9` Removed gray textbox underline artifacts globally, and refined main Source/Destination row alignment with taller, cleaner path inputs.
-- `v1.0.8.5` Completed a full source/test comment pass (file headers + XML summaries) and renamed user-facing/runtime `AegisRescueCore` references to `Rescue Engine`.
-- `v1.0.8.4` Hardened supervisor recovery so orphaned/stuck workers are tracked and cleaned up, and auto-recovery aborts (instead of spawning more workers) if the previous worker cannot be terminated cleanly.
-- `v1.0.8.3` Fixed fragile-mode resume behavior so files left `InProgress` after worker stall/recovery are promoted to non-retry skip candidates instead of being re-hammered on the next restart.
-- `v1.0.8.2` Added fragile-media hardening controls (skip-on-first-read-error, persisted do-not-retry resume behavior, and failure circuit-breaker cooldown), plus end-to-end propagation of these policies through settings, supervisor, recovery, and worker execution.
-- `v1.0.8.1` Added severity color-coding for the operations log (with settings toggle), moved destination metadata checks to a Win32 fast path, and hardened cancel/IPC recovery so malformed stream states no longer leave runs stuck waiting for cancellation acknowledgement.
-- `v1.0.7.0` Improved scan performance for tiny-file workloads by adding a dedicated scan small-file fast path and batching bad-range-map writes during scan runs.
-- `v1.0.6.8` Fixed operations log rendering after completing one job and starting another by hard-resetting pending log queues and forcing a safe virtual-list redraw path.
-- `v1.0.6.7` Fixed updater cleanup so extracted package artifacts (including wrapper folders like `win-x64`) and temporary staging/script files are removed after update apply/restart.
-- `v1.0.6.5` Hardened startup initialization to avoid `SetCompatibleTextRenderingDefault` ordering crashes during edge restart/recovery conditions.
-- `v1.0.6.3` Performed a focused codebase comment pass and refreshed project documentation (`ARCHITECTURE`, `README`, `CONTRIBUTING`, and release process docs) to match current scan-mode, bad-range-map, and resiliency behavior.
-- `v1.0.6.2` Added scan-only bad-block mode with reusable bad-range maps, fixed scan/copy mode separation bugs, preserved drive-root path normalization (`D:\`), and updated title-bar mode text to show `Scanning` during scan runs.
-- `v1.0.5.9` Hardened journal integrity with signed hash-chained ledger records, multi-generation backups, mirrored snapshots, trust/sequence-aware recovery fallback, and legacy journal compatibility retention.
-- `v1.0.5.8` Added advanced resilience hardening: remap-and-resume from existing journals after path/media failures, configurable lock/AV contention handling, policy-based source-mutation behavior (fail/skip/wait), and serial-based media identity matching that is safer across drive-letter remaps.
-- `v1.0.5.0` Added a major worker performance milestone with handle-based `RandomAccess` chunk I/O, adaptive and reverse-direction rescue passes, and a dedicated small-file fast path for lower overhead and steadier throughput.
-- `v1.0.4.9` Optimized worker copy throughput by pooling hot-path buffers, reusing per-file transfer streams, and reducing retry-path allocation/stream churn for smoother sustained transfers.
-- `v1.0.4.8` Optimized UI responsiveness with faster Settings rendering (no dark-mode opening flash) and a virtualized high-performance Job Manager grid with debounced filtering and faster details lookup.
-- `v1.0.4.7` Introduced the advanced jobs-system revamp (schema-based queue entries, migration from legacy queue IDs, richer queue/run APIs), shipped a redesigned single-grid Jobs Console with filtering/details/actions, and fixed Job Manager spacing/splitter/button alignment issues.
-- `v1.0.4.1` Added `Always ask for each conflict` overwrite policy with per-file prompts, fixed repeated Explorer context-menu enable logs on settings save, and corrected source/destination textbox wrapper rendering.
-- `v1.0.4.0` Added a new ClawHammer-style About dialog with updated XactCopy branding/logo, author attribution, centered version banner text, and a live system info snapshot.
-- `v1.0.3.7` Added README screenshots for main window and appearance settings, with image assets now tracked under `docs/screenshots`.
-- `v1.0.3.6` Added diagnostics + worker telemetry controls, virtualized and throttled runtime log rendering, expanded appearance customization (accent/density/scale/grid/progress/status rows/window chrome), explorer-launch destination prompt, and restart guidance for UI settings.
-- `v1.0.2.7` Settings now use live dirty-state save enablement, detect restart-required changes (including theme), and prompt to restart with safe defer behavior during active runs.
-- `v1.0.2.4` Added `AegisRescueCore` multi-pass rescue with range-aware journal resume, rescue telemetry/tuning, event-focused logging, and fixed high-speed UI progress rendering/finalization accuracy.
-- `v1.0.1.3` Fixed updater apply hang on `Canceling...` and improved release notes formatting in the update dialog.
-- `v1.0.0.9` Updater upgraded to download/apply releases in-app with progress, replacing page-only update prompts.
-- `v1.0.0.7` Worker renamed to `XactCopyExecutive`, shared app icon applied to worker, and standalone worker startup hardened.
-- `v1.0.0.3` Default update URL now targets XactCopy latest GitHub release endpoint.
-- `v1.0.0.1` Initial public release with resilient worker, journal recovery, telemetry, settings, and Explorer integration.
-
-## Notes
-
-- Salvage mode can keep a copy moving, but unreadable source bytes are replaced by the selected fill pattern.
-- Verification is skipped for salvaged file regions by design.
-- No copier can guarantee recovery from every hardware or OS failure mode.
+- Envelope: `{ProtocolVersion, MessageType, CorrelationId, SentUtc, Payload}`,
+  compact, PascalCase, property order = declaration order.
+- Frames: 4-byte little-endian length prefix, 16 MB ceiling.
+- Strings: System.Text.Json default encoder — short escapes for
+  `\b \t \n \f \r` and `\\`; `\uXXXX` (uppercase hex) for `"` `<` `>` `&` `'`
+  `+` `` ` ``, other control chars, and all non-ASCII (surrogate pairs for
+  astral planes).
+- `DateTimeOffset`: `yyyy-MM-ddTHH:mm:ss[.fffffff]±hh:mm`, fraction omitted
+  when zero, trailing zeros trimmed, written through the STJ fast path (no
+  encoder escaping of `+`).
+- `TimeSpan`: constant "c" format `[-][d.]hh:mm:ss[.fffffff]`, fraction always
+  7 digits when non-zero.
+- Enums: member-name strings, case-insensitive on read, integers accepted.
+- Worker pipe: server side, byte mode, single instance, overlapped, DACL =
+  GENERIC_ALL for the current user SID only (`PipeOptions.CurrentUserOnly`
+  equivalent); launched with `--pipe <name>`; no handshake message — connect,
+  then log event + 1 Hz heartbeats.
+- Storage serializer: `WriteIndented = true` → 2-space indent, `"key": value`,
+  CRLF newlines, empty containers inline (`{}`/`[]`).
+- Map envelope: `{SchemaVersion, SavedUtcTicks, PayloadSha256, Signature,
+  Payload}`; `PayloadSha256` = SHA-256 of the *standalone* indented payload
+  bytes (both sides re-serialize on load — this is why indented byte parity is
+  mandatory); `Signature` = base64 HMAC-SHA256 of
+  `"{payloadSha}|{savedTicks}|{pathFingerprint}"`.
+- Journal trust: snapshot hash = SHA-256 of raw file bytes (formatting-free);
+  ledger frames = `magic 0x58434A4C, version 1, len, indented-JSON record,
+  FNV-1a-32 checksum` (all LE); record hash =
+  `sha256hex("{Seq}|{Ticks}|{SnapshotHash}|{SnapshotLen}|{PrevHash}")`;
+  record/anchor signatures = base64 HMAC over hash + path fingerprint.
+- Path fingerprint = `sha256hex(UTF8(ToUpperInvariant(GetFullPath(path))))`.
+- HMAC keys in `%LOCALAPPDATA%\XactCopy\security\`: `journal-hmac.key` raw
+  32 bytes; `badmap-hmac.key` DPAPI-protected (CurrentUser), legacy raw
+  accepted + migrated. Both sides share the same key files.

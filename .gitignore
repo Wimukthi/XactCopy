@@ -1,7 +1,9 @@
-bin/
-obj/
-*.user
-*.suo
-.vs/
-TestResults/
-artifacts/
+# Native build output (compiled in-tree; see build.ps1 -> build\)
+/build/
+
+# .NET tool intermediate output
+tools/**/bin/
+tools/**/obj/
+
+# Inno Setup installer output
+/installer/output/

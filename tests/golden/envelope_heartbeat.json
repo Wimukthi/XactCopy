@@ -1,0 +1,1 @@
+{"ProtocolVersion":1,"MessageType":"WorkerHeartbeatEvent","CorrelationId":"","SentUtc":"2026-07-23T04:05:06.5+00:00","Payload":{"WorkerProcessId":4242,"IsJobRunning":true,"IsJobPaused":false,"ActiveJobId":"job-active-1","LastProgressUtc":"0001-01-01T00:00:00+00:00","TimestampUtc":"2026-07-23T04:05:06.1234567+00:00"}}

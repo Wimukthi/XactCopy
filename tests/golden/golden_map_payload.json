@@ -1,0 +1,35 @@
+{
+  "SchemaVersion": 1,
+  "SourceRoot": "D:\\GoldenSrc",
+  "SourceIdentity": "SER-0042 \u0026 \u003Cid\u003E",
+  "UpdatedUtc": "2026-07-23T12:00:00.123+00:00",
+  "Files": {
+    "alpha.txt": {
+      "RelativePath": "alpha.txt",
+      "SourceLength": 1234,
+      "LastWriteUtcTicks": 638000000000000000,
+      "FileFingerprint": "fp-alpha",
+      "BadRanges": [
+        {
+          "Offset": 100,
+          "Length": 50
+        },
+        {
+          "Offset": 300,
+          "Length": 25
+        }
+      ],
+      "LastScanUtc": "2026-07-23T12:00:00+00:00",
+      "LastError": "CRC error"
+    },
+    "sub\\\u0431\u0435\u0442\u0430.bin": {
+      "RelativePath": "sub\\\u0431\u0435\u0442\u0430.bin",
+      "SourceLength": 0,
+      "LastWriteUtcTicks": 0,
+      "FileFingerprint": "",
+      "BadRanges": [],
+      "LastScanUtc": "2026-07-23T12:00:00+05:30",
+      "LastError": ""
+    }
+  }
+}
