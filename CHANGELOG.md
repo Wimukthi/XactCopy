@@ -4,6 +4,33 @@ All notable changes to XactCopy are documented in this file. The format is based
 on [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped
 releases.
 
+## [2.0.0.1]
+
+### Fixed
+
+- **Explorer context menu did not pick up the selection.** Launch arguments were
+  parsed from a command line that excludes the executable path, so the first
+  switch was discarded and the selected file or folder never reached the Source
+  box. Right-clicking a file, folder, or drive now fills in the source correctly.
+- Launching from Explorer while XactCopy is **already running** no longer throws
+  the selection away — the running window picks it up instead of just surfacing.
+- The Job Manager title bar now shows the XactCopy icon.
+- The Job Manager details pane no longer jumps back to the top while you are
+  reading it; the three-second refresh leaves an unchanged pane alone.
+- The About window no longer clips the bottom of the "XactCopy" title.
+
+### Changed
+
+- **All message boxes and prompts are now dark-themed**, matching the rest of the
+  application instead of falling back to the system dialog.
+- Buttons carry **Fluent icons**, and checkboxes and glyphs are **antialiased**.
+- The Job Manager grid now draws row and column separators.
+- Update settings moved out of Settings: the "check automatically" toggle now
+  lives in the About window.
+- Application icons are now **multi-resolution** (16–256 px), so they stay sharp
+  in the title bar, Alt-Tab, and Explorer. The worker executable carries the icon
+  and version details too.
+
 ## [2.0.0] — Native application
 
 The application has been rewritten as a native C++/Win32 program. The `2.0.0`

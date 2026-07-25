@@ -109,6 +109,13 @@ constexpr int IdMenuAbout = 1115;
 
 constexpr const wchar_t* WindowClassName = L"XactCopyNativeMain";
 
+// WM_COPYDATA tag used to hand a second instance's command line to the running
+// one (so Explorer verbs still work when XactCopy is already open).
+constexpr ULONG_PTR ForwardedLaunchId = 0x58414331; // 'XAC1'
+
+// Defined below; declared here for the WM_COPYDATA handler.
+ui::LaunchOptions parse_launch_options(const wchar_t* command_line);
+
 std::string format_bytes_short(std::int64_t value) {
     if (value < 1024) return std::to_string(value) + " B";
     static const char* units[] = {"KB", "MB", "GB", "TB", "PB"};
@@ -425,14 +432,41 @@ private:
                                                   : ui::TaskbarProgressState::Normal);
                 update_menu_state();
                 return 0;
+            case WM_COPYDATA: {
+                // A second instance handed us its command line: adopt any
+                // Explorer selection it carried and apply it here.
+                auto* data = reinterpret_cast<COPYDATASTRUCT*>(lparam);
+                if (data == nullptr || data->dwData != ForwardedLaunchId ||
+                    data->lpData == nullptr || data->cbData < sizeof(wchar_t)) {
+                    return 0;
+                }
+                std::wstring command_line(static_cast<const wchar_t*>(data->lpData),
+                                          data->cbData / sizeof(wchar_t));
+                while (!command_line.empty() && command_line.back() == L'\0') {
+                    command_line.pop_back();
+                }
+                ui::LaunchOptions forwarded = parse_launch_options(command_line.c_str());
+                if (forwarded.explorer_source_paths.empty() &&
+                    ui_is_blank(forwarded.explorer_folder_path)) {
+                    return TRUE; // nothing actionable; just surfacing the window
+                }
+                if (supervisor_.is_job_running()) {
+                    append_log("Ignored an Explorer selection: a job is already running.");
+                    return TRUE;
+                }
+                launch_.explorer_folder_path = forwarded.explorer_folder_path;
+                launch_.explorer_source_paths = forwarded.explorer_source_paths;
+                launch_.explorer_scan_mode = forwarded.explorer_scan_mode;
+                apply_explorer_launch_options();
+                return TRUE;
+            }
             case WM_CLOSE:
                 if (supervisor_.is_job_running()) {
-                    int choice = MessageBoxW(
-                        hwnd_,
-                        L"A copy job is running. Cancel it and exit?\n\n"
-                        L"The journal keeps progress, so the run can resume next time.",
-                        L"XactCopy", MB_YESNO | MB_ICONWARNING);
-                    if (choice != IDYES) return 0;
+                    if (!confirm_box(L"A copy job is running. Cancel it and exit?\n\n"
+                                     L"The journal keeps progress, so the run can resume next time.",
+                                     L"XactCopy", ui::MessageIcon::Warning)) {
+                        return 0;
+                    }
                     recovery_.mark_run_interrupted("User exited while a run was active.");
                     if (!active_managed_run_id_.empty()) {
                         job_manager_.mark_run_interrupted(active_managed_run_id_,
@@ -1121,7 +1155,7 @@ private:
                 break;
             case IdAboutButton:
             case IdMenuAbout:
-                ui::AboutDialog::show(hwnd_, theme_, IdMenuCheckUpdates);
+                ui::AboutDialog::show(hwnd_, theme_, settings_, IdMenuCheckUpdates);
                 break;
             case IdMenuStartCopy:
                 start_job();
@@ -1178,8 +1212,7 @@ private:
     void save_current_as_job() {
         models::CopyJobOptions options = collect_options();
         if (ui_is_blank(options.SourceRoot)) {
-            MessageBoxW(hwnd_, L"Choose a source folder before saving a job.", L"XactCopy",
-                        MB_OK | MB_ICONINFORMATION);
+            info_box(L"Choose a source folder before saving a job.");
             return;
         }
         std::string suggested = suggest_job_name(options);
@@ -1210,14 +1243,12 @@ private:
 
     void run_saved_job(const std::string& job_id) {
         if (supervisor_.is_job_running()) {
-            MessageBoxW(hwnd_, L"A copy run is already in progress.", L"XactCopy",
-                        MB_OK | MB_ICONINFORMATION);
+            info_box(L"A copy run is already in progress.");
             return;
         }
         auto job = job_manager_.get_job_by_id(job_id);
         if (!job.has_value()) {
-            MessageBoxW(hwnd_, L"Selected job no longer exists.", L"XactCopy",
-                        MB_OK | MB_ICONWARNING);
+            warn_box(L"Selected job no longer exists.");
             return;
         }
         auto run = job_manager_.create_run_for_job(job->JobId, "job-manager");
@@ -1244,7 +1275,7 @@ private:
                         ui_is_blank(target)
                             ? L"No queued jobs are waiting to run."
                             : L"Selected queue entry no longer exists.";
-                    MessageBoxW(hwnd_, message, L"XactCopy", MB_OK | MB_ICONINFORMATION);
+                    info_box(message);
                 }
                 return;
             }
@@ -1264,6 +1295,23 @@ private:
         std::wstring leaf = storage::fsutil::get_file_name(source);
         std::string base = leaf.empty() ? std::string("Saved Job") : storage::fsutil::wide_to_utf8(leaf);
         return base;
+    }
+
+    // ---- Themed message boxes (dark-mode replacements for MessageBoxW) ------
+
+    void info_box(const std::wstring& text, const wchar_t* title = L"XactCopy") {
+        ui::MessageDialog::show(hwnd_, theme_, title, text, ui::MessageIcon::Information);
+    }
+
+    void warn_box(const std::wstring& text, const wchar_t* title = L"XactCopy") {
+        ui::MessageDialog::show(hwnd_, theme_, title, text, ui::MessageIcon::Warning);
+    }
+
+    // Returns true when the user chooses Yes.
+    bool confirm_box(const std::wstring& text, const wchar_t* title = L"XactCopy",
+                     ui::MessageIcon icon = ui::MessageIcon::Question) {
+        return ui::MessageDialog::show(hwnd_, theme_, title, text, icon,
+                                       ui::MessageButtons::YesNo) == IDYES;
     }
 
     // ---- Explorer launch application (--from-explorer[-folder]) ------------
@@ -1440,8 +1488,8 @@ private:
         std::string url = settings_.get_string("UpdateReleaseUrl", ui::kDefaultUpdateReleaseUrl);
         if (ui_is_blank(url)) {
             if (show_dialog) {
-                MessageBoxW(hwnd_, L"Open Settings and set an update release URL first.",
-                            L"XactCopy Updates", MB_OK | MB_ICONINFORMATION);
+                info_box(L"No update source is configured (UpdateReleaseUrl is empty).",
+                         L"XactCopy Updates");
             }
             return;
         }
@@ -1464,16 +1512,14 @@ private:
         if (!info.ok) {
             append_log("Update check failed: " + info.error);
             if (update_check_show_dialog_) {
-                MessageBoxW(hwnd_, storage::fsutil::utf8_to_wide(info.error).c_str(),
-                            L"XactCopy Updates", MB_OK | MB_ICONWARNING);
+                warn_box(storage::fsutil::utf8_to_wide(info.error), L"XactCopy Updates");
             }
             return;
         }
         if (!ui::UpdateService::is_update_available(ui::kNativeVersion, info.version)) {
             append_log("Update check complete: already up to date.");
             if (update_check_show_dialog_) {
-                MessageBoxW(hwnd_, L"You're already running the latest version.",
-                            L"XactCopy Updates", MB_OK | MB_ICONINFORMATION);
+                info_box(L"You're already running the latest version.", L"XactCopy Updates");
             }
             return;
         }
@@ -1605,14 +1651,12 @@ private:
                         const std::string& managed_display_name = std::string()) {
         if (starting_ || supervisor_.is_job_running()) return;
         if (ui_is_blank(options.SourceRoot)) {
-            MessageBoxW(hwnd_, L"Choose a source folder first.", L"XactCopy",
-                        MB_OK | MB_ICONINFORMATION);
+            info_box(L"Choose a source folder first.");
             return;
         }
         if (options.OperationMode == models::JobOperationMode::Copy &&
             ui_is_blank(options.DestinationRoot)) {
-            MessageBoxW(hwnd_, L"Choose a destination folder first.", L"XactCopy",
-                        MB_OK | MB_ICONINFORMATION);
+            info_box(L"Choose a destination folder first.");
             return;
         }
 
@@ -1697,8 +1741,8 @@ private:
             set_inputs_enabled(true);
             SetWindowTextW(status_label_, L"Status: Idle");
             update_menu_state();
-            MessageBoxW(hwnd_, storage::fsutil::utf8_to_wide(error).c_str(), L"XactCopy",
-                        MB_OK | MB_ICONERROR);
+            ui::MessageDialog::show(hwnd_, theme_, L"XactCopy",
+                                    storage::fsutil::utf8_to_wide(error), ui::MessageIcon::Error);
         }
     }
 
@@ -1945,9 +1989,7 @@ private:
         std::wstring text = storage::fsutil::utf8_to_wide(
             info.interruption_reason + "\n\nSource: " + run.Options.SourceRoot +
             "\nDestination: " + run.Options.DestinationRoot + "\n\nResume this run now?");
-        int choice = MessageBoxW(hwnd_, text.c_str(), L"XactCopy — Resume interrupted run",
-                                 MB_YESNO | MB_ICONQUESTION);
-        if (choice == IDYES) {
+        if (confirm_box(text, L"XactCopy — Resume interrupted run")) {
             resume_interrupted(run);
         } else {
             recovery_.mark_resume_prompt_deferred(settings_, false);
@@ -1975,6 +2017,9 @@ void add_explorer_source_path(ui::LaunchOptions& launch, const std::wstring& val
     launch.explorer_source_paths.push_back(resolved);
 }
 
+// Takes the FULL command line (GetCommandLineW), which includes the executable
+// path as argv[0]. Note wWinMain's lpCmdLine does NOT include it — passing that
+// here would silently drop the first switch.
 ui::LaunchOptions parse_launch_options(const wchar_t* command_line) {
     ui::LaunchOptions launch;
     int argc = 0;
@@ -2016,14 +2061,25 @@ ui::LaunchOptions parse_launch_options(const wchar_t* command_line) {
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    // Single instance: surface the existing window instead of a second copy.
+    // GetCommandLineW (not lpCmdLine) so argv[0] is the executable, matching
+    // parse_launch_options' expectations.
+    const wchar_t* full_command_line = GetCommandLineW();
+
+    // Single instance: hand our launch arguments to the running copy (so an
+    // Explorer verb still lands on a selection) and surface its window.
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\XactCopyNative.SingleInstance");
     if (mutex != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND existing = FindWindowW(WindowClassName, nullptr);
         if (existing != nullptr) {
+            std::wstring payload(full_command_line);
+            COPYDATASTRUCT data{};
+            data.dwData = ForwardedLaunchId;
+            data.cbData = static_cast<DWORD>((payload.size() + 1) * sizeof(wchar_t));
+            data.lpData = const_cast<wchar_t*>(payload.c_str());
+            SendMessageW(existing, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&data));
             if (IsIconic(existing)) ShowWindow(existing, SW_RESTORE);
             SetForegroundWindow(existing);
         }
@@ -2032,7 +2088,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     }
 
     MainWindow window;
-    int result = window.run(instance, parse_launch_options(command_line));
+    int result = window.run(instance, parse_launch_options(full_command_line));
     if (mutex != nullptr) CloseHandle(mutex);
     return result;
 }

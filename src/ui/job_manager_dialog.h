@@ -479,11 +479,11 @@ private:
     }
 
     void render_selected_details() {
-        SendMessageW(details_list_, WM_SETREDRAW, FALSE, 0);
-        SendMessageW(details_list_, LB_RESETCONTENT, 0, 0);
-        auto add = [this](const std::wstring& s) {
-            SendMessageW(details_list_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s.c_str()));
-        };
+        // Build the text first and bail out when it is unchanged: the 3 s
+        // auto-refresh would otherwise reset the listbox every tick, throwing
+        // away the user's scroll position mid-read.
+        std::vector<std::wstring> lines;
+        auto add = [&lines](const std::wstring& s) { lines.push_back(s); };
         const Row* row = selected_row();
         if (row == nullptr) {
             add(L"No item selected.");
@@ -511,6 +511,22 @@ private:
                 }
             }
         }
+        if (lines == details_lines_) return; // nothing changed; leave the view alone
+
+        const bool same_item = (details_row_id_ == (row != nullptr ? row->primary_id : std::string()));
+        const int top_index =
+            same_item ? static_cast<int>(SendMessageW(details_list_, LB_GETTOPINDEX, 0, 0)) : 0;
+
+        details_lines_ = lines;
+        details_row_id_ = row != nullptr ? row->primary_id : std::string();
+
+        SendMessageW(details_list_, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(details_list_, LB_RESETCONTENT, 0, 0);
+        for (const auto& text : details_lines_) {
+            SendMessageW(details_list_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text.c_str()));
+        }
+        // Restore the scroll offset when the same item is still selected.
+        if (top_index > 0) SendMessageW(details_list_, LB_SETTOPINDEX, top_index, 0);
         SendMessageW(details_list_, WM_SETREDRAW, TRUE, 0);
         InvalidateRect(details_list_, nullptr, TRUE);
     }
@@ -532,8 +548,7 @@ private:
                 DestroyWindow(hwnd);
                 return;
             default:
-                MessageBoxW(hwnd, L"Select a saved job or queue entry to run.", L"Job Manager",
-                            MB_OK | MB_ICONINFORMATION);
+                info_box(hwnd, L"Select a saved job or queue entry to run.");
                 return;
         }
     }
@@ -548,21 +563,18 @@ private:
                 break;
             case RowKind::RunHistory:
                 if (row->job_id.empty()) {
-                    MessageBoxW(hwnd,
-                                L"This run is not linked to a saved job, so it cannot be queued.",
-                                L"Job Manager", MB_OK | MB_ICONINFORMATION);
+                    info_box(hwnd,
+                             L"This run is not linked to a saved job, so it cannot be queued.");
                     return;
                 }
                 queued = manager_.queue_job(row->job_id, false, "rerun-history");
                 break;
             default:
-                MessageBoxW(hwnd, L"Queue action applies to saved jobs and saved-job run entries.",
-                            L"Job Manager", MB_OK | MB_ICONINFORMATION);
+                info_box(hwnd, L"Queue action applies to saved jobs and saved-job run entries.");
                 return;
         }
         if (!queued) {
-            MessageBoxW(hwnd, L"Unable to queue this item. It may already be queued.",
-                        L"Job Manager", MB_OK | MB_ICONINFORMATION);
+            info_box(hwnd, L"Unable to queue this item. It may already be queued.");
         }
         refresh_data(true);
     }
@@ -573,8 +585,7 @@ private:
         for (const auto& run : runs_) {
             if (!models::detail::equals_ignore_case(run.RunId, row->primary_id)) continue;
             if (run.JournalPath.empty()) {
-                MessageBoxW(hwnd, L"This run has no journal path recorded.", L"Job Manager",
-                            MB_OK | MB_ICONINFORMATION);
+                info_box(hwnd, L"This run has no journal path recorded.");
                 return;
             }
             std::wstring journal_path = storage::fsutil::utf8_to_wide(run.JournalPath);
@@ -583,8 +594,7 @@ private:
                 ShellExecuteW(hwnd, L"open", L"explorer.exe", arguments.c_str(), nullptr,
                               SW_SHOWNORMAL);
             } else {
-                MessageBoxW(hwnd, L"The journal file no longer exists on disk.", L"Job Manager",
-                            MB_OK | MB_ICONINFORMATION);
+                info_box(hwnd, L"The journal file no longer exists on disk.");
             }
             return;
         }
@@ -655,8 +665,7 @@ private:
             if (const Row* row = selected_row(); row != nullptr && row->kind == RowKind::SavedJob) {
                 std::wstring prompt = L"Delete saved job \"" + row->cells[1] +
                                       L"\"?\n\nQueued entries for this job are removed too.";
-                if (MessageBoxW(hwnd, prompt.c_str(), L"Job Manager",
-                                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) {
+                if (confirm_box(hwnd, prompt, MessageIcon::Warning)) {
                     manager_.delete_job(row->job_id);
                     refresh_data(false);
                 }
@@ -665,8 +674,7 @@ private:
         }
         if (id == IdDeleteRun) {
             if (const Row* row = selected_row(); row != nullptr && row->kind == RowKind::RunHistory) {
-                if (MessageBoxW(hwnd, L"Delete this run history entry?", L"Job Manager",
-                                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+                if (confirm_box(hwnd, L"Delete this run history entry?")) {
                     manager_.delete_run(row->primary_id);
                     refresh_data(false);
                 }
@@ -675,16 +683,14 @@ private:
         }
         if (id == IdOpenJournal) { open_journal_selected(hwnd); return; }
         if (id == IdClearQueue) {
-            if (MessageBoxW(hwnd, L"Remove every entry from the queue?", L"Job Manager",
-                            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+            if (confirm_box(hwnd, L"Remove every entry from the queue?")) {
                 manager_.clear_queue();
                 refresh_data(false);
             }
             return;
         }
         if (id == IdClearHistory) {
-            if (MessageBoxW(hwnd, L"Clear the entire run history?", L"Job Manager",
-                            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+            if (confirm_box(hwnd, L"Clear the entire run history?")) {
                 manager_.clear_run_history();
                 refresh_data(false);
             }
@@ -986,6 +992,9 @@ private:
 
         HGDIOBJ old_font = SelectObject(dc, font_);
         SetBkMode(dc, TRANSPARENT);
+        // LVS_EX_GRIDLINES is ignored for owner-drawn lists, so draw the grid
+        // here: a separator under each row and between each column.
+        const COLORREF grid = blend_color(theme_.edit, theme_.border, 70);
         const int column_count = Header_GetItemCount(ListView_GetHeader(list_));
         for (int col = 0; col < column_count && col < 10; ++col) {
             RECT cell;
@@ -1001,7 +1010,13 @@ private:
             text_rect.right -= 4;
             DrawTextW(dc, row.cells[col].c_str(), -1, &text_rect,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            if (col > 0) {
+                RECT divider{cell.left, row_rect.top, cell.left + 1, row_rect.bottom};
+                themedraw::fill_rect(dc, divider, grid);
+            }
         }
+        RECT underline{row_rect.left, row_rect.bottom - 1, row_rect.right, row_rect.bottom};
+        themedraw::fill_rect(dc, underline, grid);
         SelectObject(dc, old_font);
     }
 
@@ -1022,6 +1037,17 @@ private:
         DrawTextW(draw.hDC, text.c_str(), -1, &rect,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         SelectObject(draw.hDC, old_font);
+    }
+
+    // Themed message boxes (dark-mode replacements for MessageBoxW).
+    void info_box(HWND owner, const std::wstring& text) {
+        MessageDialog::show(owner, theme_, L"Job Manager", text, MessageIcon::Information);
+    }
+
+    bool confirm_box(HWND owner, const std::wstring& text,
+                     MessageIcon icon = MessageIcon::Question) {
+        return MessageDialog::show(owner, theme_, L"Job Manager", text, icon,
+                                   MessageButtons::YesNo) == IDYES;
     }
 
     COLORREF state_color(const Row& row) const {
@@ -1265,6 +1291,10 @@ private:
     std::vector<JobQueueEntryView> queue_entries_;
     std::vector<storage::ManagedJobRun> runs_;
     std::vector<Row> rows_;
+    // Last rendered details text + the row it belongs to, so the auto-refresh
+    // can skip rebuilding (and scrolling) an unchanged pane.
+    std::vector<std::wstring> details_lines_;
+    std::string details_row_id_;
     bool populating_ = false;
 
     HWND list_ = nullptr;

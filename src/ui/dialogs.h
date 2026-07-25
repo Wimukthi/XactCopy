@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <string>
@@ -21,7 +22,7 @@
 
 namespace xact::ui {
 
-inline constexpr const char* NativeAppVersion = "2.0.0";
+inline constexpr const char* NativeAppVersion = "2.0.0.1";
 
 namespace dialog_detail {
 
@@ -37,12 +38,18 @@ public:
         handler_ = std::move(handler);
         owner_ = owner;
 
-        WNDCLASSW window_class{};
+        // WNDCLASSEXW (not WNDCLASSW) so the class can carry a small icon —
+        // that is what the title bar draws.
+        WNDCLASSEXW window_class{};
+        window_class.cbSize = sizeof(window_class);
         window_class.lpfnWndProc = &ModalHost::static_proc;
         window_class.hInstance = GetModuleHandleW(nullptr);
         window_class.lpszClassName = class_name;
         window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        RegisterClassW(&window_class); // idempotent; re-register fails harmlessly
+        window_class.hIcon = load_app_icon(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+        window_class.hIconSm =
+            load_app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        RegisterClassExW(&window_class); // idempotent; re-register fails harmlessly
 
         UINT dpi = owner != nullptr ? GetDpiForWindow(owner) : 96;
         int scaled_width = MulDiv(width, static_cast<int>(dpi), 96);
@@ -110,6 +117,216 @@ private:
 } // namespace dialog_detail
 
 // ---------------------------------------------------------------------------
+// Themed message dialog — the dark-mode replacement for MessageBoxW. Adapted
+// from the AxiomCompress message dialog: auto-sized wrapped text, a system
+// icon, and owner-drawn buttons on the shared ModalHost.
+// ---------------------------------------------------------------------------
+
+enum class MessageIcon { None, Information, Warning, Error, Question };
+enum class MessageButtons { Ok, OkCancel, YesNo, YesNoCancel };
+
+class MessageDialog {
+public:
+    // Returns IDOK / IDCANCEL / IDYES / IDNO, matching MessageBoxW.
+    static int show(HWND owner, const ThemePalette& theme, const std::wstring& title,
+                    const std::wstring& message, MessageIcon icon = MessageIcon::Information,
+                    MessageButtons buttons = MessageButtons::Ok) {
+        MessageDialog dialog(theme, message, icon, buttons);
+        return dialog.run(owner, title);
+    }
+
+private:
+    static constexpr int IdFirstButton = 2400;
+
+    ThemePalette theme_;
+    std::wstring message_;
+    MessageIcon icon_;
+    MessageButtons buttons_;
+    dialog_detail::ModalHost host_;
+    HFONT font_ = nullptr;
+    HBRUSH window_brush_ = nullptr;
+    int result_ = IDCANCEL;
+    UINT dpi_ = 96;
+    RECT text_rect_{};
+    struct ButtonSpec { const wchar_t* text; int id; };
+    std::vector<ButtonSpec> button_specs_;
+    std::vector<HWND> button_windows_;
+
+    MessageDialog(const ThemePalette& theme, const std::wstring& message, MessageIcon icon,
+                  MessageButtons buttons)
+        : theme_(theme), message_(message), icon_(icon), buttons_(buttons) {
+        switch (buttons_) {
+            case MessageButtons::Ok:
+                button_specs_ = {{L"OK", IDOK}};
+                break;
+            case MessageButtons::OkCancel:
+                button_specs_ = {{L"OK", IDOK}, {L"Cancel", IDCANCEL}};
+                break;
+            case MessageButtons::YesNo:
+                button_specs_ = {{L"Yes", IDYES}, {L"No", IDNO}};
+                break;
+            case MessageButtons::YesNoCancel:
+                button_specs_ = {{L"Yes", IDYES}, {L"No", IDNO}, {L"Cancel", IDCANCEL}};
+                break;
+        }
+        // Dismissing via Esc / the close box maps to the least destructive choice.
+        result_ = (buttons_ == MessageButtons::Ok) ? IDOK
+                  : (buttons_ == MessageButtons::YesNo) ? IDNO
+                                                        : IDCANCEL;
+    }
+
+    ~MessageDialog() {
+        if (font_ != nullptr) DeleteObject(font_);
+        if (window_brush_ != nullptr) DeleteObject(window_brush_);
+    }
+
+    HICON system_icon() const {
+        switch (icon_) {
+            case MessageIcon::Information: return LoadIconW(nullptr, IDI_INFORMATION);
+            case MessageIcon::Warning: return LoadIconW(nullptr, IDI_WARNING);
+            case MessageIcon::Error: return LoadIconW(nullptr, IDI_ERROR);
+            case MessageIcon::Question: return LoadIconW(nullptr, IDI_QUESTION);
+            case MessageIcon::None: break;
+        }
+        return nullptr;
+    }
+
+    int run(HWND owner, const std::wstring& title) {
+        // Measure the message at the owner's DPI so the dialog is sized to fit.
+        dpi_ = owner != nullptr ? GetDpiForWindow(owner) : 96;
+        auto s = [this](int v) { return MulDiv(v, static_cast<int>(dpi_), 96); };
+        HDC screen = GetDC(nullptr);
+        HFONT measure_font = CreateFontW(-MulDiv(9, static_cast<int>(dpi_), 72), 0, 0, 0, FW_NORMAL,
+                                         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                         CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
+                                         L"Segoe UI");
+        HGDIOBJ old = SelectObject(screen, measure_font);
+        RECT calc{0, 0, s(360), 0};
+        DrawTextW(screen, message_.c_str(), -1, &calc, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        SelectObject(screen, old);
+        DeleteObject(measure_font);
+        ReleaseDC(nullptr, screen);
+
+        const int icon_span = (icon_ == MessageIcon::None) ? 0 : 32 + 16;
+        int text_w = MulDiv(calc.right - calc.left, 96, static_cast<int>(dpi_));
+        int text_h = MulDiv(calc.bottom - calc.top, 96, static_cast<int>(dpi_));
+        int content_w = icon_span + std::max(text_w, 180);
+        int width = std::max(300, std::min(460, content_w + 40));
+        // Buttons need room too (max 3 at 96 + gaps).
+        width = std::max(width, 40 + static_cast<int>(button_specs_.size()) * 104);
+        int height = 24 + std::max(text_h, (icon_ == MessageIcon::None) ? 0 : 32) + 24 + 30 + 20;
+        height = std::max(height, 150);
+
+        HWND hwnd = host_.create(owner, L"XactCopyMessageDlg", title.c_str(), width, height,
+                                 [this](HWND h, UINT m, WPARAM w, LPARAM l, bool& handled) {
+                                     return proc(h, m, w, l, handled);
+                                 });
+        if (hwnd == nullptr) return result_;
+        apply_window_icons(hwnd);
+        set_dark_title_bar(hwnd, theme_.dark);
+        host_.run_modal();
+        return result_;
+    }
+
+    LRESULT proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam, bool& handled) {
+        switch (message) {
+            case WM_CREATE: {
+                window_brush_ = CreateSolidBrush(theme_.window);
+                dpi_ = GetDpiForWindow(hwnd);
+                auto s = [this](int v) { return MulDiv(v, static_cast<int>(dpi_), 96); };
+                font_ = CreateFontW(-MulDiv(9, static_cast<int>(dpi_), 72), 0, 0, 0, FW_NORMAL,
+                                    FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                    CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
+                                    L"Segoe UI");
+                RECT client;
+                GetClientRect(hwnd, &client);
+                const int margin = s(16);
+                const int btn_w = s(96);
+                const int btn_h = s(30);
+                const int gap = s(8);
+                int x = client.right - margin - btn_w;
+                const int y = client.bottom - margin - btn_h;
+                // Lay buttons out right-to-left so the first spec ends up leftmost
+                // of the group (matching MessageBoxW's ordering).
+                for (auto it = button_specs_.rbegin(); it != button_specs_.rend(); ++it) {
+                    HWND b = CreateWindowExW(
+                        0, L"BUTTON", it->text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                        x, y, btn_w, btn_h, hwnd,
+                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(it->id)),
+                        GetModuleHandleW(nullptr), nullptr);
+                    SendMessageW(b, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                    button_windows_.push_back(b);
+                    x -= btn_w + gap;
+                }
+                if (!button_windows_.empty()) SetFocus(button_windows_.back());
+                text_rect_ = {margin + (icon_ == MessageIcon::None ? 0 : s(48)), margin,
+                              client.right - margin, y - s(12)};
+                handled = true;
+                return 0;
+            }
+            case WM_ERASEBKGND: {
+                RECT client;
+                GetClientRect(hwnd, &client);
+                themedraw::fill_rect(reinterpret_cast<HDC>(wparam), client, theme_.window);
+                handled = true;
+                return 1;
+            }
+            case WM_PAINT: {
+                PAINTSTRUCT paint{};
+                HDC dc = BeginPaint(hwnd, &paint);
+                auto s = [this](int v) { return MulDiv(v, static_cast<int>(dpi_), 96); };
+                HICON icon = system_icon();
+                if (icon != nullptr) {
+                    DrawIconEx(dc, s(16), s(16), icon, s(32), s(32), 0, nullptr, DI_NORMAL);
+                }
+                HGDIOBJ old_font = SelectObject(dc, font_);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, theme_.text);
+                RECT r = text_rect_;
+                DrawTextW(dc, message_.c_str(), -1, &r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+                SelectObject(dc, old_font);
+                EndPaint(hwnd, &paint);
+                handled = true;
+                return 0;
+            }
+            case WM_DRAWITEM:
+                themedraw::draw_button(*reinterpret_cast<DRAWITEMSTRUCT*>(lparam), theme_);
+                handled = true;
+                return TRUE;
+            case WM_COMMAND: {
+                int id = LOWORD(wparam);
+                for (const auto& spec : button_specs_) {
+                    if (spec.id == id) {
+                        result_ = id;
+                        DestroyWindow(hwnd);
+                        break;
+                    }
+                }
+                handled = true;
+                return 0;
+            }
+            case WM_CLOSE:
+                DestroyWindow(hwnd);
+                handled = true;
+                return 0;
+            case WM_DESTROY:
+                handled = true;
+                return 0;
+            default:
+                return 0;
+        }
+    }
+};
+
+// Convenience wrapper mirroring the MessageBoxW call shape.
+inline int themed_message_box(HWND owner, const ThemePalette& theme, const std::wstring& message,
+                              const std::wstring& title,
+                              MessageIcon icon = MessageIcon::Information,
+                              MessageButtons buttons = MessageButtons::Ok) {
+    return MessageDialog::show(owner, theme, title, message, icon, buttons);
+}
+
+// ---------------------------------------------------------------------------
 // Settings dialog — declarative field table over the full settings surface.
 // ---------------------------------------------------------------------------
 
@@ -138,9 +355,9 @@ private:
 
     static const std::vector<const wchar_t*>& page_names() {
         static const std::vector<const wchar_t*> names = {
-            L"Appearance",    L"Copy Defaults",       L"Performance",
-            L"Diagnostics",   L"Verification",        L"Updates",
-            L"Recovery & Startup", L"Explorer Integration"};
+            L"Appearance",    L"Copy Defaults", L"Performance",
+            L"Diagnostics",   L"Verification",  L"Recovery & Startup",
+            L"Explorer Integration"};
         return names;
     }
 
@@ -320,31 +537,26 @@ private:
                      128);
             edit_int(4, "Sample count", "DefaultSampleVerificationChunkCount", 1, 64, 3);
 
-            // --- Page 5: Updates ----------------------------------------
-            section(5, "Behavior");
-            check(5, "Check for updates on launch", "CheckUpdatesOnLaunch", false);
-            section(5, "Source");
-            edit_text(5, "Release URL", "UpdateReleaseUrl", "");
-            edit_text(5, "User-Agent", "UserAgent", "");
+            // Update settings live in the About dialog, not here.
 
-            // --- Page 6: Recovery & Startup -----------------------------
-            section(6, "Startup");
-            check(6, "Auto-start on next logon after interruption", "EnableRecoveryAutostart",
+            // --- Page 5: Recovery & Startup -----------------------------
+            section(5, "Startup");
+            check(5, "Auto-start on next logon after interruption", "EnableRecoveryAutostart",
                   true);
-            check(6, "Automatically run queued jobs on startup", "AutoRunQueuedJobsOnStartup",
+            check(5, "Automatically run queued jobs on startup", "AutoRunQueuedJobsOnStartup",
                   false);
-            section(6, "Interrupted Run Handling");
-            check(6, "Prompt to resume interrupted runs", "PromptResumeAfterCrash", true);
-            check(6, "Auto-resume interrupted runs", "AutoResumeAfterCrash", false);
-            check(6, "Keep prompting until resolved", "KeepResumePromptUntilResolved", true);
-            edit_int(6, "Heartbeat write interval (sec)", "RecoveryTouchIntervalSeconds", 1, 60,
+            section(5, "Interrupted Run Handling");
+            check(5, "Prompt to resume interrupted runs", "PromptResumeAfterCrash", true);
+            check(5, "Auto-resume interrupted runs", "AutoResumeAfterCrash", false);
+            check(5, "Keep prompting until resolved", "KeepResumePromptUntilResolved", true);
+            edit_int(5, "Heartbeat write interval (sec)", "RecoveryTouchIntervalSeconds", 1, 60,
                      2);
 
-            // --- Page 7: Explorer Integration ---------------------------
-            section(7, "Context Menu");
-            check(7, "Enable Explorer context menu integration", "EnableExplorerContextMenu",
+            // --- Page 6: Explorer Integration ---------------------------
+            section(6, "Context Menu");
+            check(6, "Enable Explorer context menu integration", "EnableExplorerContextMenu",
                   false);
-            combo(7, "File selection mode", "ExplorerSelectionMode",
+            combo(6, "File selection mode", "ExplorerSelectionMode",
                   {L"Copy selected files/folders", L"Copy full source folder"},
                   {"selected-items", "source-folder"}, "selected-items");
             return f;
@@ -860,16 +1072,22 @@ class AboutDialog {
 public:
     // `check_updates_command` (if non-zero) is posted to `owner` when the user
     // clicks "Check for Updates...", so About can trigger the main window's check.
-    static void show(HWND owner, const ThemePalette& theme, UINT check_updates_command = 0) {
-        AboutDialog dialog(theme, check_updates_command);
+    // `settings` backs the "check automatically" toggle (update settings live
+    // here rather than in the Settings dialog).
+    static void show(HWND owner, const ThemePalette& theme, AppSettings& settings,
+                     UINT check_updates_command = 0) {
+        AboutDialog dialog(theme, settings, check_updates_command);
         dialog.run(owner);
     }
 
 private:
     static constexpr int IdOkButton = 2101;
     static constexpr int IdCheckButton = 2102;
+    static constexpr int IdAutoUpdateCheck = 2103;
 
     ThemePalette theme_;
+    AppSettings& settings_;
+    bool auto_update_ = false;
     UINT check_updates_command_ = 0;
     HWND owner_ = nullptr;
     dialog_detail::ModalHost host_;
@@ -883,11 +1101,14 @@ private:
     HWND metadata_[4] = {};
     HWND components_title_ = nullptr;
     HWND components_ = nullptr;
+    HWND auto_update_check_ = nullptr;
     HWND check_btn_ = nullptr;
     HWND ok_btn_ = nullptr;
 
-    AboutDialog(const ThemePalette& theme, UINT check_updates_command)
-        : theme_(theme), check_updates_command_(check_updates_command) {}
+    AboutDialog(const ThemePalette& theme, AppSettings& settings, UINT check_updates_command)
+        : theme_(theme), settings_(settings), check_updates_command_(check_updates_command) {
+        auto_update_ = settings_.get_bool("CheckUpdatesOnLaunch", false);
+    }
 
     ~AboutDialog() {
         if (font_ != nullptr) DeleteObject(font_);
@@ -968,12 +1189,18 @@ private:
                     L"Named-pipe IPC \x2014 supervised copy worker",
                     SS_NOPREFIX);
 
+                auto_update_check_ = CreateWindowExW(
+                    0, L"BUTTON", L"Check automatically",
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, hwnd,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(IdAutoUpdateCheck)), inst,
+                    nullptr);
                 check_btn_ = make_button(L"Check for Updates...", IdCheckButton);
                 ok_btn_ = make_button(L"OK", IdOkButton);
                 if (check_updates_command_ == 0) EnableWindow(check_btn_, FALSE);
 
                 for (HWND h : {title_, description_, metadata_[0], metadata_[1], metadata_[2],
-                               metadata_[3], components_title_, components_, check_btn_, ok_btn_}) {
+                               metadata_[3], components_title_, components_, auto_update_check_,
+                               check_btn_, ok_btn_}) {
                     SendMessageW(h, WM_SETFONT,
                                  reinterpret_cast<WPARAM>(h == title_ ? title_font_ : font_), TRUE);
                 }
@@ -1021,12 +1248,26 @@ private:
                 handled = true;
                 return reinterpret_cast<LRESULT>(window_brush_);
             }
-            case WM_DRAWITEM:
-                themedraw::draw_button(*reinterpret_cast<DRAWITEMSTRUCT*>(lparam), theme_);
+            case WM_DRAWITEM: {
+                const auto& draw = *reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
+                if (draw.CtlID == IdAutoUpdateCheck) {
+                    themedraw::draw_checkbox(draw, theme_, auto_update_);
+                } else {
+                    themedraw::draw_button(draw, theme_);
+                }
                 handled = true;
                 return TRUE;
+            }
             case WM_COMMAND: {
                 int id = LOWORD(wparam);
+                if (id == IdAutoUpdateCheck) {
+                    auto_update_ = !auto_update_;
+                    settings_.set_bool("CheckUpdatesOnLaunch", auto_update_);
+                    settings_.save();
+                    InvalidateRect(auto_update_check_, nullptr, FALSE);
+                    handled = true;
+                    return 0;
+                }
                 if (id == IdOkButton) {
                     DestroyWindow(hwnd);
                 } else if (id == IdCheckButton && check_updates_command_ != 0) {
@@ -1062,9 +1303,23 @@ private:
         const int text_left = margin + icon + s(16);
         const int text_w = client.right - text_left - margin;
 
+        // Size the title from the font's real line height (ascent + descent +
+        // leading); a fixed height clips descenders at some DPIs/scales.
+        int title_h = s(34);
+        if (title_font_ != nullptr) {
+            HDC dc = GetDC(hwnd);
+            HGDIOBJ old = SelectObject(dc, title_font_);
+            TEXTMETRICW metrics{};
+            if (GetTextMetricsW(dc, &metrics)) {
+                title_h = metrics.tmHeight + metrics.tmExternalLeading + s(2);
+            }
+            SelectObject(dc, old);
+            ReleaseDC(hwnd, dc);
+        }
+
         MoveWindow(icon_, margin, margin + s(2), icon, icon, TRUE);
-        MoveWindow(title_, text_left, margin - s(2), text_w, s(34), TRUE);
-        MoveWindow(description_, text_left, margin + s(34), text_w, s(36), TRUE);
+        MoveWindow(title_, text_left, margin - s(4), text_w, title_h, TRUE);
+        MoveWindow(description_, text_left, margin - s(4) + title_h, text_w, s(34), TRUE);
 
         int y = s(108); // below the separator at y=96
         const int row = s(22);
@@ -1082,6 +1337,11 @@ private:
         MoveWindow(ok_btn_, client.right - margin - btn_w, btn_y, btn_w, btn_h, TRUE);
         MoveWindow(check_btn_, client.right - margin - btn_w - s(10) - check_w, btn_y, check_w,
                    btn_h, TRUE);
+        // Auto-update toggle sits bottom-left, vertically centred on the buttons
+        // and clamped so it can never run into the Check-for-Updates button.
+        const int toggle_right = client.right - margin - btn_w - s(10) - check_w - s(12);
+        const int toggle_w = std::max(s(120), std::min(s(170), toggle_right - margin));
+        MoveWindow(auto_update_check_, margin, btn_y + (btn_h - s(20)) / 2, toggle_w, s(20), TRUE);
         InvalidateRect(hwnd, nullptr, TRUE);
     }
 };

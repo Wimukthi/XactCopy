@@ -20,14 +20,61 @@
 #endif
 #include <windows.h>
 #include <dwmapi.h>
+#include <gdiplus.h>
 #include <uxtheme.h>
+
+#include "icons.h"
 
 #if defined(_MSC_VER)
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "msimg32.lib")
 #endif
 
 namespace xact::ui {
+
+// GDI+ is used only for the antialiased glyphs (checkmarks, radio dots); it is
+// started once on first use and shut down at exit.
+namespace gdip {
+
+class Session {
+public:
+    Session() {
+        Gdiplus::GdiplusStartupInput input;
+        ready_ = Gdiplus::GdiplusStartup(&token_, &input, nullptr) == Gdiplus::Ok;
+    }
+    ~Session() {
+        if (ready_) Gdiplus::GdiplusShutdown(token_);
+    }
+    Session(const Session&) = delete;
+    Session& operator=(const Session&) = delete;
+    bool ready() const { return ready_; }
+
+private:
+    ULONG_PTR token_ = 0;
+    bool ready_ = false;
+};
+
+inline bool ready() {
+    static Session session;
+    return session.ready();
+}
+
+inline Gdiplus::Color color_of(COLORREF color) {
+    return Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color));
+}
+
+// Gamma-corrected coverage keeps saturated accents from looking washed out
+// while retaining smooth round edges.
+inline void configure(Gdiplus::Graphics& graphics) {
+    graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+    graphics.SetCompositingQuality(Gdiplus::CompositingQualityGammaCorrected);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+}
+
+} // namespace gdip
 
 struct ThemePalette {
     bool dark = true;
@@ -390,29 +437,75 @@ inline void draw_button(const DRAWITEMSTRUCT& draw, const ThemePalette& theme) {
     HFONT font = reinterpret_cast<HFONT>(SendMessageW(draw.hwndItem, WM_GETFONT, 0, 0));
     HGDIOBJ old_font = font != nullptr ? SelectObject(draw.hDC, font) : nullptr;
     SetBkMode(draw.hDC, TRANSPARENT);
-    SetTextColor(draw.hDC, disabled ? theme.muted_text : theme.text);
+    const COLORREF content = disabled ? theme.muted_text : theme.text;
+    SetTextColor(draw.hDC, content);
     if (pressed) OffsetRect(&rect, 1, 1);
-    DrawTextW(draw.hDC, text, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    // Pair the caption with a Fluent glyph when there's room for both; otherwise
+    // fall back to centred text so narrow buttons never truncate.
+    const ButtonIcon icon = icon_for_button(draw.hwndItem);
+    bool drew_with_icon = false;
+    if (icon != ButtonIcon::None) {
+        const UINT dpi = GetDpiForWindow(draw.hwndItem);
+        auto scale = [dpi](int v) { return MulDiv(v, static_cast<int>(dpi), 96); };
+        SIZE text_size{};
+        GetTextExtentPoint32W(draw.hDC, text, static_cast<int>(wcslen(text)), &text_size);
+        const int icon_size = scale(16);
+        const int gap = scale(6);
+        const int content_width = icon_size + gap + text_size.cx;
+        const int available = (rect.right - rect.left) - scale(10);
+        if (content_width <= available) {
+            const int left = rect.left + ((rect.right - rect.left) - content_width) / 2;
+            RECT icon_rect{left, rect.top, left + icon_size, rect.bottom};
+            draw_button_icon(draw.hDC, icon, icon_rect, content, icon_size);
+            RECT text_rect = rect;
+            text_rect.left = icon_rect.right + gap;
+            text_rect.right = text_rect.left + text_size.cx;
+            DrawTextW(draw.hDC, text, -1, &text_rect,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            drew_with_icon = true;
+        }
+    }
+    if (!drew_with_icon) {
+        DrawTextW(draw.hDC, text, -1, &rect,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    }
     if (old_font != nullptr) SelectObject(draw.hDC, old_font);
 }
 
+// Antialiased checkmark via GDI+ (round caps/joins), falling back to a plain GDI
+// polyline if GDI+ is unavailable.
 inline void draw_checkmark(HDC dc, const RECT& box, COLORREF color, UINT dpi) {
     auto scale = [dpi](int value) { return MulDiv(value, static_cast<int>(dpi), 96); };
-    const int thickness = std::max(1, scale(2));
-    HPEN pen = CreatePen(PS_SOLID, thickness, color);
-    HGDIOBJ old_pen = SelectObject(dc, pen);
     const int width = box.right - box.left;
     const int height = box.bottom - box.top;
-    POINT points[3] = {
+    const POINT points[3] = {
         {box.left + width * 22 / 100, box.top + height * 52 / 100},
         {box.left + width * 42 / 100, box.top + height * 72 / 100},
         {box.left + width * 78 / 100, box.top + height * 30 / 100},
     };
-    MoveToEx(dc, points[0].x, points[0].y, nullptr);
-    LineTo(dc, points[1].x, points[1].y);
-    LineTo(dc, points[2].x, points[2].y);
-    SelectObject(dc, old_pen);
-    DeleteObject(pen);
+    if (!gdip::ready()) {
+        HPEN pen = CreatePen(PS_SOLID, std::max(1, scale(2)), color);
+        HGDIOBJ old_pen = SelectObject(dc, pen);
+        MoveToEx(dc, points[0].x, points[0].y, nullptr);
+        LineTo(dc, points[1].x, points[1].y);
+        LineTo(dc, points[2].x, points[2].y);
+        SelectObject(dc, old_pen);
+        DeleteObject(pen);
+        return;
+    }
+    Gdiplus::Graphics graphics(dc);
+    gdip::configure(graphics);
+    const Gdiplus::REAL stroke = static_cast<Gdiplus::REAL>(scale(2));
+    Gdiplus::Pen pen(gdip::color_of(color), stroke < 1.75f ? 1.75f : stroke);
+    pen.SetLineCap(Gdiplus::LineCapRound, Gdiplus::LineCapRound, Gdiplus::DashCapRound);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    const Gdiplus::PointF path[3] = {
+        {static_cast<Gdiplus::REAL>(points[0].x), static_cast<Gdiplus::REAL>(points[0].y)},
+        {static_cast<Gdiplus::REAL>(points[1].x), static_cast<Gdiplus::REAL>(points[1].y)},
+        {static_cast<Gdiplus::REAL>(points[2].x), static_cast<Gdiplus::REAL>(points[2].y)},
+    };
+    graphics.DrawLines(&pen, path, 3);
 }
 
 inline void draw_checkbox(const DRAWITEMSTRUCT& draw, const ThemePalette& theme, bool checked) {

@@ -1,12 +1,11 @@
-// XactCopy native UI resources: application icon, embedded manifest
-// (ComCtl32 v6 + PerMonitorV2 DPI awareness), and version information.
+// XactCopyExecutive (worker) resources: application icon + version information.
+// The worker is launched by the UI, but it still shows up in Task Manager and
+// UAC/security prompts, so it carries the same icon and version metadata.
 #include <windows.h>
 
-#include "resource.h"
+#define IDI_XACTCOPY 101
 
 IDI_XACTCOPY ICON "..\\..\\Icons\\xactcopy.ico"
-
-1 24 "app.manifest"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION 2,0,0,1
@@ -26,10 +25,10 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "Wimukthi Bandara"
-            VALUE "FileDescription", "XactCopy resilient file mover and bad-block scanner"
+            VALUE "FileDescription", "XactCopy copy/scan worker"
             VALUE "FileVersion", "2.0.0.1"
-            VALUE "InternalName", "XactCopy"
-            VALUE "OriginalFilename", "XactCopy.exe"
+            VALUE "InternalName", "XactCopyExecutive"
+            VALUE "OriginalFilename", "XactCopyExecutive.exe"
             VALUE "ProductName", "XactCopy"
             VALUE "ProductVersion", "2.0.0.1"
         END
