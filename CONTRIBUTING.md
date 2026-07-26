@@ -11,6 +11,9 @@ single PowerShell script.
   - **MSYS2 g++** (default) — the mingw64 `bin` directory must be on `PATH`
     (the build script prepends `C:\msys64\mingw64\bin`), **or**
   - **MSVC** (Visual Studio 2022/2026, Desktop C++ workload).
+- A checkout of **Wimukthi.Win32Theme** beside this repository. The default
+  layout is `Software\Wimukthi.Win32Theme` and `Software\XactCopyNative`.
+  For another location, pass `-ThemeRoot <path>` to `build.ps1`.
 - Optional, for packaging: **[Inno Setup 6](https://jrsoftware.org/isinfo.php)**
   (`winget install --id JRSoftware.InnoSetup --exact`).
 - Optional, for the cross-compatibility tests: the **.NET SDK** and a checkout of
@@ -24,6 +27,9 @@ single PowerShell script.
 
 # MSVC
 .\build.ps1 -Compiler msvc -RunTests
+
+# Theme framework checked out somewhere else
+.\build.ps1 -ThemeRoot D:\Libraries\Wimukthi.Win32Theme -RunTests
 ```
 
 Binaries are written in-tree to `build\`:

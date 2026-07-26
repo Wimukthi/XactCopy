@@ -55,6 +55,10 @@ Source: "{#SourceBuildDir}\XactCopyExecutive.exe"; DestDir: "{app}"; Flags: igno
 Source: "{#SourceRoot}\Icons\xactcopy.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceRoot}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceRoot}\..\Wimukthi.Win32Theme\LICENSE"; DestDir: "{app}\licenses"; DestName: "Wimukthi.Win32Theme-MIT.txt"; Flags: ignoreversion
+Source: "{#SourceRoot}\..\Wimukthi.Win32Theme\third_party\darkmodelib\LICENSE.md"; DestDir: "{app}\licenses"; DestName: "Darkmodelib-MPL-2.0.txt"; Flags: ignoreversion
+Source: "{#SourceRoot}\..\Wimukthi.Win32Theme\third_party\darkmodelib\LICENSE-MIT.md"; DestDir: "{app}\licenses"; DestName: "Darkmodelib-MIT.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\XactCopy"; Filename: "{app}\XactCopy.exe"; WorkingDir: "{app}"

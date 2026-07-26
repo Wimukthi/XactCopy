@@ -48,7 +48,6 @@
 #if defined(_MSC_VER)
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "dwmapi.lib")
-#pragma comment(lib, "uxtheme.lib")
 #endif
 
 namespace {
@@ -153,9 +152,9 @@ public:
         theme_ = ui::make_theme(settings_.theme(),
                                 settings_.get_string("AccentColorMode", "auto"),
                                 settings_.get_string("AccentColorHex", "#5A78C8"));
+        ui::configure_theme_engine(settings_.theme(), theme_);
         colorize_log_ = settings_.get_bool("UiColorizeLogBySeverity", true);
         ui_scale_percent_ = settings_.get_int("UiScalePercent", 50, 250, 100);
-        if (theme_.dark) ui::enable_app_dark_mode();
 
         WNDCLASSW window_class{};
         window_class.lpfnWndProc = &MainWindow::static_window_proc;
@@ -330,17 +329,6 @@ private:
     }
 
     LRESULT window_proc(UINT message, WPARAM wparam, LPARAM lparam) {
-        // Dark menubar painting (UAH messages) + the system underline repaint.
-        LRESULT menubar_result = 0;
-        if (ui::handle_menubar_message(hwnd_, message, wparam, lparam, theme_, menubar_result)) {
-            return menubar_result;
-        }
-        if (message == WM_NCPAINT || message == WM_NCACTIVATE) {
-            LRESULT result = DefWindowProcW(hwnd_, message, wparam, lparam);
-            ui::draw_menubar_underline(hwnd_, theme_);
-            return result;
-        }
-
         switch (message) {
             case WM_CREATE:
                 on_create();
@@ -390,12 +378,7 @@ private:
                 return reinterpret_cast<LRESULT>(edit_brush_);
             }
             case WM_SETTINGCHANGE:
-                // Re-derive the palette when Windows flips light/dark and the
-                // user follows the system theme.
-                if (lparam != 0 &&
-                    lstrcmpiW(reinterpret_cast<const wchar_t*>(lparam), L"ImmersiveColorSet") == 0 &&
-                    settings_.theme() != "dark" && settings_.theme() != "light" &&
-                    settings_.theme() != "classic") {
+                if (ui::handle_theme_setting_change(lparam)) {
                     apply_theme();
                 }
                 return 0;
@@ -795,12 +778,13 @@ private:
         theme_ = ui::make_theme(settings_.theme(),
                                 settings_.get_string("AccentColorMode", "auto"),
                                 settings_.get_string("AccentColorHex", "#5A78C8"));
+        ui::configure_theme_engine(settings_.theme(), theme_);
         if (window_brush_ != nullptr) DeleteObject(window_brush_);
         if (edit_brush_ != nullptr) DeleteObject(edit_brush_);
         window_brush_ = CreateSolidBrush(theme_.window);
         edit_brush_ = CreateSolidBrush(theme_.edit);
 
-        ui::set_dark_title_bar(hwnd_, theme_.dark);
+        ui::attach_theme_window(hwnd_);
         for (HWND control : {log_list_, source_edit_, destination_edit_, buffer_edit_,
                              retries_edit_, timeout_edit_}) {
             ui::apply_control_theme(control, theme_.dark);
