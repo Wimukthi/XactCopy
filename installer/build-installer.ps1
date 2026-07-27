@@ -2,7 +2,7 @@
 # File: installer\build-installer.ps1
 # Purpose: Builds the native XactCopy binaries (via ..\build.ps1) and packages
 #          them into an Inno Setup installer. The installer version is read from
-#          src\ui\app.rc so the setup metadata always matches the binary.
+#          src\version.h so the setup metadata always matches the binary.
 # Usage:   .\build-installer.ps1 [-Compiler gcc|msvc] [-SkipBuild] [-SkipTests]
 #          [-Version x.y.z.w] [-OutputDir <path>]
 # -----------------------------------------------------------------------------
@@ -32,15 +32,15 @@ function Find-InnoCompiler {
     throw "ISCC.exe was not found. Install Inno Setup 6, e.g. winget install --id JRSoftware.InnoSetup --exact"
 }
 
-function Get-ResourceVersion {
-    $resourceFile = Join-Path $script:RepoRoot "src\ui\app.rc"
-    $versionLine = Get-Content -LiteralPath $resourceFile | Where-Object {
-        $_ -match 'VALUE\s+"ProductVersion",\s+"([^"]+)"'
+function Get-SourceVersion {
+    $versionFile = Join-Path $script:RepoRoot "src\version.h"
+    $versionLine = Get-Content -LiteralPath $versionFile | Where-Object {
+        $_ -match '^\s*#define\s+XACTCOPY_VERSION_STRING\s+"([^"]+)"'
     } | Select-Object -First 1
-    if ($versionLine -and $versionLine -match 'VALUE\s+"ProductVersion",\s+"([^"]+)"') {
+    if ($versionLine -and $versionLine -match '^\s*#define\s+XACTCOPY_VERSION_STRING\s+"([^"]+)"') {
         return $Matches[1]
     }
-    throw "Could not read ProductVersion from src\ui\app.rc."
+    throw "Could not read XACTCOPY_VERSION_STRING from src\version.h."
 }
 
 $buildDir = Join-Path $script:RepoRoot "build"
@@ -67,11 +67,11 @@ foreach ($binary in @($appExe, $workerExe)) {
     }
 }
 
-$resourceVersion = Get-ResourceVersion
+$resourceVersion = Get-SourceVersion
 if (-not $explicitVersion) {
     $Version = $resourceVersion
 } elseif ($Version -ne $resourceVersion) {
-    throw "Requested installer version $Version does not match src\ui\app.rc version $resourceVersion."
+    throw "Requested installer version $Version does not match src\version.h version $resourceVersion."
 }
 
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null

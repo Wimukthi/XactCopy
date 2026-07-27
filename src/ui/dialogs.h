@@ -16,13 +16,14 @@
 #include <string>
 #include <vector>
 
+#include "../version.h"
 #include "app_icon.h"
 #include "settings.h"
 #include "theme.h"
 
 namespace xact::ui {
 
-inline constexpr const char* NativeAppVersion = "2.0.0.3";
+inline constexpr const char* NativeAppVersion = XACTCOPY_VERSION_STRING;
 
 namespace dialog_detail {
 

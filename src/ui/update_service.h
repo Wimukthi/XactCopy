@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "../version.h"
 #include "../core/crypto.h"
 #include "../core/json.h"
 #include "../storage/stores.h" // fsutil::utf8_to_wide / wide_to_utf8
@@ -54,7 +55,14 @@ struct AppVersion {
 };
 
 // Native build version — the "current version" for update comparisons.
-inline constexpr AppVersion kNativeVersion{2, 0, 0, 2};
+inline constexpr AppVersion kNativeVersion{
+    XACTCOPY_VERSION_MAJOR,
+    XACTCOPY_VERSION_MINOR,
+    XACTCOPY_VERSION_BUILD,
+    XACTCOPY_VERSION_REVISION
+};
+inline constexpr wchar_t kNativeUserAgent[] =
+    L"XactCopy/" XACTCOPY_VERSION_WSTRING L"-native";
 
 struct UpdateReleaseInfo {
     std::string tag_name;
@@ -371,7 +379,7 @@ public:
                          });
         for (const UpdateAssetInfo* c : candidates) {
             auto text = update_detail::https_get(storage::fsutil::utf8_to_wide(c->download_url),
-                                                 L"XactCopy/2.0.0.3-native");
+                                                 kNativeUserAgent);
             if (!text.has_value()) continue;
             std::string parsed = update_detail::parse_sha256_from_checksum_text(*text, asset.name);
             if (!parsed.empty()) return parsed;
@@ -410,7 +418,7 @@ public:
         uc.dwUrlPathLength = std::size(path);
         if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return std::string();
 
-        HINTERNET session = WinHttpOpen(L"XactCopy/2.0.0.3-native", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        HINTERNET session = WinHttpOpen(kNativeUserAgent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (session == nullptr) return std::string();
         DWORD to = 600000;
@@ -498,8 +506,7 @@ public:
             return info;
         }
         std::wstring url = storage::fsutil::utf8_to_wide(release_url);
-        std::wstring user_agent = L"XactCopy/2.0.0.3-native";
-        auto body = update_detail::https_get(url, user_agent);
+        auto body = update_detail::https_get(url, kNativeUserAgent);
         if (!body.has_value()) {
             info.error = "Could not reach the update server.";
             return info;

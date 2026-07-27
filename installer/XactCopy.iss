@@ -1,9 +1,9 @@
 ; Inno Setup script for XactCopy (native C++ build).
-; The build wrapper passes AppVersion from the executable resource so installer
+; The build wrapper passes AppVersion from src\version.h so installer
 ; names and Windows uninstall metadata stay aligned with the binary.
 
 #ifndef AppVersion
-#define AppVersion "2.0.0.3"
+#error "AppVersion must be supplied by installer\build-installer.ps1"
 #endif
 
 #ifndef SourceBuildDir

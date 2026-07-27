@@ -12,8 +12,10 @@
 #include <thread>
 #include <vector>
 
+#include "../src/version.h"
 #include "../src/core/ipc.h"
 #include "../src/core/pipe.h"
+#include "../src/ui/update_service.h"
 
 namespace {
 
@@ -38,6 +40,27 @@ void check_equal(const std::string& actual, const std::string& expected, const s
 }
 
 // ---------------------------------------------------------------------------
+
+void test_app_version() {
+    std::string numeric =
+        std::to_string(XACTCOPY_VERSION_MAJOR) + "." +
+        std::to_string(XACTCOPY_VERSION_MINOR) + "." +
+        std::to_string(XACTCOPY_VERSION_BUILD) + "." +
+        std::to_string(XACTCOPY_VERSION_REVISION);
+    check_equal(XACTCOPY_VERSION_STRING, numeric,
+                "Product version string matches numeric version");
+
+    xact::ui::AppVersion published =
+        xact::ui::update_detail::parse_version("v" XACTCOPY_VERSION_STRING);
+    check(!xact::ui::UpdateService::is_update_available(
+              xact::ui::kNativeVersion, published),
+          "Current published version is not reported as an update");
+
+    ++published.revision;
+    check(xact::ui::UpdateService::is_update_available(
+              xact::ui::kNativeVersion, published),
+          "Newer revision is reported as an update");
+}
 
 void test_timespan_format() {
     using xact::time::TimeSpan;
@@ -436,6 +459,7 @@ void test_goldens(const std::string& golden_dir) {
 } // namespace
 
 int main(int argc, char** argv) {
+    test_app_version();
     test_timespan_format();
     test_datetimeoffset_format();
     test_json_writer_and_parser();

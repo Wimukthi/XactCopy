@@ -4,6 +4,14 @@ All notable changes to XactCopy are documented in this file. The format is based
 on [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped
 releases.
 
+## [2.0.0.4]
+
+### Fixed
+
+- The update checker no longer reports the currently installed release as a new
+  update. Product-version metadata, updater comparisons, About text, and
+  installer packaging now share one version definition to prevent drift.
+
 ## [2.0.0.3]
 
 ### Changed

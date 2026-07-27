@@ -1,0 +1,16 @@
+#ifndef XACTCOPY_VERSION_H
+#define XACTCOPY_VERSION_H
+
+// Single source of truth for the product version. Keep these macros usable by
+// both C++ and the Windows resource compiler.
+#define XACTCOPY_VERSION_MAJOR 2
+#define XACTCOPY_VERSION_MINOR 0
+#define XACTCOPY_VERSION_BUILD 0
+#define XACTCOPY_VERSION_REVISION 4
+
+#define XACTCOPY_VERSION_COMMA \
+    XACTCOPY_VERSION_MAJOR, XACTCOPY_VERSION_MINOR, XACTCOPY_VERSION_BUILD, XACTCOPY_VERSION_REVISION
+#define XACTCOPY_VERSION_STRING "2.0.0.4"
+#define XACTCOPY_VERSION_WSTRING L"2.0.0.4"
+
+#endif
