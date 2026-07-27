@@ -4,6 +4,22 @@ All notable changes to XactCopy are documented in this file. The format is based
 on [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped
 releases.
 
+## [2.0.0.3]
+
+### Changed
+
+- Native Windows light/dark mode, High Contrast, title bars, menus, and common
+  control theming now use the shared `Wimukthi.Win32Theme` framework.
+- XactCopy retains its existing palette, Fluent icons, progress indicators, and
+  application-specific owner-drawn controls.
+- GCC and MSVC builds accept `-ThemeRoot` when the framework is not checked out
+  beside XactCopy.
+
+### Packaging
+
+- The installer includes the framework and Darkmodelib license notices, and the
+  repository documents where to obtain the corresponding source.
+
 ## [2.0.0.2]
 
 ### Fixed

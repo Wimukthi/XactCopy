@@ -22,7 +22,7 @@
 
 namespace xact::ui {
 
-inline constexpr const char* NativeAppVersion = "2.0.0.2";
+inline constexpr const char* NativeAppVersion = "2.0.0.3";
 
 namespace dialog_detail {
 
