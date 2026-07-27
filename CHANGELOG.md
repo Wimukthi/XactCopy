@@ -4,6 +4,14 @@ All notable changes to XactCopy are documented in this file. The format is based
 on [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped
 releases.
 
+## [2.0.0.5]
+
+### Fixed
+
+- Explorer file and folder context-menu actions now show the exact selected item
+  as the source and always copy only that selection. The internal parent folder
+  used by the worker is no longer exposed in the Source box.
+
 ## [2.0.0.4]
 
 ### Fixed

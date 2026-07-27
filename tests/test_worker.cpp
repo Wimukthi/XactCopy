@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 
+#include "../src/ui/selection.h"
 #include "../src/worker/engine_support.h"
 
 namespace {
@@ -98,11 +99,57 @@ void test_scan_source_cancellation() {
     remove_tree(root);
 }
 
+void test_exact_item_selection() {
+    std::printf("--- selection: exact Explorer item ---\n");
+    std::wstring root = make_tree(2, 2);
+    std::wstring selected_folder = root + L"\\dir0";
+    std::wstring selected_file = root + L"\\dir1\\file0.bin";
+
+    ui::SelectionModel folder_selection;
+    check(folder_selection.add(selected_folder), "selected folder accepted");
+    check(_wcsicmp(folder_selection.display_path().c_str(), selected_folder.c_str()) == 0,
+          "selected folder remains the displayed source");
+    std::wstring folder_root = folder_selection.common_root();
+    check(_wcsicmp(folder_root.c_str(), root.c_str()) == 0,
+          "selected folder uses its parent only as the worker root");
+    auto folder_relative = folder_selection.relative_paths(folder_root);
+    check(folder_relative.size() == 1 &&
+              models::detail::equals_ignore_case(folder_relative[0], "dir0"),
+          "selected folder becomes the exact worker filter");
+
+    SourceScanResult folder_scan =
+        scan_source(folder_root, folder_relative, models::SymlinkHandlingMode::Skip,
+                    true, nullptr);
+    check(folder_scan.files.size() == 2 &&
+              engine::detail::starts_with_ignore_case(
+                  folder_scan.files[0].relative_path, "dir0\\") &&
+              engine::detail::starts_with_ignore_case(
+                  folder_scan.files[1].relative_path, "dir0\\"),
+          "folder filter excludes sibling folders");
+
+    ui::SelectionModel file_selection;
+    check(file_selection.add(selected_file), "selected file accepted");
+    check(_wcsicmp(file_selection.display_path().c_str(), selected_file.c_str()) == 0,
+          "selected file remains the displayed source");
+    std::wstring file_root = file_selection.common_root();
+    auto file_relative = file_selection.relative_paths(file_root);
+    SourceScanResult file_scan =
+        scan_source(file_root, file_relative, models::SymlinkHandlingMode::Skip,
+                    true, nullptr);
+    check(file_scan.files.size() == 1 &&
+              models::detail::equals_ignore_case(
+                  file_scan.files[0].relative_path, "file0.bin"),
+          "file filter copies only the exact selected file");
+
+    remove_tree(root);
+}
+
 } // namespace
 
 int main() {
     test_scan_source_fast_and_complete();
     test_scan_source_cancellation();
+    test_exact_item_selection();
 
     if (g_failures == 0) {
         std::printf("WORKER PASS: %d checks\n", g_checks);

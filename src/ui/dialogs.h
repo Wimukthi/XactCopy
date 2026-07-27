@@ -557,9 +557,6 @@ private:
             section(6, "Context Menu");
             check(6, "Enable Explorer context menu integration", "EnableExplorerContextMenu",
                   false);
-            combo(6, "File selection mode", "ExplorerSelectionMode",
-                  {L"Copy selected files/folders", L"Copy full source folder"},
-                  {"selected-items", "source-folder"}, "selected-items");
             return f;
         }();
         return table;

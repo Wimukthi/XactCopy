@@ -3,8 +3,9 @@
 // Purpose: SelectionModel — the single source of truth for "what to copy" when
 //          the user picks more than one item. Explorer verbs, forwarded launches
 //          from a second instance, the Add-Files dialog, and drag-and-drop all
-//          funnel into one model, which resolves the set to a common source root
-//          plus the relative paths the worker's SelectionFilter understands.
+//          funnel into one model, which keeps the exact user-facing selection
+//          while resolving the execution root and relative paths the worker's
+//          SelectionFilter understands.
 // -----------------------------------------------------------------------------
 
 #pragma once
@@ -51,9 +52,17 @@ public:
         return folders;
     }
 
-    // The folder the copy runs from. A single directory resolves to its parent
-    // (so the directory itself is copied, not just its contents); anything else
-    // resolves to the deepest shared ancestor.
+    // What the Source box should show. A single item remains the exact file or
+    // folder the user selected; multiple items show their shared source root.
+    std::wstring display_path() const {
+        if (items_.empty()) return std::wstring();
+        if (items_.size() == 1) return items_[0];
+        return common_root();
+    }
+
+    // The directory the worker runs from. This is intentionally separate from
+    // display_path(): the worker needs a directory root plus a relative filter
+    // to copy the selected directory itself rather than flattening its contents.
     std::wstring common_root() const {
         if (items_.empty()) return std::wstring();
         if (items_.size() == 1 && is_directory(items_[0])) {

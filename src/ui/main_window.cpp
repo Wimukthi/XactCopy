@@ -279,8 +279,9 @@ private:
     bool checking_updates_ = false;
     bool update_check_show_dialog_ = false;
     std::thread update_thread_;
-    std::string explorer_selection_root_;         // normalized source root, if any
-    std::vector<std::string> explorer_selected_paths_; // relative paths for selected-items mode
+    std::string explorer_selection_root_;    // internal directory root sent to the worker
+    std::string explorer_selection_display_; // exact item/common root shown in the Source box
+    std::vector<std::string> explorer_selected_paths_; // relative paths for the exact selection
 
     // Multi-item selection: accumulated across a burst of arrivals, then applied
     // once by the coalescing timer (see queue_selection/commit_selection).
@@ -1187,8 +1188,8 @@ private:
         switch (id) {
             case IdSourceBrowse:
                 // Choosing a source folder replaces any queued item selection.
+                if (!selection_.empty()) clear_selection(/*restore_root*/ false);
                 browse_folder(source_edit_);
-                if (!selection_.empty()) clear_selection();
                 break;
             case IdSourceAddFiles:
                 add_files_to_selection();
@@ -1281,7 +1282,7 @@ private:
     void save_current_as_job() {
         models::CopyJobOptions options = collect_options();
         if (ui_is_blank(options.SourceRoot)) {
-            info_box(L"Choose a source folder before saving a job.");
+            info_box(L"Choose a source before saving a job.");
             return;
         }
         std::string suggested = suggest_job_name(options);
@@ -1359,8 +1360,19 @@ private:
         }
     }
 
+    static std::string display_source(const models::CopyJobOptions& options) {
+        if (options.SelectedRelativePaths.size() != 1) return options.SourceRoot;
+        std::wstring source =
+            storage::fsutil::get_full_path(storage::fsutil::utf8_to_wide(options.SourceRoot));
+        if (!source.empty() && source.back() != L'\\' && source.back() != L'/') {
+            source.push_back(L'\\');
+        }
+        source += storage::fsutil::utf8_to_wide(options.SelectedRelativePaths[0]);
+        return storage::fsutil::wide_to_utf8(storage::fsutil::get_full_path(source));
+    }
+
     std::string suggest_job_name(const models::CopyJobOptions& options) {
-        std::wstring source = storage::fsutil::utf8_to_wide(options.SourceRoot);
+        std::wstring source = storage::fsutil::utf8_to_wide(display_source(options));
         std::wstring leaf = storage::fsutil::get_file_name(source);
         std::string base = leaf.empty() ? std::string("Saved Job") : storage::fsutil::wide_to_utf8(leaf);
         return base;
@@ -1417,6 +1429,7 @@ private:
         selection_wants_destination_ = false;
 
         explorer_selection_root_.clear();
+        explorer_selection_display_.clear();
         explorer_selected_paths_.clear();
         if (selection_.empty()) {
             update_selection_ui();
@@ -1430,44 +1443,51 @@ private:
             update_selection_ui();
             return;
         }
-        SetWindowTextW(source_edit_, root.c_str());
+        std::wstring display = selection_.display_path();
+        SetWindowTextW(source_edit_, display.c_str());
 
         std::vector<std::string> relative = selection_.relative_paths(root);
-        const bool whole_folder =
-            relative.empty() ||
-            settings_.get_string("ExplorerSelectionMode", "selected-items") == "source-folder";
-        if (!whole_folder) {
+        if (!relative.empty()) {
             explorer_selection_root_ = storage::fsutil::wide_to_utf8(root);
+            explorer_selection_display_ = storage::fsutil::wide_to_utf8(display);
             explorer_selected_paths_ = std::move(relative);
         }
 
         if (launch_.explorer_scan_mode) {
             SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0); // Scan Bad Blocks
         }
-        append_log("Source set to " + storage::fsutil::wide_to_utf8(root) + " (" +
+        append_log("Source set to " + storage::fsutil::wide_to_utf8(display) + " (" +
                    std::to_string(selection_.size()) + " item(s) selected).");
         update_selection_ui();
 
         if (want_destination) prompt_destination_from_explorer();
     }
 
-    void clear_selection() {
+    void clear_selection(bool restore_root = true) {
+        if (restore_root && !explorer_selection_root_.empty()) {
+            SetWindowTextW(source_edit_,
+                           storage::fsutil::utf8_to_wide(explorer_selection_root_).c_str());
+        }
         selection_.clear();
         explorer_selection_root_.clear();
+        explorer_selection_display_.clear();
         explorer_selected_paths_.clear();
         update_selection_ui();
         append_log("Selection cleared; the whole source folder will be copied.");
     }
 
-    // The source box only shows the common root, so surface what is actually
-    // queued underneath it.
+    // A multi-selection needs a summary because the Source box can only show its
+    // common root. Keep the same confirmation for a single exact item.
     void update_selection_ui() {
         const bool active = !explorer_selected_paths_.empty();
         const bool was_visible = selection_label_ != nullptr &&
                                  IsWindowVisible(selection_label_) != FALSE;
         if (selection_label_ != nullptr) {
             std::wstring text =
-                active ? selection_.summary() + L" \x2014 only these will be copied" : L"";
+                active ? selection_.summary() +
+                             (selection_.size() == 1 ? L" \x2014 only this will be copied"
+                                                     : L" \x2014 only these will be copied")
+                       : L"";
             SetWindowTextW(selection_label_, text.c_str());
             ShowWindow(selection_label_, active ? SW_SHOW : SW_HIDE);
         }
@@ -1546,6 +1566,7 @@ private:
             }
             selection_.clear();
             explorer_selection_root_.clear();
+            explorer_selection_display_.clear();
             explorer_selected_paths_.clear();
             update_selection_ui();
             SetWindowTextW(source_edit_, folder.c_str());
@@ -1725,13 +1746,15 @@ private:
         int timeout_seconds = read_int_field(timeout_edit_, 1, 86400, 10);
         options.OperationTimeout = time::TimeSpan::from_seconds(timeout_seconds);
 
-        // Explorer selected-items mode: forward the relative selection set when
-        // the source box still points at the captured selection root.
+        // The Source box shows an exact single item, while the worker accepts a
+        // directory root plus relative paths. Translate back only while the box
+        // still contains the captured display path (manual edits opt out).
         if (!explorer_selected_paths_.empty() &&
             models::detail::equals_ignore_case(
                 storage::fsutil::wide_to_utf8(storage::fsutil::get_full_path(
                     storage::fsutil::utf8_to_wide(options.SourceRoot))),
-                explorer_selection_root_)) {
+                explorer_selection_display_)) {
+            options.SourceRoot = explorer_selection_root_;
             options.SelectedRelativePaths = explorer_selected_paths_;
         }
         return options;
@@ -1744,7 +1767,7 @@ private:
                         const std::string& managed_display_name = std::string()) {
         if (starting_ || supervisor_.is_job_running()) return;
         if (ui_is_blank(options.SourceRoot)) {
-            info_box(L"Choose a source folder first.");
+            info_box(L"Choose a source first.");
             return;
         }
         if (options.OperationMode == models::JobOperationMode::Copy &&
@@ -1762,7 +1785,7 @@ private:
                            "Job: " + (options.OperationMode == models::JobOperationMode::ScanOnly
                                           ? std::string("Bad Block Scan")
                                           : std::string("Copy")) +
-                           " — " + options.SourceRoot).c_str());
+                           " — " + display_source(options)).c_str());
 
         // Record a managed run in the catalog so the Job Manager history tracks
         // every copy/scan, matching MainForm's CreateAdHocRun/CreateRunForJob.

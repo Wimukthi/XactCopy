@@ -143,7 +143,9 @@ interrupted run and offers to **Resume** it (continuing from the journal),
 Enable **Settings → Explorer Integration** to add XactCopy to the Windows shell:
 
 - **Copy with XactCopy** — on files, folders, drives, and folder backgrounds.
-  Multi-select is supported; the selection is handed to XactCopy as the source.
+  A selected item is shown as the exact source and only that item is copied.
+  Multi-select copies the selected items together from their shared source
+  folder. Using the folder-background command copies the full folder.
 - **Scan for Bad Blocks with XactCopy** — on folders and drives; opens XactCopy
   ready to scan that target.
 - **Open with / drag-and-drop** — XactCopy is registered as an application, so you
