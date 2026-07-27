@@ -3,7 +3,8 @@
 # Purpose: Builds the native XactCopy worker, UI, and tests without CMake.
 #          Default toolchain is MSYS2 g++; -Compiler msvc uses VS 18 cl after
 #          loading vcvars64. Output goes to the project's own build\ folder.
-# Usage:   .\build.ps1 [-Compiler gcc|msvc] [-RunTests] [-CrossTests] [-GoldenDir <path>]
+# Usage:   .\build.ps1 [-Compiler gcc|msvc] [-RunTests] [-CrossTests]
+#                      [-GoldenDir <path>] [-ThemeRoot <path>]
 # -----------------------------------------------------------------------------
 
 param(
@@ -11,13 +12,29 @@ param(
     [string]$Compiler = "gcc",
     [switch]$RunTests,
     [switch]$CrossTests,
-    [string]$GoldenDir = ""
+    [string]$GoldenDir = "",
+    [string]$ThemeRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 $cppRoot = $PSScriptRoot
 $outDir = Join-Path $cppRoot "build"
 New-Item -ItemType Directory -Force $outDir | Out-Null
+
+if ([string]::IsNullOrWhiteSpace($ThemeRoot)) {
+    $ThemeRoot = Join-Path (Split-Path $cppRoot -Parent) "Wimukthi.Win32Theme"
+}
+if (-not (Test-Path (Join-Path $ThemeRoot "include\wimukthi\win32_theme.hpp"))) {
+    throw "Wimukthi.Win32Theme not found at '$ThemeRoot'. Pass -ThemeRoot to override."
+}
+$ThemeRoot = (Resolve-Path $ThemeRoot).Path
+$themeFacadeSource = Join-Path $ThemeRoot "src\win32_theme.cpp"
+$darkmodelibRoot = Join-Path $ThemeRoot "third_party\darkmodelib"
+$themeSources = @($themeFacadeSource) + @(
+    Get-ChildItem -LiteralPath (Join-Path $darkmodelibRoot "src") -Filter "*.cpp" |
+        Sort-Object Name |
+        ForEach-Object FullName
+)
 
 if ([string]::IsNullOrWhiteSpace($GoldenDir)) {
     $GoldenDir = Join-Path $cppRoot "tests\golden"
@@ -45,6 +62,16 @@ if ($Compiler -eq "gcc") {
     $env:PATH = "$mingwBin;$env:PATH"
 
     $commonFlags = @("-std=c++20", "-O2", "-Wall", "-Wextra", "-static")
+    $themeFlags = @(
+        "-I$(Join-Path $ThemeRoot 'include')",
+        "-I$(Join-Path $darkmodelibRoot 'include')",
+        "-I$(Join-Path $darkmodelibRoot 'src')",
+        "-DSTRICT_TYPED_ITEMIDS",
+        "-DVC_EXTRALEAN",
+        "-DSUPPORT_UTF8",
+        "-D_DARKMODELIB_NO_INI_CONFIG",
+        "-D_DARKMODELIB_CUSTOM_MEM=0x002"
+    )
     $coreLibs = @("-ladvapi32", "-luser32")
     $storageLibs = @("-lbcrypt", "-lcrypt32", "-lole32", "-lshell32", "-luuid", "-ladvapi32", "-luser32")
 
@@ -75,13 +102,21 @@ if ($Compiler -eq "gcc") {
     $uiRes = Join-Path $outDir "xactcopy_ui_res.o"
     & windres (Join-Path $cppRoot "src\ui\app.rc") $uiRes --include-dir (Join-Path $cppRoot "src\ui")
     if ($LASTEXITCODE -ne 0) { throw "ui resource compile failed" }
-    & g++ @commonFlags -municode -mwindows $uiSource $uiRes -o $uiExe @storageLibs -lcomctl32 -ldwmapi -luxtheme -lgdi32 -lgdiplus -lmsimg32 -lwinhttp
+    & g++ @commonFlags @themeFlags -municode -mwindows $uiSource @themeSources $uiRes -o $uiExe @storageLibs -lcomctl32 -lcomdlg32 -ldwmapi -luxtheme -lgdi32 -lgdiplus -lmsimg32 -lshlwapi -lwinhttp
     if ($LASTEXITCODE -ne 0) { throw "ui build failed" }
 } else {
     $vcvars = "C:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Auxiliary\Build\vcvars64.bat"
     if (-not (Test-Path $vcvars)) {
         throw "vcvars64.bat not found at $vcvars"
     }
+    $themeSourceArgs = ($themeSources | ForEach-Object { '"' + $_ + '"' }) -join " "
+    $themeIncludeArgs =
+        '/I"' + (Join-Path $ThemeRoot "include") + '" ' +
+        '/I"' + (Join-Path $darkmodelibRoot "include") + '" ' +
+        '/I"' + (Join-Path $darkmodelibRoot "src") + '"'
+    $themeDefinitionArgs =
+        "/DSTRICT_TYPED_ITEMIDS /DVC_EXTRALEAN /DSUPPORT_UTF8 " +
+        "/D_DARKMODELIB_NO_INI_CONFIG /D_DARKMODELIB_CUSTOM_MEM=0x002"
 
     Write-Host "[msvc] building worker + tests"
     $script = @"
@@ -100,7 +135,7 @@ cl /nologo /std:c++20 /permissive- /W4 /O2 /EHsc /utf-8 "$workerTestSource" /Fe:
 if errorlevel 1 exit /b 1
 rc /nologo /fo "$outDir\xactcopy_ui.res" "$cppRoot\src\ui\app.rc"
 if errorlevel 1 exit /b 1
-cl /nologo /std:c++20 /permissive- /W4 /O2 /EHsc /utf-8 /DUNICODE /D_UNICODE "$uiSource" /Fe:"$uiExe" /Fo:"$outDir\\" /link /SUBSYSTEM:WINDOWS "$outDir\xactcopy_ui.res" bcrypt.lib crypt32.lib ole32.lib shell32.lib uuid.lib advapi32.lib user32.lib comctl32.lib dwmapi.lib uxtheme.lib gdi32.lib gdiplus.lib msimg32.lib winhttp.lib
+cl /nologo /std:c++20 /permissive- /W4 /O2 /EHsc /utf-8 /DUNICODE /D_UNICODE $themeDefinitionArgs $themeIncludeArgs "$uiSource" $themeSourceArgs /Fe:"$uiExe" /Fo:"$outDir\\" /link /SUBSYSTEM:WINDOWS "$outDir\xactcopy_ui.res" bcrypt.lib crypt32.lib ole32.lib shell32.lib uuid.lib advapi32.lib user32.lib comctl32.lib comdlg32.lib dwmapi.lib uxtheme.lib gdi32.lib gdiplus.lib msimg32.lib shlwapi.lib winhttp.lib
 "@
     $batPath = Join-Path $outDir "msvc_build.bat"
     # Batch files must be CRLF-terminated ASCII or cmd mis-parses them.

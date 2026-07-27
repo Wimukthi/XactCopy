@@ -101,4 +101,5 @@ See the **[User Guide](docs/USER_GUIDE.md)** for what every option does.
 ## License
 
 XactCopy is released under the **GNU General Public License v3.0**. See
-[LICENSE](LICENSE).
+[LICENSE](LICENSE). Component licensing and corresponding-source information
+are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

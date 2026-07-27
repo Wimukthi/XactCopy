@@ -1,10 +1,7 @@
 // -----------------------------------------------------------------------------
 // File: cpp\src\ui\theme.h
-// Purpose: Dark/light theming for the native XactCopy UI, adapted from the
-//          AxiomCompress gui layer: palette construction with accent blending,
-//          system dark-mode + high-contrast detection, dark title bars and
-//          DarkMode_Explorer scrollbars, and owner-drawn button/checkbox/
-//          combo painting with hot/pressed/focus states.
+// Purpose: XactCopy-specific palettes and owner-drawn controls. Generic Win32
+//          dark-mode integration is provided by Wimukthi.Win32Theme.
 // -----------------------------------------------------------------------------
 
 #pragma once
@@ -21,13 +18,12 @@
 #include <windows.h>
 #include <dwmapi.h>
 #include <gdiplus.h>
-#include <uxtheme.h>
 
 #include "icons.h"
+#include <wimukthi/win32_theme.hpp>
 
 #if defined(_MSC_VER)
 #pragma comment(lib, "dwmapi.lib")
-#pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "msimg32.lib")
 #endif
@@ -113,20 +109,12 @@ inline COLORREF readable_text_color(COLORREF background) {
 }
 
 inline bool high_contrast_enabled() {
-    HIGHCONTRASTW high_contrast{};
-    high_contrast.cbSize = sizeof(high_contrast);
-    return SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(high_contrast), &high_contrast, 0) &&
-           (high_contrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
+    return wimukthi::win32_theme::is_high_contrast();
 }
 
 inline bool system_prefers_dark_mode() {
     if (high_contrast_enabled()) return false;
-    DWORD apps_use_light_theme = 1;
-    DWORD size = sizeof(apps_use_light_theme);
-    const auto result = RegGetValueW(
-        HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-        L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &apps_use_light_theme, &size);
-    return result == ERROR_SUCCESS && apps_use_light_theme == 0;
+    return wimukthi::win32_theme::is_dark();
 }
 
 // Parses "#RRGGBB" (or "RRGGBB"); falls back on malformed input.
@@ -219,186 +207,79 @@ inline ThemePalette make_theme(const std::string& theme_setting,
     return theme;
 }
 
-// Opts the process into dark-mode control rendering (uxtheme ordinal 135,
-// the same undocumented switch File Explorer and most dark Win32 apps use).
-// Without it, DarkMode_CFD/DarkMode_Explorer classes only partially apply.
-// ForceDark (2) additionally renders popup menus dark natively; FlushMenuThemes
-// (ordinal 136) applies the change to already-created menus.
-inline void enable_app_dark_mode() {
-    HMODULE uxtheme = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (uxtheme == nullptr) return;
-    using SetPreferredAppModeFn = int(WINAPI*)(int);
-    using FlushMenuThemesFn = void(WINAPI*)();
-    auto set_preferred_app_mode = reinterpret_cast<SetPreferredAppModeFn>(
-        reinterpret_cast<void*>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(135))));
-    auto flush_menu_themes = reinterpret_cast<FlushMenuThemesFn>(
-        reinterpret_cast<void*>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(136))));
-    if (set_preferred_app_mode != nullptr) {
-        set_preferred_app_mode(2); // ForceDark: dark controls AND dark popup menus
-    }
-    if (flush_menu_themes != nullptr) flush_menu_themes();
+inline wimukthi::win32_theme::Mode shared_theme_mode(const std::string& setting) {
+    using Mode = wimukthi::win32_theme::Mode;
+    if (setting == "dark") return Mode::dark;
+    if (setting == "light") return Mode::light;
+    if (setting == "classic") return Mode::classic;
+    return Mode::system;
 }
 
-// Per-window dark opt-in (uxtheme ordinal 133). Required in addition to the
-// process-level SetPreferredAppMode for a control's DarkMode_Explorer theme to
-// render consistently (dark background/scrollbars AND light text) even when the
-// OS apps-theme is Light — without it the ListView paints black-on-dark text.
-inline void allow_dark_mode_for_window(HWND hwnd, bool allow = true) {
-    if (hwnd == nullptr) return;
-    static auto allow_fn = [] {
-        HMODULE uxtheme = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        using AllowDarkModeForWindowFn = bool(WINAPI*)(HWND, BOOL);
-        return uxtheme == nullptr
-                   ? nullptr
-                   : reinterpret_cast<AllowDarkModeForWindowFn>(
-                         reinterpret_cast<void*>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(133))));
-    }();
-    if (allow_fn != nullptr) allow_fn(hwnd, allow ? TRUE : FALSE);
-}
-
-// ---------------------------------------------------------------------------
-// Dark menu BAR painting via the undocumented UAH messages (the technique
-// popularized by Notepad++/WinDbg). Popups go dark via ForceDark above; the
-// horizontal bar itself must be custom-painted through WM_UAHDRAWMENU/ITEM.
-// ---------------------------------------------------------------------------
-
-#ifndef WM_UAHDRAWMENU
-#define WM_UAHDRAWMENU 0x0091
-#define WM_UAHDRAWMENUITEM 0x0092
-#define WM_UAHINITMENU 0x0093
-#define WM_UAHMEASUREMENUITEM 0x0094
-#endif
-
-struct UAHMenu {
-    HMENU menu;
-    HDC dc;
-    DWORD flags;
-};
-
-struct UAHMenuItemMetrics {
-    union {
-        struct { DWORD cx, cy; } size[4];
-        struct { RECT rect[4]; } rects;
+inline void configure_theme_engine(const std::string& setting, const ThemePalette& theme) {
+    using namespace wimukthi::win32_theme;
+    Configuration configuration;
+    configuration.mode = shared_theme_mode(setting);
+    configuration.use_custom_palette = !high_contrast_enabled() && setting != "classic";
+    configuration.palette = {
+        theme.window,
+        theme.edit,
+        theme.button_hot,
+        theme.window,
+        blend_color(theme.window, theme.log_error, 18),
+        theme.text,
+        theme.muted_text,
+        theme.muted_text,
+        theme.accent,
+        theme.border,
+        theme.focus,
+        theme.border,
+        theme.selection,
+        theme.edit,
+        theme.text,
+        theme.border,
+        theme.panel,
+        theme.button_hot,
+        theme.text,
+        theme.border,
     };
-};
-
-struct UAHMenuPopupMetrics {
-    DWORD rgcx[4];
-    DWORD fUpdateMaxWidths : 2;
-};
-
-struct UAHMenuItem {
-    int position;
-    UAHMenuItemMetrics umim;
-    UAHMenuPopupMetrics umpm;
-};
-
-struct UAHDrawMenuItem {
-    DRAWITEMSTRUCT dis;
-    UAHMenu um;
-    UAHMenuItem umi;
-};
-
-// Handles the UAH menubar messages. Returns true when the message was
-// consumed (only when `dark` — light mode falls through to DefWindowProc).
-inline bool handle_menubar_message(HWND hwnd, UINT message, WPARAM /*wparam*/, LPARAM lparam,
-                                   const ThemePalette& theme, LRESULT& result) {
-    if (!theme.dark) return false;
-    switch (message) {
-        case WM_UAHDRAWMENU: {
-            auto* menu = reinterpret_cast<UAHMenu*>(lparam);
-            MENUBARINFO bar_info{};
-            bar_info.cbSize = sizeof(bar_info);
-            if (!GetMenuBarInfo(hwnd, OBJID_MENU, 0, &bar_info)) return false;
-            RECT window_rect{};
-            GetWindowRect(hwnd, &window_rect);
-            RECT bar_rect = bar_info.rcBar;
-            OffsetRect(&bar_rect, -window_rect.left, -window_rect.top);
-            HBRUSH brush = CreateSolidBrush(theme.window);
-            FillRect(menu->dc, &bar_rect, brush);
-            DeleteObject(brush);
-            result = 0;
-            return true;
-        }
-        case WM_UAHDRAWMENUITEM: {
-            auto* item = reinterpret_cast<UAHDrawMenuItem*>(lparam);
-            wchar_t text[64]{};
-            MENUITEMINFOW info{};
-            info.cbSize = sizeof(info);
-            info.fMask = MIIM_STRING;
-            info.dwTypeData = text;
-            info.cch = 63;
-            GetMenuItemInfoW(item->um.menu, static_cast<UINT>(item->umi.position), TRUE, &info);
-
-            const DWORD state = item->dis.itemState;
-            const bool hot = (state & (ODS_HOTLIGHT | ODS_SELECTED)) != 0;
-            const bool disabled = (state & (ODS_INACTIVE | ODS_GRAYED | ODS_DISABLED)) != 0;
-
-            HBRUSH fill = CreateSolidBrush(hot ? theme.button_hot : theme.window);
-            FillRect(item->dis.hDC, &item->dis.rcItem, fill);
-            DeleteObject(fill);
-
-            SetBkMode(item->dis.hDC, TRANSPARENT);
-            SetTextColor(item->dis.hDC, disabled ? theme.muted_text : theme.text);
-            DWORD text_flags = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
-            if ((state & ODS_NOACCEL) != 0) text_flags |= DT_HIDEPREFIX;
-            RECT text_rect = item->dis.rcItem;
-            DrawTextW(item->dis.hDC, text, -1, &text_rect, text_flags);
-            result = 0;
-            return true;
-        }
-        case WM_UAHINITMENU:
-        case WM_UAHMEASUREMENUITEM:
-            return false; // default measuring is fine
-        default:
-            return false;
-    }
+    configure(configuration);
 }
 
-// Paints over the 1 px system line under the menubar that DefWindowProc leaves
-// behind; call after DefWindowProc for WM_NCPAINT / WM_NCACTIVATE when dark.
-inline void draw_menubar_underline(HWND hwnd, const ThemePalette& theme) {
-    if (!theme.dark) return;
-    MENUBARINFO bar_info{};
-    bar_info.cbSize = sizeof(bar_info);
-    if (!GetMenuBarInfo(hwnd, OBJID_MENU, 0, &bar_info)) return;
-    RECT window_rect{};
-    GetWindowRect(hwnd, &window_rect);
-    RECT line = bar_info.rcBar;
-    OffsetRect(&line, -window_rect.left, -window_rect.top);
-    line.top = line.bottom;
-    line.bottom = line.top + 1;
-    HDC dc = GetWindowDC(hwnd);
-    if (dc != nullptr) {
-        HBRUSH brush = CreateSolidBrush(theme.border);
-        FillRect(dc, &line, brush);
-        DeleteObject(brush);
-        ReleaseDC(hwnd, dc);
-    }
+inline bool handle_theme_setting_change(LPARAM lparam) {
+    return wimukthi::win32_theme::handle_setting_change(lparam);
+}
+
+inline void attach_theme_window(HWND hwnd) {
+    wimukthi::win32_theme::AttachOptions options;
+    options.child_controls = false;
+    options.control_colours = false;
+    options.custom_draw_notifications = false;
+    wimukthi::win32_theme::attach(hwnd, options);
+}
+
+// Compatibility shim for existing dialog code. The shared framework owns the
+// per-window UxTheme integration.
+inline void allow_dark_mode_for_window(HWND hwnd, bool allow = true) {
+    (void)allow;
+    wimukthi::win32_theme::apply_control(hwnd);
 }
 
 inline void set_dark_title_bar(HWND hwnd, bool dark) {
-    BOOL enabled = dark ? TRUE : FALSE;
-    // 20 on current builds; 19 on older Windows 10 releases.
-    if (FAILED(DwmSetWindowAttribute(hwnd, 20, &enabled, sizeof(enabled)))) {
-        DwmSetWindowAttribute(hwnd, 19, &enabled, sizeof(enabled));
-    }
+    (void)dark;
+    wimukthi::win32_theme::apply_title_bar(hwnd);
 }
 
 // DarkMode_Explorer gives native dark scrollbars on list/edit controls; the
 // per-window opt-in must precede it so it renders consistently on a Light OS.
 inline void apply_control_theme(HWND control, bool dark) {
-    if (control == nullptr) return;
-    if (dark) allow_dark_mode_for_window(control, true);
-    SetWindowTheme(control, dark ? L"DarkMode_Explorer" : nullptr, nullptr);
-    InvalidateRect(control, nullptr, FALSE);
+    (void)dark;
+    wimukthi::win32_theme::apply_control(control);
 }
 
 // Combos need the CFD theme class for a dark frame + dropdown arrow.
 inline void apply_combo_theme(HWND combo, bool dark) {
-    if (combo == nullptr) return;
-    SetWindowTheme(combo, dark ? L"DarkMode_CFD" : nullptr, nullptr);
-    InvalidateRect(combo, nullptr, FALSE);
+    (void)dark;
+    wimukthi::win32_theme::apply_combo_box(combo);
 }
 
 // ---------------------------------------------------------------------------

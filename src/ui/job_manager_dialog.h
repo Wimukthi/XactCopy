@@ -787,9 +787,9 @@ private:
         int details_height = scale(110);
         int list_height = client.bottom - list_top - footer_height - details_height - scale(16);
         // LVS_OWNERDRAWFIXED: the control emits WM_DRAWITEM per row and draws no
-        // item text itself, so the DarkMode_Explorer theme can't paint black
-        // item text on a Light OS (NM_CUSTOMDRAW alone didn't reliably override
-        // it on screen). Scrollbars stay dark via the theme + AllowDarkMode.
+        // item text itself, so the common-control theme cannot paint black item
+        // text on a Light OS (NM_CUSTOMDRAW alone didn't reliably override it
+        // on screen). The shared framework keeps the scrollbars dark.
         list_ = CreateWindowExW(0, WC_LISTVIEWW, L"",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
                                     LVS_SHOWSELALWAYS | LVS_OWNERDRAWFIXED,
@@ -798,19 +798,14 @@ private:
                                 GetModuleHandleW(nullptr), nullptr);
         ListView_SetExtendedListViewStyle(list_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER |
                                                      LVS_EX_HEADERDRAGDROP);
-        // Dark scrollbars require the per-window opt-in BEFORE applying the
-        // DarkMode_Explorer theme; otherwise the theme renders black-on-dark item
-        // text when the OS apps-theme is Light. (Rows/header are still fully
-        // owner-drawn on top for the per-cell state colors.)
-        if (theme_.dark) allow_dark_mode_for_window(list_, true);
-        SetWindowTheme(list_, theme_.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        // Rows/header are still fully owner-drawn on top for per-cell colours.
+        apply_control_theme(list_, theme_.dark);
         // Same Segoe UI 9pt as the rest of the dialog (the ListView and its
         // header otherwise fall back to the default system font).
         SendMessageW(list_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
         if (HWND header = ListView_GetHeader(list_)) {
             SendMessageW(header, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
-            if (theme_.dark) allow_dark_mode_for_window(header, true);
-            SetWindowTheme(header, theme_.dark ? L"DarkMode_ItemsView" : nullptr, nullptr);
+            wimukthi::win32_theme::apply_theme_class(header, L"DarkMode_ItemsView");
         }
         ListView_SetBkColor(list_, theme_.edit);
         ListView_SetTextBkColor(list_, theme_.edit);

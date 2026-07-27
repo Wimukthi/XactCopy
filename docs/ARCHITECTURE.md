@@ -85,8 +85,10 @@ Everything lives under `%LOCALAPPDATA%\XactCopy\`:
 
 The UI is a native **C++/Win32** application (no managed runtime):
 
-- A shared theming layer provides dark/light palettes, accent blending, dark
-  title bars and menus, and owner-drawn controls, tracking the system theme live.
+- `Wimukthi.Win32Theme` provides the reusable Windows integration: process and
+  window dark-mode opt-in, title bars, menus, common controls, High Contrast,
+  and live system-theme changes. XactCopy keeps only its palette, accent
+  blending, icons, progress bars, and other application-specific owner drawing.
 - The process is **Per-Monitor-V2 DPI aware**; fonts and layout rebuild on
   monitor changes.
 - Long-running work is kept off the UI thread; progress messages are coalesced so
