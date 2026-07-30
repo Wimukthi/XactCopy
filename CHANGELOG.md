@@ -4,6 +4,41 @@ All notable changes to XactCopy are documented in this file. The format is based
 on [Keep a Changelog](https://keepachangelog.com/); this project uses date-stamped
 releases.
 
+## [2.0.0.6]
+
+### Removed
+
+- The .NET interop tooling is retired along with the VB.NET implementation it
+  tested: `tools/GoldenGen`, `tools/StorageProbe`, `tools/InteropProbe`, the
+  `build.ps1 -CrossTests` suite, and the cross-compat modes in the storage test
+  binary. `tests/golden/` stays as frozen wire-format fixtures, and the catalog
+  fixture those probes shared now drives a native round-trip test instead, so no
+  coverage is lost. Reading journals, bad-range maps, and settings written by the
+  1.x releases is unaffected and still tested.
+
+### Changed
+
+- **Journals are compressed.** Snapshots over 64 KB are stored as an
+  XPRESS_HUFF container instead of raw JSON; smaller journals stay plain text so
+  the common case is still readable. Combined with the slimmer encoding below, a
+  real 196,519-entry whole-drive journal drops from 96.3 MB to 4.1 MB, and its
+  full on-disk artifact set (snapshot, three backups, and the mirror copies of
+  each) from 578 MB to 24.9 MB. Journals written by earlier builds are detected
+  and read as before, so upgrading keeps existing resume state.
+- **Journals are substantially smaller and far cheaper to write.** Journal file
+  entries no longer store members that hold their default value, and no longer
+  repeat the relative path that already keys the entry. On a real 196,519-entry
+  whole-drive journal this cuts the snapshot from 96.3 MB to 54.2 MB. Both the
+  native and .NET readers treat an absent member as its default, so journals
+  written by either implementation still load identically on the other.
+- **Journal flush frequency now scales with journal size.** A snapshot is
+  rewritten in full on every flush, so on a large job the previous fixed 500 ms
+  cadence cost more I/O than the copy itself. Flushes are now budgeted against
+  measured save cost, holding journal I/O near 5% of run time. Small journals are
+  unaffected and keep their sub-second cadence.
+- Rotating a journal backup renames the previous snapshot instead of copying it,
+  removing a full file read and write per save on both the primary and the mirror.
+
 ## [2.0.0.5]
 
 ### Fixed
