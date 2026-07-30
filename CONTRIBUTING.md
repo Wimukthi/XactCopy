@@ -16,8 +16,6 @@ single PowerShell script.
   For another location, pass `-ThemeRoot <path>` to `build.ps1`.
 - Optional, for packaging: **[Inno Setup 6](https://jrsoftware.org/isinfo.php)**
   (`winget install --id JRSoftware.InnoSetup --exact`).
-- Optional, for the cross-compatibility tests: the **.NET SDK** and a checkout of
-  the legacy VB.NET tree (see [below](#cross-compatibility-tests)).
 
 ## Build and test
 
@@ -66,26 +64,34 @@ that setup (and/or a `win-x64.zip`) to a GitHub release tagged at the new versio
   integration, the updater, and the app icon/resources.
 - `tests/` — the unit-test suites plus golden files.
 - `installer/` — the Inno Setup script and its build wrapper.
-- `tools/` — .NET helpers used for test-vector generation and
-  cross-compatibility checks (see below).
+- `tools/` — `New-AppIcon.ps1`, which regenerates the multi-resolution app icon.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
 
-## Cross-compatibility tests
+## Golden files
 
-XactCopy's storage and IPC formats are byte-compatible with the previous VB.NET
-implementation, which is preserved on the **`vbnet-legacy`** branch and the
-**`vbnet-final`** tag. The `-CrossTests` suite validates both directions using
-the .NET stores, so it needs that tree checked out alongside this one:
+`tests/golden/` pins the wire format: the IPC envelopes, the indented JSON of
+stored artifacts, and the escaping, number, and date formatting rules. The core
+and storage suites byte-compare against it, so an accidental change to any
+serializer fails the build rather than silently altering an on-disk format.
 
-```powershell
-# check the legacy VB.NET tree out next to this repo, then:
-.\build.ps1 -CrossTests
-```
+These files were originally emitted by the .NET implementation to prove the two
+builds were byte-compatible. That implementation is retired and the generators
+that produced them (`GoldenGen`, `StorageProbe`, `InteropProbe`) have been
+removed, so the goldens are now **frozen fixtures** — there is no regeneration
+tool, and that is deliberate. If you intentionally change a serialized shape,
+update the affected golden by hand or emit it from the writer under test, and
+say why in the commit.
 
-The `tools/StorageProbe`, `tools/InteropProbe`, and `tools/GoldenGen` .NET
-projects drive those checks and regenerate `tests/golden/`. They are only needed
-when changing serialized shapes or the IPC protocol.
+Two of them play a specific role worth knowing:
+
+- `golden_journal_payload.json` is in the **old .NET shape** and is not what the
+  current writer emits. It is the fixture proving the reader still loads
+  journals written by earlier builds, which is what keeps an upgrade from losing
+  a user's resume state. Leave it alone.
+- `golden_journal_payload_slim.json` is the **current writer's** output, which
+  omits default-valued members. This is the one to regenerate when journal
+  serialization changes.
 
 ## Conventions
 

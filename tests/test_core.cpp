@@ -354,8 +354,9 @@ void test_frame_layer() {
 }
 
 // ---------------------------------------------------------------------------
-// Golden files (produced by cpp/tools/GoldenGen via the real .NET serializer).
-// Skipped silently when not yet generated.
+// Golden files. These were originally emitted by the real .NET serializer and
+// are now frozen fixtures in tests/golden: they pin the wire format the shipped
+// protocol and stored artifacts use. Skipped silently when not present.
 // ---------------------------------------------------------------------------
 
 std::string read_file(const std::string& path) {
@@ -371,7 +372,7 @@ void test_goldens(const std::string& golden_dir) {
 
     std::string escapes = read_file(golden_dir + "/string_escapes.json");
     if (escapes.empty()) {
-        std::printf("NOTE: goldens not found in %s; run cpp\\tools\\GoldenGen first.\n", golden_dir.c_str());
+        std::printf("NOTE: goldens not found in %s; pass the goldens directory.\n", golden_dir.c_str());
         return;
     }
 
