@@ -1,0 +1,34 @@
+{
+  "JobId": "golden-journal-01",
+  "SourceRoot": "D:\\GoldenSrc",
+  "DestinationRoot": "E:\\GoldenDest",
+  "CreatedUtc": "2026-07-23T00:00:00+00:00",
+  "UpdatedUtc": "2026-07-23T01:30:00.5+00:00",
+  "Files": {
+    "alpha.txt": {
+      "SourceLength": 1234,
+      "SourceLastWriteUtcTicks": 638000000000000000,
+      "BytesCopied": 1234,
+      "State": "CompletedWithRecovery",
+      "RecoveredRanges": [
+        {
+          "Offset": 0,
+          "Length": 128
+        }
+      ],
+      "RescueRanges": [
+        {
+          "Offset": 512,
+          "Length": 64,
+          "State": "Recovered"
+        }
+      ],
+      "LastRescuePass": "Scrape"
+    },
+    "empty.dat": {
+      "SourceLength": 0,
+      "SourceLastWriteUtcTicks": 0,
+      "BytesCopied": 0
+    }
+  }
+}

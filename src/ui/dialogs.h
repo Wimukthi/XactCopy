@@ -525,6 +525,10 @@ private:
             check(3, "Show UI diagnostics strip", "UiShowDiagnostics", true);
             edit_int(3, "Diagnostics refresh (ms)", "UiDiagnosticsRefreshMs", 100, 5000, 250);
             edit_int(3, "Virtual log max lines", "UiMaxLogLines", 1000, 1000000, 50000);
+            section(3, "Journal Storage");
+            check(3, "Discard backups after a run completes", "CompactJournalsOnCompletion", true);
+            edit_int(3, "Delete journals after (days, 0=keep)", "JournalRetentionDays", 0, 3650, 30);
+            edit_int(3, "Always keep newest journals", "JournalKeepMinimum", 0, 1000, 10);
 
             // --- Page 4: Verification -----------------------------------
             section(4, "Verification Defaults");

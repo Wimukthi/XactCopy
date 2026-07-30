@@ -8,7 +8,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -238,6 +240,59 @@ inline void set_hidden(const std::wstring& path) {
     }
 }
 
+inline std::int64_t file_size(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return 0;
+    return (static_cast<std::int64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+}
+
+// Last-write time as a FILETIME-derived 64-bit value (100 ns since 1601).
+inline std::uint64_t last_write_time(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return 0;
+    ULARGE_INTEGER value{};
+    value.LowPart = data.ftLastWriteTime.dwLowDateTime;
+    value.HighPart = data.ftLastWriteTime.dwHighDateTime;
+    return value.QuadPart;
+}
+
+inline std::uint64_t now_file_time() {
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER value{};
+    value.LowPart = now.dwLowDateTime;
+    value.HighPart = now.dwHighDateTime;
+    return value.QuadPart;
+}
+
+// Deletes a file if present; clears read-only/hidden first. Returns the number
+// of bytes reclaimed (0 when the file was absent or could not be removed).
+inline std::int64_t delete_file(const std::wstring& path) {
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) return 0;
+    std::int64_t size = file_size(path);
+    if ((attributes & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN)) != 0) {
+        SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+    }
+    return DeleteFileW(path.c_str()) ? size : 0;
+}
+
+// Non-recursive listing of files in `directory` matching `pattern` (e.g. L"*.json").
+inline std::vector<std::wstring> enumerate_files(const std::wstring& directory,
+                                                 const std::wstring& pattern) {
+    std::vector<std::wstring> files;
+    WIN32_FIND_DATAW find{};
+    HANDLE handle = FindFirstFileExW((directory + L"\\" + pattern).c_str(), FindExInfoBasic, &find,
+                                     FindExSearchNameMatch, nullptr, 0);
+    if (handle == INVALID_HANDLE_VALUE) return files;
+    do {
+        if ((find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+        files.push_back(directory + L"\\" + find.cFileName);
+    } while (FindNextFileW(handle, &find));
+    FindClose(handle);
+    return files;
+}
+
 } // namespace fsutil
 
 // ---------------------------------------------------------------------------
@@ -245,6 +300,157 @@ inline void set_hidden(const std::wstring& path) {
 // ---------------------------------------------------------------------------
 
 namespace detail {
+
+// ---------------------------------------------------------------------------
+// Journal snapshot compression
+//
+// A whole-drive journal is tens of megabytes of highly repetitive JSON, and the
+// whole snapshot is rewritten on every flush, to both the primary and the
+// mirror. Compressing it is worth ~13x on real data.
+//
+// The Windows Compression API (cabinet.dll, Windows 8+) is bound at runtime
+// rather than linked, for two reasons: neither toolchain's build line has to
+// change, and a system where the API is missing degrades to plain JSON instead
+// of failing to start. The few types and constants used are declared here for
+// the same reason — compressapi.h is not present in every MinGW distribution.
+// ---------------------------------------------------------------------------
+
+namespace compression {
+
+inline constexpr DWORD AlgorithmXpressHuff = 4;
+
+// Chosen by measurement against a real 196k-entry journal: XPRESS_HUFF gives
+// 13.1x for 48 ms, MSZIP 16.1x for 579 ms, LZMS a worse 15.3x for 6.5 s.
+// Compression cost feeds the engine's flush budget, so paying half a second per
+// save to save another 800 KB would simply make journal flushes rarer.
+inline constexpr DWORD PreferredAlgorithm = AlgorithmXpressHuff;
+
+// Below this the header and the loss of a plain-text, greppable journal cost
+// more than the bytes saved, so small journals stay readable JSON.
+inline constexpr std::size_t MinimumPayloadBytes = 64 * 1024;
+
+// "XCJZ" + version + algorithm + reserved(2) + uncompressed length (8, LE).
+inline constexpr std::size_t HeaderSize = 16;
+inline constexpr unsigned char Magic[4] = {'X', 'C', 'J', 'Z'};
+inline constexpr unsigned char ContainerVersion = 1;
+
+// Refuse to allocate for an implausible declared length in a corrupt header.
+inline constexpr std::uint64_t MaximumDecompressedBytes = 1024ull * 1024ull * 1024ull;
+
+using CreateCompressorFn = BOOL(WINAPI*)(DWORD, void*, void**);
+using CloseCompressorFn = BOOL(WINAPI*)(void*);
+using CompressFn = BOOL(WINAPI*)(void*, const void*, SIZE_T, void*, SIZE_T, SIZE_T*);
+using CreateDecompressorFn = BOOL(WINAPI*)(DWORD, void*, void**);
+using CloseDecompressorFn = BOOL(WINAPI*)(void*);
+using DecompressFn = BOOL(WINAPI*)(void*, const void*, SIZE_T, void*, SIZE_T, SIZE_T*);
+
+struct Api {
+    CreateCompressorFn create_compressor = nullptr;
+    CloseCompressorFn close_compressor = nullptr;
+    CompressFn compress = nullptr;
+    CreateDecompressorFn create_decompressor = nullptr;
+    CloseDecompressorFn close_decompressor = nullptr;
+    DecompressFn decompress = nullptr;
+    bool available = false;
+};
+
+inline const Api& api() {
+    static const Api resolved = [] {
+        Api a;
+        HMODULE module = LoadLibraryW(L"cabinet.dll");
+        if (module == nullptr) return a;
+        auto bind = [module](const char* name) {
+            return reinterpret_cast<void*>(GetProcAddress(module, name));
+        };
+        a.create_compressor = reinterpret_cast<CreateCompressorFn>(bind("CreateCompressor"));
+        a.close_compressor = reinterpret_cast<CloseCompressorFn>(bind("CloseCompressor"));
+        a.compress = reinterpret_cast<CompressFn>(bind("Compress"));
+        a.create_decompressor = reinterpret_cast<CreateDecompressorFn>(bind("CreateDecompressor"));
+        a.close_decompressor = reinterpret_cast<CloseDecompressorFn>(bind("CloseDecompressor"));
+        a.decompress = reinterpret_cast<DecompressFn>(bind("Decompress"));
+        a.available = a.create_compressor && a.close_compressor && a.compress &&
+                      a.create_decompressor && a.close_decompressor && a.decompress;
+        return a;
+    }();
+    return resolved;
+}
+
+inline bool is_container(const unsigned char* data, std::size_t size) {
+    return size >= HeaderSize && std::memcmp(data, Magic, sizeof(Magic)) == 0;
+}
+
+// Returns the container bytes, or the payload unchanged when compression is
+// unavailable, declined, or unprofitable. Callers treat the result as opaque.
+inline std::string encode_snapshot(const std::string& payload) {
+    if (payload.size() < MinimumPayloadBytes) return payload;
+    const Api& a = api();
+    if (!a.available) return payload;
+
+    void* compressor = nullptr;
+    if (!a.create_compressor(PreferredAlgorithm, nullptr, &compressor) || compressor == nullptr) {
+        return payload;
+    }
+
+    SIZE_T bound = 0;
+    a.compress(compressor, payload.data(), payload.size(), nullptr, 0, &bound);
+    if (bound == 0) bound = payload.size() + (payload.size() / 2) + 1024;
+
+    std::string container(HeaderSize + bound, '\0');
+    SIZE_T produced = 0;
+    BOOL ok = a.compress(compressor, payload.data(), payload.size(),
+                         container.data() + HeaderSize, bound, &produced);
+    a.close_compressor(compressor);
+    if (!ok || produced == 0 || HeaderSize + produced >= payload.size()) {
+        return payload; // No win (or failed) — keep the plain JSON.
+    }
+
+    auto* header = reinterpret_cast<unsigned char*>(container.data());
+    std::memcpy(header, Magic, sizeof(Magic));
+    header[4] = ContainerVersion;
+    header[5] = static_cast<unsigned char>(PreferredAlgorithm);
+    header[6] = 0;
+    header[7] = 0;
+    std::uint64_t original = payload.size();
+    for (int i = 0; i < 8; ++i) {
+        header[8 + i] = static_cast<unsigned char>((original >> (i * 8)) & 0xFF);
+    }
+    container.resize(HeaderSize + produced);
+    return container;
+}
+
+// Inverse of encode_snapshot. Bytes that are not a container are returned
+// as-is, which is what keeps journals written before compression — and by the
+// legacy .NET build — loading unchanged.
+inline std::optional<std::string> decode_snapshot(const unsigned char* data, std::size_t size) {
+    if (!is_container(data, size)) {
+        return std::string(reinterpret_cast<const char*>(data), size);
+    }
+    if (data[4] != ContainerVersion) return std::nullopt;
+
+    std::uint64_t original = 0;
+    for (int i = 0; i < 8; ++i) {
+        original |= static_cast<std::uint64_t>(data[8 + i]) << (i * 8);
+    }
+    if (original == 0 || original > MaximumDecompressedBytes) return std::nullopt;
+
+    const Api& a = api();
+    if (!a.available) return std::nullopt;
+
+    void* decompressor = nullptr;
+    if (!a.create_decompressor(data[5], nullptr, &decompressor) || decompressor == nullptr) {
+        return std::nullopt;
+    }
+
+    std::string payload(static_cast<std::size_t>(original), '\0');
+    SIZE_T restored = 0;
+    BOOL ok = a.decompress(decompressor, data + HeaderSize, size - HeaderSize,
+                           payload.data(), payload.size(), &restored);
+    a.close_decompressor(decompressor);
+    if (!ok || restored != payload.size()) return std::nullopt;
+    return payload;
+}
+
+} // namespace compression
 
 struct SecurityContext {
     std::string path_fingerprint; // sha256 hex of UTF-8(normalized path)
@@ -304,7 +510,21 @@ inline void rotate_backups(const std::wstring& snapshot_path, int generation_cou
                 DeleteFileW(destination.c_str());
             }
             if (fsutil::file_exists(source)) {
-                CopyFileW(source.c_str(), destination.c_str(), FALSE);
+                // Rename rather than copy: the caller always writes a fresh
+                // snapshot immediately after rotating, so duplicating the old
+                // one costs a full file read+write per save for nothing. A
+                // whole-drive journal is 100 MB+, and this ran on both the
+                // primary and the mirror every flush.
+                //
+                // The snapshot is briefly absent between this move and the
+                // commit in write_atomic_bytes. That window is already covered:
+                // load() walks snapshot -> .bak1 -> .bak2 -> .bak3 -> mirror,
+                // and .bak1 now holds exactly the content the snapshot had, so
+                // a crash here recovers the same state a crash one step later
+                // would have.
+                if (!MoveFileExW(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                    CopyFileW(source.c_str(), destination.c_str(), FALSE);
+                }
             }
         }
     }
@@ -801,11 +1021,18 @@ public:
         json::Writer w(/*indented*/ true);
         journal.to_json(w);
         std::string payload = w.take();
-        std::string snapshot_hash = crypto::sha256_hex(payload);
+
+        // Compress once, then hash and store the bytes that actually land on
+        // disk. The ledger's SnapshotHash/SnapshotLength therefore continue to
+        // describe the file exactly as written, and the trust chain needs no
+        // change: a hash is only ever compared against the same bytes it was
+        // taken from, never re-derived from a fresh serialization.
+        std::string snapshot = detail::compression::encode_snapshot(payload);
+        std::string snapshot_hash = crypto::sha256_hex(snapshot);
 
         std::wstring mirror_path = detail::build_mirror_path(journal_path, L"journals-mirror", L"journal");
-        detail::save_snapshot_set(journal_path, payload, BackupGenerationCount);
-        detail::save_snapshot_set(mirror_path, payload, BackupGenerationCount);
+        detail::save_snapshot_set(journal_path, snapshot, BackupGenerationCount);
+        detail::save_snapshot_set(mirror_path, snapshot, BackupGenerationCount);
 
         detail::SecurityContext context = create_security_context(journal_path);
         std::wstring primary_anchor = anchor_path(journal_path);
@@ -867,6 +1094,145 @@ public:
     static std::wstring ledger_path(const std::wstring& snapshot_path) { return snapshot_path + L".ledger"; }
     static std::wstring anchor_path(const std::wstring& snapshot_path) { return snapshot_path + L".anchor"; }
 
+    // -----------------------------------------------------------------------
+    // Maintenance
+    //
+    // The rotating backups exist to protect a journal that is being rewritten
+    // every flush while a job runs. Once a run has finished successfully they
+    // are dead weight, and they dominate on-disk size: three generations of a
+    // large journal, duplicated into the mirror, is roughly six extra copies.
+    // -----------------------------------------------------------------------
+
+    // Drops the backup generations for a finished journal (primary and mirror).
+    // The snapshots, ledger, and anchor are left intact, so the tamper-evident
+    // chain and later inspection are unaffected. Returns bytes reclaimed.
+    static std::int64_t compact_completed(const std::wstring& journal_path) {
+        if (journal_path.empty()) return 0;
+        std::int64_t reclaimed = 0;
+        std::wstring mirror =
+            detail::build_mirror_path(journal_path, L"journals-mirror", L"journal");
+        for (const std::wstring& base : {journal_path, mirror}) {
+            for (int generation = 1; generation <= BackupGenerationCount; ++generation) {
+                reclaimed += fsutil::delete_file(detail::backup_path(base, generation));
+            }
+        }
+        return reclaimed;
+    }
+
+    // Compacts every journal in the folder except the protected (still
+    // resumable) ones. Runs at startup so rotations left by runs that finished
+    // before compaction existed — or by a build without it — are reclaimed too.
+    static std::int64_t compact_all(const std::vector<std::wstring>& protected_paths,
+                                    const std::wstring& journals_root = std::wstring()) {
+        std::wstring root = journals_root.empty()
+                                ? fsutil::local_app_data() + L"\\XactCopy\\journals"
+                                : journals_root;
+        std::vector<std::wstring> protected_upper;
+        protected_upper.reserve(protected_paths.size());
+        for (const auto& path : protected_paths) {
+            if (!path.empty()) protected_upper.push_back(fsutil::to_upper_invariant(path));
+        }
+
+        std::int64_t reclaimed = 0;
+        for (const auto& path : fsutil::enumerate_files(root, L"job-*.json")) {
+            std::wstring upper = fsutil::to_upper_invariant(path);
+            bool is_protected = false;
+            for (const auto& guard : protected_upper) {
+                if (guard == upper) { is_protected = true; break; }
+            }
+            if (!is_protected) reclaimed += compact_completed(path);
+        }
+        return reclaimed;
+    }
+
+    struct PruneOptions {
+        // Journals untouched for longer than this are removed. 0 disables
+        // age-based pruning entirely.
+        int retention_days = 30;
+        // Always keep this many of the most recent journals, whatever their age,
+        // so a quiet month never empties the history.
+        int keep_minimum = 10;
+        // Journals that must never be removed: the active run and anything still
+        // resumable (running, paused, or interrupted).
+        std::vector<std::wstring> protected_paths;
+        // Directory to sweep. Empty means the real journals folder; tests point
+        // this at a scratch directory so a sweep can never reach user data.
+        std::wstring journals_root;
+    };
+
+    struct PruneResult {
+        int journals_removed = 0;
+        std::int64_t bytes_reclaimed = 0;
+    };
+
+    // Removes old completed journals along with their backups, ledger, anchor,
+    // and mirror counterparts.
+    static PruneResult prune(const PruneOptions& options) {
+        PruneResult result;
+        std::wstring root = options.journals_root.empty()
+                                ? fsutil::local_app_data() + L"\\XactCopy\\journals"
+                                : options.journals_root;
+        // Deliberately strict: only files the store itself creates are candidates.
+        std::vector<std::wstring> journals = fsutil::enumerate_files(root, L"job-*.json");
+        if (journals.empty()) return result;
+
+        std::vector<std::wstring> protected_upper;
+        protected_upper.reserve(options.protected_paths.size());
+        for (const auto& path : options.protected_paths) {
+            if (!path.empty()) protected_upper.push_back(fsutil::to_upper_invariant(path));
+        }
+
+        // Newest first, so keep_minimum protects the most recent history.
+        std::vector<std::pair<std::uint64_t, std::wstring>> ordered;
+        ordered.reserve(journals.size());
+        for (const auto& path : journals) {
+            ordered.emplace_back(fsutil::last_write_time(path), path);
+        }
+        std::sort(ordered.begin(), ordered.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        const std::uint64_t now = fsutil::now_file_time();
+        // FILETIME ticks are 100 ns units.
+        const std::uint64_t max_age =
+            static_cast<std::uint64_t>(options.retention_days) * 24ULL * 60ULL * 60ULL * 10000000ULL;
+
+        for (std::size_t index = 0; index < ordered.size(); ++index) {
+            if (static_cast<int>(index) < options.keep_minimum) continue;
+            if (options.retention_days <= 0) break;
+            const std::uint64_t written = ordered[index].second.empty() ? 0 : ordered[index].first;
+            if (written == 0 || now <= written || (now - written) < max_age) continue;
+
+            const std::wstring& path = ordered[index].second;
+            std::wstring upper = fsutil::to_upper_invariant(path);
+            bool is_protected = false;
+            for (const auto& guard : protected_upper) {
+                if (guard == upper) { is_protected = true; break; }
+            }
+            if (is_protected) continue;
+
+            result.bytes_reclaimed += remove_journal_set(path);
+            ++result.journals_removed;
+        }
+        return result;
+    }
+
+    // Deletes every artifact belonging to one journal: snapshot, backups,
+    // ledger, anchor, and the mirror copies of all of them.
+    static std::int64_t remove_journal_set(const std::wstring& journal_path) {
+        std::int64_t reclaimed = 0;
+        std::wstring mirror =
+            detail::build_mirror_path(journal_path, L"journals-mirror", L"journal");
+        for (const std::wstring& base : {journal_path, mirror}) {
+            for (int generation = 1; generation <= BackupGenerationCount; ++generation) {
+                reclaimed += fsutil::delete_file(detail::backup_path(base, generation));
+            }
+            reclaimed += fsutil::delete_file(ledger_path(base));
+            reclaimed += fsutil::delete_file(anchor_path(base));
+            reclaimed += fsutil::delete_file(base);
+        }
+        return reclaimed;
+    }
+
 private:
     struct SeedState {
         std::int64_t sequence = 0;
@@ -910,9 +1276,14 @@ private:
         if (!bytes.has_value() || bytes->empty()) return std::nullopt;
 
         try {
+            // Hash the raw file, then decode: a snapshot may be a compressed
+            // container or plain JSON (written before compression, or by the
+            // legacy .NET build), and both must keep loading.
             std::string snapshot_hash = crypto::sha256_hex(*bytes);
-            std::string_view text(reinterpret_cast<const char*>(bytes->data()), bytes->size());
-            json::Value root = json::parse(text);
+            std::optional<std::string> decoded =
+                detail::compression::decode_snapshot(bytes->data(), bytes->size());
+            if (!decoded.has_value()) return std::nullopt;
+            json::Value root = json::parse(*decoded);
             if (!root.is_object()) return std::nullopt;
             JobJournal journal = JobJournal::from_json(root);
             normalize_journal(journal);

@@ -55,6 +55,14 @@ rotating backups and mirror copies, and made tamper-evident:
 This is what powers **resume** and **crash recovery**: on restart the journal is
 merged with the current source to pick up precisely where the last run left off.
 
+Because a snapshot is rewritten in full on every flush, its cost scales with the
+journal — a whole-drive job produces a 100 MB+ snapshot. Flush frequency is
+therefore budgeted rather than fixed: after a save costing *N* ms the next flush
+waits at least *19N*, holding journal I/O near 5% of run time at any journal
+size. Small journals save in about a millisecond and keep the original
+sub-second cadence. The trade is that a large job may redo up to one interval of
+work after a crash, which is cheap next to rewriting the snapshot twice a second.
+
 ## Bad-range maps
 
 A bad-range map records the unreadable byte ranges of a specific source. Maps are
@@ -102,11 +110,24 @@ formats are stable and inspectable:
 - **JSON** is emitted compactly for IPC and indented (2-space, CRLF) for stored
   artifacts, with a serializer that matches .NET's System.Text.Json escaping and
   number/date formatting.
+- **Journal file entries omit default-valued members**, and omit `RelativePath`
+  when it only repeats the key the entry is stored under. Readers treat an absent
+  member as its default, so this is an encoding difference rather than a schema
+  one. It is worth roughly 40% of a large journal, which is otherwise dominated
+  by empty strings, `false`, and `[]`.
+- **Journal snapshots over 64 KB are compressed** into a container: `"XCJZ"`,
+  a version and algorithm byte, and the uncompressed length, followed by an
+  XPRESS_HUFF stream. Smaller journals stay plain JSON so the common case is
+  still readable in a text editor. Reads sniff the magic, so plain-JSON
+  snapshots — written by older builds, or by the legacy .NET build — keep
+  loading unchanged. The ledger hashes the bytes as written, compressed or not.
+  Bad-range maps, the job catalog, ledgers, and anchors are all small and stay
+  uncompressed and inspectable.
 - **Timestamps** use ISO‑8601 `DateTimeOffset` and the constant `TimeSpan`
   ("c") format.
 - **Path fingerprints** are `SHA‑256(UTF‑8(ToUpperInvariant(fullPath)))`.
 - **Signatures** are base64 HMAC‑SHA256 over the relevant hash plus the path
   fingerprint.
 
-These formats are exercised by the golden-file and cross-compatibility tests
-described in [CONTRIBUTING](../CONTRIBUTING.md).
+These formats are pinned by the golden files described in
+[CONTRIBUTING](../CONTRIBUTING.md), which the test suites byte-compare against.
