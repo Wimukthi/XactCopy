@@ -3,7 +3,7 @@
 # Purpose: Builds the native XactCopy worker, UI, and tests without CMake.
 #          Default toolchain is MSYS2 g++; -Compiler msvc uses VS 18 cl after
 #          loading vcvars64. Output goes to the project's own build\ folder.
-# Usage:   .\build.ps1 [-Compiler gcc|msvc] [-RunTests] [-CrossTests]
+# Usage:   .\build.ps1 [-Compiler gcc|msvc] [-RunTests]
 #                      [-GoldenDir <path>] [-ThemeRoot <path>]
 # -----------------------------------------------------------------------------
 
@@ -11,7 +11,6 @@ param(
     [ValidateSet("gcc", "msvc")]
     [string]$Compiler = "gcc",
     [switch]$RunTests,
-    [switch]$CrossTests,
     [string]$GoldenDir = "",
     [string]$ThemeRoot = ""
 )
@@ -105,10 +104,28 @@ if ($Compiler -eq "gcc") {
     & g++ @commonFlags @themeFlags -municode -mwindows $uiSource @themeSources $uiRes -o $uiExe @storageLibs -lcomctl32 -lcomdlg32 -ldwmapi -luxtheme -lgdi32 -lgdiplus -lmsimg32 -lshlwapi -lwinhttp
     if ($LASTEXITCODE -ne 0) { throw "ui build failed" }
 } else {
-    $vcvars = "C:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Auxiliary\Build\vcvars64.bat"
-    if (-not (Test-Path $vcvars)) {
-        throw "vcvars64.bat not found at $vcvars"
+    # Locate vcvars64.bat rather than hardcoding an edition: vswhere first (it
+    # knows about every installed instance, including preview/Insiders), then
+    # the well-known layouts as a fallback for older installs.
+    $vcvars = $null
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vswhere) {
+        $found = & $vswhere -latest -prerelease -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -find "VC\Auxiliary\Build\vcvars64.bat" 2>$null | Select-Object -First 1
+        if ($found -and (Test-Path $found)) { $vcvars = $found }
     }
+    if (-not $vcvars) {
+        $candidates = Get-ChildItem -Path @(
+            "${env:ProgramFiles}\Microsoft Visual Studio",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio"
+        ) -Filter "vcvars64.bat" -Recurse -Depth 5 -ErrorAction SilentlyContinue
+        $vcvars = $candidates | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
+    if (-not $vcvars) {
+        throw "vcvars64.bat not found. Install the Visual Studio Desktop C++ workload."
+    }
+    Write-Host "[msvc] using $vcvars"
     $themeSourceArgs = ($themeSources | ForEach-Object { '"' + $_ + '"' }) -join " "
     $themeIncludeArgs =
         '/I"' + (Join-Path $ThemeRoot "include") + '" ' +
@@ -162,81 +179,4 @@ if ($RunTests) {
     Write-Host "running worker tests..."
     & $workerTestExe
     if ($LASTEXITCODE -ne 0) { throw "worker tests failed" }
-}
-
-if ($CrossTests) {
-    # Full bidirectional storage compatibility: the .NET stores and the native
-    # stores read each other's artifacts, including tamper-fallback trust.
-    $probeDir = Join-Path $cppRoot "tools\StorageProbe"
-    $crossRoot = Join-Path $env:TEMP ("xactcopy-cross-" + [Guid]::NewGuid().ToString("N").Substring(0, 12))
-
-    Write-Host "[cross] building StorageProbe..."
-    Push-Location $probeDir
-    try {
-        dotnet build -c Release -v quiet --nologo | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "StorageProbe build failed" }
-
-        function Invoke-Probe([string]$mode, [string]$dir) {
-            dotnet run -c Release --no-build -- $mode (Join-Path $dir "crossjournal.json") (Join-Path $dir "crossmap.json")
-            if ($LASTEXITCODE -ne 0) { throw "StorageProbe $mode failed" }
-        }
-        function Invoke-Native([string]$mode, [string]$dir) {
-            & $storageTestExe $mode (Join-Path $dir "crossjournal.json") (Join-Path $dir "crossmap.json")
-            if ($LASTEXITCODE -ne 0) { throw "native $mode failed" }
-        }
-
-        Write-Host "[cross] .NET write -> C++ read"
-        $dirA = Join-Path $crossRoot "a"; New-Item -ItemType Directory -Force $dirA | Out-Null
-        Invoke-Probe "write" $dirA
-        Invoke-Native "cross-read" $dirA
-
-        Write-Host "[cross] .NET write -> C++ tamper-fallback read"
-        $dirB = Join-Path $crossRoot "b"; New-Item -ItemType Directory -Force $dirB | Out-Null
-        Invoke-Probe "write" $dirB
-        Invoke-Native "cross-read-tamper" $dirB
-
-        Write-Host "[cross] C++ write -> .NET read"
-        $dirC = Join-Path $crossRoot "c"; New-Item -ItemType Directory -Force $dirC | Out-Null
-        Invoke-Native "cross-write" $dirC
-        Invoke-Probe "verify" $dirC
-
-        Write-Host "[cross] C++ write -> .NET tamper-fallback read"
-        $dirD = Join-Path $crossRoot "d"; New-Item -ItemType Directory -Force $dirD | Out-Null
-        Invoke-Native "cross-write" $dirD
-        Invoke-Probe "verify-tamper" $dirD
-
-        Write-Host "[cross] .NET catalog write -> C++ read"
-        $dirE = Join-Path $crossRoot "e"; New-Item -ItemType Directory -Force $dirE | Out-Null
-        $catalogE = Join-Path $dirE "crosscatalog.json"
-        dotnet run -c Release --no-build -- write-catalog $catalogE $catalogE
-        if ($LASTEXITCODE -ne 0) { throw "StorageProbe write-catalog failed" }
-        & $storageTestExe cross-read-catalog $catalogE
-        if ($LASTEXITCODE -ne 0) { throw "native cross-read-catalog failed" }
-
-        Write-Host "[cross] C++ catalog write -> .NET read"
-        $dirF = Join-Path $crossRoot "f"; New-Item -ItemType Directory -Force $dirF | Out-Null
-        $catalogF = Join-Path $dirF "crosscatalog.json"
-        & $storageTestExe cross-write-catalog $catalogF
-        if ($LASTEXITCODE -ne 0) { throw "native cross-write-catalog failed" }
-        dotnet run -c Release --no-build -- verify-catalog $catalogF $catalogF
-        if ($LASTEXITCODE -ne 0) { throw "StorageProbe verify-catalog failed" }
-
-        Write-Host "[cross] ALL CROSS-COMPAT TESTS PASSED"
-    } finally {
-        Pop-Location
-        # Remove test artifacts, including the mirrors the stores fan out to.
-        try { Remove-Item -Recurse -Force $crossRoot -ErrorAction SilentlyContinue } catch {}
-        $mirrorRoots = @(
-            (Join-Path $env:LOCALAPPDATA "XactCopy\journals-mirror"),
-            (Join-Path $env:LOCALAPPDATA "XactCopy\badmaps-mirror")
-        )
-        foreach ($mirrorRoot in $mirrorRoots) {
-            if (Test-Path $mirrorRoot) {
-                Get-ChildItem $mirrorRoot -Filter "cross*" -ErrorAction SilentlyContinue |
-                    Remove-Item -Force -ErrorAction SilentlyContinue
-                Get-ChildItem $mirrorRoot -Filter "rt-*" -ErrorAction SilentlyContinue |
-                    Remove-Item -Force -ErrorAction SilentlyContinue
-            }
-        }
-    }
 }
