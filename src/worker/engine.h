@@ -302,8 +302,9 @@ public:
 
         JobJournal journal = merge_journal(existing, scan.files,
                                            wide_to_utf8(source_root), wide_to_utf8(destination_root), job_id);
-        journal_store_.save(journal_path, journal);
-        last_journal_flush_tick_ = GetTickCount64();
+        // Priming save: also measures what a save of this journal costs, so the
+        // very first throttled flush is already priced correctly.
+        save_journal_now(journal_path, journal);
 
         ProgressAccumulator progress;
         progress.total_files = static_cast<std::int32_t>(scan.files.size());
@@ -315,8 +316,7 @@ public:
             std::string fast_error = run_fast_scan_mode(scan.files, source_root, progress, journal,
                                                         journal_path, cancel);
             flush_bad_range_map();
-            journal_store_.save(journal_path, journal);
-            last_journal_flush_tick_ = GetTickCount64();
+            save_journal_now(journal_path, journal);
             CopyJobResult fast_result = create_result(
                 progress, journal_path,
                 fast_error.empty() && progress.failed_files == 0, false, fast_error);
@@ -430,8 +430,7 @@ public:
                     descriptor, *entry, progress, journal, journal_path,
                     /*preserve_existing_coverage*/ false, /*seed_progress*/ true, cancel);
                 if (!scan_error.empty() && !options_.ContinueOnFileError) {
-                    journal_store_.save(journal_path, journal);
-                    last_journal_flush_tick_ = GetTickCount64();
+                    save_journal_now(journal_path, journal);
                     return create_result(progress, journal_path, false, false, scan_error);
                 }
                 continue;
@@ -454,7 +453,6 @@ public:
             }
 
             std::optional<std::string> copy_error;
-            bool copy_error_fatal_result = false;
             bool recovered = false;
             bool fragile_skip = false;
             std::string fragile_message;
@@ -526,14 +524,13 @@ public:
             flush_journal(journal_path, journal, true);
 
             if (!options_.ContinueOnFileError) {
-                journal_store_.save(journal_path, journal);
-                (void)copy_error_fatal_result;
+                save_journal_now(journal_path, journal);
                 return create_result(progress, journal_path, false, false, *copy_error);
             }
         }
 
         flush_bad_range_map();
-        journal_store_.save(journal_path, journal);
+        save_journal_now(journal_path, journal);
         CopyJobResult final_result = create_result(progress, journal_path,
                                                    progress.failed_files == 0, false, std::string());
         emit_run_summary(final_result);
@@ -577,6 +574,7 @@ private:
 
     ULONGLONG run_started_tick_ = 0;
     ULONGLONG last_journal_flush_tick_ = 0;
+    ULONGLONG last_journal_save_cost_ms_ = 0;
     ULONGLONG throttle_window_start_tick_ = 0;
     std::int64_t throttle_window_bytes_ = 0;
     std::string expected_source_identity_;
@@ -815,12 +813,45 @@ private:
         return true;
     }
 
+    // Saves unconditionally and records what it cost, so the throttle below can
+    // price the next flush. Used for the job's own boundaries (first save,
+    // phase end, failure exits) where the snapshot must land regardless.
+    void save_journal_now(const std::wstring& journal_path, JobJournal& journal) {
+        ULONGLONG started = GetTickCount64();
+        journal_store_.save(journal_path, journal);
+        last_journal_save_cost_ms_ = GetTickCount64() - started;
+        last_journal_flush_tick_ = GetTickCount64();
+    }
+
+    // A journal save is O(journal size): the whole snapshot is re-serialized,
+    // hashed, rotated, and mirrored. On a whole-drive job that snapshot is
+    // 100 MB+, so a fixed 500 ms cadence spends more I/O on journaling than on
+    // the copy itself — and the throttle silently degrades into "save as fast
+    // as the disk allows", which is what makes a large job crawl.
+    //
+    // Instead of a fixed cadence, bound journaling's share of wall time: after
+    // a save costing N ms the next flush waits at least N * (Divisor - 1), so
+    // journal I/O settles near 1/Divisor of the run whatever the journal size.
+    // Small journals save in ~1 ms and keep the original sub-second cadence;
+    // only journals big enough to hurt back off. The ceiling keeps even a huge
+    // journal checkpointing regularly.
+    //
+    // The cost is resume granularity: a large job may redo up to one interval
+    // of work after a crash. That is a good trade against spending half the run
+    // rewriting a snapshot, and it does not affect stall detection — the
+    // supervisor watches heartbeats and progress events, not journal writes.
+    static constexpr ULONGLONG JournalFlushDutyDivisor = 20;
+    static constexpr ULONGLONG MaximumJournalFlushIntervalMs = 5 * 60 * 1000;
+
     void flush_journal(const std::wstring& journal_path, JobJournal& journal, bool force) {
         ULONGLONG now = GetTickCount64();
         ULONGLONG interval_ms = force ? 500 : 1000;
+        ULONGLONG budget_ms = last_journal_save_cost_ms_ * (JournalFlushDutyDivisor - 1);
+        if (budget_ms > interval_ms) {
+            interval_ms = std::min(budget_ms, MaximumJournalFlushIntervalMs);
+        }
         if (last_journal_flush_tick_ != 0 && now - last_journal_flush_tick_ < interval_ms) return;
-        journal_store_.save(journal_path, journal);
-        last_journal_flush_tick_ = now;
+        save_journal_now(journal_path, journal);
     }
 
     // ---- Per-file gates ---------------------------------------------------

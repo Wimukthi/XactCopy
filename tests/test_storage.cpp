@@ -1,13 +1,9 @@
 // -----------------------------------------------------------------------------
 // File: cpp\tests\test_storage.cpp
-// Purpose: Storage-layer tests: crypto vectors, STJ-indented byte parity
-//          against .NET goldens, native store round-trips and tamper fallback,
-//          plus cross-compat modes driven by build.ps1 together with the .NET
-//          StorageProbe (canonical content must match Program.cs exactly).
-// Modes:   (none)                                unit tests + goldens
-//          cross-write <journalPath> <mapPath>   write canonical artifacts
-//          cross-read <journalPath> <mapPath>    read + verify artifacts
-//          cross-read-tamper <journalPath> <mapPath>  corrupt primaries, verify fallback
+// Purpose: Storage-layer tests: crypto vectors, indented-writer byte parity
+//          against the goldens, journal compression and maintenance, native
+//          store round-trips and tamper fallback, and job catalog round-trip.
+// Usage:   xactcopy_storage_tests.exe [goldenDir]
 // -----------------------------------------------------------------------------
 
 #include <chrono>
@@ -58,7 +54,8 @@ std::string read_file(const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------
-// Canonical cross-compat content — must mirror StorageProbe/Program.cs.
+// Canonical journal and map content, shared by the native round-trip and
+// tamper-fallback tests below.
 // ---------------------------------------------------------------------------
 
 storage::JobJournal build_journal_v1() {
@@ -304,10 +301,77 @@ void test_ordered_file_map_scale() {
     check(map.entries.front().first == "dir0\\file0.bin", "upsert preserved insertion order");
 }
 
+// The object golden_journal_payload.json is expected to deserialize into,
+// whichever writer produced the bytes.
+storage::JobJournal build_golden_journal() {
+    storage::JobJournal journal;
+    journal.JobId = "golden-journal-01";
+    journal.SourceRoot = "D:\\GoldenSrc";
+    journal.DestinationRoot = "E:\\GoldenDest";
+    journal.CreatedUtc = *time::DateTimeOffset::parse("2026-07-23T00:00:00+00:00");
+    journal.UpdatedUtc = *time::DateTimeOffset::parse("2026-07-23T01:30:00.5+00:00");
+
+    storage::JournalFileEntry alpha;
+    alpha.RelativePath = "alpha.txt";
+    alpha.SourceLength = 1234;
+    alpha.SourceLastWriteUtcTicks = 638000000000000000LL;
+    alpha.BytesCopied = 1234;
+    alpha.State = storage::FileCopyState::CompletedWithRecovery;
+    alpha.RecoveredRanges.push_back({0, 128});
+    alpha.RescueRanges.push_back({512, 64, storage::RescueRangeState::Recovered});
+    alpha.LastRescuePass = "Scrape";
+    journal.Files.set("alpha.txt", std::move(alpha));
+
+    storage::JournalFileEntry empty;
+    empty.RelativePath = "empty.dat";
+    empty.State = storage::FileCopyState::Pending;
+    journal.Files.set("empty.dat", std::move(empty));
+    return journal;
+}
+
+bool entries_equivalent(const storage::JournalFileEntry& a, const storage::JournalFileEntry& b) {
+    if (a.RelativePath != b.RelativePath || a.SourceLength != b.SourceLength ||
+        a.SourceLastWriteUtcTicks != b.SourceLastWriteUtcTicks || a.BytesCopied != b.BytesCopied ||
+        a.State != b.State || a.LastError != b.LastError || a.DoNotRetry != b.DoNotRetry ||
+        a.LastRescuePass != b.LastRescuePass ||
+        a.RecoveredRanges.size() != b.RecoveredRanges.size() ||
+        a.RescueRanges.size() != b.RescueRanges.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.RecoveredRanges.size(); ++i) {
+        if (a.RecoveredRanges[i].Offset != b.RecoveredRanges[i].Offset ||
+            a.RecoveredRanges[i].Length != b.RecoveredRanges[i].Length) {
+            return false;
+        }
+    }
+    for (std::size_t i = 0; i < a.RescueRanges.size(); ++i) {
+        if (a.RescueRanges[i].Offset != b.RescueRanges[i].Offset ||
+            a.RescueRanges[i].Length != b.RescueRanges[i].Length ||
+            a.RescueRanges[i].State != b.RescueRanges[i].State) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool journals_equivalent(const storage::JobJournal& a, const storage::JobJournal& b) {
+    if (a.JobId != b.JobId || a.SourceRoot != b.SourceRoot ||
+        a.DestinationRoot != b.DestinationRoot || !(a.CreatedUtc == b.CreatedUtc) ||
+        !(a.UpdatedUtc == b.UpdatedUtc) || a.Files.size() != b.Files.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.Files.entries.size(); ++i) {
+        if (a.Files.entries[i].first != b.Files.entries[i].first) return false;
+        if (!entries_equivalent(a.Files.entries[i].second, b.Files.entries[i].second)) return false;
+    }
+    return true;
+}
+
 void test_storage_goldens(const std::string& golden_dir) {
     std::string map_golden = read_file(golden_dir + "/golden_map_payload.json");
     if (map_golden.empty()) {
-        std::printf("NOTE: storage goldens not found in %s; run GoldenGen first.\n", golden_dir.c_str());
+        std::printf("NOTE: storage goldens not found in %s; pass the goldens directory.\n",
+                    golden_dir.c_str());
         return;
     }
 
@@ -343,12 +407,36 @@ void test_storage_goldens(const std::string& golden_dir) {
     check_equal(storage::BadRangeMapStore::serialize_map(reparsed), map_golden,
                 "golden map reparse byte-for-byte");
 
+    // The journal writer omits default-valued members, so its output is
+    // deliberately no longer byte-identical to the .NET writer's. What still
+    // has to hold is interop, and that is what these three checks cover:
+    //   1. the .NET-shaped golden still loads into an identical object,
+    //   2. the slim output is byte-stable (regression guard on the writer),
+    //   3. re-reading the slim output reproduces the same object, which is the
+    //      property that keeps a .NET reader (defaults for absent members)
+    //      equivalent to ours.
     std::string journal_golden = read_file(golden_dir + "/golden_journal_payload.json");
     if (!journal_golden.empty()) {
-        storage::JobJournal reparsed_journal = storage::JobJournal::from_json(json::parse(journal_golden));
+        storage::JobJournal from_dotnet = storage::JobJournal::from_json(json::parse(journal_golden));
+        check(journals_equivalent(from_dotnet, build_golden_journal()),
+              "golden journal: .NET-shaped payload still loads to the expected object");
+
         json::Writer w(/*indented*/ true);
-        reparsed_journal.to_json(w);
-        check_equal(w.take(), journal_golden, "golden journal reparse byte-for-byte");
+        from_dotnet.to_json(w);
+        std::string slim = w.take();
+
+        std::string slim_golden = read_file(golden_dir + "/golden_journal_payload_slim.json");
+        if (!slim_golden.empty()) {
+            check_equal(slim, slim_golden, "golden journal slim payload byte-for-byte");
+        }
+
+        storage::JobJournal round_tripped = storage::JobJournal::from_json(json::parse(slim));
+        storage::JobJournalStore::normalize_journal(round_tripped);
+        storage::JobJournal expected = from_dotnet;
+        storage::JobJournalStore::normalize_journal(expected);
+        check(journals_equivalent(round_tripped, expected),
+              "golden journal: slim payload round-trips to the same object");
+        check(slim.size() < journal_golden.size(), "golden journal: slim payload is smaller");
     }
 
     std::string empty_golden = read_file(golden_dir + "/golden_journal_empty.json");
@@ -358,6 +446,196 @@ void test_storage_goldens(const std::string& golden_dir) {
         empty_journal.to_json(w);
         check_equal(w.take(), empty_golden, "golden empty-files journal byte-for-byte");
     }
+}
+
+// Journal snapshots are compressed above a size threshold. The container must
+// round-trip, small journals must stay plain JSON, and — the one that actually
+// matters for upgrades — a plain-JSON journal already on disk must still load.
+void test_journal_compression(const std::wstring& work_dir) {
+    std::printf("--- journal compression: container + legacy plain-JSON reads ---\n");
+    storage::fsutil::create_directories(work_dir);
+
+    // Small journal: stays readable JSON, no container header.
+    {
+        std::wstring path = work_dir + L"\\job-small.json";
+        storage::JobJournalStore store;
+        storage::JobJournal journal;
+        journal.JobId = "small";
+        journal.SourceRoot = "C:\\src";
+        journal.DestinationRoot = "C:\\dst";
+        store.save(path, journal);
+
+        auto bytes = storage::fsutil::read_all_bytes(path);
+        check(bytes.has_value() && !bytes->empty(), "compression: small journal written");
+        check(bytes.has_value() && (*bytes)[0] == '{',
+              "compression: small journal stays plain JSON");
+        auto loaded = store.load(path);
+        check(loaded.has_value() && loaded->JobId == "small", "compression: small journal loads");
+        storage::JobJournalStore::remove_journal_set(path);
+    }
+
+    // Large journal: compressed container, and it must survive a full round-trip
+    // through the store including the ledger's trust check.
+    {
+        std::wstring path = work_dir + L"\\job-large.json";
+        storage::JobJournalStore store;
+        storage::JobJournal journal;
+        journal.JobId = "large";
+        journal.SourceRoot = "C:\\src";
+        journal.DestinationRoot = "C:\\dst";
+        for (int i = 0; i < 4000; ++i) {
+            storage::JournalFileEntry entry;
+            entry.RelativePath = "folder\\subfolder\\file-" + std::to_string(i) + ".bin";
+            entry.SourceLength = 1024 * (i + 1);
+            entry.BytesCopied = entry.SourceLength;
+            entry.State = storage::FileCopyState::Completed;
+            entry.LastRescuePass = "FastHealthScan";
+            std::string key = entry.RelativePath;
+            journal.Files.set(std::move(key), std::move(entry));
+        }
+        store.save(path, journal);
+
+        auto bytes = storage::fsutil::read_all_bytes(path);
+        check(bytes.has_value() && bytes->size() >= 4, "compression: large journal written");
+        bool is_container = bytes.has_value() && bytes->size() >= 16 && (*bytes)[0] == 'X' &&
+                            (*bytes)[1] == 'C' && (*bytes)[2] == 'J' && (*bytes)[3] == 'Z';
+        check(is_container, "compression: large journal is a compressed container");
+
+        json::Writer w(/*indented*/ true);
+        journal.to_json(w);
+        std::size_t plain_size = w.take().size();
+        check(bytes.has_value() && bytes->size() < plain_size / 2,
+              "compression: container is less than half the plain size (" +
+                  std::to_string(bytes.has_value() ? bytes->size() : 0) + " vs " +
+                  std::to_string(plain_size) + ")");
+
+        auto loaded = store.load(path);
+        check(loaded.has_value() && loaded->JobId == "large",
+              "compression: compressed journal loads through the ledger");
+        check(loaded.has_value() && loaded->Files.size() == 4000,
+              "compression: every entry survives the round-trip");
+        if (loaded.has_value()) {
+            const auto* entry = loaded->Files.find("folder\\subfolder\\file-1234.bin");
+            check(entry != nullptr && entry->SourceLength == 1024 * 1235 &&
+                      entry->State == storage::FileCopyState::Completed &&
+                      entry->RelativePath == "folder\\subfolder\\file-1234.bin",
+                  "compression: entry contents and key-derived path are intact");
+        }
+        storage::JobJournalStore::remove_journal_set(path);
+    }
+
+    // Upgrade path: a plain-JSON journal sitting on disk from an older build
+    // (or the legacy .NET build) still loads, with no ledger present at all.
+    {
+        std::wstring path = work_dir + L"\\job-legacy.json";
+        std::string legacy =
+            "{\r\n  \"JobId\": \"legacy\",\r\n  \"SourceRoot\": \"D:\\\\Old\",\r\n"
+            "  \"DestinationRoot\": \"E:\\\\Old\",\r\n"
+            "  \"CreatedUtc\": \"2026-01-01T00:00:00+00:00\",\r\n"
+            "  \"UpdatedUtc\": \"2026-01-01T00:00:00+00:00\",\r\n  \"Files\": {\r\n"
+            "    \"legacy.bin\": {\r\n      \"RelativePath\": \"legacy.bin\",\r\n"
+            "      \"SourceLength\": 4096,\r\n      \"BytesCopied\": 4096,\r\n"
+            "      \"State\": \"Completed\",\r\n      \"LastError\": \"\",\r\n"
+            "      \"DoNotRetry\": false,\r\n      \"RecoveredRanges\": [],\r\n"
+            "      \"RescueRanges\": [],\r\n      \"LastRescuePass\": \"\"\r\n    }\r\n  }\r\n}";
+        storage::fsutil::write_file_raw(path, reinterpret_cast<const unsigned char*>(legacy.data()),
+                                        legacy.size(), false, false);
+
+        storage::JobJournalStore store;
+        auto loaded = store.load(path);
+        check(loaded.has_value() && loaded->JobId == "legacy",
+              "compression: legacy plain-JSON journal still loads");
+        if (loaded.has_value()) {
+            const auto* entry = loaded->Files.find("legacy.bin");
+            check(entry != nullptr && entry->BytesCopied == 4096 &&
+                      entry->State == storage::FileCopyState::Completed,
+                  "compression: legacy entry read correctly");
+        }
+        storage::JobJournalStore::remove_journal_set(path);
+    }
+}
+
+// Journal maintenance: compaction must drop only the rotating backups, and
+// pruning must never touch a journal that is still resumable.
+void test_journal_maintenance(const std::wstring& work_dir) {
+    std::printf("--- journal maintenance: compaction + retention ---\n");
+    storage::fsutil::create_directories(work_dir);
+    // Named like a real journal so the store's strict job-*.json sweep sees it.
+    std::wstring journal_path = work_dir + L"\\job-maint.json";
+
+    storage::JobJournalStore store;
+    storage::JobJournal journal;
+    journal.JobId = "maintenance";
+    journal.SourceRoot = "C:\\src";
+    journal.DestinationRoot = "C:\\dst";
+
+    // Three saves produce the full backup rotation (bak1..bak3).
+    for (int i = 0; i < 4; ++i) {
+        journal.UpdatedUtc = time::DateTimeOffset::now_utc();
+        store.save(journal_path, journal);
+    }
+
+    int backups_before = 0;
+    for (int generation = 1; generation <= storage::JobJournalStore::BackupGenerationCount;
+         ++generation) {
+        if (storage::fsutil::file_exists(journal_path + L".bak" + std::to_wstring(generation))) {
+            ++backups_before;
+        }
+    }
+    check(backups_before > 0, "maintenance: rotation produced backup generations");
+
+    std::int64_t reclaimed = storage::JobJournalStore::compact_completed(journal_path);
+    check(reclaimed > 0, "maintenance: compaction reclaimed bytes");
+
+    int backups_after = 0;
+    for (int generation = 1; generation <= storage::JobJournalStore::BackupGenerationCount;
+         ++generation) {
+        if (storage::fsutil::file_exists(journal_path + L".bak" + std::to_wstring(generation))) {
+            ++backups_after;
+        }
+    }
+    check(backups_after == 0, "maintenance: compaction removed every backup generation");
+
+    // The snapshot and its trust chain must survive, and still load.
+    check(storage::fsutil::file_exists(journal_path), "maintenance: snapshot kept after compaction");
+    check(storage::fsutil::file_exists(journal_path + L".ledger"),
+          "maintenance: ledger kept after compaction");
+    auto reloaded = store.load(journal_path);
+    check(reloaded.has_value() && reloaded->JobId == "maintenance",
+          "maintenance: journal still loads after compaction");
+
+    // Retention must skip a protected (still resumable) journal.
+    storage::JobJournalStore::PruneOptions options;
+    options.retention_days = 1;
+    options.keep_minimum = 0;
+    options.protected_paths.push_back(journal_path);
+    options.journals_root = work_dir;
+    storage::JobJournalStore::PruneResult guarded = storage::JobJournalStore::prune(options);
+    check(storage::fsutil::file_exists(journal_path),
+          "maintenance: protected journal survives pruning");
+    (void)guarded;
+
+    // keep_minimum alone must also hold a journal back, regardless of age.
+    storage::JobJournalStore::PruneOptions keep_all;
+    keep_all.retention_days = 1;
+    keep_all.keep_minimum = 1000;
+    keep_all.journals_root = work_dir;
+    storage::JobJournalStore::prune(keep_all);
+    check(storage::fsutil::file_exists(journal_path),
+          "maintenance: keep_minimum holds journals back");
+
+    // Retention disabled must be a no-op.
+    storage::JobJournalStore::PruneOptions disabled;
+    disabled.retention_days = 0;
+    disabled.journals_root = work_dir;
+    storage::JobJournalStore::PruneResult none = storage::JobJournalStore::prune(disabled);
+    check(none.journals_removed == 0, "maintenance: retention_days=0 disables pruning");
+
+    // Tear down: save() also writes into the real mirror directory, so remove
+    // this journal's whole artifact set rather than leaving strays behind.
+    storage::JobJournalStore::remove_journal_set(journal_path);
+    check(!storage::fsutil::file_exists(journal_path),
+          "maintenance: remove_journal_set clears the journal");
 }
 
 void test_native_store_roundtrip(const std::wstring& work_dir) {
@@ -405,9 +683,16 @@ void test_native_store_roundtrip(const std::wstring& work_dir) {
     verify_map_v1(recovered_map, "native-tamper");
 }
 
-// --- Canonical job catalog shared with tools/StorageProbe/Program.cs --------
+// --- Job catalog round-trip ------------------------------------------------
+//
+// This fixture was originally the shared canonical content for the .NET
+// StorageProbe cross-check. That tooling is retired, but the content is still
+// the most thorough catalog exercise we have — non-ASCII names and paths,
+// nullable members that must stay null, enum members, and an optional result
+// present on one run and absent on another — so it now drives a native
+// save/load round-trip instead.
 
-storage::JobCatalog build_cross_catalog() {
+storage::JobCatalog build_canonical_catalog() {
     auto fixed_time = [](const char* text) {
         return *time::DateTimeOffset::parse(text);
     };
@@ -488,7 +773,7 @@ storage::JobCatalog build_cross_catalog() {
     return catalog;
 }
 
-void verify_cross_catalog(const storage::JobCatalog& catalog, const std::string& tag) {
+void verify_canonical_catalog(const storage::JobCatalog& catalog, const std::string& tag) {
     check(catalog.SchemaVersion == 2, tag + ": catalog schema 2");
     check(catalog.Jobs.size() == 1, tag + ": one job");
     if (catalog.Jobs.size() == 1) {
@@ -533,83 +818,38 @@ void verify_cross_catalog(const storage::JobCatalog& catalog, const std::string&
     }
 }
 
+void test_catalog_roundtrip(const std::wstring& work_dir) {
+    std::printf("--- job catalog: canonical content round-trip ---\n");
+    storage::fsutil::create_directories(work_dir);
+    std::wstring path = work_dir + L"\\rt-catalog.json";
+
+    storage::JobCatalogStore store(path);
+    // save() normalizes in place, so it takes a mutable reference.
+    storage::JobCatalog catalog = build_canonical_catalog();
+    check(store.save(catalog), "catalog round-trip: save");
+    verify_canonical_catalog(store.load(), "catalog round-trip");
+
+    storage::fsutil::delete_file(path);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc >= 3 && (std::string(argv[1]) == "cross-write-catalog" ||
-                      std::string(argv[1]) == "cross-read-catalog")) {
-        std::string mode = argv[1];
-        storage::JobCatalogStore catalog_store(utf8_to_wide(argv[2]));
-        if (mode == "cross-write-catalog") {
-            storage::JobCatalog catalog = build_cross_catalog();
-            check(catalog_store.save(catalog), "native catalog write");
-        } else {
-            verify_cross_catalog(catalog_store.load(), "cpp-load");
-        }
-        if (g_failures == 0) {
-            std::printf("STORAGE CATALOG %s OK: %d checks\n", mode.c_str(), g_checks);
-            return 0;
-        }
-        std::printf("STORAGE CATALOG FAILED: %d of %d checks\n", g_failures, g_checks);
-        return 1;
-    }
+    test_crypto_vectors();
+    test_indented_writer_basics();
+    test_ordered_file_map_scale();
 
-    if (argc >= 4) {
-        std::string mode = argv[1];
-        std::wstring journal_path = utf8_to_wide(argv[2]);
-        std::wstring map_path = utf8_to_wide(argv[3]);
-        storage::JobJournalStore journal_store;
-        storage::BadRangeMapStore map_store;
+    std::string golden_dir = argc > 1 ? argv[1] : "tests/golden";
+    test_storage_goldens(golden_dir);
 
-        if (mode == "cross-write") {
-            journal_store.save(journal_path, build_journal_v1());
-            journal_store.save(journal_path, build_journal_v2());
-            map_store.save(map_path, build_map_v1());
-            map_store.save(map_path, build_map_v2());
-            std::printf("NATIVE STORAGE WRITE OK (journal x2, map x2)\n");
-            return 0;
-        }
-        if (mode == "cross-read") {
-            verify_journal(journal_store.load(journal_path), "cpp-load");
-            verify_map(map_store.load(map_path), "cpp-load");
-        } else if (mode == "cross-read-tamper") {
-            storage::JobJournal tampered_journal = build_journal_v2();
-            tampered_journal.JobId = "TAMPERED";
-            json::Writer jw(true);
-            tampered_journal.to_json(jw);
-            storage::fsutil::write_atomic_bytes(journal_path, jw.take());
-
-            storage::BadRangeMap tampered_map = build_map_v2();
-            tampered_map.SourceIdentity = "TAMPERED";
-            storage::fsutil::write_atomic_bytes(map_path, storage::BadRangeMapStore::serialize_map(tampered_map));
-
-            auto journal = journal_store.load(journal_path);
-            check(journal.has_value() && journal->JobId != "TAMPERED",
-                  "cross tamper: journal fell back to trusted snapshot");
-            verify_journal(journal, "cpp-tamper");
-
-            auto map = map_store.load(map_path);
-            check(map.has_value() && map->SourceIdentity != "TAMPERED",
-                  "cross tamper: map fell back to signed snapshot");
-            verify_map_v1(map, "cpp-tamper");
-        } else {
-            std::printf("unknown mode: %s\n", mode.c_str());
-            return 2;
-        }
-    } else {
-        test_crypto_vectors();
-        test_indented_writer_basics();
-        test_ordered_file_map_scale();
-
-        std::string golden_dir = argc > 1 ? argv[1] : "tests/golden";
-        test_storage_goldens(golden_dir);
-
-        wchar_t temp_root[MAX_PATH];
-        GetTempPathW(MAX_PATH, temp_root);
-        std::wstring work_dir = std::wstring(temp_root) + L"xactcopy-storage-test-" +
-                                storage::fsutil::random_temp_suffix().substr(0, 12);
-        test_native_store_roundtrip(work_dir);
-    }
+    wchar_t temp_root[MAX_PATH];
+    GetTempPathW(MAX_PATH, temp_root);
+    std::wstring work_dir = std::wstring(temp_root) + L"xactcopy-storage-test-" +
+                            storage::fsutil::random_temp_suffix().substr(0, 12);
+    test_native_store_roundtrip(work_dir);
+    test_journal_compression(work_dir);
+    test_journal_maintenance(work_dir);
+    test_catalog_roundtrip(work_dir);
 
     if (g_failures == 0) {
         std::printf("STORAGE PASS: %d checks\n", g_checks);

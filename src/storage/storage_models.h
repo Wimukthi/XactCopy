@@ -222,18 +222,43 @@ struct JournalFileEntry {
     std::vector<RescueRange> RescueRanges;
     std::string LastRescuePass;
 
-    void to_json(json::Writer& w) const {
+    // Default-valued members are omitted, and RelativePath is omitted when it
+    // just repeats the key this entry is stored under (JobJournal passes that
+    // key in; standalone callers pass nothing and get the full shape).
+    //
+    // This is a writer-side change only: every models::detail::read overload
+    // leaves its target at the member initializer when the key is absent, and
+    // System.Text.Json does the same, so both the native and .NET readers
+    // reconstruct an identical object. normalize_journal already restores
+    // RelativePath from the key. It matters because a whole-drive journal is
+    // dominated by defaults — on a real 196k-entry, 100 MB journal the omitted
+    // fields plus the duplicated path account for 42% of the file.
+    void to_json(json::Writer& w, std::string_view map_key = {}) const {
         w.begin_object();
-        w.key("RelativePath"); w.value(RelativePath);
+        if (map_key.empty() || RelativePath != map_key) {
+            w.key("RelativePath"); w.value(RelativePath);
+        }
         w.key("SourceLength"); w.value(SourceLength);
         w.key("SourceLastWriteUtcTicks"); w.value(SourceLastWriteUtcTicks);
         w.key("BytesCopied"); w.value(BytesCopied);
-        w.key("State"); w.value(to_string(State));
-        w.key("LastError"); w.value(LastError);
-        w.key("DoNotRetry"); w.value(DoNotRetry);
-        detail::write_range_array(w, "RecoveredRanges", RecoveredRanges);
-        detail::write_range_array(w, "RescueRanges", RescueRanges);
-        w.key("LastRescuePass"); w.value(LastRescuePass);
+        if (State != FileCopyState::Pending) {
+            w.key("State"); w.value(to_string(State));
+        }
+        if (!LastError.empty()) {
+            w.key("LastError"); w.value(LastError);
+        }
+        if (DoNotRetry) {
+            w.key("DoNotRetry"); w.value(DoNotRetry);
+        }
+        if (!RecoveredRanges.empty()) {
+            detail::write_range_array(w, "RecoveredRanges", RecoveredRanges);
+        }
+        if (!RescueRanges.empty()) {
+            detail::write_range_array(w, "RescueRanges", RescueRanges);
+        }
+        if (!LastRescuePass.empty()) {
+            w.key("LastRescuePass"); w.value(LastRescuePass);
+        }
         w.end_object();
     }
 
@@ -274,7 +299,7 @@ struct JobJournal {
         w.begin_object();
         for (const auto& [key, entry] : Files.entries) {
             w.key(key);
-            entry.to_json(w);
+            entry.to_json(w, key);
         }
         w.end_object();
         w.end_object();

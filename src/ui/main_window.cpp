@@ -184,6 +184,10 @@ public:
         job_manager_.mark_any_running_runs_interrupted(
             "XactCopy restarted; the previous run did not finish cleanly.");
 
+        // Retention runs after the interrupted marking above, so a crashed run's
+        // journal is already flagged resumable and therefore protected.
+        prune_old_journals();
+
         sync_explorer_integration(false);
         apply_explorer_launch_options();
 
@@ -2084,8 +2088,70 @@ private:
                            storage::fsutil::utf8_to_wide("Journal: " + result.JournalPath).c_str());
         }
 
+        // A run that finished cleanly no longer needs its rotating backups —
+        // those only guard a journal that is still being rewritten. The snapshot,
+        // ledger, and anchor stay, so the run remains inspectable and verifiable.
+        if (result.Succeeded && !result.JournalPath.empty() &&
+            settings_.get_bool("CompactJournalsOnCompletion", true)) {
+            std::int64_t reclaimed = storage::JobJournalStore::compact_completed(
+                storage::fsutil::utf8_to_wide(result.JournalPath));
+            if (reclaimed > 0) {
+                append_log("Reclaimed " + format_bytes_short(reclaimed) +
+                           " of journal backups for the completed run.");
+            }
+        }
+
         // Drain the queue after each run finishes (MainForm.QueueAutoQueuedRun).
         run_next_queued_job(/*manual*/ false);
+    }
+
+    // ---- Journal retention -------------------------------------------------
+
+    // Removes old completed journals at startup. Anything still resumable — the
+    // active run, or a run left Running/Paused/Interrupted — is protected, since
+    // resume reads straight from the journal.
+    void prune_old_journals() {
+        storage::JobJournalStore::PruneOptions options;
+        options.retention_days = settings_.get_int("JournalRetentionDays", 0, 3650, 30);
+        options.keep_minimum = settings_.get_int("JournalKeepMinimum", 0, 1000, 10);
+        const bool compact = settings_.get_bool("CompactJournalsOnCompletion", true);
+        if (options.retention_days <= 0 && !compact) return;
+
+        for (const auto& run : job_manager_.get_recent_runs(1000)) {
+            if (run.JournalPath.empty()) continue;
+            switch (run.Status) {
+                case storage::ManagedJobRunStatus::Running:
+                case storage::ManagedJobRunStatus::Paused:
+                case storage::ManagedJobRunStatus::Queued:
+                case storage::ManagedJobRunStatus::Interrupted:
+                    options.protected_paths.push_back(
+                        storage::fsutil::utf8_to_wide(run.JournalPath));
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        if (options.retention_days > 0) {
+            storage::JobJournalStore::PruneResult result =
+                storage::JobJournalStore::prune(options);
+            if (result.journals_removed > 0) {
+                append_log("Journal retention: removed " + std::to_string(result.journals_removed) +
+                           " journal(s) older than " + std::to_string(options.retention_days) +
+                           " days, reclaiming " + format_bytes_short(result.bytes_reclaimed) + ".");
+            }
+        }
+
+        // Reclaim rotations left behind by runs that finished earlier; only the
+        // still-resumable journals keep their backups.
+        if (compact) {
+            std::int64_t reclaimed =
+                storage::JobJournalStore::compact_all(options.protected_paths);
+            if (reclaimed > 0) {
+                append_log("Journal maintenance: reclaimed " + format_bytes_short(reclaimed) +
+                           " of backup rotations.");
+            }
+        }
     }
 
     // ---- Recovery prompt ---------------------------------------------------
