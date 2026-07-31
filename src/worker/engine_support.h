@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\worker\engine_support.h
+// File: src\worker\engine_support.h
 // Purpose: Support types for the native copy engine: error/cancellation model,
 //          pause control, file metadata, directory scanner (FindFirstFileEx),
 //          transfer session with timed positional I/O, and the env-driven

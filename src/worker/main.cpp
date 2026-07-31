@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\worker\main.cpp
+// File: src\worker\main.cpp
 // Purpose: XactCopyExecutive (native) — out-of-process copy worker. Speaks the
 //          .NET worker's IPC contract (connection log, 1 Hz heartbeats, ping/
 //          pause/resume/cancel/shutdown) and executes copy jobs through the

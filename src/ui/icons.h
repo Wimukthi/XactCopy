@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\ui\icons.h
+// File: src\ui\icons.h
 // Purpose: Fluent UI System Icons for owner-drawn buttons. Icons ship as 24x24
 //          8-bit coverage masks (generated from the pinned Fluent SVG subset);
 //          at draw time a mask is bilinearly resampled to the requested size,

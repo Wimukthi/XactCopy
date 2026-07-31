@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\core\dotnet_time.h
+// File: src\core\dotnet_time.h
 // Purpose: DateTimeOffset and TimeSpan value types matching .NET semantics and
 //          the System.Text.Json wire formats used by the XactCopy IPC protocol
 //          (ISO 8601 round-trip timestamps, constant "c" format durations).

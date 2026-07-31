@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\storage\stores.h
+// File: src\storage\stores.h
 // Purpose: C++ port of XactCopy.Storage: JobJournalStore and BadRangeMapStore
 //          with the full hardening pipeline — atomic write-through snapshots,
 //          rotating backups, mirror snapshots, HMAC-signed envelopes, and the

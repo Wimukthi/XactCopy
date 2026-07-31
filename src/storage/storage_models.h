@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\storage\storage_models.h
+// File: src\storage\storage_models.h
 // Purpose: C++ port of the XactCopy persistence models: job journals and
 //          bad-range maps, with JSON output matching the .NET indented
 //          serializer field-for-field (dictionaries keep document order and

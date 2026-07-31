@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\core\json.h
+// File: src\core\json.h
 // Purpose: Minimal JSON DOM, parser, and writer compatible with the JSON shape
 //          produced by System.Text.Json in the .NET XactCopy build (compact
 //          output, PascalCase keys, default JavaScriptEncoder escaping).

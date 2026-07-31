@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\core\crypto.h
+// File: src\core\crypto.h
 // Purpose: Crypto primitives for XactCopy storage signing: SHA-256 and
 //          HMAC-SHA256 via Windows CNG (BCrypt), DPAPI key protection,
 //          secure random bytes, hex/base64 encoding, constant-time compare.

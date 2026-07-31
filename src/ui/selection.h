@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\ui\selection.h
+// File: src\ui\selection.h
 // Purpose: SelectionModel — the single source of truth for "what to copy" when
 //          the user picks more than one item. Explorer verbs, forwarded launches
 //          from a second instance, the Add-Files dialog, and drag-and-drop all

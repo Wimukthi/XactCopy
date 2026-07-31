@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\tests\test_storage.cpp
+// File: tests\test_storage.cpp
 // Purpose: Storage-layer tests: crypto vectors, indented-writer byte parity
 //          against the goldens, journal compression and maintenance, native
 //          store round-trips and tamper fallback, and job catalog round-trip.

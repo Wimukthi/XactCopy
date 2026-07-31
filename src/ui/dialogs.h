@@ -1,11 +1,11 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\ui\dialogs.h
-// Purpose: Themed modal dialogs for the native UI. The Settings dialog mirrors
-//          the full .NET SettingsForm surface: eight navigation pages
-//          (Appearance, Copy Defaults, Performance, Diagnostics, Verification,
-//          Updates, Recovery & Startup, Explorer Integration) built from a
-//          declarative field table bound to the DOM-preserving settings store.
-//          Plus the About dialog. All on a shared ModalHost.
+// File: src\ui\dialogs.h
+// Purpose: Themed modal dialogs for the native UI. The Settings dialog has seven
+//          navigation pages (Appearance, Copy Defaults, Performance,
+//          Diagnostics, Verification, Recovery & Startup, Explorer Integration)
+//          built from a declarative field table bound to the DOM-preserving
+//          settings store. Update settings live in the About dialog. Both sit on
+//          a shared ModalHost.
 // -----------------------------------------------------------------------------
 
 #pragma once

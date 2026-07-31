@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\core\ipc.h
+// File: src\core\ipc.h
 // Purpose: C++ port of the XactCopy IPC contract: envelope serialization, the
 //          message-type registry, and every command/event payload exchanged
 //          between the supervisor (UI) and XactCopyExecutive (worker).
