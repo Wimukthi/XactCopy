@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\ui\supervisor.h
+// File: src\ui\supervisor.h
 // Purpose: Native port of WorkerSupervisor — spawns XactCopyExecutive, drives
 //          jobs over the named-pipe IPC contract, monitors heartbeats and job
 //          activity, and restarts/resumes the worker after stalls, exits, or

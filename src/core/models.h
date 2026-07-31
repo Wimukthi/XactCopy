@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\core\models.h
+// File: src\core\models.h
 // Purpose: C++ port of XactCopy.Core model types (enums, run options, results,
 //          progress snapshots) with JSON serialization that matches the .NET
 //          System.Text.Json output field-for-field.

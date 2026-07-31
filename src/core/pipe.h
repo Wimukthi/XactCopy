@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\core\pipe.h
+// File: src\core\pipe.h
 // Purpose: Win32 named-pipe transport for XactCopy IPC. Reproduces the .NET
 //          JsonMessagePipe framing (4-byte little-endian length prefix, 16 MB
 //          frame ceiling) and the CurrentUserOnly server security descriptor.

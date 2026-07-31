@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\ui\recovery.h
+// File: src\ui\recovery.h
 // Purpose: Native port of the crash-recovery layer: RecoveryStateStore
 //          (runtime\recovery-state.json, .NET-compatible), RecoveryService
 //          (interrupted-run detection, prompt/auto-resume policy, run

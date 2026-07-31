@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\ui\settings.h
+// File: src\ui\settings.h
 // Purpose: Native settings access over the .NET UI's settings.json. Loads the
 //          file as a JSON DOM, exposes typed getters/setters for the keys the
 //          native UI uses, and saves atomically while PRESERVING every other

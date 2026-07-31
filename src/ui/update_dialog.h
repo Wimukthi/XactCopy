@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\ui\update_dialog.h
+// File: src\ui\update_dialog.h
 // Purpose: Themed "Update Available" dialog (port of XactCopy.UI UpdateForm).
 //          Shows the release summary + notes, downloads the best release asset
 //          over WinHTTP with progress, verifies its SHA-256, and applies the

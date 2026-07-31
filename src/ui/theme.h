@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\ui\theme.h
+// File: src\ui\theme.h
 // Purpose: XactCopy-specific palettes and owner-drawn controls. Generic Win32
 //          dark-mode integration is provided by Wimukthi.Win32Theme.
 // -----------------------------------------------------------------------------

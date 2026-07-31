@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\src\ui\main_window.cpp
+// File: src\ui\main_window.cpp
 // Purpose: XactCopy native UI. Win32 main window over the ported supervisor/
 //          recovery/settings core with the shared dark/light theme layer:
 //          owner-drawn buttons/checkboxes/combos, severity-colored log,

@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// File: cpp\tests\test_supervisor.cpp
+// File: tests\test_supervisor.cpp
 // Purpose: Headless tests for the native UI core: WorkerSupervisor driving the
 //          native worker end-to-end (clean job, kill-mid-job auto-recovery
 //          with journal resume), RecoveryService state round-trip, and
