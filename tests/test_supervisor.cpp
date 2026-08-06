@@ -303,6 +303,142 @@ void test_settings_preservation() {
     (void)future;
 }
 
+void test_settings_option_mapping() {
+    std::printf("--- settings: complete option mapping ---\n");
+    std::wstring work = make_work_dir();
+    ui::AppSettings settings(work + L"\\settings.json");
+
+    settings.set_string("DefaultOverwritePolicy", "ask");
+    settings.set_string("DefaultTransferEnginePolicy", "native");
+    settings.set_string("DefaultSymlinkHandling", "follow");
+    settings.set_string("DefaultVerificationMode", "sampled");
+    settings.set_string("DefaultVerificationHashAlgorithm", "sha512");
+    settings.set_string("DefaultSalvageFillPattern", "random");
+    settings.set_string("DefaultSourceMutationPolicy", "wait-for-reappearance");
+    settings.set_string("DefaultScanPerformanceProfile", "precise");
+    settings.set_string("WorkerTelemetryProfile", "debug");
+
+    settings.set_bool("DefaultResumeFromJournal", false);
+    settings.set_bool("DefaultSalvageUnreadableBlocks", false);
+    settings.set_bool("DefaultContinueOnFileError", false);
+    settings.set_bool("DefaultVerifyAfterCopy", true);
+    settings.set_bool("DefaultUseBadRangeMap", false);
+    settings.set_bool("DefaultSkipKnownBadRanges", false);
+    settings.set_bool("DefaultUpdateBadRangeMapFromRun", false);
+    settings.set_bool("DefaultUseExperimentalRawDiskScan", true);
+    settings.set_bool("DefaultUseAdaptiveBuffer", true);
+    settings.set_bool("DefaultWaitForMediaAvailability", true);
+    settings.set_bool("DefaultWaitForFileLockRelease", true);
+    settings.set_bool("DefaultTreatAccessDeniedAsContention", true);
+    settings.set_bool("DefaultFragileMediaMode", true);
+    settings.set_bool("DefaultSkipFileOnFirstReadError", false);
+    settings.set_bool("DefaultPersistFragileSkipsAcrossResume", false);
+    settings.set_bool("DefaultPreserveTimestamps", false);
+    settings.set_bool("DefaultCopyEmptyDirectories", false);
+
+    settings.set_int("DefaultBadRangeMapMaxAgeDays", 7);
+    settings.set_int("DefaultLockContentionProbeIntervalMs", 750);
+    settings.set_int("DefaultFragileFailureWindowSeconds", 31);
+    settings.set_int("DefaultFragileFailureThreshold", 5);
+    settings.set_int("DefaultFragileCooldownSeconds", 9);
+    settings.set_int("DefaultBufferSizeMb", 16);
+    settings.set_int("DefaultMaxRetries", 23);
+    settings.set_int("DefaultOperationTimeoutSeconds", 17);
+    settings.set_int("DefaultPerFileTimeoutSeconds", 29);
+    settings.set_int("DefaultMaxThroughputMbPerSecond", 123);
+    settings.set_int("DefaultParallelSmallFileWorkers", 7);
+    settings.set_int("DefaultParallelScanWorkers", 6);
+    settings.set_int("DefaultSmallFileThresholdKb", 512);
+    settings.set_string("DefaultWorkerProcessPriorityClass", "BelowNormal");
+    settings.set_int("WorkerProgressIntervalMs", 125);
+    settings.set_int("WorkerMaxLogsPerSecond", 321);
+    settings.set_int("DefaultRescueFastScanChunkKb", 64);
+    settings.set_int("DefaultRescueTrimChunkKb", 65);
+    settings.set_int("DefaultRescueScrapeChunkKb", 66);
+    settings.set_int("DefaultRescueRetryChunkKb", 67);
+    settings.set_int("DefaultRescueSplitMinimumKb", 68);
+    settings.set_int("DefaultRescueFastScanRetries", 8);
+    settings.set_int("DefaultRescueTrimRetries", 9);
+    settings.set_int("DefaultRescueScrapeRetries", 10);
+    settings.set_int("DefaultSampleVerificationChunkKb", 256);
+    settings.set_int("DefaultSampleVerificationChunkCount", 11);
+
+    const models::CopyJobOptions options = settings.build_default_options();
+    check(options.OverwritePolicyValue == models::OverwritePolicy::Ask,
+          "overwrite policy maps");
+    check(options.TransferEnginePolicyValue == models::TransferEnginePolicy::NativeFast,
+          "transfer engine maps");
+    check(options.SymlinkHandling == models::SymlinkHandlingMode::Follow,
+          "symlink policy maps");
+    check(options.VerificationModeValue == models::VerificationMode::Sampled &&
+              options.VerifyAfterCopy,
+          "verification mode and enable flag map");
+    check(ui::verification_combo_index(options) == 1,
+          "sampled verification selects the sampled UI option");
+    models::CopyJobOptions full_verification = options;
+    full_verification.VerificationModeValue = models::VerificationMode::Full;
+    check(ui::verification_combo_index(full_verification) == 2,
+          "full verification selects the full UI option");
+    full_verification.VerifyAfterCopy = false;
+    check(ui::verification_combo_index(full_verification) == 0,
+          "disabled verification selects the none UI option");
+    check(options.VerificationHashAlgorithmValue == models::VerificationHashAlgorithm::Sha512,
+          "verification hash maps");
+    check(options.SalvageFillPatternValue == models::SalvageFillPattern::Random,
+          "salvage fill maps");
+    check(options.SourceMutationPolicyValue == models::SourceMutationPolicy::WaitForReappearance,
+          "source mutation policy maps");
+    check(options.ScanPerformanceProfileValue == models::ScanPerformanceProfile::Precise,
+          "scan profile maps");
+    check(options.WorkerTelemetryProfileValue == models::WorkerTelemetryProfile::Debug,
+          "telemetry profile maps");
+
+    check(!options.ResumeFromJournal && !options.SalvageUnreadableBlocks &&
+              !options.ContinueOnFileError && !options.UseBadRangeMap &&
+              !options.SkipKnownBadRanges && !options.UpdateBadRangeMapFromRun,
+          "copy/map boolean defaults map");
+    check(options.UseExperimentalRawDiskScan && options.UseAdaptiveBufferSizing &&
+              options.WaitForMediaAvailability && options.WaitForFileLockRelease &&
+              options.TreatAccessDeniedAsContention,
+          "contention and raw-scan booleans map");
+    check(options.FragileMediaMode && !options.SkipFileOnFirstReadError &&
+              !options.PersistFragileSkipAcrossResume && !options.PreserveTimestamps &&
+              !options.CopyEmptyDirectories,
+          "fragile and copy behavior booleans map");
+
+    check(options.BadRangeMapMaxAgeDays == 7 &&
+              options.LockContentionProbeInterval == time::TimeSpan::from_milliseconds(750) &&
+              options.FragileFailureWindowSeconds == 31 &&
+              options.FragileFailureThreshold == 5 && options.FragileCooldownSeconds == 9,
+          "map, contention, and fragile numeric settings map");
+    check(options.BufferSizeBytes == 16 * 1024 * 1024 && options.MaxRetries == 23 &&
+              options.OperationTimeout == time::TimeSpan::from_seconds(17) &&
+              options.PerFileTimeout == time::TimeSpan::from_seconds(29),
+          "buffer, retry, and timeout settings map");
+    check(options.MaxThroughputBytesPerSecond == 123LL * 1024 * 1024 &&
+              options.ParallelSmallFileWorkers == 7 && options.ParallelScanWorkers == 6 &&
+              options.SmallFileThresholdBytes == 512 * 1024 &&
+              options.WorkerProcessPriorityClass == "BelowNormal",
+          "performance settings map");
+    check(options.WorkerProgressEmitIntervalMs == 125 && options.WorkerMaxLogsPerSecond == 321,
+          "worker telemetry numeric settings map");
+    check(options.RescueFastScanChunkBytes == 64 * 1024 &&
+              options.RescueTrimChunkBytes == 65 * 1024 &&
+              options.RescueScrapeChunkBytes == 66 * 1024 &&
+              options.RescueRetryChunkBytes == 67 * 1024 &&
+              options.RescueSplitMinimumBytes == 68 * 1024 &&
+              options.RescueFastScanRetries == 8 && options.RescueTrimRetries == 9 &&
+              options.RescueScrapeRetries == 10,
+          "rescue tuning settings map");
+    check(options.SampleVerificationChunkBytes == 256 * 1024 &&
+              options.SampleVerificationChunkCount == 11,
+          "sample verification settings map");
+
+    ui::AppSettings auto_settings(work + L"\\auto-settings.json");
+    check(auto_settings.build_default_options().ParallelSmallFileWorkers == 0,
+          "zero small-file workers remains the documented auto value");
+}
+
 void test_job_catalog_store() {
     std::printf("--- job catalog: store round-trip + normalization ---\n");
     std::wstring work = make_work_dir();
@@ -490,6 +626,7 @@ void test_job_manager_service() {
 
 int main() {
     test_settings_preservation();
+    test_settings_option_mapping();
     test_recovery_service();
     test_job_catalog_store();
     test_job_manager_service();

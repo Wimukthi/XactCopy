@@ -15,6 +15,7 @@
 
 #include "../src/storage/job_catalog.h"
 #include "../src/storage/stores.h"
+#include "../src/ui/settings.h"
 
 namespace {
 
@@ -832,6 +833,79 @@ void test_catalog_roundtrip(const std::wstring& work_dir) {
     storage::fsutil::delete_file(path);
 }
 
+void test_main_window_run_defaults(const std::wstring& work_dir) {
+    std::printf("--- UI run defaults: explicit save is scoped and durable ---\n");
+    storage::fsutil::create_directories(work_dir);
+    std::wstring path = work_dir + L"\\run-defaults.json";
+    const std::string initial =
+        R"({"KeepMe":"untouched","DefaultUseExperimentalRawDiskScan":true,"DefaultUpdateBadRangeMapFromRun":false,"DefaultVerificationMode":"full"})";
+    check(storage::fsutil::write_atomic_bytes(path, initial),
+          "run defaults: seed settings file");
+
+    ui::AppSettings settings(path);
+    models::CopyJobOptions options = settings.build_default_options();
+    options.OperationMode = models::JobOperationMode::ScanOnly;
+    options.SourceRoot = "C:\\source";
+    options.DestinationRoot = "D:\\destination";
+    options.OverwritePolicyValue = models::OverwritePolicy::Ask;
+    options.TransferEnginePolicyValue = models::TransferEnginePolicy::NativeFast;
+    options.ResumeFromJournal = false;
+    options.SalvageUnreadableBlocks = false;
+    options.ContinueOnFileError = false;
+    options.UseBadRangeMap = false;
+    options.SkipKnownBadRanges = true; // save must normalize this dependency
+    options.UseAdaptiveBufferSizing = true;
+    options.WaitForMediaAvailability = true;
+    options.FragileMediaMode = true;
+    options.VerifyAfterCopy = true;
+    options.VerificationModeValue = models::VerificationMode::Sampled;
+    options.BufferSizeBytes = 32 * 1024 * 1024;
+    options.MaxRetries = 7;
+    options.OperationTimeout = time::TimeSpan::from_seconds(45);
+    settings.save_run_defaults(options);
+
+    ui::AppSettings loaded(path);
+    models::CopyJobOptions defaults = loaded.build_default_options();
+    check(defaults.OverwritePolicyValue == models::OverwritePolicy::Ask,
+          "run defaults: overwrite policy persisted");
+    check(defaults.TransferEnginePolicyValue == models::TransferEnginePolicy::NativeFast,
+          "run defaults: transfer engine persisted");
+    check(!defaults.ResumeFromJournal && !defaults.SalvageUnreadableBlocks &&
+              !defaults.ContinueOnFileError,
+          "run defaults: safety checkboxes persisted");
+    check(!defaults.UseBadRangeMap && !defaults.SkipKnownBadRanges,
+          "run defaults: bad-range dependency normalized");
+    check(defaults.UseAdaptiveBufferSizing && defaults.WaitForMediaAvailability &&
+              defaults.FragileMediaMode,
+          "run defaults: tuning checkboxes persisted");
+    check(defaults.VerifyAfterCopy &&
+              defaults.VerificationModeValue == models::VerificationMode::Sampled,
+          "run defaults: verification mode persisted");
+    check(defaults.BufferSizeBytes == 32 * 1024 * 1024 && defaults.MaxRetries == 7 &&
+              defaults.OperationTimeout.ticks == time::TimeSpan::from_seconds(45).ticks,
+          "run defaults: numeric controls persisted");
+    check(loaded.get_bool("DefaultUseExperimentalRawDiskScan", false),
+          "run defaults: raw-disk default preserved");
+    check(!loaded.get_bool("DefaultUpdateBadRangeMapFromRun", true),
+          "run defaults: unrelated default preserved");
+    check(loaded.get_string("KeepMe", "") == "untouched",
+          "run defaults: unrelated settings preserved");
+    check(loaded.get_string("OperationMode", "missing") == "missing" &&
+              loaded.get_string("SourceRoot", "missing") == "missing",
+          "run defaults: operation and paths are not globalized");
+
+    options.VerifyAfterCopy = false;
+    options.VerificationModeValue = models::VerificationMode::None;
+    settings.save_run_defaults(options);
+    ui::AppSettings disabled_verification(path);
+    models::CopyJobOptions disabled = disabled_verification.build_default_options();
+    check(!disabled.VerifyAfterCopy &&
+              disabled.VerificationModeValue == models::VerificationMode::Sampled,
+          "run defaults: disabling verification preserves re-enable mode");
+
+    storage::fsutil::delete_file(path);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -850,6 +924,7 @@ int main(int argc, char** argv) {
     test_journal_compression(work_dir);
     test_journal_maintenance(work_dir);
     test_catalog_roundtrip(work_dir);
+    test_main_window_run_defaults(work_dir);
 
     if (g_failures == 0) {
         std::printf("STORAGE PASS: %d checks\n", g_checks);

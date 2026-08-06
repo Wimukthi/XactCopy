@@ -23,6 +23,8 @@ public:
                                            const std::wstring& title, const std::wstring& prompt,
                                            const std::string& initial_value) {
         TextPromptDialog dialog(theme, prompt, initial_value);
+        dialog.host_.set_density_percent(theme.density_percent);
+        dialog.host_.set_scale_percent(theme.scale_percent);
         dialog.host_.create(owner, L"XactCopyTextPrompt", title.c_str(), 380, 150,
                             [&dialog](HWND h, UINT m, WPARAM w, LPARAM l, bool& handled) {
                                 return dialog.proc(h, m, w, l, handled);
@@ -45,11 +47,12 @@ private:
     LRESULT proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam, bool& handled) {
         switch (message) {
             case WM_CREATE: {
-                set_dark_title_bar(hwnd, theme_.dark);
+                set_dark_title_bar(hwnd, theme_.dark && theme_.themed_chrome);
                 apply_window_icons(hwnd);
                 window_brush_ = CreateSolidBrush(theme_.window);
                 edit_brush_ = CreateSolidBrush(theme_.edit);
-                UINT dpi = GetDpiForWindow(hwnd);
+                UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                                         theme_.scale_percent);
                 auto scale = [dpi](int value) { return MulDiv(value, static_cast<int>(dpi), 96); };
                 font_ = CreateFontW(-MulDiv(9, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL,
                                     FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
@@ -171,6 +174,8 @@ public:
         JobManagerDialog dialog(manager, theme, settings);
         int width = settings.get_int("JobManagerWidth", 700, 20000, 1080);
         int height = settings.get_int("JobManagerHeight", 460, 20000, 640);
+        dialog.host_.set_density_percent(theme.density_percent);
+        dialog.host_.set_scale_percent(theme.scale_percent);
         dialog.host_.create(owner, L"XactCopyJobManager", L"Job Manager", width, height,
                             [&dialog](HWND h, UINT m, WPARAM w, LPARAM l, bool& handled) {
                                 return dialog.proc(h, m, w, l, handled);
@@ -218,7 +223,11 @@ private:
     static constexpr UINT_PTR SearchDebounceTimerId = 2;
 
     JobManagerDialog(JobManagerService& manager, const ThemePalette& theme, AppSettings& settings)
-        : manager_(manager), theme_(theme), settings_(settings) {}
+        : manager_(manager), theme_(theme), settings_(settings) {
+        grid_alternating_rows_ = settings_.get_bool("GridAlternatingRows", true);
+        grid_row_height_ = settings_.get_int("GridRowHeight", 18, 48, 24);
+        grid_header_style_ = settings_.get_string("GridHeaderStyle", "default");
+    }
 
     void save_placement(HWND hwnd) {
         RECT r;
@@ -699,10 +708,11 @@ private:
     }
 
     void on_create(HWND hwnd) {
-        set_dark_title_bar(hwnd, theme_.dark);
+        set_dark_title_bar(hwnd, theme_.dark && theme_.themed_chrome);
         window_brush_ = CreateSolidBrush(theme_.window);
         edit_brush_ = CreateSolidBrush(theme_.edit);
-        UINT dpi = GetDpiForWindow(hwnd);
+        UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                                 theme_.scale_percent);
         auto scale = [dpi](int value) { return MulDiv(value, static_cast<int>(dpi), 96); };
         font_ = CreateFontW(-MulDiv(9, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL, FALSE,
                             FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -892,7 +902,8 @@ private:
     // window can be freely resized.
     void relayout(HWND hwnd) {
         if (list_ == nullptr) return;
-        UINT dpi = GetDpiForWindow(hwnd);
+        UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                                 theme_.scale_percent);
         auto scale = [dpi](int v) { return MulDiv(v, static_cast<int>(dpi), 96); };
         RECT client;
         GetClientRect(hwnd, &client);
@@ -962,7 +973,8 @@ private:
         int used = 0;
         for (int i = 0; i < 9; ++i) used += ListView_GetColumnWidth(list_, i);
         int last = lr.right - used - GetSystemMetrics(SM_CXVSCROLL) - 4;
-        UINT dpi = GetDpiForWindow(list_);
+        UINT dpi = ui_layout_dpi(GetDpiForWindow(list_), theme_.density_percent,
+                                 theme_.scale_percent);
         if (last > MulDiv(120, static_cast<int>(dpi), 96)) {
             ListView_SetColumnWidth(list_, 9, last);
         }
@@ -977,7 +989,10 @@ private:
         const bool selected = (draw.itemState & ODS_SELECTED) != 0;
 
         RECT row_rect = draw.rcItem;
-        const COLORREF bg = selected ? theme_.selection : theme_.edit;
+        const COLORREF alternate = blend_color(theme_.edit, theme_.panel, 35);
+        const COLORREF bg = selected ? theme_.selection
+                                     : (grid_alternating_rows_ && (index & 1) ? alternate
+                                                                              : theme_.edit);
         themedraw::fill_rect(dc, row_rect, bg);
 
         if (index >= rows_.size()) return;
@@ -988,7 +1003,9 @@ private:
         HGDIOBJ old_font = SelectObject(dc, font_);
         SetBkMode(dc, TRANSPARENT);
         // LVS_EX_GRIDLINES is ignored for owner-drawn lists, so draw the grid
-        // here: a separator under each row and between each column.
+        // for populated rows explicitly. The empty tail is repainted by the
+        // ListView subclass below to prevent native column rules continuing
+        // below the last item.
         const COLORREF grid = blend_color(theme_.edit, theme_.border, 70);
         const int column_count = Header_GetItemCount(ListView_GetHeader(list_));
         for (int col = 0; col < column_count && col < 10; ++col) {
@@ -1105,7 +1122,21 @@ private:
             case CDDS_PREPAINT:
                 return CDRF_NOTIFYITEMDRAW;
             case CDDS_ITEMPREPAINT: {
-                themedraw::fill_rect(draw->hdc, draw->rc, theme_.panel);
+                std::string style = grid_header_style_;
+                for (char& c : style) {
+                    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+                }
+                COLORREF header_background = theme_.panel;
+                COLORREF header_text = theme_.muted_text;
+                HFONT header_font = font_;
+                if (style == "minimal") {
+                    header_background = theme_.edit;
+                } else if (style == "prominent") {
+                    header_background = blend_color(theme_.panel, theme_.accent, 18);
+                    header_text = readable_text_color(header_background);
+                    header_font = title_font_;
+                }
+                themedraw::fill_rect(draw->hdc, draw->rc, header_background);
                 RECT border = draw->rc;
                 border.left = border.right - 1;
                 themedraw::fill_rect(draw->hdc, border, theme_.border);
@@ -1115,9 +1146,9 @@ private:
                 item.pszText = text;
                 item.cchTextMax = 127;
                 Header_GetItem(ListView_GetHeader(list_), static_cast<int>(draw->dwItemSpec), &item);
-                HGDIOBJ old_font = SelectObject(draw->hdc, font_);
+                HGDIOBJ old_font = SelectObject(draw->hdc, header_font);
                 SetBkMode(draw->hdc, TRANSPARENT);
-                SetTextColor(draw->hdc, theme_.muted_text);
+                SetTextColor(draw->hdc, header_text);
                 RECT text_rect = draw->rc;
                 text_rect.left += 6;
                 text_rect.right -= 6;
@@ -1131,11 +1162,37 @@ private:
         }
     }
 
+    // The native report-view paints column rules through the unused area below
+    // the last item. Keep the populated-row grid, but cover only that empty
+    // tail after the ListView has painted so the rules stop at the data.
+    void paint_list_empty_tail(HWND list) {
+        if (list == nullptr) return;
+        RECT client{};
+        GetClientRect(list, &client);
+
+        const int item_count = ListView_GetItemCount(list);
+        if (item_count <= 0) return;
+        RECT last_item{};
+        if (!ListView_GetItemRect(list, item_count - 1, &last_item, LVIR_BOUNDS)) return;
+        if (last_item.bottom >= client.bottom) return;
+
+        RECT empty_tail{client.left, last_item.bottom, client.right, client.bottom};
+        HDC dc = GetDC(list);
+        if (dc == nullptr) return;
+        themedraw::fill_rect(dc, empty_tail, theme_.edit);
+        ReleaseDC(list, dc);
+    }
+
     // Intercepts the child header's NM_CUSTOMDRAW (which the ListView would
     // otherwise theme itself, painting black header text on a Light OS).
     static LRESULT CALLBACK list_subclass_proc(HWND hwnd, UINT message, WPARAM wparam,
-                                               LPARAM lparam, UINT_PTR, DWORD_PTR ref) {
+                                                LPARAM lparam, UINT_PTR, DWORD_PTR ref) {
         auto* self = reinterpret_cast<JobManagerDialog*>(ref);
+        if (message == WM_PAINT) {
+            LRESULT result = DefSubclassProc(hwnd, message, wparam, lparam);
+            if (self != nullptr) self->paint_list_empty_tail(hwnd);
+            return result;
+        }
         if (message == WM_NOTIFY && self != nullptr) {
             auto* hdr = reinterpret_cast<NMHDR*>(lparam);
             if (hdr->code == NM_CUSTOMDRAW && hdr->hwndFrom == ListView_GetHeader(hwnd)) {
@@ -1158,7 +1215,8 @@ private:
             case WM_DPICHANGED: {
                 // Moved to a different-DPI monitor: rebuild fonts, re-font every
                 // child, adopt the suggested bounds, and relayout.
-                UINT dpi = HIWORD(wparam);
+                UINT dpi = ui_layout_dpi(HIWORD(wparam), theme_.density_percent,
+                                         theme_.scale_percent);
                 if (font_ != nullptr) DeleteObject(font_);
                 if (title_font_ != nullptr) DeleteObject(title_font_);
                 font_ = CreateFontW(-MulDiv(9, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL, FALSE,
@@ -1189,7 +1247,8 @@ private:
                 return 0;
             }
             case WM_GETMINMAXINFO: {
-                UINT dpi = GetDpiForWindow(hwnd);
+                UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                                         theme_.scale_percent);
                 auto* mmi = reinterpret_cast<MINMAXINFO*>(lparam);
                 mmi->ptMinTrackSize.x = MulDiv(760, static_cast<int>(dpi), 96);
                 mmi->ptMinTrackSize.y = MulDiv(480, static_cast<int>(dpi), 96);
@@ -1236,6 +1295,20 @@ private:
                 handled = true;
                 return TRUE;
             }
+            case WM_MEASUREITEM: {
+                const auto& measure = *reinterpret_cast<MEASUREITEMSTRUCT*>(lparam);
+                if (measure.CtlType == ODT_LISTVIEW &&
+                    static_cast<int>(measure.CtlID) == IdList) {
+                    auto* mutable_measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lparam);
+                    UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                                             theme_.scale_percent);
+                    mutable_measure->itemHeight =
+                        MulDiv(grid_row_height_, static_cast<int>(dpi), 96);
+                    handled = true;
+                    return TRUE;
+                }
+                return 0;
+            }
             case WM_NOTIFY: {
                 LRESULT result = on_notify(hwnd, reinterpret_cast<NMHDR*>(lparam));
                 handled = true;
@@ -1279,6 +1352,9 @@ private:
     JobManagerService& manager_;
     ThemePalette theme_;
     AppSettings& settings_;
+    bool grid_alternating_rows_ = true;
+    int grid_row_height_ = 24;
+    std::string grid_header_style_ = "default";
     dialog_detail::ModalHost host_;
     JobManagerRequest request_;
 

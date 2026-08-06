@@ -5,9 +5,10 @@
 //          TrimSweep / TrimSweepReverse / Scrape / RetryBad), salvage fill,
 //          retry/backoff with contention and availability policies, media
 //          identity guard, native CopyFileEx fast path, and verification.
-//          Phase 3a scope: Copy mode. ScanOnly, bad-range-map hints, raw disk
-//          scan, parallel small-file phase, and adaptive buffer sizing are
-//          declared below and refused/degraded explicitly until ported.
+//          ScanOnly, bad-range-map hints, parallel small-file acceleration,
+//          and adaptive buffering are included; raw-disk requests explicitly
+//          use the read-only allocated-file raw-volume backend with standard
+//          file-I/O fallback when the source layout is unsupported.
 // -----------------------------------------------------------------------------
 
 #pragma once
@@ -28,6 +29,7 @@
 #include "../core/models.h"
 #include "../storage/stores.h"
 #include "engine_support.h"
+#include "raw_disk_scan.h"
 
 namespace xact::engine {
 
@@ -223,6 +225,8 @@ public:
         native_fallback_files_ = 0;
         created_directories_.clear();
         fragile_failure_timestamps_.clear();
+        raw_disk_scan_context_.reset();
+        raw_scan_fallback_logged_paths_.clear();
         throttle_window_start_tick_ = 0;
         throttle_window_bytes_ = 0;
 
@@ -237,11 +241,7 @@ public:
         initialize_media_identity_expectations(source_root, destination_root);
         wait_for_media_availability(source_root, destination_root, cancel);
         ensure_media_identity_integrity(source_root, destination_root, !scan_only, true);
-        if (scan_only && options_.UseExperimentalRawDiskScan) {
-            // Raw-disk reads are not ported; the .NET worker uses the same
-            // standard-file-read fallback when raw access is unavailable.
-            emit_log("Scan backend: Raw disk unavailable (not ported in native build); using standard file reads.");
-        }
+        initialize_raw_disk_scan_context(scan_only, source_root);
         if (!scan_only) {
             storage::fsutil::create_directories(destination_root);
         }
@@ -255,6 +255,8 @@ public:
                                             [&cancel] { return cancel.is_cancelled(); });
         std::int64_t total_bytes = 0;
         for (const auto& file : scan.files) total_bytes += file.length;
+        const std::int32_t parallel_small_file_workers =
+            resolve_parallel_small_file_workers(static_cast<std::int32_t>(scan.files.size()));
         emit_log("Scan complete. " + std::to_string(scan.files.size()) + " file(s), " +
                  format_bytes(total_bytes) + " total.");
         if (scan_only) {
@@ -267,7 +269,7 @@ public:
         } else {
             emit_destination_capacity_warning(destination_root, total_bytes);
             emit_log("Transfer engine policy: " + std::string(models::to_string(options_.TransferEnginePolicyValue)) + ".");
-            emit_log("Small-file acceleration: workers=" + std::to_string(options_.ParallelSmallFileWorkers) +
+            emit_log("Small-file acceleration: workers=" + std::to_string(parallel_small_file_workers) +
                      ", threshold=" + format_bytes(options_.SmallFileThresholdBytes) + ".");
         }
 
@@ -327,7 +329,7 @@ public:
         // Parallel small-file bulk phase (copy mode only; mirrors the .NET
         // eligibility gates — sequential loop later treats these as completed).
         std::vector<std::string> parallel_completed;
-        if (!scan_only && is_native_acceleration_allowed() && options_.ParallelSmallFileWorkers > 1 &&
+        if (!scan_only && is_native_acceleration_allowed() && parallel_small_file_workers > 1 &&
             !options_.FragileMediaMode && !options_.WaitForFileLockRelease &&
             options_.MaxThroughputBytesPerSecond <= 0 &&
             resolve_verification_mode() == models::VerificationMode::None &&
@@ -349,7 +351,8 @@ public:
             }
             if (eligible.size() > 1) {
                 parallel_completed = copy_small_files_parallel(eligible, destination_root, journal,
-                                                               journal_path, cancel);
+                                                               journal_path, cancel,
+                                                               parallel_small_file_workers);
             }
         }
         auto take_parallel_completed = [&parallel_completed](const std::string& relative) {
@@ -569,6 +572,7 @@ private:
     ProgressCallback progress_callback_;
     LogCallback log_callback_;
     std::optional<FaultInjector> fault_injector_;
+    std::unique_ptr<RawDiskScanContext> raw_disk_scan_context_;
     storage::JobJournalStore journal_store_;
     storage::BadRangeMapStore bad_range_map_store_;
 
@@ -602,6 +606,46 @@ private:
     std::mutex journal_lock_;
     std::mutex progress_lock_;
     std::mutex map_lock_;
+    std::mutex raw_scan_fallback_lock_;
+    std::unordered_set<std::string> raw_scan_fallback_logged_paths_;
+
+    void initialize_raw_disk_scan_context(bool scan_only, const std::wstring& source_root) {
+        raw_disk_scan_context_.reset();
+        if (!scan_only || !options_.UseExperimentalRawDiskScan) return;
+
+        std::string reason;
+        try {
+            auto context = RawDiskScanContext::try_create(source_root, reason);
+            if (context) {
+                emit_log("Scan backend: Raw disk (experimental) enabled. Sector size " +
+                         format_bytes(context->sector_size_bytes()) + ", cluster size " +
+                         format_bytes(context->cluster_size_bytes()) + ".");
+                raw_disk_scan_context_ = std::move(context);
+                return;
+            }
+        } catch (const std::exception& ex) {
+            reason = ex.what();
+        }
+
+        if (reason.empty()) reason = "unsupported source or media.";
+        emit_log("Scan backend: Raw disk unavailable (" + reason +
+                 "); using standard file reads.");
+    }
+
+    void emit_raw_disk_fallback_once(const std::wstring& source_path, const std::string& reason) {
+        std::string key = wide_to_utf8(storage::fsutil::get_full_path(source_path));
+        if (key.empty()) key = wide_to_utf8(source_path);
+        if (key.empty()) key = "(unknown)";
+        std::string folded = key;
+        for (char& c : folded) {
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        }
+        std::lock_guard<std::mutex> guard(raw_scan_fallback_lock_);
+        if (!raw_scan_fallback_logged_paths_.insert(folded).second) return;
+        std::string detail = reason.empty() ? "unsupported source layout" : reason;
+        if (detail.empty() || detail.back() != '.') detail.push_back('.');
+        emit_log("Raw disk scan fallback for '" + key + "': " + detail);
+    }
 
     // ---- Options validation ----------------------------------------------
 
@@ -643,7 +687,7 @@ private:
             options_.RescueScrapeRetries < 0) {
             fail("Rescue pass retries cannot be negative.");
         }
-        if (options_.ParallelSmallFileWorkers < 1) fail("ParallelSmallFileWorkers must be at least 1.");
+        if (options_.ParallelSmallFileWorkers < 0) fail("ParallelSmallFileWorkers cannot be negative.");
         if (options_.ParallelScanWorkers < 0) fail("ParallelScanWorkers cannot be negative.");
         if (options_.SmallFileThresholdBytes < MinimumRescueBlockSize) fail("SmallFileThresholdBytes must be at least 4096.");
         if (options_.FragileFailureWindowSeconds <= 0) fail("FragileFailureWindowSeconds must be greater than zero.");
@@ -1961,8 +2005,26 @@ private:
                         throw *fault;
                     }
                 }
-                std::int32_t bytes_read = timed_io::read_at(
-                    session.source_handle(), offset, buffer, length, operation_timeout_ms(), cancel);
+
+                std::int32_t bytes_read = 0;
+                if (raw_disk_scan_context_) {
+                    RawDiskReadResult raw = raw_disk_scan_context_->read_chunk(
+                        source_path, relative_path, offset, length, buffer,
+                        operation_timeout_ms(), cancel);
+                    if (raw.state == RawDiskReadResult::State::Success) {
+                        bytes_read = raw.BytesRead;
+                    } else if (raw.state == RawDiskReadResult::State::Failure && raw.Error.has_value()) {
+                        throw *raw.Error;
+                    } else {
+                        emit_raw_disk_fallback_once(source_path, raw.FallbackReason);
+                        bytes_read = timed_io::read_at(
+                            session.source_handle(), offset, buffer, length,
+                            operation_timeout_ms(), cancel);
+                    }
+                } else {
+                    bytes_read = timed_io::read_at(
+                        session.source_handle(), offset, buffer, length, operation_timeout_ms(), cancel);
+                }
                 if (bytes_read != length) {
                     throw IoError("Short read at offset " + std::to_string(offset) + ". Expected " +
                                   std::to_string(length) + ", got " + std::to_string(bytes_read) + ".");
@@ -2601,6 +2663,18 @@ private:
         return std::max(1, std::min(file_count, std::min(8, processors)));
     }
 
+    std::int32_t resolve_parallel_small_file_workers(std::int32_t file_count) const {
+        if (options_.OperationMode != models::JobOperationMode::Copy || file_count <= 1) return 1;
+        if (options_.ParallelSmallFileWorkers > 0) {
+            return std::max(1, std::min(64, std::min(file_count, options_.ParallelSmallFileWorkers)));
+        }
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        std::int32_t processors = std::max<std::int32_t>(
+            1, static_cast<std::int32_t>(info.dwNumberOfProcessors));
+        return std::max(1, std::min(file_count, std::min(8, processors)));
+    }
+
     static bool is_completed_scan_journal_entry(const JournalFileEntry& entry,
                                                 const SourceFileDescriptor& descriptor) {
         if (entry.State != FileCopyState::Completed &&
@@ -3209,12 +3283,13 @@ private:
 
     std::vector<std::string> copy_small_files_parallel(
         const std::vector<SourceFileDescriptor>& files, const std::wstring& destination_root,
-        JobJournal& journal, const std::wstring& journal_path, const CancelContext& cancel) {
+        JobJournal& journal, const std::wstring& journal_path, const CancelContext& cancel,
+        std::int32_t worker_count) {
         std::vector<std::string> completed_paths;
         if (files.empty()) return completed_paths;
 
         emit_log("Parallel small file phase: " + std::to_string(files.size()) + " file(s) using " +
-                 std::to_string(options_.ParallelSmallFileWorkers) + " worker(s).");
+                 std::to_string(worker_count) + " worker(s).");
 
         for (const auto& descriptor : files) {
             std::wstring destination_path = destination_path_for(destination_root, descriptor);
@@ -3225,7 +3300,7 @@ private:
         }
 
         std::int32_t concurrency = std::max(
-            1, std::min<std::int32_t>(options_.ParallelSmallFileWorkers,
+            1, std::min<std::int32_t>(worker_count,
                                       static_cast<std::int32_t>(files.size())));
         std::mutex work_lock;
         std::size_t next_index = 0;

@@ -35,6 +35,13 @@ copies the whole folder again.
 Below the paths are the four mode combos (**Mode**, **Engine**, **Overwrite**,
 **Verify**), the resilience toggles, and the numeric tuning fields.
 
+The main-window values are per-run overrides. Click **Save defaults**, or use
+**Tools -> Save Current Settings as Defaults**, to persist the reusable engine,
+overwrite, verification, resilience, buffer, retry, and timeout choices for
+future runs. The selected mode, source, destination, and journal remain
+per-run; use **Jobs -> Save Current Options As Job...** when an exact job
+profile should be retained.
+
 While a job runs the window shows:
 
 - Two progress bars: the current file and the job overall.
@@ -43,6 +50,10 @@ While a job runs the window shows:
   rescue-pass telemetry.
 - A **Journal** path for the run, and a diagnostics row.
 - A live, severity-coloured operations log.
+
+The operations log has vertical and horizontal scroll bars, so long paths,
+journal details, and diagnostic messages can be inspected without being
+truncated.
 
 **Start**, **Pause**, and **Cancel** are always available; the input controls
 lock during a run so the job cannot be changed underneath itself.
@@ -210,9 +221,10 @@ pattern used for unrecoverable bytes (zero, `0xFF`, or random).
 
 Bad Range Map — whether maps are used and updated, whether known-bad ranges are
 skipped, and the maximum age of a map before it is ignored. **Experimental raw
-disk scan backend** currently has no effect: raw-disk reads are not implemented
-in the native build, and a scan with it enabled logs that it is falling back to
-standard file reads.
+disk scan backend** reads allocated file extents directly from a local NTFS
+volume when XactCopy is running elevated. It remains scan-only, does not scan
+free or unallocated space, and automatically falls back to standard file reads
+for unsupported layouts or unavailable raw access.
 
 ### Performance
 
@@ -284,7 +296,7 @@ for the release asset, the update is refused rather than applied unverified.
 | Menu | Items |
 | --- | --- |
 | **File** | Start / Pause / Resume / Cancel Copy · Open Journal Folder · Open Crash Folder · Exit |
-| **Tools** | Scan for Bad Blocks… · Settings… · Check for Updates… |
+| **Tools** | Scan for Bad Blocks… · Settings… · Save Current Settings as Defaults · Check for Updates… |
 | **Jobs** | Save Current Options As Job… · Job Manager… · Resume Interrupted Job · Run Next Queued Job |
 | **Help** | About XactCopy |
 

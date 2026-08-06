@@ -19,6 +19,11 @@
 
 namespace xact::ui {
 
+inline int verification_combo_index(const models::CopyJobOptions& options) {
+    if (!options.VerifyAfterCopy) return 0;
+    return options.VerificationModeValue == models::VerificationMode::Sampled ? 1 : 2;
+}
+
 class AppSettings {
 public:
     static std::wstring default_path() {
@@ -144,7 +149,11 @@ public:
         options.ContinueOnFileError = get_bool("DefaultContinueOnFileError", true);
         options.VerifyAfterCopy = get_bool("DefaultVerifyAfterCopy", false);
         options.UseBadRangeMap = get_bool("DefaultUseBadRangeMap", true);
-        options.SkipKnownBadRanges = get_bool("DefaultSkipKnownBadRanges", true);
+        // Skipping a known range only has meaning when the map is enabled. Keep
+        // the in-memory defaults coherent even if an older settings file has
+        // the two independent keys set to a contradictory combination.
+        options.SkipKnownBadRanges =
+            options.UseBadRangeMap && get_bool("DefaultSkipKnownBadRanges", true);
         options.UpdateBadRangeMapFromRun = get_bool("DefaultUpdateBadRangeMapFromRun", true);
         options.BadRangeMapMaxAgeDays = get_int("DefaultBadRangeMapMaxAgeDays", 0, 3650, 30);
         options.UseExperimentalRawDiskScan = get_bool("DefaultUseExperimentalRawDiskScan", false);
@@ -172,7 +181,9 @@ public:
             static_cast<std::int64_t>(get_int("DefaultMaxThroughputMbPerSecond", 0, 4096, 0)) *
             1024 * 1024;
         std::int32_t parallel_small = get_int("DefaultParallelSmallFileWorkers", 0, 64, 0);
-        options.ParallelSmallFileWorkers = parallel_small <= 0 ? 1 : parallel_small;
+        // Zero is retained as the UI's documented "auto" value; the engine
+        // resolves it against the processor count after it knows the file set.
+        options.ParallelSmallFileWorkers = parallel_small;
         options.ParallelScanWorkers = get_int("DefaultParallelScanWorkers", 0, 64, 0);
         options.SmallFileThresholdBytes =
             get_int("DefaultSmallFileThresholdKb", 4, 1048576, 256) * 1024;
@@ -195,6 +206,67 @@ public:
         options.SampleVerificationChunkCount =
             get_int("DefaultSampleVerificationChunkCount", 1, 64, 3);
         return options;
+    }
+
+    // Persist only the options represented by the main-window run controls.
+    // Paths, operation mode, journal identity, and recovery state deliberately
+    // remain per-run/per-job instead of becoming global defaults.
+    void save_run_defaults(const models::CopyJobOptions& options) {
+        using namespace models;
+
+        auto overwrite_name = [](OverwritePolicy value) {
+            switch (value) {
+                case OverwritePolicy::SkipExisting: return "skip-existing";
+                case OverwritePolicy::OverwriteIfSourceNewer: return "overwrite-if-newer";
+                case OverwritePolicy::Ask: return "ask";
+                case OverwritePolicy::Overwrite:
+                default: return "overwrite";
+            }
+        };
+        auto engine_name = [](TransferEnginePolicy value) {
+            switch (value) {
+                case TransferEnginePolicy::ManagedRescue: return "managed";
+                case TransferEnginePolicy::NativeFast: return "native";
+                case TransferEnginePolicy::Auto:
+                default: return "auto";
+            }
+        };
+
+        set_string("DefaultOverwritePolicy", overwrite_name(options.OverwritePolicyValue));
+        set_string("DefaultTransferEnginePolicy",
+                   engine_name(options.TransferEnginePolicyValue));
+        set_bool("DefaultResumeFromJournal", options.ResumeFromJournal);
+        set_bool("DefaultSalvageUnreadableBlocks", options.SalvageUnreadableBlocks);
+        set_bool("DefaultContinueOnFileError", options.ContinueOnFileError);
+        set_bool("DefaultUseBadRangeMap", options.UseBadRangeMap);
+        set_bool("DefaultSkipKnownBadRanges",
+                 options.UseBadRangeMap && options.SkipKnownBadRanges);
+        set_bool("DefaultUseAdaptiveBuffer", options.UseAdaptiveBufferSizing);
+        set_bool("DefaultWaitForMediaAvailability", options.WaitForMediaAvailability);
+        set_bool("DefaultFragileMediaMode", options.FragileMediaMode);
+
+        const bool verify = options.VerifyAfterCopy &&
+                            options.VerificationModeValue != VerificationMode::None;
+        set_bool("DefaultVerifyAfterCopy", verify);
+        // The Settings dialog intentionally has no "None" mode; disabling
+        // verification is represented by DefaultVerifyAfterCopy=false. Keep
+        // the selected hash mode intact so re-enabling verification restores it.
+        if (verify) {
+            set_string("DefaultVerificationMode",
+                       options.VerificationModeValue == VerificationMode::Sampled ? "sampled"
+                                                                                   : "full");
+        }
+
+        const std::int32_t buffer_mb = std::clamp(
+            options.BufferSizeBytes / (1024 * 1024), static_cast<std::int32_t>(1),
+            static_cast<std::int32_t>(256));
+        set_int("DefaultBufferSizeMb", buffer_mb);
+        set_int("DefaultMaxRetries", std::clamp(options.MaxRetries, 0, 1000));
+        const std::int64_t timeout_seconds = options.OperationTimeout.ticks / 10000000LL;
+        set_int("DefaultOperationTimeoutSeconds",
+                static_cast<std::int32_t>(std::clamp<std::int64_t>(
+                    timeout_seconds, 1, 3600)));
+        save();
     }
 
     bool prompt_resume_after_crash() const { return get_bool("PromptResumeAfterCrash", true); }

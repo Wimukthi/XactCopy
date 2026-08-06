@@ -136,6 +136,8 @@ supersedes the 1.x VB.NET releases.
 - Copy engines: **Auto**, **Native Fast**, and **Managed Rescue**.
 - Overwrite policies: overwrite, skip existing, overwrite-if-newer, and ask.
 - Bad-block scanning with precise and fast parallel profiles.
+- Optional elevated raw-volume reads for allocated files on local NTFS volumes,
+  with per-file fallback to standard reads and no bad-range format changes.
 - Bad-range maps: known-bad regions are saved and skipped on later runs.
 - Integrity verification with SHA-256/512, full or sampled.
 - Adaptive buffering, wait-for-media, and continue-on-error handling.
@@ -147,7 +149,7 @@ supersedes the 1.x VB.NET releases.
 - Job Manager: saved jobs, a run queue, and run history with journal links.
 - Crash recovery: interrupted runs are detected and can be resumed from their
   journal on next launch.
-- Settings across eight pages, preserved across upgrades.
+- Settings across seven pages, preserved across upgrades.
 - Live telemetry: throughput with running average, ETA, buffer utilisation, and
   rescue-pass progress, plus a severity-coloured log.
 

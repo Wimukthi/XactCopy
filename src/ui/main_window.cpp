@@ -8,8 +8,10 @@
 // -----------------------------------------------------------------------------
 
 #include <deque>
+#include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -90,6 +92,7 @@ constexpr int IdRetriesEdit = 1024;
 constexpr int IdTimeoutEdit = 1025;
 constexpr int IdCurrentBar = 1026;
 constexpr int IdOverallBar = 1027;
+constexpr int IdSaveDefaultsButton = 1028;
 
 // Menu command ids (mirrors the .NET MainForm menu strip).
 constexpr int IdMenuStartCopy = 1101;
@@ -107,6 +110,7 @@ constexpr int IdMenuJobManager = 1112;
 constexpr int IdMenuResumeInterrupted = 1113;
 constexpr int IdMenuRunNextQueued = 1114;
 constexpr int IdMenuAbout = 1115;
+constexpr int IdMenuSaveDefaults = 1116;
 
 constexpr int IdSourceAddFiles = 1040;
 constexpr int IdClearSelection = 1041;
@@ -115,6 +119,7 @@ constexpr int IdClearSelection = 1041;
 // arrives as a burst of launches. Selections are accumulated and applied once
 // this quiet period elapses, giving one source root and one destination prompt.
 constexpr UINT IdSelectionTimer = 1;
+constexpr UINT IdDiagnosticsTimer = 2;
 constexpr UINT SelectionCoalesceMs = 700;
 
 constexpr const wchar_t* WindowClassName = L"XactCopyNativeMain";
@@ -155,6 +160,11 @@ public:
         ui::configure_theme_engine(settings_.theme(), theme_);
         colorize_log_ = settings_.get_bool("UiColorizeLogBySeverity", true);
         ui_scale_percent_ = settings_.get_int("UiScalePercent", 50, 250, 100);
+        ui_density_percent_ = ui::ui_density_percent(settings_.get_string("UiDensity", "normal"));
+        theme_.themed_chrome = !models::detail::equals_ignore_case(
+            settings_.get_string("WindowChromeMode", "themed"), "standard");
+        theme_.density_percent = ui_density_percent_;
+        theme_.scale_percent = ui_scale_percent_;
 
         WNDCLASSW window_class{};
         window_class.lpfnWndProc = &MainWindow::static_window_proc;
@@ -174,7 +184,7 @@ public:
         if (hwnd_ == nullptr) return 1;
 
         ui::apply_window_icons(hwnd_);
-        ui::set_dark_title_bar(hwnd_, theme_.dark);
+        ui::set_dark_title_bar(hwnd_, theme_.dark && theme_.themed_chrome);
         DragAcceptFiles(hwnd_, TRUE); // dropped items join the selection
         restore_window_placement();
         ShowWindow(hwnd_, restore_maximized_ ? SW_SHOWMAXIMIZED : SW_SHOW);
@@ -242,6 +252,7 @@ private:
     HWND timeout_label_ = nullptr;
     HWND timeout_edit_ = nullptr;
     HWND start_button_ = nullptr;
+    HWND save_defaults_button_ = nullptr;
     HWND settings_button_ = nullptr;
     HWND about_button_ = nullptr;
     HWND pause_button_ = nullptr;
@@ -261,6 +272,7 @@ private:
     HWND diagnostics_label_ = nullptr;
     HWND status_label_ = nullptr;
     HWND log_list_ = nullptr;
+    int log_horizontal_extent_ = 0;
     HFONT font_ = nullptr;
     HFONT mono_font_ = nullptr;
     HBRUSH window_brush_ = nullptr;
@@ -270,6 +282,7 @@ private:
     ui::ThemePalette theme_;
     bool colorize_log_ = true;
     int ui_scale_percent_ = 100; // UiScalePercent setting (global UI scale)
+    int ui_density_percent_ = 100; // UiDensity setting (compact/normal/comfortable)
     ui::AppSettings settings_;
     ui::RecoveryService recovery_;
     ui::WorkerSupervisor supervisor_;
@@ -312,6 +325,8 @@ private:
     std::int64_t buffer_sample_bytes_total_ = 0;
     std::int64_t buffer_samples_count_ = 0;
     bool show_diagnostics_ = false;
+    int diagnostics_refresh_ms_ = 250;
+    std::optional<models::CopyProgressSnapshot> latest_progress_;
     // Appearance settings consumed by the UI.
     bool show_buffer_row_ = true;
     bool show_rescue_row_ = true;
@@ -484,6 +499,10 @@ private:
                     commit_selection();
                     return 0;
                 }
+                if (wparam == IdDiagnosticsTimer) {
+                    refresh_diagnostics_label();
+                    return 0;
+                }
                 return DefWindowProcW(hwnd_, message, wparam, lparam);
             case WM_DROPFILES: {
                 // Files/folders dropped on the window join the same selection.
@@ -518,6 +537,8 @@ private:
                 DestroyWindow(hwnd_);
                 return 0;
             case WM_DESTROY:
+                KillTimer(hwnd_, IdSelectionTimer);
+                KillTimer(hwnd_, IdDiagnosticsTimer);
                 save_window_placement();
                 if (start_thread_.joinable()) start_thread_.join();
                 if (update_thread_.joinable()) update_thread_.join();
@@ -543,18 +564,24 @@ private:
         return handle;
     }
 
-    // Monitor DPI folded with the UiScalePercent setting, so a single "effective
-    // DPI" drives both fonts (rebuild_fonts) and geometry (layout).
-    int effective_dpi() {
-        int clamped = std::clamp(ui_scale_percent_, 50, 250);
-        return static_cast<int>(GetDpiForWindow(hwnd_)) * clamped / 100;
+    int effective_scale_percent() const {
+        const int base = std::clamp(ui_scale_percent_, 50, 250);
+        const int density = std::clamp(ui_density_percent_, 80, 120);
+        return std::clamp((base * density + 50) / 100, 50, 250);
+    }
+
+    // Monitor DPI folded with both global scale and density, so a single
+    // effective DPI drives fonts and geometry consistently.
+    int effective_dpi() const {
+        return static_cast<int>(GetDpiForWindow(hwnd_)) * effective_scale_percent() / 100;
     }
 
     // Per-monitor DPI: fonts are rebuilt for the window's current monitor and
     // re-applied on WM_DPICHANGED (mirrors AxiomCompress MainWindow::update_dpi).
-    // `dpi` is the raw monitor DPI; UiScalePercent is folded in here.
+    // `dpi` is the raw monitor DPI; UiScalePercent and UiDensity are folded in
+    // here so a density change updates both control geometry and text metrics.
     void rebuild_fonts(UINT dpi) {
-        int eff = static_cast<int>(dpi) * std::clamp(ui_scale_percent_, 50, 250) / 100;
+        int eff = static_cast<int>(dpi) * effective_scale_percent() / 100;
         if (font_ != nullptr) DeleteObject(font_);
         if (mono_font_ != nullptr) DeleteObject(mono_font_);
         font_ = CreateFontW(-MulDiv(9, eff, 72), 0, 0, 0, FW_NORMAL, FALSE,
@@ -571,7 +598,6 @@ private:
 
     void apply_fonts() {
         int log_points = settings_.get_int("LogFontSizePoints", 7, 20, 9);
-        UINT dpi = GetDpiForWindow(hwnd_);
         // Must cover EVERY control that references font_: rebuild_fonts() deletes
         // the old handle, so any control left on the stale handle repaints with a
         // GDI fallback (looks bold/wrong). Owner-drawn buttons/checks/combos read
@@ -584,7 +610,8 @@ private:
             map_check_,        adaptive_check_,      continue_check_,   skip_known_bad_check_,
             wait_media_check_, fragile_check_,       buffer_label_,     buffer_edit_,
             retries_label_,    retries_edit_,        timeout_label_,    timeout_edit_,
-            start_button_,     pause_button_,        cancel_button_,    settings_button_,
+            start_button_,     pause_button_,        cancel_button_,    save_defaults_button_,
+            settings_button_,
             about_button_,     current_label_,       stats_label_,      status_label_,
             throughput_label_, eta_label_,           buffer_usage_label_, rescue_label_,
             job_summary_label_, journal_label_,      diagnostics_label_,
@@ -597,9 +624,63 @@ private:
         if (log_list_ != nullptr) {
             SendMessageW(log_list_, WM_SETFONT, reinterpret_cast<WPARAM>(mono_font_), TRUE);
             SendMessageW(log_list_, LB_SETITEMHEIGHT, 0,
-                         MulDiv(log_points + 6, static_cast<int>(dpi), 72));
+                         MulDiv(log_points + 6, effective_dpi(), 72));
         }
+        rebuild_log_horizontal_extent();
         InvalidateRect(hwnd_, nullptr, TRUE);
+    }
+
+    int measure_log_text_width(HDC dc, const std::wstring& text) const {
+        if (dc == nullptr || text.empty()) return 0;
+        SIZE size{};
+        int length = static_cast<int>(std::min<std::size_t>(
+            text.size(), static_cast<std::size_t>(std::numeric_limits<int>::max())));
+        if (!GetTextExtentPoint32W(dc, text.data(), length, &size)) return 0;
+        return size.cx + MulDiv(8, effective_dpi(), 96);
+    }
+
+    void update_log_horizontal_extent(const std::wstring& text) {
+        if (log_list_ == nullptr || mono_font_ == nullptr) return;
+        HDC dc = GetDC(log_list_);
+        if (dc == nullptr) return;
+        HGDIOBJ old_font = SelectObject(dc, mono_font_);
+        int extent = measure_log_text_width(dc, text);
+        SelectObject(dc, old_font);
+        ReleaseDC(log_list_, dc);
+        if (extent <= log_horizontal_extent_) return;
+        log_horizontal_extent_ = extent;
+        SendMessageW(log_list_, LB_SETHORIZONTALEXTENT,
+                     static_cast<WPARAM>(log_horizontal_extent_), 0);
+    }
+
+    void rebuild_log_horizontal_extent() {
+        if (log_list_ == nullptr || mono_font_ == nullptr) return;
+        HDC dc = GetDC(log_list_);
+        if (dc == nullptr) return;
+        HGDIOBJ old_font = SelectObject(dc, mono_font_);
+        int extent = 0;
+        int count = static_cast<int>(SendMessageW(log_list_, LB_GETCOUNT, 0, 0));
+        for (int index = 0; index < count; ++index) {
+            LRESULT length = SendMessageW(log_list_, LB_GETTEXTLEN, index, 0);
+            if (length < 0) continue;
+            std::wstring text(static_cast<std::size_t>(length) + 1, L'\0');
+            SendMessageW(log_list_, LB_GETTEXT, index,
+                         reinterpret_cast<LPARAM>(text.data()));
+            text.resize(static_cast<std::size_t>(length));
+            extent = std::max(extent, measure_log_text_width(dc, text));
+        }
+        SelectObject(dc, old_font);
+        ReleaseDC(log_list_, dc);
+        log_horizontal_extent_ = extent;
+        SendMessageW(log_list_, LB_SETHORIZONTALEXTENT,
+                     static_cast<WPARAM>(log_horizontal_extent_), 0);
+    }
+
+    void reset_log_horizontal_extent() {
+        log_horizontal_extent_ = 0;
+        if (log_list_ != nullptr) {
+            SendMessageW(log_list_, LB_SETHORIZONTALEXTENT, 0, 0);
+        }
     }
 
     void on_create() {
@@ -674,6 +755,8 @@ private:
         start_button_ = create(L"BUTTON", L"Start", WS_TABSTOP | BS_OWNERDRAW, IdStartButton);
         pause_button_ = create(L"BUTTON", L"Pause", WS_TABSTOP | BS_OWNERDRAW, IdPauseButton);
         cancel_button_ = create(L"BUTTON", L"Cancel", WS_TABSTOP | BS_OWNERDRAW, IdCancelButton);
+        save_defaults_button_ =
+            create(L"BUTTON", L"Save defaults", WS_TABSTOP | BS_OWNERDRAW, IdSaveDefaultsButton);
         settings_button_ =
             create(L"BUTTON", L"Settings...", WS_TABSTOP | BS_OWNERDRAW, IdSettingsButton);
         about_button_ = create(L"BUTTON", L"About", WS_TABSTOP | BS_OWNERDRAW, IdAboutButton);
@@ -702,15 +785,16 @@ private:
         // WS_BORDER (flat 1px, matches the edits) instead of WS_EX_CLIENTEDGE,
         // which draws a white sunken 3D edge the dark theme can't repaint.
         log_list_ = create(L"LISTBOX", L"",
-                           WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOINTEGRALHEIGHT |
+                           WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | WS_BORDER | LBS_NOINTEGRALHEIGHT |
                                LBS_DISABLENOSCROLL | LBS_NOSEL | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
                            IdLogList, 0, mono_font_);
         SendMessageW(log_list_, LB_SETITEMHEIGHT, 0,
-                     MulDiv(log_points + 6, static_cast<int>(dpi), 72));
+                     MulDiv(log_points + 6, effective_dpi(), 72));
 
         build_menu_bar();
         apply_theme();
         apply_appearance_settings();
+        configure_diagnostics_timer();
         apply_settings_defaults();
         wire_supervisor_events();
         update_menu_state();
@@ -733,6 +817,8 @@ private:
         HMENU tools_menu = CreatePopupMenu();
         AppendMenuW(tools_menu, MF_STRING, IdMenuScanBadBlocks, L"Scan for &Bad Blocks...");
         AppendMenuW(tools_menu, MF_STRING, IdMenuSettings, L"&Settings...");
+        AppendMenuW(tools_menu, MF_STRING, IdMenuSaveDefaults,
+                    L"Save Current Settings as &Defaults");
         AppendMenuW(tools_menu, MF_STRING, IdMenuCheckUpdates, L"Check for &Updates...");
 
         HMENU jobs_menu = CreatePopupMenu();
@@ -783,7 +869,14 @@ private:
         theme_ = ui::make_theme(settings_.theme(),
                                 settings_.get_string("AccentColorMode", "auto"),
                                 settings_.get_string("AccentColorHex", "#5A78C8"));
+        theme_.themed_chrome = !models::detail::equals_ignore_case(
+            settings_.get_string("WindowChromeMode", "themed"), "standard");
+        ui_scale_percent_ = settings_.get_int("UiScalePercent", 50, 250, 100);
+        ui_density_percent_ = ui::ui_density_percent(settings_.get_string("UiDensity", "normal"));
+        theme_.density_percent = ui_density_percent_;
+        theme_.scale_percent = ui_scale_percent_;
         ui::configure_theme_engine(settings_.theme(), theme_);
+        ui::set_dark_title_bar(hwnd_, theme_.dark && theme_.themed_chrome);
         if (window_brush_ != nullptr) DeleteObject(window_brush_);
         if (edit_brush_ != nullptr) DeleteObject(edit_brush_);
         window_brush_ = CreateSolidBrush(theme_.window);
@@ -812,8 +905,7 @@ private:
         SendMessageW(engine_combo_, CB_SETCURSEL, engine_index, 0);
         SendMessageW(overwrite_combo_, CB_SETCURSEL,
                      static_cast<int>(defaults.OverwritePolicyValue), 0);
-        int verify_index =
-            defaults.VerifyAfterCopy ? 2 : static_cast<int>(defaults.VerificationModeValue);
+        int verify_index = ui::verification_combo_index(defaults);
         SendMessageW(verify_combo_, CB_SETCURSEL, verify_index, 0);
         set_check(IdSalvageCheck, defaults.SalvageUnreadableBlocks);
         set_check(IdResumeCheck, defaults.ResumeFromJournal);
@@ -823,6 +915,7 @@ private:
         set_check(IdSkipKnownBadCheck, defaults.SkipKnownBadRanges);
         set_check(IdWaitMediaCheck, defaults.WaitForMediaAvailability);
         set_check(IdFragileCheck, defaults.FragileMediaMode);
+        sync_bad_range_controls();
 
         int buffer_mb = std::max(1, defaults.BufferSizeBytes / (1024 * 1024));
         SetWindowTextW(buffer_edit_, std::to_wstring(buffer_mb).c_str());
@@ -873,6 +966,15 @@ private:
         if (control != nullptr) InvalidateRect(control, nullptr, FALSE);
     }
 
+    void sync_bad_range_controls() {
+        if (skip_known_bad_check_ == nullptr) return;
+        bool enabled = get_check(IdMapCheck);
+        // A running job disables all parameter inputs. Preserve that state when
+        // the dependency is refreshed after a checkbox click or job completion.
+        if (map_check_ != nullptr && !IsWindowEnabled(map_check_)) enabled = false;
+        EnableWindow(skip_known_bad_check_, enabled ? TRUE : FALSE);
+    }
+
     static bool is_checkbox_id(int id) {
         return id == IdSalvageCheck || id == IdResumeCheck || id == IdMapCheck ||
                id == IdAdaptiveCheck || id == IdContinueCheck || id == IdSkipKnownBadCheck ||
@@ -882,7 +984,8 @@ private:
     static bool is_button_id(int id) {
         return id == IdSourceBrowse || id == IdDestinationBrowse || id == IdStartButton ||
                id == IdPauseButton || id == IdCancelButton || id == IdSettingsButton ||
-               id == IdAboutButton || id == IdSourceAddFiles || id == IdClearSelection;
+               id == IdAboutButton || id == IdSourceAddFiles || id == IdClearSelection ||
+               id == IdSaveDefaultsButton;
     }
 
     bool on_draw_item(const DRAWITEMSTRUCT& draw) {
@@ -953,6 +1056,14 @@ private:
         bar_thin_ = settings_.get_string("ProgressBarStyle", "thick") == "thin";
     }
 
+    void configure_diagnostics_timer() {
+        diagnostics_refresh_ms_ = settings_.get_int("UiDiagnosticsRefreshMs", 100, 5000, 250);
+        if (hwnd_ != nullptr) {
+            KillTimer(hwnd_, IdDiagnosticsTimer);
+            SetTimer(hwnd_, IdDiagnosticsTimer, static_cast<UINT>(diagnostics_refresh_ms_), nullptr);
+        }
+    }
+
     // ---- Window placement persistence -------------------------------------
 
     void save_window_placement() {
@@ -1008,6 +1119,7 @@ private:
         for (HWND control : inputs) {
             if (control != nullptr) EnableWindow(control, enabled ? TRUE : FALSE);
         }
+        sync_bad_range_controls();
     }
 
     void draw_log_item(const DRAWITEMSTRUCT& draw) {
@@ -1129,9 +1241,13 @@ private:
         place(cancel_button_, (button_width + gap) * 2, button_width, scale(30));
         int about_width = scale(80);
         int settings_width = scale(100);
+        int save_defaults_width = scale(126);
         place(about_button_, width - about_width, about_width, scale(30));
         place(settings_button_, width - about_width - gap - settings_width, settings_width,
               scale(30));
+        place(save_defaults_button_,
+              width - about_width - gap - settings_width - gap - save_defaults_width,
+              save_defaults_width, scale(30));
         y += scale(30) + gap;
 
         place(current_label_, 0, width);
@@ -1187,6 +1303,7 @@ private:
     void on_command(int id, int notification) {
         if (is_checkbox_id(id) && notification == BN_CLICKED) {
             set_check(id, !get_check(id));
+            if (id == IdMapCheck) sync_bad_range_controls();
             return;
         }
         switch (id) {
@@ -1219,13 +1336,20 @@ private:
                     colorize_log_ = settings_.get_bool("UiColorizeLogBySeverity", true);
                     show_diagnostics_ = settings_.get_bool("UiShowDiagnostics", false);
                     ui_scale_percent_ = settings_.get_int("UiScalePercent", 50, 250, 100);
+                    ui_density_percent_ =
+                        ui::ui_density_percent(settings_.get_string("UiDensity", "normal"));
                     apply_appearance_settings();
+                    configure_diagnostics_timer();
                     rebuild_fonts(GetDpiForWindow(hwnd_));
                     apply_fonts();
                     apply_theme();
                     layout();
                     sync_explorer_integration(true);
                 }
+                break;
+            case IdSaveDefaultsButton:
+            case IdMenuSaveDefaults:
+                save_current_as_defaults();
                 break;
             case IdAboutButton:
             case IdMenuAbout:
@@ -1281,6 +1405,13 @@ private:
             default:
                 break;
         }
+    }
+
+    void save_current_as_defaults() {
+        settings_.save_run_defaults(collect_options());
+        append_log("Saved current run settings as defaults.");
+        SetWindowTextW(status_label_, L"Status: Defaults saved");
+        info_box(L"The current run settings were saved as defaults for future runs.");
     }
 
     void save_current_as_job() {
@@ -1732,7 +1863,7 @@ private:
         options.VerificationModeValue = verify == 1   ? models::VerificationMode::Sampled
                                         : verify == 2 ? models::VerificationMode::Full
                                                       : models::VerificationMode::None;
-        options.VerifyAfterCopy = false;
+        options.VerifyAfterCopy = options.VerificationModeValue != models::VerificationMode::None;
 
         options.SalvageUnreadableBlocks = get_check(IdSalvageCheck);
         options.ResumeFromJournal = get_check(IdResumeCheck);
@@ -1781,6 +1912,7 @@ private:
         }
 
         SendMessageW(log_list_, LB_RESETCONTENT, 0, 0);
+        reset_log_horizontal_extent();
         reset_telemetry();
         SetWindowTextW(journal_label_, storage::fsutil::utf8_to_wide(
                                            "Journal: " + compute_journal_path(options)).c_str());
@@ -1900,11 +2032,13 @@ private:
         }
         int index = static_cast<int>(
             SendMessageW(log_list_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(wide.c_str())));
+        update_log_horizontal_extent(wide);
         SendMessageW(log_list_, LB_SETTOPINDEX, index, 0);
     }
 
     void apply_progress(const models::CopyProgressSnapshot& snapshot) {
         recovery_.touch_active_run(active_run_id_);
+        latest_progress_ = snapshot;
 
         SetWindowTextW(current_label_,
                        storage::fsutil::utf8_to_wide(
@@ -1941,6 +2075,7 @@ private:
     void reset_telemetry() {
         smoothed_bytes_per_second_ = 0.0;
         telemetry_started_ = false;
+        latest_progress_.reset();
         telemetry_last_bytes_copied_ = 0;
         buffer_sample_bytes_total_ = 0;
         buffer_samples_count_ = 0;
@@ -1952,6 +2087,19 @@ private:
         SetWindowTextW(buffer_usage_label_, L"Buffer: -");
         SetWindowTextW(rescue_label_, L"Rescue: -");
         SetWindowTextW(diagnostics_label_, L"Diagnostics: -");
+    }
+
+    void refresh_diagnostics_label() {
+        if (!show_diagnostics_ || !latest_progress_.has_value()) {
+            SetWindowTextW(diagnostics_label_, L"Diagnostics: -");
+            return;
+        }
+        const auto& snapshot = *latest_progress_;
+        std::string diag = "Diagnostics: active " + std::to_string(snapshot.ActiveFileCount) +
+                           " | scan workers " + std::to_string(snapshot.ScanWorkerCount) +
+                           " | recovered " + std::to_string(snapshot.RecoveredFiles) +
+                           " | skipped " + std::to_string(snapshot.SkippedFiles);
+        SetWindowTextW(diagnostics_label_, storage::fsutil::utf8_to_wide(diag).c_str());
     }
 
     static std::string format_eta(double seconds) {
@@ -2039,13 +2187,9 @@ private:
             SetWindowTextW(rescue_label_, storage::fsutil::utf8_to_wide(rescue).c_str());
         }
 
-        if (show_diagnostics_) {
-            std::string diag = "Diagnostics: active " + std::to_string(snapshot.ActiveFileCount) +
-                               " | scan workers " + std::to_string(snapshot.ScanWorkerCount) +
-                               " | recovered " + std::to_string(snapshot.RecoveredFiles) +
-                               " | skipped " + std::to_string(snapshot.SkippedFiles);
-            SetWindowTextW(diagnostics_label_, storage::fsutil::utf8_to_wide(diag).c_str());
-        }
+        // The diagnostics strip is refreshed by UiDiagnosticsRefreshMs rather
+        // than by every worker snapshot, keeping high-frequency progress events
+        // from becoming a second UI update stream.
     }
 
     void apply_result(const models::CopyJobResult& result) {
