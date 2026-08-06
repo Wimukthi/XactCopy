@@ -38,7 +38,8 @@ transfer. XactCopy treats bad media as the expected case:
 - **Bad-block scanning** — survey a drive or folder for unreadable sectors
   without copying anything, in a precise or a fast parallel profile, and save the
   result as a **bad-range map** so later copies skip known-bad regions instead of
-  re-reading them.
+  re-reading them. An optional elevated raw-volume backend reads allocated file
+  extents directly on local NTFS volumes and falls back safely when unsupported.
 - **Integrity verification** — verify copied data with SHA-256/512, either in
   full or sampled for speed.
 - **Job Manager** — save copy/scan jobs, queue them, and review run history with
@@ -78,6 +79,10 @@ file next to every asset so you can verify the download.
 3. Adjust options if you like — the defaults are sensible — then press **Start**.
    Progress, throughput, ETA, and a live log update as it runs; **Pause** and
    **Cancel** stay available throughout.
+
+The main-window choices are per-run overrides. Use **Save defaults** when you
+want the reusable options to seed future runs; use a saved job when the mode,
+paths, and complete option set must be retained together.
 
 For a failing drive, the recommended recipe is **Scan Bad Blocks** first to build
 a bad-range map, then **Copy** with *Use bad-range map* and *Salvage* enabled so

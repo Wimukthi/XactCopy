@@ -83,6 +83,15 @@ fingerprint of the source path let XactCopy trust a map only if it matches the
 media it was made for. *Use bad-range map* and *Skip known-bad ranges* let a
 later copy avoid re-reading regions already known to be dead.
 
+## Raw-volume scan backend
+
+Scan-only jobs can optionally open a local NTFS volume read-only and resolve
+each selected file's allocated extents with `FSCTL_GET_RETRIEVAL_POINTERS`.
+Sector-aligned reads are translated back into the existing file-relative rescue
+ranges, so journals, bad-range maps, and the IPC contract remain unchanged.
+Raw access requires elevation and falls back to standard file reads for
+unsupported layouts; it does not inspect free or unallocated space.
+
 ## Recovery state
 
 A small recovery-state file tracks the currently active run and whether the last

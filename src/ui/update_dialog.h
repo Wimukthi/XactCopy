@@ -109,6 +109,8 @@ private:
     bool apply_launched_ = false;
 
     void run(HWND owner) {
+        host_.set_density_percent(theme_.density_percent);
+        host_.set_scale_percent(theme_.scale_percent);
         HWND hwnd = host_.create(
             owner, L"XactCopyUpdateDlg", L"XactCopy Update", 640, 560,
             [this](HWND h, UINT m, WPARAM w, LPARAM l, bool& handled) {
@@ -117,7 +119,7 @@ private:
             /*resizable=*/true);
         if (hwnd == nullptr) return;
         apply_window_icons(hwnd);
-        set_dark_title_bar(hwnd, theme_.dark);
+        set_dark_title_bar(hwnd, theme_.dark && theme_.themed_chrome);
         host_.run_modal();
     }
 
@@ -145,7 +147,8 @@ private:
         hwnd_ = hwnd;
         window_brush_ = CreateSolidBrush(theme_.window);
         edit_brush_ = CreateSolidBrush(theme_.edit);
-        UINT dpi = GetDpiForWindow(hwnd);
+        UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                                 theme_.scale_percent);
         build_fonts(dpi);
         HINSTANCE inst = GetModuleHandleW(nullptr);
 
@@ -337,7 +340,10 @@ private:
         return w > MulDiv(80, dpi(), 96) ? w : MulDiv(80, dpi(), 96);
     }
 
-    UINT dpi() { return hwnd_ != nullptr ? GetDpiForWindow(hwnd_) : 96; }
+    UINT dpi() {
+        return ui_layout_dpi(hwnd_ != nullptr ? GetDpiForWindow(hwnd_) : 96,
+                             theme_.density_percent, theme_.scale_percent);
+    }
 
     // --- layout -------------------------------------------------------------
 
@@ -346,7 +352,8 @@ private:
         GetClientRect(hwnd, &client);
         const int w = client.right;
         const int h = client.bottom;
-        UINT d = GetDpiForWindow(hwnd);
+        UINT d = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                               theme_.scale_percent);
         auto s = [d](int v) { return MulDiv(v, static_cast<int>(d), 96); };
         const int pad = s(14);
         const int line = s(20);
@@ -426,7 +433,7 @@ private:
         SetBkMode(draw.hDC, TRANSPARENT);
         SetTextColor(draw.hDC, heading ? theme_.text : theme_.muted_text);
         RECT rect = draw.rcItem;
-        rect.left += MulDiv(8, static_cast<int>(GetDpiForWindow(hwnd_)), 96);
+        rect.left += MulDiv(8, static_cast<int>(dpi()), 96);
         std::wstring line = storage::fsutil::utf8_to_wide(notes_lines_[idx]);
         DrawTextW(draw.hDC, line.c_str(), -1, &rect,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -790,7 +797,8 @@ private:
                 return 0;
             case WM_GETMINMAXINFO: {
                 auto* mmi = reinterpret_cast<MINMAXINFO*>(lparam);
-                UINT d = GetDpiForWindow(hwnd);
+                UINT d = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                                       theme_.scale_percent);
                 mmi->ptMinTrackSize.x = MulDiv(560, static_cast<int>(d), 96);
                 mmi->ptMinTrackSize.y = MulDiv(460, static_cast<int>(d), 96);
                 handled = true;
@@ -849,7 +857,8 @@ private:
                 return 0;
             }
             case WM_DPICHANGED: {
-                UINT d = HIWORD(wparam);
+                UINT d = ui_layout_dpi(HIWORD(wparam), theme_.density_percent,
+                                       theme_.scale_percent);
                 build_fonts(d);
                 for (HWND h : {title_label_, current_label_, latest_label_, package_label_,
                                notes_list_, progress_bar_, status_label_, detail_label_,

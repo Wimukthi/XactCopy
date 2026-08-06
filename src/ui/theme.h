@@ -74,6 +74,12 @@ inline void configure(Gdiplus::Graphics& graphics) {
 
 struct ThemePalette {
     bool dark = true;
+    // Settings that affect top-level windows/layout are carried with the
+    // palette so every native dialog opened by the main window observes the
+    // same appearance choice.
+    bool themed_chrome = true;
+    int density_percent = 100;
+    int scale_percent = 100;
     COLORREF accent = RGB(0x5A, 0x78, 0xC8);
     COLORREF window = RGB(32, 32, 32);
     COLORREF panel = RGB(45, 45, 48);
@@ -131,6 +137,25 @@ inline COLORREF parse_color_hex(const std::string& text, COLORREF fallback) {
         else return fallback;
     }
     return RGB((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF);
+}
+
+inline int ui_density_percent(const std::string& setting) {
+    std::string normalized;
+    normalized.reserve(setting.size());
+    for (char c : setting) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        normalized.push_back(c);
+    }
+    if (normalized == "compact") return 92;
+    if (normalized == "comfortable") return 108;
+    return 100;
+}
+
+inline UINT ui_layout_dpi(UINT monitor_dpi, int density_percent, int scale_percent = 100) {
+    const int density = std::clamp(density_percent, 80, 120);
+    const int scale = std::clamp(scale_percent, 50, 250);
+    const int combined = MulDiv(scale, density, 100);
+    return static_cast<UINT>(MulDiv(static_cast<int>(monitor_dpi), combined, 100));
 }
 
 inline COLORREF system_accent_color(COLORREF fallback) {
@@ -265,7 +290,23 @@ inline void allow_dark_mode_for_window(HWND hwnd, bool allow = true) {
 }
 
 inline void set_dark_title_bar(HWND hwnd, bool dark) {
-    (void)dark;
+    if (hwnd == nullptr) return;
+
+    // The shared theme framework intentionally applies the configured system
+    // title-bar mode. Standard chrome is the one setting it cannot infer from
+    // the palette, so explicitly clear the Windows dark-title-bar attribute
+    // when the user asks for an unthemed title bar.
+    if (!dark) {
+        constexpr DWORD UseImmersiveDarkMode = 20;
+        constexpr DWORD UseImmersiveDarkModeLegacy = 19;
+        BOOL enabled = FALSE;
+        HRESULT result = DwmSetWindowAttribute(hwnd, UseImmersiveDarkMode, &enabled,
+                                               sizeof(enabled));
+        if (FAILED(result)) {
+            DwmSetWindowAttribute(hwnd, UseImmersiveDarkModeLegacy, &enabled, sizeof(enabled));
+        }
+        return;
+    }
     wimukthi::win32_theme::apply_title_bar(hwnd);
 }
 

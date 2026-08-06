@@ -34,6 +34,14 @@ public:
     using MessageHandler =
         std::function<LRESULT(HWND, UINT, WPARAM, LPARAM, bool& handled)>;
 
+    void set_density_percent(int density_percent) {
+        density_percent_ = std::clamp(density_percent, 80, 120);
+    }
+
+    void set_scale_percent(int scale_percent) {
+        scale_percent_ = std::clamp(scale_percent, 50, 250);
+    }
+
     HWND create(HWND owner, const wchar_t* class_name, const wchar_t* title, int width,
                 int height, MessageHandler handler, bool resizable = false) {
         handler_ = std::move(handler);
@@ -53,8 +61,9 @@ public:
         RegisterClassExW(&window_class); // idempotent; re-register fails harmlessly
 
         UINT dpi = owner != nullptr ? GetDpiForWindow(owner) : 96;
-        int scaled_width = MulDiv(width, static_cast<int>(dpi), 96);
-        int scaled_height = MulDiv(height, static_cast<int>(dpi), 96);
+        UINT layout_dpi = ui_layout_dpi(dpi, density_percent_, scale_percent_);
+        int scaled_width = MulDiv(width, static_cast<int>(layout_dpi), 96);
+        int scaled_height = MulDiv(height, static_cast<int>(layout_dpi), 96);
 
         RECT owner_rect{};
         if (owner != nullptr) GetWindowRect(owner, &owner_rect);
@@ -95,6 +104,8 @@ public:
 private:
     HWND hwnd_ = nullptr;
     HWND owner_ = nullptr;
+    int density_percent_ = 100;
+    int scale_percent_ = 100;
     MessageHandler handler_;
 
     static LRESULT CALLBACK static_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -194,7 +205,10 @@ private:
 
     int run(HWND owner, const std::wstring& title) {
         // Measure the message at the owner's DPI so the dialog is sized to fit.
-        dpi_ = owner != nullptr ? GetDpiForWindow(owner) : 96;
+        host_.set_density_percent(theme_.density_percent);
+        host_.set_scale_percent(theme_.scale_percent);
+        dpi_ = ui_layout_dpi(owner != nullptr ? GetDpiForWindow(owner) : 96,
+                             theme_.density_percent, theme_.scale_percent);
         auto s = [this](int v) { return MulDiv(v, static_cast<int>(dpi_), 96); };
         HDC screen = GetDC(nullptr);
         HFONT measure_font = CreateFontW(-MulDiv(9, static_cast<int>(dpi_), 72), 0, 0, 0, FW_NORMAL,
@@ -224,7 +238,7 @@ private:
                                  });
         if (hwnd == nullptr) return result_;
         apply_window_icons(hwnd);
-        set_dark_title_bar(hwnd, theme_.dark);
+        set_dark_title_bar(hwnd, theme_.dark && theme_.themed_chrome);
         host_.run_modal();
         return result_;
     }
@@ -233,7 +247,8 @@ private:
         switch (message) {
             case WM_CREATE: {
                 window_brush_ = CreateSolidBrush(theme_.window);
-                dpi_ = GetDpiForWindow(hwnd);
+                dpi_ = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                                     theme_.scale_percent);
                 auto s = [this](int v) { return MulDiv(v, static_cast<int>(dpi_), 96); };
                 font_ = CreateFontW(-MulDiv(9, static_cast<int>(dpi_), 72), 0, 0, 0, FW_NORMAL,
                                     FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
@@ -460,8 +475,8 @@ private:
             check(1, "Use bad-range map when available", "DefaultUseBadRangeMap", true);
             check(1, "Skip known bad ranges during copy", "DefaultSkipKnownBadRanges", true);
             check(1, "Update map from scan/copy runs", "DefaultUpdateBadRangeMapFromRun", true);
-            check(1, "Experimental raw disk scan backend", "DefaultUseExperimentalRawDiskScan",
-                  false);
+            check(1, "Raw volume scan (local NTFS; Administrator)",
+                  "DefaultUseExperimentalRawDiskScan", false);
             edit_int(1, "Map max age (days, 0=never)", "DefaultBadRangeMapMaxAgeDays", 0, 3650,
                      30);
 
@@ -606,6 +621,8 @@ private:
 
     bool run(HWND owner) {
         stage_from_settings();
+        host_.set_density_percent(theme_.density_percent);
+        host_.set_scale_percent(theme_.scale_percent);
         HWND hwnd = host_.create(
             owner, L"XactCopySettingsDlg", L"Settings", 900, 720,
             [this](HWND h, UINT m, WPARAM w, LPARAM l, bool& handled) {
@@ -613,7 +630,7 @@ private:
             });
         if (hwnd == nullptr) return false;
         apply_window_icons(hwnd);
-        set_dark_title_bar(hwnd, theme_.dark);
+        set_dark_title_bar(hwnd, theme_.dark && theme_.themed_chrome);
         host_.run_modal();
         return saved_;
     }
@@ -730,7 +747,8 @@ private:
         current_page_ = page;
 
         HWND hwnd = host_.hwnd();
-        UINT dpi = GetDpiForWindow(hwnd);
+        UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                                 theme_.scale_percent);
         auto scale = [dpi](int value) { return MulDiv(value, static_cast<int>(dpi), 96); };
 
         RECT client;
@@ -890,7 +908,8 @@ private:
         window_brush_ = CreateSolidBrush(theme_.window);
         edit_brush_ = CreateSolidBrush(theme_.edit);
         panel_brush_ = CreateSolidBrush(theme_.panel);
-        UINT dpi = GetDpiForWindow(hwnd);
+        UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                                 theme_.scale_percent);
         auto scale = [dpi](int value) { return MulDiv(value, static_cast<int>(dpi), 96); };
         font_ = CreateFontW(-MulDiv(9, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL, FALSE,
                             FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -933,7 +952,8 @@ private:
 
     void draw_nav_item(const DRAWITEMSTRUCT& draw) {
         const bool selected = (draw.itemState & ODS_SELECTED) != 0;
-        UINT dpi = GetDpiForWindow(nav_list_);
+        UINT dpi = ui_layout_dpi(GetDpiForWindow(nav_list_), theme_.density_percent,
+                                 theme_.scale_percent);
         auto s = [dpi](int v) { return MulDiv(v, static_cast<int>(dpi), 96); };
         RECT r = draw.rcItem;
         // Selected rows get an accent-tinted fill; others sit flush on the rail.
@@ -968,7 +988,8 @@ private:
                 GetClientRect(hwnd, &client);
                 themedraw::fill_rect(dc, client, theme_.window);
                 // Left navigation rail: a panel-colored sidebar with a 1px edge.
-                UINT dpi = GetDpiForWindow(hwnd);
+                UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                                         theme_.scale_percent);
                 auto s = [dpi](int v) { return MulDiv(v, static_cast<int>(dpi), 96); };
                 RECT rail{0, 0, s(188), client.bottom};
                 themedraw::fill_rect(dc, rail, theme_.panel);
@@ -1120,6 +1141,8 @@ private:
 
     void run(HWND owner) {
         owner_ = owner;
+        host_.set_density_percent(theme_.density_percent);
+        host_.set_scale_percent(theme_.scale_percent);
         HWND hwnd = host_.create(
             owner, L"XactCopyAboutDlg", L"About XactCopy", 480, 400,
             [this](HWND h, UINT m, WPARAM w, LPARAM l, bool& handled) {
@@ -1127,7 +1150,7 @@ private:
             });
         if (hwnd == nullptr) return;
         apply_window_icons(hwnd);
-        set_dark_title_bar(hwnd, theme_.dark);
+        set_dark_title_bar(hwnd, theme_.dark && theme_.themed_chrome);
         host_.run_modal();
     }
 
@@ -1140,7 +1163,8 @@ private:
         switch (message) {
             case WM_CREATE: {
                 window_brush_ = CreateSolidBrush(theme_.window);
-                UINT dpi = GetDpiForWindow(hwnd);
+                UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                                         theme_.scale_percent);
                 font_ = CreateFontW(-MulDiv(9, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL,
                                     FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
@@ -1227,7 +1251,8 @@ private:
                 HDC dc = BeginPaint(hwnd, &paint);
                 RECT client;
                 GetClientRect(hwnd, &client);
-                UINT dpi = GetDpiForWindow(hwnd);
+                UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                                         theme_.scale_percent);
                 auto scale = [dpi](int v) { return MulDiv(v, static_cast<int>(dpi), 96); };
                 int y = scale(96);
                 HPEN pen = CreatePen(PS_SOLID, 1, theme_.border);
@@ -1298,7 +1323,8 @@ private:
     void layout(HWND hwnd) {
         RECT client;
         GetClientRect(hwnd, &client);
-        UINT dpi = GetDpiForWindow(hwnd);
+        UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+                                 theme_.scale_percent);
         auto s = [dpi](int v) { return MulDiv(v, static_cast<int>(dpi), 96); };
         const int margin = s(20);
         const int icon = s(48);

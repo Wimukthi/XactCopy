@@ -87,12 +87,18 @@ Set **Settings → Performance → Scan profile** to *Fast health scan* and rais
 **Scan workers**. The fast profile still falls back to precise reads around any
 fault it finds, so the resulting map stays accurate.
 
-### Enabling "Experimental raw disk scan backend" changes nothing
+### The raw disk scan backend falls back to standard reads
 
-That is expected. Raw-disk reads are not implemented in the native build; a scan
-with the option enabled logs that it is falling back to standard file reads and
-proceeds normally. The setting is retained only for compatibility with settings
-files written by the 1.x releases.
+The raw backend is intentionally limited to allocated files on local NTFS
+volumes. It also requires XactCopy to be running as Administrator because it
+opens the source volume for read-only direct access. Network paths, other file
+systems, compressed or encrypted files, reparse-point files, and changing file
+layouts fall back to ordinary file reads automatically. Check the operations log
+for the specific fallback reason.
+
+Raw-volume scanning does not inspect free or unallocated sectors. Use a
+dedicated disk-surface diagnostic tool when the goal is to survey the entire
+physical medium.
 
 ### Scanning a whole drive misses areas
 
