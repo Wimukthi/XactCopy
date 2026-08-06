@@ -5,6 +5,24 @@ All notable changes to XactCopy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions are four-part (`major.minor.build.revision`) and tagged `v<version>`.
 
+## [2.0.0.7] — 2026-08-06
+
+### Added
+
+- **Raw disk scanning** can read allocated NTFS file extents directly for
+  damaged-media scans, with standard file I/O retained as the safe fallback.
+  The experimental path is opt-in and requires the appropriate Windows access.
+- **Persistent run defaults** can be saved explicitly from the main window, so
+  reusable scan, recovery, buffer, retry, timeout, and verification choices
+  survive a restart without persisting job-specific paths.
+
+### Changed
+
+- The log window now provides horizontal scrolling for long paths and messages.
+- Job Manager keeps the populated row and column grid while removing the heavy
+  column rules that previously continued through the empty list tail.
+- Raw-scan, settings, worker, storage, and UI regression coverage was expanded.
+
 ## [2.0.0.6] — 2026-07-30
 
 ### Changed
