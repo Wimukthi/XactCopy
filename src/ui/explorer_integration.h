@@ -3,7 +3,7 @@
 // the running app via the EnableExplorerContextMenu setting. It registers:
 //   * "Copy with XactCopy" verbs on files, folders, drives, and folder
 //     backgrounds (the original context-menu integration).
-//   * "Scan for Bad Blocks with XactCopy" verbs on folders and drives.
+//   * "Assess Readable Files with XactCopy" verbs on folders and drives.
 //   * An Applications\XactCopy.exe entry (FriendlyAppName + DefaultIcon + open
 //     command + SupportedTypes) so XactCopy appears in "Open with" and accepts
 //     files dragged onto it.
@@ -43,7 +43,7 @@ public:
         return table;
     }
 
-    // "Scan for Bad Blocks with XactCopy" verbs (folders + drives).
+    // "Assess Readable Files with XactCopy" verbs (folders + drives).
     static const std::vector<Target>& scan_targets() {
         static const std::vector<Target> table = {
             {L"Directory", L"--scan-from-explorer \"%1\" %*", true},
@@ -99,7 +99,7 @@ private:
     static bool register_all(const std::wstring& executable_path) {
         bool ok = true;
         ok &= register_verbs(targets(), MenuKeyName, L"Copy with XactCopy", executable_path);
-        ok &= register_verbs(scan_targets(), ScanKeyName, L"Scan for Bad Blocks with XactCopy",
+        ok &= register_verbs(scan_targets(), ScanKeyName, L"Assess Readable Files with XactCopy",
                              executable_path);
         register_application(executable_path);
         register_app_paths(executable_path);

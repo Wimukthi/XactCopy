@@ -111,6 +111,8 @@ constexpr int IdMenuResumeInterrupted = 1113;
 constexpr int IdMenuRunNextQueued = 1114;
 constexpr int IdMenuAbout = 1115;
 constexpr int IdMenuSaveDefaults = 1116;
+constexpr int IdMenuInspectBadMap = 1117;
+constexpr int IdMenuClearBadMap = 1118;
 
 constexpr int IdSourceAddFiles = 1040;
 constexpr int IdClearSelection = 1041;
@@ -151,7 +153,8 @@ public:
         instance_ = instance;
         launch_ = launch;
 
-        INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_PROGRESS_CLASS | ICC_BAR_CLASSES};
+        INITCOMMONCONTROLSEX icc{
+            sizeof(icc), ICC_PROGRESS_CLASS | ICC_BAR_CLASSES | ICC_WIN95_CLASSES};
         InitCommonControlsEx(&icc);
 
         theme_ = ui::make_theme(settings_.theme(),
@@ -165,6 +168,10 @@ public:
             settings_.get_string("WindowChromeMode", "themed"), "standard");
         theme_.density_percent = ui_density_percent_;
         theme_.scale_percent = ui_scale_percent_;
+        // WM_GETMINMAXINFO can arrive before WM_CREATE. Seed the cached DPI so
+        // the first size and minimum bounds are correct on a high-DPI primary
+        // monitor instead of assuming 96 DPI until on_create().
+        monitor_dpi_ = GetDpiForSystem();
 
         WNDCLASSW window_class{};
         window_class.lpfnWndProc = &MainWindow::static_window_proc;
@@ -178,10 +185,21 @@ public:
         // WS_CLIPCHILDREN stops the parent's WM_ERASEBKGND from painting over the
         // child controls during a resize, which is what smears the owner-drawn
         // progress bars.
-        hwnd_ = CreateWindowExW(0, WindowClassName, L"XactCopy",
-                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT,
-                                CW_USEDEFAULT, 960, 800, nullptr, nullptr, instance, this);
+        const int initial_dpi = effective_dpi();
+        hwnd_ = CreateWindowExW(
+            0, WindowClassName, L"XactCopy", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(960, initial_dpi, 96),
+            MulDiv(800, initial_dpi, 96), nullptr, nullptr, instance, this);
         if (hwnd_ == nullptr) return 1;
+
+        const HWND warning_target = hwnd_;
+        auto post_persistence_warning = [warning_target](const std::string& message) {
+            PostMessageW(warning_target, WM_APP_LOG, 0,
+                         reinterpret_cast<LPARAM>(
+                             new std::string("WARNING: " + message)));
+        };
+        job_manager_.on_persistence_warning = post_persistence_warning;
+        recovery_.on_persistence_warning = post_persistence_warning;
 
         ui::apply_window_icons(hwnd_);
         ui::set_dark_title_bar(hwnd_, theme_.dark && theme_.themed_chrome);
@@ -189,6 +207,16 @@ public:
         restore_window_placement();
         ShowWindow(hwnd_, restore_maximized_ ? SW_SHOWMAXIMIZED : SW_SHOW);
         UpdateWindow(hwnd_);
+        if (!settings_.load_warning().empty()) {
+            append_log("WARNING: " + settings_.load_warning());
+            warn_box(storage::fsutil::utf8_to_wide(settings_.load_warning()),
+                     L"Settings recovery");
+        }
+        if (!job_manager_.load_warning().empty()) {
+            append_log("WARNING: " + job_manager_.load_warning());
+            warn_box(storage::fsutil::utf8_to_wide(job_manager_.load_warning()),
+                     L"Job catalog recovery");
+        }
 
         // Any managed run still marked Running/Paused is a leftover from a crash.
         job_manager_.mark_any_running_runs_interrupted(
@@ -278,6 +306,8 @@ private:
     HBRUSH window_brush_ = nullptr;
     HBRUSH edit_brush_ = nullptr;
     HMENU menu_bar_ = nullptr;
+    UINT monitor_dpi_ = 96;
+    ui::TooltipManager tooltips_;
 
     ui::ThemePalette theme_;
     bool colorize_log_ = true;
@@ -309,6 +339,17 @@ private:
     HWND source_add_files_ = nullptr;
     HWND clear_selection_ = nullptr;
     std::map<int, bool> check_states_;
+    bool suppress_source_change_ = false;
+    int active_mode_index_ = -1;
+    int copy_profile_index_ = 2; // Custom preserves advanced saved defaults.
+    int copy_overwrite_index_ = 0;
+    int copy_verify_index_ = 2;
+    bool applying_copy_profile_ = false;
+    int scan_profile_index_ = 0;
+    int scan_backend_index_ = 0;
+    int scan_map_index_ = 0;
+    models::TransferEnginePolicy custom_transfer_engine_ =
+        models::TransferEnginePolicy::Auto;
 
     // Async job start (spawn + pipe connect must not block the UI thread).
     std::thread start_thread_;
@@ -331,7 +372,7 @@ private:
     bool show_buffer_row_ = true;
     bool show_rescue_row_ = true;
     bool bar_show_percentage_ = false;
-    bool bar_thin_ = false;
+    int progress_bar_height_logical_ = 14;
 
     static LRESULT CALLBACK static_window_proc(HWND hwnd, UINT message, WPARAM wparam,
                                                LPARAM lparam) {
@@ -357,17 +398,28 @@ private:
                 layout();
                 return 0;
             case WM_DPICHANGED: {
-                // Monitor transition: adopt the suggested bounds for the new
-                // monitor, rebuild fonts at the new DPI, and relayout.
+                // Cache the new monitor DPI before touching any metric. During
+                // WM_DPICHANGED, querying the window while it still has its old
+                // bounds can otherwise mix old item heights with new fonts.
                 const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
-                rebuild_fonts(HIWORD(wparam));
-                apply_fonts();
-                ui::apply_window_icons(hwnd_);
+                monitor_dpi_ = HIWORD(wparam) != 0 ? HIWORD(wparam) : LOWORD(wparam);
                 SetWindowPos(hwnd_, nullptr, suggested->left, suggested->top,
                              suggested->right - suggested->left,
                              suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
+                rebuild_fonts(monitor_dpi_);
+                apply_fonts();
+                tooltips_.update_dpi(static_cast<UINT>(effective_dpi()));
+                ui::apply_window_icons(hwnd_);
                 layout();
-                InvalidateRect(hwnd_, nullptr, TRUE);
+                RedrawWindow(hwnd_, nullptr, nullptr,
+                             RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+                return 0;
+            }
+            case WM_GETMINMAXINFO: {
+                auto* limits = reinterpret_cast<MINMAXINFO*>(lparam);
+                const int dpi = effective_dpi();
+                limits->ptMinTrackSize.x = MulDiv(760, dpi, 96);
+                limits->ptMinTrackSize.y = MulDiv(620, dpi, 96);
                 return 0;
             }
             case WM_ERASEBKGND: {
@@ -488,6 +540,10 @@ private:
                 for (const auto& raw : forwarded.explorer_source_paths) {
                     paths.push_back(resolve_full_path(raw));
                 }
+                if (!forwarded.explorer_scan_mode) {
+                    SendMessageW(mode_combo_, CB_SETCURSEL, 0, 0);
+                    sync_mode_ui();
+                }
                 queue_selection(paths, forwarded.explorer_scan_mode, /*want_destination*/ true);
                 return TRUE;
             }
@@ -534,12 +590,15 @@ private:
                                                           "Application closed while the run was active.");
                     }
                 }
+                if (!save_window_placement()) {
+                    warn_box(storage::fsutil::utf8_to_wide(settings_.last_save_error()),
+                             L"Window settings could not be saved");
+                }
                 DestroyWindow(hwnd_);
                 return 0;
             case WM_DESTROY:
                 KillTimer(hwnd_, IdSelectionTimer);
                 KillTimer(hwnd_, IdDiagnosticsTimer);
-                save_window_placement();
                 if (start_thread_.joinable()) start_thread_.join();
                 if (update_thread_.joinable()) update_thread_.join();
                 supervisor_.stop();
@@ -573,7 +632,7 @@ private:
     // Monitor DPI folded with both global scale and density, so a single
     // effective DPI drives fonts and geometry consistently.
     int effective_dpi() const {
-        return static_cast<int>(GetDpiForWindow(hwnd_)) * effective_scale_percent() / 100;
+        return static_cast<int>(monitor_dpi_) * effective_scale_percent() / 100;
     }
 
     // Per-monitor DPI: fonts are rebuilt for the window's current monitor and
@@ -625,6 +684,12 @@ private:
             SendMessageW(log_list_, WM_SETFONT, reinterpret_cast<WPARAM>(mono_font_), TRUE);
             SendMessageW(log_list_, LB_SETITEMHEIGHT, 0,
                          MulDiv(log_points + 6, effective_dpi(), 72));
+        }
+        const int combo_item_height = MulDiv(22, effective_dpi(), 96);
+        for (HWND combo : {mode_combo_, engine_combo_, overwrite_combo_, verify_combo_}) {
+            if (combo == nullptr) continue;
+            SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), combo_item_height);
+            SendMessageW(combo, CB_SETITEMHEIGHT, 0, combo_item_height);
         }
         rebuild_log_horizontal_extent();
         InvalidateRect(hwnd_, nullptr, TRUE);
@@ -687,8 +752,8 @@ private:
         window_brush_ = CreateSolidBrush(theme_.window);
         edit_brush_ = CreateSolidBrush(theme_.edit);
 
-        UINT dpi = GetDpiForWindow(hwnd_);
-        rebuild_fonts(dpi);
+        monitor_dpi_ = GetDpiForWindow(hwnd_);
+        rebuild_fonts(monitor_dpi_);
         int log_points = settings_.get_int("LogFontSizePoints", 7, 20, 9);
 
         source_label_ = create(L"STATIC", L"Source:", 0, 0);
@@ -712,18 +777,8 @@ private:
         engine_combo_ = create(L"COMBOBOX", L"", combo_style, IdEngineCombo);
         overwrite_combo_ = create(L"COMBOBOX", L"", combo_style, IdOverwriteCombo);
         verify_combo_ = create(L"COMBOBOX", L"", combo_style, IdVerifyCombo);
-        for (const wchar_t* item : {L"Copy", L"Scan Bad Blocks"}) {
+        for (const wchar_t* item : {L"Verified Copy / Recovery", L"Assess Readable Files"}) {
             SendMessageW(mode_combo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
-        }
-        for (const wchar_t* item :
-             {L"Engine: Auto", L"Engine: Managed Rescue", L"Engine: Native Fast"}) {
-            SendMessageW(engine_combo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
-        }
-        for (const wchar_t* item : {L"Overwrite", L"Skip existing", L"Overwrite if newer", L"Ask"}) {
-            SendMessageW(overwrite_combo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
-        }
-        for (const wchar_t* item : {L"Verify: None", L"Verify: Sampled", L"Verify: Full"}) {
-            SendMessageW(verify_combo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
         }
 
         salvage_check_ = create(L"BUTTON", L"Salvage unreadable blocks",
@@ -791,6 +846,9 @@ private:
         SendMessageW(log_list_, LB_SETITEMHEIGHT, 0,
                      MulDiv(log_points + 6, effective_dpi(), 72));
 
+        tooltips_.create(hwnd_, static_cast<UINT>(effective_dpi()), theme_.dark);
+        configure_tooltips();
+
         build_menu_bar();
         apply_theme();
         apply_appearance_settings();
@@ -801,13 +859,69 @@ private:
         layout();
     }
 
+    void configure_tooltips() {
+        auto add = [this](HWND control, const wchar_t* text) { tooltips_.add(control, text); };
+
+        add(source_label_, L"The folder or common root XactCopy will read. Drag-and-drop and Explorer selections are also accepted.");
+        add(source_edit_, L"Enter the source folder. When individual files are selected, this shows their common root while the selection row lists the subset.");
+        add(source_browse_, L"Choose one source folder and replace the current source selection.");
+        add(source_add_files_, L"Add one or more files or folders to an exact selection without replacing items already selected.");
+        add(selection_label_, L"Summary of the exact files and folders selected beneath the displayed source root.");
+        add(clear_selection_, L"Clear the exact-item selection and return to copying or scanning the entire source folder.");
+        add(destination_label_, L"The folder that receives copied files. Assess Readable Files mode is read-only and does not require a destination.");
+        add(destination_edit_, L"Enter the destination folder. XactCopy stages and verifies each file beside its final path before replacement.");
+        add(destination_browse_, L"Choose the destination folder.");
+
+        add(mode_combo_, L"Choose a destination-producing verified copy/recovery workflow, or a read-only assessment of accessible source files.");
+        add(engine_combo_, L"In copy mode choose a safe workflow profile. In assessment mode choose Auto, Fast, or Precise scanning. Low-level engine selection remains under Settings.");
+        add(overwrite_combo_, L"In copy mode this controls destination conflicts. In assessment mode it selects standard file reads or direct NTFS allocated-extent reads, which require administrator access.");
+        add(verify_combo_, L"In copy mode choose destination verification. In assessment mode choose whether findings are saved to the source-specific bad-range map.");
+
+        add(salvage_check_, L"If source blocks remain unreadable, write the configured fill pattern so readable data can still be recovered. The result is reported as recovered/incomplete, never as an exact copy.");
+        add(resume_check_, L"Load the matching journal and continue interrupted work. Completed files are reused only after the configured validation allows it.");
+        add(map_check_, L"Load remembered bad ranges for the same source. Only fresh, identity-matching entries are trusted as skip hints.");
+        add(adaptive_check_, L"Let XactCopy grow or shrink I/O buffers from observed performance and failures instead of using one fixed size.");
+        add(continue_check_, L"Continue with later files after an error. Failed or skipped files remain visible and the run cannot be reported as an exact success.");
+        add(skip_known_bad_check_, L"Avoid ranges already marked bad in a compatible map. This reduces repeated stress on failing media but does not recover the skipped bytes by itself.");
+        add(wait_media_check_, L"Keep waiting if the source or destination disappears, such as a removable drive being reconnected. Cancel remains available.");
+        add(fragile_check_, L"Use conservative reads and stop stressing files/media after clustered failures. Recommended for unstable devices; slower on healthy storage.");
+
+        add(buffer_label_, L"Base I/O buffer size in MiB. Smaller buffers isolate bad regions more precisely; larger buffers can improve healthy-device throughput.");
+        add(buffer_edit_, L"Base I/O buffer size in MiB. Adaptive mode may adjust it while the job runs.");
+        add(retries_label_, L"Additional XactCopy retries after Windows, the filesystem, storage driver, controller, and device have already applied their own retry policies.");
+        add(retries_edit_, L"Enter 0-32 additional attempts for retry-capable managed I/O. High values can repeatedly stress failing media; the recommended default is 2.");
+        add(timeout_label_, L"Timeout for an individual I/O operation, in seconds.");
+        add(timeout_edit_, L"Enter the per-operation timeout. This is not the total job duration; retries and media-wait policies can extend the run.");
+
+        add(start_button_, L"Validate the current options and start the copy or read-only file-readability assessment.");
+        add(pause_button_, L"Pause or resume scheduling and managed I/O at a safe cancellation point. An in-flight Windows API call may finish first.");
+        add(cancel_button_, L"Request cancellation. If a storage driver does not respond within five seconds, XactCopy force-stops the isolated worker. Click again to force-stop immediately.");
+        add(save_defaults_button_, L"Save the visible run controls as defaults for future jobs without saving the current source, destination, or operation mode.");
+        add(settings_button_, L"Open advanced appearance, copy, performance, diagnostics, verification, recovery, and Explorer-integration settings.");
+        add(about_button_, L"Show version, build, components, and update options.");
+
+        add(current_label_, L"The file or scan item currently being processed.");
+        add(current_bar_, L"Progress within the current file or scan item.");
+        add(overall_bar_, L"Overall progress across all enumerated source data.");
+        add(stats_label_, L"Current processed-file and processed-byte totals for the active job.");
+        add(throughput_label_, L"Recent transfer rate and smoothed average rate.");
+        add(eta_label_, L"Estimated time remaining. It stabilizes after enough throughput samples are available.");
+        add(buffer_usage_label_, L"Current adaptive-buffer size and related I/O buffer telemetry.");
+        add(rescue_label_, L"Current rescue pass and unreadable-range status.");
+        add(job_summary_label_, L"Active operation name and source summary.");
+        add(journal_label_, L"Path of the resumable journal used by this run.");
+        add(diagnostics_label_, L"UI and worker diagnostic counters. Enable or configure this strip in Settings.");
+        add(log_list_, L"Detailed worker and supervisor log. Severity can be color-coded; use the horizontal scrollbar for long lines.");
+        add(status_label_, L"Supervisor state for worker startup, connection, running, pause, cancellation, recovery, and completion.");
+    }
+
     // Mirrors the .NET MainForm menu strip (File / Tools / Jobs / Help).
     void build_menu_bar() {
         HMENU file_menu = CreatePopupMenu();
-        AppendMenuW(file_menu, MF_STRING, IdMenuStartCopy, L"&Start Copy");
-        AppendMenuW(file_menu, MF_STRING, IdMenuPauseCopy, L"&Pause Copy");
-        AppendMenuW(file_menu, MF_STRING, IdMenuResumeCopy, L"&Resume Copy");
-        AppendMenuW(file_menu, MF_STRING, IdMenuCancelCopy, L"&Cancel Copy");
+        AppendMenuW(file_menu, MF_STRING, IdMenuStartCopy, L"&Start Operation");
+        AppendMenuW(file_menu, MF_STRING, IdMenuPauseCopy, L"&Pause Operation");
+        AppendMenuW(file_menu, MF_STRING, IdMenuResumeCopy, L"&Resume Operation");
+        AppendMenuW(file_menu, MF_STRING, IdMenuCancelCopy, L"&Cancel Operation");
         AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(file_menu, MF_STRING, IdMenuOpenJournals, L"Open &Journal Folder");
         AppendMenuW(file_menu, MF_STRING, IdMenuOpenCrash, L"Open &Crash Folder");
@@ -815,7 +929,10 @@ private:
         AppendMenuW(file_menu, MF_STRING, IdMenuExit, L"E&xit");
 
         HMENU tools_menu = CreatePopupMenu();
-        AppendMenuW(tools_menu, MF_STRING, IdMenuScanBadBlocks, L"Scan for &Bad Blocks...");
+        AppendMenuW(tools_menu, MF_STRING, IdMenuScanBadBlocks, L"&Assess Readable Files...");
+        AppendMenuW(tools_menu, MF_STRING, IdMenuInspectBadMap, L"Inspect Source &Bad-Range Map...");
+        AppendMenuW(tools_menu, MF_STRING, IdMenuClearBadMap, L"Clear Source Bad-Range &Map...");
+        AppendMenuW(tools_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(tools_menu, MF_STRING, IdMenuSettings, L"&Settings...");
         AppendMenuW(tools_menu, MF_STRING, IdMenuSaveDefaults,
                     L"Save Current Settings as &Defaults");
@@ -848,6 +965,8 @@ private:
         };
         set_enabled(IdMenuStartCopy, !running);
         set_enabled(IdMenuScanBadBlocks, !running);
+        set_enabled(IdMenuInspectBadMap, !running);
+        set_enabled(IdMenuClearBadMap, !running);
         set_enabled(IdMenuPauseCopy, running && !paused_);
         set_enabled(IdMenuResumeCopy, running && paused_);
         set_enabled(IdMenuCancelCopy, running);
@@ -865,6 +984,82 @@ private:
         ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
 
+    std::optional<std::wstring> selected_source_map_path() {
+        std::string source = window_text_utf8(source_edit_);
+        if (ui_is_blank(source)) {
+            warn_box(L"Choose a source before inspecting its bad-range map.");
+            return std::nullopt;
+        }
+        return storage::BadRangeMapStore::get_default_map_path(
+            storage::fsutil::get_full_path(storage::fsutil::utf8_to_wide(source)));
+    }
+
+    void inspect_source_bad_range_map() {
+        auto path = selected_source_map_path();
+        if (!path.has_value()) return;
+        storage::BadRangeMapStore store;
+        std::optional<storage::BadRangeMap> map;
+        try {
+            map = store.load(*path);
+        } catch (const std::exception& ex) {
+            warn_box(L"The bad-range map could not be authenticated or opened.\n\n" +
+                         storage::fsutil::utf8_to_wide(ex.what()),
+                     L"Bad-range map");
+            return;
+        }
+        if (!map.has_value()) {
+            info_box(L"No authenticated bad-range map exists for the selected source.\n\n" +
+                         *path,
+                     L"Bad-range map");
+            return;
+        }
+
+        std::int64_t bad_bytes = 0;
+        std::size_t range_count = 0;
+        std::size_t confirmed_files = 0;
+        for (const auto& [key, entry] : map->Files.entries) {
+            (void)key;
+            if (entry.ConfirmationCount >= 2 && !entry.BadRanges.empty()) ++confirmed_files;
+            range_count += entry.BadRanges.size();
+            for (const auto& range : entry.BadRanges) {
+                if (range.Length > 0) bad_bytes += range.Length;
+            }
+        }
+        std::wstring summary =
+            L"Source: " + storage::fsutil::utf8_to_wide(map->SourceRoot) +
+            L"\nMedia identity: " + storage::fsutil::utf8_to_wide(map->SourceIdentity) +
+            L"\nUpdated: " + storage::fsutil::utf8_to_wide(map->UpdatedUtc.to_string()) +
+            L"\nFiles recorded: " + std::to_wstring(map->Files.entries.size()) +
+            L"\nFiles with confirmed skip hints: " + std::to_wstring(confirmed_files) +
+            L"\nRecorded ranges: " + std::to_wstring(range_count) +
+            L"\nRecorded unreadable bytes: " +
+            storage::fsutil::utf8_to_wide(format_bytes_short(bad_bytes)) +
+            L"\n\nMap: " + *path;
+        info_box(summary, L"Bad-range map");
+    }
+
+    void clear_source_bad_range_map() {
+        auto path = selected_source_map_path();
+        if (!path.has_value()) return;
+        if (!confirm_box(
+                L"Remove the selected source's authenticated bad-range map, backups, and mirror?\n\n"
+                L"This does not modify the source media. Future runs will rediscover unreadable ranges.\n\n" +
+                    *path,
+                L"Clear bad-range map", ui::MessageIcon::Warning)) {
+            return;
+        }
+        const std::int64_t reclaimed = storage::BadRangeMapStore::remove_map_set(*path);
+        if (reclaimed <= 0) {
+            info_box(L"No bad-range map artifacts were found for the selected source.",
+                     L"Bad-range map");
+            return;
+        }
+        append_log("Cleared source bad-range map and trusted backups (" +
+                   format_bytes_short(reclaimed) + ").");
+        info_box(L"The map and its trusted backups were removed. The source media was not changed.",
+                 L"Bad-range map cleared");
+    }
+
     void apply_theme() {
         theme_ = ui::make_theme(settings_.theme(),
                                 settings_.get_string("AccentColorMode", "auto"),
@@ -877,6 +1072,8 @@ private:
         theme_.scale_percent = ui_scale_percent_;
         ui::configure_theme_engine(settings_.theme(), theme_);
         ui::set_dark_title_bar(hwnd_, theme_.dark && theme_.themed_chrome);
+        tooltips_.update_dpi(static_cast<UINT>(effective_dpi()));
+        tooltips_.apply_theme(theme_.dark);
         if (window_brush_ != nullptr) DeleteObject(window_brush_);
         if (edit_brush_ != nullptr) DeleteObject(edit_brush_);
         window_brush_ = CreateSolidBrush(theme_.window);
@@ -895,18 +1092,123 @@ private:
         InvalidateRect(hwnd_, nullptr, TRUE);
     }
 
+    static void replace_combo_items(HWND combo,
+                                    std::initializer_list<const wchar_t*> items) {
+        SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+        for (const wchar_t* item : items) {
+            SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+        }
+    }
+
+    bool is_scan_mode() const {
+        return mode_combo_ != nullptr &&
+               SendMessageW(mode_combo_, CB_GETCURSEL, 0, 0) == 1;
+    }
+
+    void apply_copy_profile(int profile) {
+        copy_profile_index_ = std::clamp(profile, 0, 2);
+        if (copy_profile_index_ == 2) return;
+
+        applying_copy_profile_ = true;
+        const bool recovery = copy_profile_index_ == 1;
+        set_check(IdSalvageCheck, recovery);
+        set_check(IdContinueCheck, recovery);
+        set_check(IdFragileCheck, recovery);
+        set_check(IdAdaptiveCheck, recovery);
+        set_check(IdWaitMediaCheck, recovery);
+        if (recovery) {
+            set_check(IdMapCheck, true);
+            set_check(IdSkipKnownBadCheck, false);
+        }
+        copy_verify_index_ = 2;
+        SendMessageW(verify_combo_, CB_SETCURSEL, copy_verify_index_, 0);
+        SetWindowTextW(buffer_edit_, recovery ? L"1" : L"4");
+        SetWindowTextW(retries_edit_, L"2");
+        SetWindowTextW(timeout_edit_, L"10");
+        sync_bad_range_controls();
+        applying_copy_profile_ = false;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void mark_copy_profile_custom() {
+        if (is_scan_mode() || applying_copy_profile_ || copy_profile_index_ == 2) return;
+        copy_profile_index_ = 2;
+        SendMessageW(engine_combo_, CB_SETCURSEL, copy_profile_index_, 0);
+    }
+
+    void sync_mode_ui(bool user_changed = false) {
+        int requested = static_cast<int>(SendMessageW(mode_combo_, CB_GETCURSEL, 0, 0));
+        if (requested != 1) requested = 0;
+
+        if (active_mode_index_ == 0) {
+            copy_profile_index_ = std::max(
+                0, static_cast<int>(SendMessageW(engine_combo_, CB_GETCURSEL, 0, 0)));
+            copy_overwrite_index_ = std::max(
+                0, static_cast<int>(SendMessageW(overwrite_combo_, CB_GETCURSEL, 0, 0)));
+            copy_verify_index_ = std::max(
+                0, static_cast<int>(SendMessageW(verify_combo_, CB_GETCURSEL, 0, 0)));
+        } else if (active_mode_index_ == 1) {
+            scan_profile_index_ = std::max(
+                0, static_cast<int>(SendMessageW(engine_combo_, CB_GETCURSEL, 0, 0)));
+            scan_backend_index_ = std::max(
+                0, static_cast<int>(SendMessageW(overwrite_combo_, CB_GETCURSEL, 0, 0)));
+            scan_map_index_ = std::max(
+                0, static_cast<int>(SendMessageW(verify_combo_, CB_GETCURSEL, 0, 0)));
+        }
+
+        active_mode_index_ = requested;
+        if (requested == 1) {
+            replace_combo_items(engine_combo_, {L"Scan: Auto", L"Scan: Fast", L"Scan: Precise"});
+            replace_combo_items(overwrite_combo_,
+                                {L"Reads: Standard Files", L"Reads: Direct NTFS (Admin)"});
+            replace_combo_items(verify_combo_, {L"Map: Save Findings", L"Map: Do Not Save"});
+            SendMessageW(engine_combo_, CB_SETCURSEL, scan_profile_index_, 0);
+            SendMessageW(overwrite_combo_, CB_SETCURSEL, scan_backend_index_, 0);
+            SendMessageW(verify_combo_, CB_SETCURSEL, scan_map_index_, 0);
+            SetWindowTextW(resume_check_, L"Reuse previous scan progress");
+            SetWindowTextW(start_button_, L"Start assessment");
+        } else {
+            replace_combo_items(engine_combo_,
+                                {L"Profile: Verified Copy", L"Profile: Recover Media",
+                                 L"Profile: Custom"});
+            replace_combo_items(overwrite_combo_,
+                                {L"Overwrite", L"Skip existing", L"Overwrite if newer",
+                                 L"Stop on conflict"});
+            replace_combo_items(verify_combo_,
+                                {L"Verify: None", L"Verify: Sampled", L"Verify: Full"});
+            SendMessageW(engine_combo_, CB_SETCURSEL, copy_profile_index_, 0);
+            SendMessageW(overwrite_combo_, CB_SETCURSEL, copy_overwrite_index_, 0);
+            SendMessageW(verify_combo_, CB_SETCURSEL, copy_verify_index_, 0);
+            SetWindowTextW(resume_check_, L"Reuse verified previous progress");
+            SetWindowTextW(start_button_, L"Start copy");
+            if (user_changed) launch_.explorer_scan_mode = false;
+        }
+
+        const bool scan = requested == 1;
+        for (HWND control : {destination_label_, destination_edit_, destination_browse_,
+                             salvage_check_}) {
+            if (control != nullptr) ShowWindow(control, scan ? SW_HIDE : SW_SHOW);
+        }
+        layout();
+    }
+
     void apply_settings_defaults() {
         auto defaults = settings_.build_default_options();
         SendMessageW(mode_combo_, CB_SETCURSEL, 0, 0);
-        int engine_index =
-            defaults.TransferEnginePolicyValue == models::TransferEnginePolicy::ManagedRescue ? 1
-            : defaults.TransferEnginePolicyValue == models::TransferEnginePolicy::NativeFast  ? 2
-                                                                                              : 0;
-        SendMessageW(engine_combo_, CB_SETCURSEL, engine_index, 0);
-        SendMessageW(overwrite_combo_, CB_SETCURSEL,
-                     static_cast<int>(defaults.OverwritePolicyValue), 0);
-        int verify_index = ui::verification_combo_index(defaults);
-        SendMessageW(verify_combo_, CB_SETCURSEL, verify_index, 0);
+        custom_transfer_engine_ = defaults.TransferEnginePolicyValue;
+        copy_profile_index_ = 2;
+        copy_overwrite_index_ = static_cast<int>(defaults.OverwritePolicyValue);
+        copy_verify_index_ = ui::verification_combo_index(defaults);
+        scan_profile_index_ = static_cast<int>(defaults.ScanPerformanceProfileValue);
+        scan_backend_index_ = defaults.UseExperimentalRawDiskScan ? 1 : 0;
+        // A new installation saves scan findings by default. An explicit
+        // existing setting still wins, including a deliberate read-only map
+        // policy saved from the assessment UI.
+        scan_map_index_ = settings_.contains("DefaultUpdateBadRangeMapFromRun")
+                              ? (defaults.UpdateBadRangeMapFromRun ? 0 : 1)
+                              : 0;
+        active_mode_index_ = -1;
+        sync_mode_ui();
         set_check(IdSalvageCheck, defaults.SalvageUnreadableBlocks);
         set_check(IdResumeCheck, defaults.ResumeFromJournal);
         set_check(IdMapCheck, defaults.UseBadRangeMap);
@@ -1053,7 +1355,11 @@ private:
         show_buffer_row_ = settings_.get_bool("ShowBufferStatusRow", true);
         show_rescue_row_ = settings_.get_bool("ShowRescueStatusRow", true);
         bar_show_percentage_ = settings_.get_bool("ProgressBarShowPercentage", false);
-        bar_thin_ = settings_.get_string("ProgressBarStyle", "thick") == "thin";
+        const std::string bar_style = settings_.get_string("ProgressBarStyle", "standard");
+        progress_bar_height_logical_ =
+            models::detail::equals_ignore_case(bar_style, "thin")
+                ? 10
+                : models::detail::equals_ignore_case(bar_style, "thick") ? 18 : 14;
     }
 
     void configure_diagnostics_timer() {
@@ -1066,17 +1372,19 @@ private:
 
     // ---- Window placement persistence -------------------------------------
 
-    void save_window_placement() {
+    bool save_window_placement() {
         WINDOWPLACEMENT wp{};
         wp.length = sizeof(wp);
-        if (!GetWindowPlacement(hwnd_, &wp)) return;
+        if (!GetWindowPlacement(hwnd_, &wp)) return true;
         const RECT& r = wp.rcNormalPosition;
-        settings_.set_int("MainWindowX", r.left);
-        settings_.set_int("MainWindowY", r.top);
-        settings_.set_int("MainWindowWidth", r.right - r.left);
-        settings_.set_int("MainWindowHeight", r.bottom - r.top);
-        settings_.set_bool("MainWindowMaximized", wp.showCmd == SW_SHOWMAXIMIZED);
-        settings_.save();
+        return settings_.update_and_save([&](ui::AppSettings& target) {
+            target.set_int("MainWindowX", r.left);
+            target.set_int("MainWindowY", r.top);
+            target.set_int("MainWindowWidth", r.right - r.left);
+            target.set_int("MainWindowHeight", r.bottom - r.top);
+            target.set_int("MainWindowDpi", static_cast<int>(monitor_dpi_));
+            target.set_bool("MainWindowMaximized", wp.showCmd == SW_SHOWMAXIMIZED);
+        });
     }
 
     void restore_window_placement() {
@@ -1085,6 +1393,7 @@ private:
         if (w < 400 || h < 300) return; // unset or implausible — keep defaults
         int x = settings_.get_int("MainWindowX", -32000, 32000, 0);
         int y = settings_.get_int("MainWindowY", -32000, 32000, 0);
+        const int saved_dpi = settings_.get_int("MainWindowDpi", 0, 960, 0);
 
         // Clamp onto a visible monitor so a saved position from an unplugged
         // display doesn't strand the window off-screen.
@@ -1099,6 +1408,18 @@ private:
                 x = wa.left + ((wa.right - wa.left) - w) / 2;
                 y = wa.top + ((wa.bottom - wa.top) - h) / 2;
             }
+        }
+        // Crossing monitors while applying a saved size in one SetWindowPos
+        // lets WM_DPICHANGED scale that size again. Move first so the window
+        // adopts the target monitor's DPI, then apply the saved physical size.
+        // New placements carry their source DPI and can also survive a later
+        // monitor-scaling change; legacy placements remain byte-for-byte sized.
+        SetWindowPos(hwnd_, nullptr, x, y, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        const UINT target_dpi = GetDpiForWindow(hwnd_);
+        if (saved_dpi > 0 && target_dpi > 0) {
+            w = MulDiv(w, static_cast<int>(target_dpi), saved_dpi);
+            h = MulDiv(h, static_cast<int>(target_dpi), saved_dpi);
         }
         SetWindowPos(hwnd_, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         restore_maximized_ = settings_.get_bool("MainWindowMaximized", false);
@@ -1195,10 +1516,12 @@ private:
             y += scale(20) + gap;
         }
 
-        place(destination_label_, 0, label_width);
-        place(destination_edit_, label_width + gap, edit_width);
-        place(destination_browse_, label_width + gap + edit_width + gap, browse_width);
-        y += row_height + gap;
+        if (!is_scan_mode()) {
+            place(destination_label_, 0, label_width);
+            place(destination_edit_, label_width + gap, edit_width);
+            place(destination_browse_, label_width + gap + edit_width + gap, browse_width);
+            y += row_height + gap;
+        }
 
         int combo_width = (width - gap * 3) / 4;
         place(mode_combo_, 0, combo_width, row_height * 8);
@@ -1208,10 +1531,16 @@ private:
         y += row_height + gap;
 
         int check_width = (width - gap * 3) / 4;
-        place(salvage_check_, 0, check_width);
-        place(resume_check_, check_width + gap, check_width);
-        place(map_check_, (check_width + gap) * 2, check_width);
-        place(adaptive_check_, (check_width + gap) * 3, check_width);
+        if (is_scan_mode()) {
+            place(resume_check_, 0, check_width);
+            place(map_check_, check_width + gap, check_width);
+            place(adaptive_check_, (check_width + gap) * 2, check_width);
+        } else {
+            place(salvage_check_, 0, check_width);
+            place(resume_check_, check_width + gap, check_width);
+            place(map_check_, (check_width + gap) * 2, check_width);
+            place(adaptive_check_, (check_width + gap) * 3, check_width);
+        }
         y += row_height + gap;
 
         place(continue_check_, 0, check_width);
@@ -1252,8 +1581,7 @@ private:
 
         place(current_label_, 0, width);
         y += row_height;
-        // ProgressBarStyle setting: thin bars are shorter.
-        const int bar_height = bar_thin_ ? scale(10) : scale(18);
+        const int bar_height = scale(progress_bar_height_logical_);
         place(current_bar_, 0, width, bar_height);
         y += bar_height + gap;
         place(overall_bar_, 0, width, bar_height);
@@ -1296,15 +1624,41 @@ private:
         place(log_list_, 0, width, log_height);
         y += log_height + gap;
         place(status_label_, 0, width);
+        tooltips_.update_layout();
     }
 
     // ---- Commands ----------------------------------------------------------
 
     void on_command(int id, int notification) {
+        if (id == IdSourceEdit && notification == EN_CHANGE && !suppress_source_change_ &&
+            !explorer_selected_paths_.empty()) {
+            clear_selection(/*restore_root*/ false);
+            append_log("Exact-item selection cleared because the Source field was edited.");
+            return;
+        }
+        if (id == IdModeCombo && notification == CBN_SELCHANGE) {
+            sync_mode_ui(true);
+            return;
+        }
+        if (id == IdEngineCombo && notification == CBN_SELCHANGE && !is_scan_mode()) {
+            apply_copy_profile(static_cast<int>(
+                SendMessageW(engine_combo_, CB_GETCURSEL, 0, 0)));
+            return;
+        }
         if (is_checkbox_id(id) && notification == BN_CLICKED) {
             set_check(id, !get_check(id));
             if (id == IdMapCheck) sync_bad_range_controls();
+            mark_copy_profile_custom();
             return;
+        }
+        if (!is_scan_mode() && notification == CBN_SELCHANGE &&
+            (id == IdOverwriteCombo || id == IdVerifyCombo)) {
+            mark_copy_profile_custom();
+            return;
+        }
+        if (!is_scan_mode() && notification == EN_CHANGE &&
+            (id == IdBufferEdit || id == IdRetriesEdit || id == IdTimeoutEdit)) {
+            mark_copy_profile_custom();
         }
         switch (id) {
             case IdSourceBrowse:
@@ -1379,8 +1733,15 @@ private:
                 PostMessageW(hwnd_, WM_CLOSE, 0, 0);
                 break;
             case IdMenuScanBadBlocks:
-                SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0); // Scan Bad Blocks
+                SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0); // Assess Readable Files
+                sync_mode_ui();
                 start_job();
+                break;
+            case IdMenuInspectBadMap:
+                inspect_source_bad_range_map();
+                break;
+            case IdMenuClearBadMap:
+                clear_source_bad_range_map();
                 break;
             case IdMenuSettings:
                 on_command(IdSettingsButton, 0);
@@ -1408,18 +1769,40 @@ private:
     }
 
     void save_current_as_defaults() {
-        settings_.save_run_defaults(collect_options());
+        models::CopyJobOptions options;
+        try {
+            options = collect_options();
+        } catch (const std::exception& ex) {
+            warn_box(storage::fsutil::utf8_to_wide(ex.what()), L"Invalid run setting");
+            return;
+        }
+        if (!settings_.save_run_defaults(options)) {
+            const std::wstring error = storage::fsutil::utf8_to_wide(
+                settings_.last_save_error().empty()
+                    ? "The defaults could not be saved."
+                    : settings_.last_save_error());
+            warn_box(error, L"Defaults could not be saved");
+            SetWindowTextW(status_label_, L"Status: Defaults not saved");
+            return;
+        }
         append_log("Saved current run settings as defaults.");
         SetWindowTextW(status_label_, L"Status: Defaults saved");
         info_box(L"The current run settings were saved as defaults for future runs.");
     }
 
     void save_current_as_job() {
-        models::CopyJobOptions options = collect_options();
+        models::CopyJobOptions options;
+        try {
+            options = collect_options();
+        } catch (const std::exception& ex) {
+            warn_box(storage::fsutil::utf8_to_wide(ex.what()), L"Invalid run setting");
+            return;
+        }
         if (ui_is_blank(options.SourceRoot)) {
             info_box(L"Choose a source before saving a job.");
             return;
         }
+        bind_media_identities(options);
         std::string suggested = suggest_job_name(options);
         auto name = ui::TextPromptDialog::show(hwnd_, theme_, L"Save Job",
                                                L"Name for this saved job:", suggested);
@@ -1469,6 +1852,26 @@ private:
         if (supervisor_.is_job_running()) return;
         std::string target = queue_entry_id;
         bool show_empty_dialog = manual;
+        if (!manual && ui_is_blank(target)) {
+            // Do not dequeue attended-only jobs merely to reject them. Leave
+            // each one in place with a concrete reason, and continue looking
+            // for a later queue entry that is safe to run unattended.
+            const auto queued = job_manager_.get_queue_entries();
+            target.clear();
+            for (const auto& candidate : queued) {
+                auto job = job_manager_.get_job_by_id(candidate.JobId);
+                if (!job.has_value()) continue;
+                const std::string issue = job->Options.unattended_policy_issue();
+                if (issue.empty()) {
+                    target = candidate.QueueEntryId;
+                    break;
+                }
+                if (job_manager_.mark_queue_entry_blocked(candidate.QueueEntryId, issue)) {
+                    append_log("Deferred automatic queued job '" + job->Name + "': " + issue + ".");
+                }
+            }
+            if (target.empty()) return;
+        }
         for (;;) {
             ui::QueuedJobWorkItem work_item;
             bool dequeued = ui_is_blank(target)
@@ -1579,7 +1982,9 @@ private:
             return;
         }
         std::wstring display = selection_.display_path();
+        suppress_source_change_ = true;
         SetWindowTextW(source_edit_, display.c_str());
+        suppress_source_change_ = false;
 
         std::vector<std::string> relative = selection_.relative_paths(root);
         if (!relative.empty()) {
@@ -1589,8 +1994,10 @@ private:
         }
 
         if (launch_.explorer_scan_mode) {
-            SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0); // Scan Bad Blocks
+            SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0); // Assess Readable Files
+            sync_mode_ui();
         }
+        launch_.explorer_scan_mode = false;
         append_log("Source set to " + storage::fsutil::wide_to_utf8(display) + " (" +
                    std::to_string(selection_.size()) + " item(s) selected).");
         update_selection_ui();
@@ -1600,15 +2007,18 @@ private:
 
     void clear_selection(bool restore_root = true) {
         if (restore_root && !explorer_selection_root_.empty()) {
+            suppress_source_change_ = true;
             SetWindowTextW(source_edit_,
                            storage::fsutil::utf8_to_wide(explorer_selection_root_).c_str());
+            suppress_source_change_ = false;
         }
         selection_.clear();
         explorer_selection_root_.clear();
         explorer_selection_display_.clear();
         explorer_selected_paths_.clear();
         update_selection_ui();
-        append_log("Selection cleared; the whole source folder will be copied.");
+        append_log(std::string("Selection cleared; the whole source folder will be ") +
+                   (is_scan_mode() ? "assessed." : "copied."));
     }
 
     // A multi-selection needs a summary because the Source box can only show its
@@ -1705,7 +2115,14 @@ private:
             explorer_selected_paths_.clear();
             update_selection_ui();
             SetWindowTextW(source_edit_, folder.c_str());
-            if (launch_.explorer_scan_mode) SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0);
+            if (launch_.explorer_scan_mode) {
+                SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0);
+                sync_mode_ui();
+            } else {
+                SendMessageW(mode_combo_, CB_SETCURSEL, 0, 0);
+                sync_mode_ui();
+            }
+            launch_.explorer_scan_mode = false;
             append_log("Source set from Explorer background folder: " +
                        storage::fsutil::wide_to_utf8(folder));
             prompt_destination_from_explorer();
@@ -1722,7 +2139,7 @@ private:
     }
 
     void prompt_destination_from_explorer() {
-        if (launch_.explorer_scan_mode) return; // scans write no destination
+        if (is_scan_mode()) return; // assessments write no destination
         if (supervisor_.is_job_running()) return;
         std::string current = window_text_utf8(destination_edit_);
         if (!ui_is_blank(current)) return;
@@ -1750,8 +2167,18 @@ private:
         if (update_thread_.joinable()) update_thread_.join();
         HWND hwnd = hwnd_;
         update_thread_ = std::thread([hwnd, url]() {
-            auto* info = new ui::UpdateReleaseInfo(ui::UpdateService::get_latest_release(url));
-            PostMessageW(hwnd, WM_APP_UPDATE_DONE, 0, reinterpret_cast<LPARAM>(info));
+            auto* info = new ui::UpdateReleaseInfo;
+            try {
+                *info = ui::UpdateService::get_latest_release(url);
+            } catch (const std::exception& ex) {
+                info->error = std::string("Update check failed: ") + ex.what();
+            } catch (...) {
+                info->error = "Update check failed unexpectedly.";
+            }
+            if (!PostMessageW(hwnd, WM_APP_UPDATE_DONE, 0,
+                              reinterpret_cast<LPARAM>(info))) {
+                delete info;
+            }
         });
     }
 
@@ -1833,13 +2260,19 @@ private:
         return storage::fsutil::wide_to_utf8(std::wstring(buffer, length));
     }
 
-    int read_int_field(HWND edit, int min_value, int max_value, int fallback) {
+    int read_int_field(HWND edit, int min_value, int max_value, const char* label) {
         std::string text = window_text_utf8(edit);
         try {
-            int value = std::stoi(text);
-            return std::clamp(value, min_value, max_value);
+            std::size_t consumed = 0;
+            long long value = std::stoll(text, &consumed, 10);
+            if (consumed != text.size() || value < min_value || value > max_value) {
+                throw std::out_of_range("value outside range");
+            }
+            return static_cast<int>(value);
         } catch (...) {
-            return fallback;
+            throw std::runtime_error(std::string(label) + " must be a whole number from " +
+                                     std::to_string(min_value) + " to " +
+                                     std::to_string(max_value) + ".");
         }
     }
 
@@ -1851,21 +2284,49 @@ private:
         int mode = static_cast<int>(SendMessageW(mode_combo_, CB_GETCURSEL, 0, 0));
         options.OperationMode =
             mode == 1 ? models::JobOperationMode::ScanOnly : models::JobOperationMode::Copy;
-        int engine = static_cast<int>(SendMessageW(engine_combo_, CB_GETCURSEL, 0, 0));
-        options.TransferEnginePolicyValue =
-            engine == 1   ? models::TransferEnginePolicy::ManagedRescue
-            : engine == 2 ? models::TransferEnginePolicy::NativeFast
-                          : models::TransferEnginePolicy::Auto;
-        int overwrite = static_cast<int>(SendMessageW(overwrite_combo_, CB_GETCURSEL, 0, 0));
-        options.OverwritePolicyValue =
-            static_cast<models::OverwritePolicy>(overwrite < 0 || overwrite > 3 ? 0 : overwrite);
-        int verify = static_cast<int>(SendMessageW(verify_combo_, CB_GETCURSEL, 0, 0));
-        options.VerificationModeValue = verify == 1   ? models::VerificationMode::Sampled
-                                        : verify == 2 ? models::VerificationMode::Full
-                                                      : models::VerificationMode::None;
-        options.VerifyAfterCopy = options.VerificationModeValue != models::VerificationMode::None;
+        if (options.OperationMode == models::JobOperationMode::ScanOnly) {
+            options.DestinationRoot.clear();
+            int profile = static_cast<int>(SendMessageW(engine_combo_, CB_GETCURSEL, 0, 0));
+            options.ScanPerformanceProfileValue =
+                profile == 1   ? models::ScanPerformanceProfile::Fast
+                : profile == 2 ? models::ScanPerformanceProfile::Precise
+                               : models::ScanPerformanceProfile::Auto;
+            options.UseExperimentalRawDiskScan =
+                SendMessageW(overwrite_combo_, CB_GETCURSEL, 0, 0) == 1;
+            options.UpdateBadRangeMapFromRun =
+                SendMessageW(verify_combo_, CB_GETCURSEL, 0, 0) != 1;
+            options.TransferEnginePolicyValue = models::TransferEnginePolicy::ManagedRescue;
+            options.VerifyAfterCopy = false;
+            options.VerificationModeValue = models::VerificationMode::None;
+            options.SalvageUnreadableBlocks = false;
+        } else {
+            int profile = static_cast<int>(SendMessageW(engine_combo_, CB_GETCURSEL, 0, 0));
+            options.TransferEnginePolicyValue =
+                profile == 0   ? models::TransferEnginePolicy::Auto
+                : profile == 1 ? models::TransferEnginePolicy::ManagedRescue
+                               : custom_transfer_engine_;
+            if (profile == 1) {
+                options.UpdateBadRangeMapFromRun = true;
+                // Access-denied-as-contention is an expert lock policy that is
+                // intentionally incompatible with salvage. The Recover Media
+                // profile must remain runnable even if an older custom default
+                // left that hidden setting enabled.
+                options.TreatAccessDeniedAsContention = false;
+            }
+            int overwrite = static_cast<int>(
+                SendMessageW(overwrite_combo_, CB_GETCURSEL, 0, 0));
+            options.OverwritePolicyValue = static_cast<models::OverwritePolicy>(
+                overwrite < 0 || overwrite > 3 ? 0 : overwrite);
+            int verify = static_cast<int>(SendMessageW(verify_combo_, CB_GETCURSEL, 0, 0));
+            options.VerificationModeValue =
+                verify == 1   ? models::VerificationMode::Sampled
+                : verify == 2 ? models::VerificationMode::Full
+                              : models::VerificationMode::None;
+            options.VerifyAfterCopy =
+                options.VerificationModeValue != models::VerificationMode::None;
+            options.SalvageUnreadableBlocks = get_check(IdSalvageCheck);
+        }
 
-        options.SalvageUnreadableBlocks = get_check(IdSalvageCheck);
         options.ResumeFromJournal = get_check(IdResumeCheck);
         bool use_map = get_check(IdMapCheck);
         options.UseBadRangeMap = use_map;
@@ -1875,10 +2336,11 @@ private:
         options.WaitForMediaAvailability = get_check(IdWaitMediaCheck);
         options.FragileMediaMode = get_check(IdFragileCheck);
 
-        int buffer_mb = read_int_field(buffer_edit_, 1, 4096, 4);
-        options.BufferSizeBytes = buffer_mb * 1024 * 1024;
-        options.MaxRetries = read_int_field(retries_edit_, 0, 1000, 12);
-        int timeout_seconds = read_int_field(timeout_edit_, 1, 86400, 10);
+        int buffer_mb = read_int_field(buffer_edit_, 1, 256, "Buffer size");
+        options.BufferSizeBytes = static_cast<std::int32_t>(
+            static_cast<std::int64_t>(buffer_mb) * 1024 * 1024);
+        options.MaxRetries = read_int_field(retries_edit_, 0, 32, "Retry count");
+        int timeout_seconds = read_int_field(timeout_edit_, 1, 3600, "Operation timeout");
         options.OperationTimeout = time::TimeSpan::from_seconds(timeout_seconds);
 
         // The Source box shows an exact single item, while the worker accepts a
@@ -1895,9 +2357,27 @@ private:
         return options;
     }
 
-    void start_job() { start_job_with(collect_options(), false); }
+    void start_job() {
+        try {
+            start_job_with(collect_options(), false);
+        } catch (const std::exception& ex) {
+            warn_box(storage::fsutil::utf8_to_wide(ex.what()), L"Invalid run setting");
+        }
+    }
 
-    void start_job_with(const models::CopyJobOptions& options, bool from_recovery,
+    static void bind_media_identities(models::CopyJobOptions& options) {
+        if (options.ExpectedSourceIdentity.empty()) {
+            options.ExpectedSourceIdentity = storage::fsutil::resolve_media_identity(
+                storage::fsutil::utf8_to_wide(options.SourceRoot));
+        }
+        if (options.OperationMode == models::JobOperationMode::ScanOnly) return;
+        if (options.ExpectedDestinationIdentity.empty()) {
+            options.ExpectedDestinationIdentity = storage::fsutil::resolve_media_identity(
+                storage::fsutil::utf8_to_wide(options.DestinationRoot));
+        }
+    }
+
+    void start_job_with(models::CopyJobOptions options, bool from_recovery,
                         std::string managed_run_id = std::string(),
                         const std::string& managed_display_name = std::string()) {
         if (starting_ || supervisor_.is_job_running()) return;
@@ -1911,6 +2391,38 @@ private:
             return;
         }
 
+        if (options.OperationMode == models::JobOperationMode::Copy) {
+            std::wstring risks;
+            auto add_risk = [&risks](const wchar_t* risk) {
+                risks += L"\n  - ";
+                risks += risk;
+            };
+            if (!options.VerifyAfterCopy ||
+                options.VerificationModeValue == models::VerificationMode::None) {
+                add_risk(L"Destination bytes will not be verified after copying.");
+            } else if (options.VerificationModeValue != models::VerificationMode::Full) {
+                add_risk(L"Sampled verification can miss corruption outside the sampled ranges.");
+            }
+            if (options.ContinueOnFileError) {
+                add_risk(L"Continuing after an error can leave a mixed, incomplete destination set.");
+            }
+            if (options.SalvageUnreadableBlocks &&
+                options.AllowRecoveredOverwriteExisting) {
+                add_risk(L"Synthetic salvage bytes may replace an existing destination file.");
+            }
+            if (options.AllowDecryptedDestination) {
+                add_risk(L"EFS-encrypted source data may be published as plaintext.");
+            }
+            if (!risks.empty() &&
+                !confirm_box(L"This run uses attended-only integrity settings:" + risks +
+                                 L"\n\nProceed with these risks?",
+                             L"XactCopy - Confirm integrity risks",
+                             ui::MessageIcon::Warning)) {
+                return;
+            }
+        }
+        bind_media_identities(options);
+
         SendMessageW(log_list_, LB_RESETCONTENT, 0, 0);
         reset_log_horizontal_extent();
         reset_telemetry();
@@ -1919,7 +2431,7 @@ private:
         SetWindowTextW(job_summary_label_,
                        storage::fsutil::utf8_to_wide(
                            "Job: " + (options.OperationMode == models::JobOperationMode::ScanOnly
-                                          ? std::string("Bad Block Scan")
+                                          ? std::string("Readability Assessment")
                                           : std::string("Copy")) +
                            " — " + display_source(options)).c_str());
 
@@ -1931,7 +2443,7 @@ private:
             if (display_name.empty()) {
                 if (from_recovery) { display_name = "Recovered Copy Session"; trigger = "resume-interrupted"; }
                 else if (options.OperationMode == models::JobOperationMode::ScanOnly) {
-                    display_name = "Bad Block Scan"; trigger = "scan";
+                    display_name = "Readability Assessment"; trigger = "scan";
                 } else { display_name = "Manual Copy"; }
             }
             managed_run_id = job_manager_.create_ad_hoc_run(options, display_name, trigger).RunId;
@@ -1973,6 +2485,11 @@ private:
             active_run_id_ = supervisor_.current_job_id();
             recovery_.mark_job_started(active_run_id_, pending_start_job_name_,
                                        pending_start_options_, "", settings_);
+            if (latest_progress_.has_value()) {
+                recovery_.update_media_identities(
+                    active_run_id_, latest_progress_->SourceMediaIdentity,
+                    latest_progress_->DestinationMediaIdentity);
+            }
             if (!active_managed_run_id_.empty()) {
                 job_manager_.mark_run_running(active_managed_run_id_,
                                               compute_journal_path(pending_start_options_));
@@ -2038,6 +2555,8 @@ private:
 
     void apply_progress(const models::CopyProgressSnapshot& snapshot) {
         recovery_.touch_active_run(active_run_id_);
+        recovery_.update_media_identities(active_run_id_, snapshot.SourceMediaIdentity,
+                                          snapshot.DestinationMediaIdentity);
         latest_progress_ = snapshot;
 
         SetWindowTextW(current_label_,
@@ -2053,15 +2572,30 @@ private:
                               paused_ ? ui::TaskbarProgressState::Paused
                                       : ui::TaskbarProgressState::Normal);
 
+        const std::int64_t work_completed = snapshot.WorkBytesCompleted > 0
+                                                ? snapshot.WorkBytesCompleted
+                                                : snapshot.TotalBytesCopied;
         std::string stats =
             std::to_string(snapshot.CompletedFiles) + "/" + std::to_string(snapshot.TotalFiles) +
-            " files  •  " + format_bytes_short(snapshot.TotalBytesCopied) + " / " +
+            " files  •  " + format_bytes_short(work_completed) + " / " +
             format_bytes_short(snapshot.TotalBytes);
+        stats += pending_start_options_.OperationMode == models::JobOperationMode::ScanOnly
+                     ? " assessed"
+                     : " processed";
+        if (snapshot.BytesSkipped > 0) {
+            stats += "  •  " + format_bytes_short(snapshot.BytesSkipped) + " skipped";
+        }
+        if (snapshot.BytesReused > 0) {
+            stats += "  •  " + format_bytes_short(snapshot.BytesReused) + " reused";
+        }
         if (snapshot.FailedFiles > 0) {
             stats += "  •  " + std::to_string(snapshot.FailedFiles) + " failed";
         }
         if (snapshot.RecoveredFiles > 0) {
-            stats += "  •  " + std::to_string(snapshot.RecoveredFiles) + " recovered";
+            stats += "  •  " + std::to_string(snapshot.RecoveredFiles) +
+                     (pending_start_options_.OperationMode == models::JobOperationMode::ScanOnly
+                          ? " with unreadable ranges"
+                          : " recovered");
         }
         if (!snapshot.RescuePass.empty()) stats += "  •  pass: " + snapshot.RescuePass;
         if (snapshot.ScanWorkerCount > 1) {
@@ -2116,18 +2650,29 @@ private:
     // Mirrors MainForm.UpdateTransferTelemetry: EWMA speed (0.65/0.35), running
     // average, ETA from smoothed speed, and average buffer utilization.
     void update_transfer_telemetry(const models::CopyProgressSnapshot& snapshot) {
+        const bool scan =
+            pending_start_options_.OperationMode == models::JobOperationMode::ScanOnly;
+        std::int64_t activity_bytes = scan ? snapshot.BytesRead : snapshot.BytesWritten;
+        // Compatibility with an older worker during an in-place update.
+        if (activity_bytes == 0 && snapshot.BytesRead == 0 && snapshot.BytesWritten == 0 &&
+            snapshot.WorkBytesCompleted == 0) {
+            activity_bytes = snapshot.TotalBytesCopied;
+        }
+        const std::int64_t work_completed = snapshot.WorkBytesCompleted > 0
+                                                ? snapshot.WorkBytesCompleted
+                                                : snapshot.TotalBytesCopied;
         time::DateTimeOffset now_utc = time::DateTimeOffset::now_utc();
         if (!telemetry_started_) {
             telemetry_started_ = true;
             telemetry_start_utc_ = now_utc;
             telemetry_last_sample_utc_ = now_utc;
-            telemetry_last_bytes_copied_ = snapshot.TotalBytesCopied;
+            telemetry_last_bytes_copied_ = activity_bytes;
         }
 
         double interval_seconds =
             static_cast<double>(now_utc.utc_ticks() - telemetry_last_sample_utc_.utc_ticks()) /
             10000000.0;
-        std::int64_t delta_bytes = snapshot.TotalBytesCopied - telemetry_last_bytes_copied_;
+        std::int64_t delta_bytes = activity_bytes - telemetry_last_bytes_copied_;
         if (interval_seconds > 0 && delta_bytes >= 0) {
             double instant = static_cast<double>(delta_bytes) / interval_seconds;
             smoothed_bytes_per_second_ = smoothed_bytes_per_second_ <= 0
@@ -2135,23 +2680,24 @@ private:
                                              : smoothed_bytes_per_second_ * 0.65 + instant * 0.35;
         }
         telemetry_last_sample_utc_ = now_utc;
-        telemetry_last_bytes_copied_ = snapshot.TotalBytesCopied;
+        telemetry_last_bytes_copied_ = activity_bytes;
 
         double elapsed_seconds =
             static_cast<double>(now_utc.utc_ticks() - telemetry_start_utc_.utc_ticks()) /
             10000000.0;
         double average_bps =
-            elapsed_seconds > 0 ? static_cast<double>(snapshot.TotalBytesCopied) / elapsed_seconds : 0.0;
+            elapsed_seconds > 0 ? static_cast<double>(activity_bytes) / elapsed_seconds : 0.0;
 
         SetWindowTextW(throughput_label_,
                        storage::fsutil::utf8_to_wide(
-                           "Speed: " +
+                           std::string(scan ? "Read: " : "Write: ") +
                            format_bytes_short(static_cast<std::int64_t>(smoothed_bytes_per_second_ + 0.5)) +
                            "/s (avg " +
                            format_bytes_short(static_cast<std::int64_t>(average_bps + 0.5)) + "/s)")
                            .c_str());
 
-        std::int64_t remaining_bytes = std::max<std::int64_t>(0, snapshot.TotalBytes - snapshot.TotalBytesCopied);
+        std::int64_t remaining_bytes =
+            std::max<std::int64_t>(0, snapshot.TotalBytes - work_completed);
         double reference_speed = smoothed_bytes_per_second_ > 1.0 ? smoothed_bytes_per_second_ : average_bps;
         if (remaining_bytes <= 0) {
             SetWindowTextW(eta_label_, L"ETA: 00:00:00");
@@ -2211,14 +2757,37 @@ private:
         InvalidateRect(pause_button_, nullptr, FALSE);
         InvalidateRect(cancel_button_, nullptr, FALSE);
 
+        const bool scan =
+            pending_start_options_.OperationMode == models::JobOperationMode::ScanOnly;
+        const bool assessment_findings = scan && result.RecoveredFiles > 0;
         std::string summary =
-            std::string(result.Succeeded ? "Completed"
-                                         : (result.Cancelled ? "Cancelled" : "Failed")) +
-            ": " + std::to_string(result.CompletedFiles) + "/" + std::to_string(result.TotalFiles) +
-            " files, " + format_bytes_short(result.CopiedBytes) + " copied";
+            std::string(result.Succeeded ? (assessment_findings ? "Completed with findings"
+                                                                : "Completed")
+                                         : (result.Cancelled ? "Cancelled"
+                                                              : (result.is_incomplete() ? "Incomplete" : "Failed"))) +
+            ": " + std::to_string(result.CompletedFiles) + "/" +
+            std::to_string(result.TotalFiles) + " files, " +
+            (scan ? format_bytes_short(result.BytesRead) + " read"
+                  : format_bytes_short(result.BytesWritten > 0 ? result.BytesWritten
+                                                               : result.CopiedBytes) +
+                        " written");
+        if (!scan && result.BytesVerified > 0) {
+            summary += ", " + format_bytes_short(result.BytesVerified) + " verification I/O";
+        }
         if (result.FailedFiles > 0) summary += ", " + std::to_string(result.FailedFiles) + " failed";
+        if (result.RecoveredFiles > 0) {
+            summary += ", " + std::to_string(result.RecoveredFiles) +
+                       (scan ? " file(s) with unreadable ranges" : " recovered");
+        }
+        if (result.SkippedFiles > 0) summary += ", " + std::to_string(result.SkippedFiles) + " skipped";
         if (!result.ErrorMessage.empty()) summary += " — " + result.ErrorMessage;
         append_log(summary);
+        if (!result.IntegrityNotice.empty()) {
+            append_log("Integrity notice: " + result.IntegrityNotice);
+        }
+        if (!result.MetadataNotice.empty()) {
+            append_log("Metadata notice: " + result.MetadataNotice);
+        }
         set_progress_bar(overall_bar_, overall_permille_, result.Succeeded ? 1000 : 0);
         if (result.Succeeded) {
             taskbar_.clear(hwnd_);
@@ -2398,19 +2967,45 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     // Explorer verb still lands on a selection) and surface its window.
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\XactCopyNative.SingleInstance");
     if (mutex != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND existing = FindWindowW(WindowClassName, nullptr);
+        HWND existing = nullptr;
+        // The first process owns the mutex before it registers its window
+        // class. Wait for that startup gap instead of silently dropping an
+        // Explorer selection launched a few milliseconds later.
+        for (int attempt = 0; attempt < 200 && existing == nullptr; ++attempt) {
+            existing = FindWindowW(WindowClassName, nullptr);
+            if (existing == nullptr) Sleep(50);
+        }
         if (existing != nullptr) {
             std::wstring payload(full_command_line);
             COPYDATASTRUCT data{};
             data.dwData = ForwardedLaunchId;
             data.cbData = static_cast<DWORD>((payload.size() + 1) * sizeof(wchar_t));
             data.lpData = const_cast<wchar_t*>(payload.c_str());
-            SendMessageW(existing, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&data));
+            DWORD_PTR forwarded = 0;
+            if (!SendMessageTimeoutW(existing, WM_COPYDATA, 0,
+                                     reinterpret_cast<LPARAM>(&data),
+                                     SMTO_ABORTIFHUNG | SMTO_BLOCK, 5000, &forwarded)) {
+                MessageBoxW(nullptr,
+                            L"The running XactCopy window did not accept the Explorer selection. "
+                            L"Please retry after it becomes responsive.",
+                            L"XactCopy", MB_OK | MB_ICONWARNING);
+            }
             if (IsIconic(existing)) ShowWindow(existing, SW_RESTORE);
             SetForegroundWindow(existing);
+            CloseHandle(mutex);
+            return 0;
         }
-        CloseHandle(mutex);
-        return 0;
+        // If the original process exited during startup, take ownership and
+        // continue as the primary instance. Otherwise report the handoff
+        // failure rather than pretending the requested selection was queued.
+        if (WaitForSingleObject(mutex, 0) != WAIT_OBJECT_0) {
+            MessageBoxW(nullptr,
+                        L"XactCopy is starting, but its window was not available to receive this "
+                        L"selection. Please try the Explorer command again.",
+                        L"XactCopy", MB_OK | MB_ICONWARNING);
+            CloseHandle(mutex);
+            return 1;
+        }
     }
 
     MainWindow window;

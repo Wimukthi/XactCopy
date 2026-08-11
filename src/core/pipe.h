@@ -124,6 +124,7 @@ public:
     ~MessagePipe() { close(); }
 
     bool is_open() const noexcept { return handle_ != INVALID_HANDLE_VALUE && handle_ != nullptr; }
+    HANDLE native_handle() const noexcept { return handle_; }
 
     void close() noexcept {
         if (is_open()) {

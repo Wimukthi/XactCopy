@@ -60,6 +60,70 @@ void test_app_version() {
     check(xact::ui::UpdateService::is_update_available(
               xact::ui::kNativeVersion, published),
           "Newer revision is reported as an update");
+
+    xact::ui::AppVersion malformed =
+        xact::ui::update_detail::parse_version("v999999999999999999999.1");
+    check(malformed.major == 0 && malformed.minor == 0,
+          "Overflowing release version text is rejected without integer overflow");
+}
+
+void test_update_security_contracts() {
+    using namespace xact::ui;
+    check(update_detail::is_https_url("https://github.com/example/package.zip"),
+          "Updater accepts HTTPS URLs");
+    check(!update_detail::is_https_url("http://github.com/example/package.zip") &&
+              !update_detail::is_https_url("file:///C:/package.zip") &&
+              !update_detail::is_https_url("https://user:secret@example.com/package.zip"),
+          "Updater rejects insecure, local, and credential-bearing URLs");
+    check(update_detail::is_safe_asset_name("XactCopy-2.0.0.8-win-x64.zip") &&
+              !update_detail::is_safe_asset_name("..\\package.zip") &&
+              !update_detail::is_safe_asset_name("C:package.zip"),
+          "Updater accepts only leaf asset names");
+
+    UpdateReleaseInfo release;
+    release.version = update_detail::parse_version("v2.0.0.8");
+    release.assets = {
+        {"checksums.sha256", "https://github.com/example/checksums.sha256", 100, ""},
+        {"source.zip", "https://github.com/example/source.zip", 100, ""},
+        {"XactCopy-2.0.0.8-win-x64.zip",
+         "https://github.com/example/XactCopy-2.0.0.8-win-x64.zip", 100, ""},
+        {"XactCopySetup-v2.0.0.8-win-x64.exe",
+         "https://github.com/example/XactCopySetup-v2.0.0.8-win-x64.exe", 100, ""},
+    };
+    const UpdateAssetInfo* selected = UpdateService::select_best_asset(release);
+    check(selected != nullptr &&
+              selected->name == "XactCopySetup-v2.0.0.8-win-x64.exe",
+          "Updater selects the exact Windows installer instead of an unrelated asset");
+
+    UpdateReleaseInfo lookalike_release;
+    lookalike_release.version = release.version;
+    lookalike_release.assets = {
+        {"XactCopy-preview-2.0.0.8-win-x64.exe",
+         "https://example.com/XactCopy-preview-2.0.0.8-win-x64.exe", 100, ""},
+    };
+    check(UpdateService::select_best_asset(lookalike_release) == nullptr,
+          "Updater rejects a lookalike package name for the selected release");
+
+    UpdateReleaseInfo invalid_release;
+    invalid_release.assets = {
+        {"XactCopy-win-x64.zip", "http://example.com/XactCopy-win-x64.zip", 100, ""},
+        {"notes.txt", "https://example.com/notes.txt", 100, ""},
+    };
+    check(UpdateService::select_best_asset(invalid_release) == nullptr,
+          "Updater reports no package when every release asset is ineligible");
+
+    UpdateReleaseInfo oversized_release;
+    oversized_release.version = release.version;
+    oversized_release.assets = {
+        {"XactCopySetup-v2.0.0.8-win-x64.exe",
+         "https://example.com/XactCopySetup-v2.0.0.8-win-x64.exe",
+         update_detail::kMaximumUpdatePackageBytes + 1, std::string(64, 'a')},
+    };
+    check(UpdateService::select_best_asset(oversized_release) == nullptr,
+          "Updater rejects implausibly large release packages");
+    UpdateReleaseInfo insecure = UpdateService::get_latest_release("http://example.com/latest");
+    check(!insecure.ok && insecure.error.find("HTTPS") != std::string::npos,
+          "Updater rejects an insecure release feed before network access");
 }
 
 void test_timespan_format() {
@@ -207,6 +271,11 @@ void test_json_writer_and_parser() {
     check(num.as_object()->find("A")->as_double() == 1500.0, "Parser scientific double");
     check(num.as_object()->find("B")->as_double() == -0.25, "Parser negative double");
     check(num.as_object()->find("C")->as_int64() == 9223372036854775807LL, "Parser int64 max");
+    Value narrow = parse("{\"Huge\":4294967297,\"Fraction\":1.5,\"WholeDouble\":2.0}");
+    check(narrow.as_object()->find("Huge")->as_int32(7) == 7 &&
+              narrow.as_object()->find("Fraction")->as_int32(7) == 7 &&
+              narrow.as_object()->find("WholeDouble")->as_int32(7) == 2,
+          "JSON integer conversion rejects overflow and fractional values safely");
 
     // Whitespace tolerance and malformed input.
     Value ws = parse("  { \"A\" : [ 1 , 2 ] , \"B\" : \"x\" }  ");
@@ -252,15 +321,66 @@ void test_options_roundtrip() {
     check(restored.LockContentionProbeInterval == time::TimeSpan::from_milliseconds(500), "Options default timespan kept");
     check(restored.RescueScrapeRetries == 2, "Options default int kept");
 
-    // Missing fields keep defaults; unknown fields are ignored; enums parse
-    // case-insensitively and from integers.
+    // Missing fields keep the integrity-first defaults; unknown fields are
+    // ignored; enums parse case-insensitively and from integers.
     auto partial = models::CopyJobOptions::from_json(json::parse(
         "{\"sourceroot\":\"X:\\\\\",\"OverwritePolicy\":\"skipexisting\",\"SymlinkHandling\":1,"
         "\"NotARealField\":123}"));
     check_equal(partial.SourceRoot, "X:\\", "Options case-insensitive field");
     check(partial.OverwritePolicyValue == models::OverwritePolicy::SkipExisting, "Options case-insensitive enum");
     check(partial.SymlinkHandling == models::SymlinkHandlingMode::Follow, "Options numeric enum");
-    check(partial.MaxRetries == 12, "Options missing field default");
+    check(partial.MaxRetries == 2 && partial.VerifyAfterCopy &&
+              partial.VerificationModeValue == models::VerificationMode::Full &&
+              !partial.SalvageUnreadableBlocks && !partial.ContinueOnFileError,
+          "Options missing fields use the integrity-first profile");
+    auto malformed_numeric = models::CopyJobOptions::from_json(
+        json::parse("{\"MaxRetries\":4294967297,\"VerificationMode\":99,"
+                    "\"SymlinkHandling\":99}"));
+    check(malformed_numeric.MaxRetries == 2 &&
+              malformed_numeric.VerificationModeValue == models::VerificationMode::Full &&
+              malformed_numeric.SymlinkHandling == models::SymlinkHandlingMode::Skip,
+          "Out-of-range option integers and enums retain safe model defaults");
+
+    models::CopyJobOptions unattended;
+    unattended.SourceRoot = "D:\\Source";
+    unattended.DestinationRoot = "E:\\Dest";
+    unattended.ExpectedSourceIdentity = "vol:SOURCE:00000001";
+    unattended.ExpectedDestinationIdentity = "vol:DEST:00000002";
+    check(unattended.has_safe_unattended_policy(),
+          "full verification plus bound media is safe for unattended copy");
+    unattended.VerificationModeValue = models::VerificationMode::Sampled;
+    check(!unattended.has_safe_unattended_policy(),
+          "sampled verification remains an attended-only integrity choice");
+    unattended.VerificationModeValue = models::VerificationMode::Full;
+    unattended.ContinueOnFileError = true;
+    check(!unattended.has_safe_unattended_policy(),
+          "continue-on-error cannot silently run unattended");
+    unattended.ContinueOnFileError = false;
+    unattended.AllowRecoveredOverwriteExisting = true;
+    check(unattended.has_safe_unattended_policy(),
+          "inactive recovered-output override does not block unattended copy");
+    unattended.SalvageUnreadableBlocks = true;
+    check(!unattended.has_safe_unattended_policy(),
+          "recovered-output overwrite override cannot run unattended");
+    unattended.SalvageUnreadableBlocks = false;
+    unattended.AllowRecoveredOverwriteExisting = false;
+    unattended.OperationMode = models::JobOperationMode::ScanOnly;
+    unattended.ExpectedDestinationIdentity.clear();
+    check(unattended.has_safe_unattended_policy(),
+          "read-only scan needs only a bound source identity for unattended use");
+
+    models::CopyJobResult result;
+    result.Succeeded = true;
+    result.IntegrityNotice = "Verification was intentionally disabled.";
+    result.MetadataNotice = "Hard-link topology was flattened.";
+    json::Writer result_writer;
+    result.to_json(result_writer);
+    models::CopyJobResult restored_result =
+        models::CopyJobResult::from_json(json::parse(result_writer.take()));
+    check(restored_result.ErrorMessage.empty() &&
+              restored_result.IntegrityNotice == result.IntegrityNotice &&
+              restored_result.MetadataNotice == result.MetadataNotice,
+          "Result notices round-trip without becoming failures");
 }
 
 void test_envelope() {
@@ -364,7 +484,11 @@ std::string read_file(const std::string& path) {
     if (!stream) return std::string();
     std::ostringstream buffer;
     buffer << stream.rdbuf();
-    return buffer.str();
+    std::string text = buffer.str();
+    // Fixture editors may add a final line terminator; the serialized JSON
+    // payload itself never includes it.
+    while (!text.empty() && (text.back() == '\r' || text.back() == '\n')) text.pop_back();
+    return text;
 }
 
 void test_goldens(const std::string& golden_dir) {
@@ -461,6 +585,7 @@ void test_goldens(const std::string& golden_dir) {
 
 int main(int argc, char** argv) {
     test_app_version();
+    test_update_security_contracts();
     test_timespan_format();
     test_datetimeoffset_format();
     test_json_writer_and_parser();

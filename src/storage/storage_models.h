@@ -214,6 +214,9 @@ struct JournalFileEntry {
     std::string RelativePath;
     std::int64_t SourceLength = 0;
     std::int64_t SourceLastWriteUtcTicks = 0;
+    std::int64_t SourceChangeUtcTicks = 0;
+    std::int64_t SourceFileIndex = 0;
+    std::int64_t SourceVolumeSerial = 0;
     std::int64_t BytesCopied = 0;
     FileCopyState State = FileCopyState::Pending;
     std::string LastError;
@@ -240,6 +243,15 @@ struct JournalFileEntry {
         }
         w.key("SourceLength"); w.value(SourceLength);
         w.key("SourceLastWriteUtcTicks"); w.value(SourceLastWriteUtcTicks);
+        if (SourceChangeUtcTicks != 0) {
+            w.key("SourceChangeUtcTicks"); w.value(SourceChangeUtcTicks);
+        }
+        if (SourceFileIndex != 0) {
+            w.key("SourceFileIndex"); w.value(SourceFileIndex);
+        }
+        if (SourceVolumeSerial != 0) {
+            w.key("SourceVolumeSerial"); w.value(SourceVolumeSerial);
+        }
         w.key("BytesCopied"); w.value(BytesCopied);
         if (State != FileCopyState::Pending) {
             w.key("State"); w.value(to_string(State));
@@ -269,6 +281,9 @@ struct JournalFileEntry {
         models::detail::read(obj, "RelativePath", e.RelativePath);
         models::detail::read(obj, "SourceLength", e.SourceLength);
         models::detail::read(obj, "SourceLastWriteUtcTicks", e.SourceLastWriteUtcTicks);
+        models::detail::read(obj, "SourceChangeUtcTicks", e.SourceChangeUtcTicks);
+        models::detail::read(obj, "SourceFileIndex", e.SourceFileIndex);
+        models::detail::read(obj, "SourceVolumeSerial", e.SourceVolumeSerial);
         models::detail::read(obj, "BytesCopied", e.BytesCopied);
         e.State = models::detail::enum_parse(FileCopyState_Table, obj->find("State"), e.State);
         models::detail::read(obj, "LastError", e.LastError);
@@ -331,8 +346,11 @@ struct BadRangeMapFileEntry {
     std::string RelativePath;
     std::int64_t SourceLength = 0;
     std::int64_t LastWriteUtcTicks = 0;
+    std::int64_t SourceFileIndex = 0;
+    std::int64_t SourceVolumeSerial = 0;
     std::string FileFingerprint;
     std::vector<ByteRange> BadRanges;
+    std::int32_t ConfirmationCount = 0;
     DateTimeOffset LastScanUtc = DateTimeOffset::now_utc();
     std::string LastError;
 
@@ -341,8 +359,17 @@ struct BadRangeMapFileEntry {
         w.key("RelativePath"); w.value(RelativePath);
         w.key("SourceLength"); w.value(SourceLength);
         w.key("LastWriteUtcTicks"); w.value(LastWriteUtcTicks);
+        if (SourceFileIndex != 0) {
+            w.key("SourceFileIndex"); w.value(SourceFileIndex);
+        }
+        if (SourceVolumeSerial != 0) {
+            w.key("SourceVolumeSerial"); w.value(SourceVolumeSerial);
+        }
         w.key("FileFingerprint"); w.value(FileFingerprint);
         detail::write_range_array(w, "BadRanges", BadRanges);
+        if (ConfirmationCount != 0) {
+            w.key("ConfirmationCount"); w.value(ConfirmationCount);
+        }
         w.key("LastScanUtc"); w.value_literal_string(LastScanUtc.to_string());
         w.key("LastError"); w.value(LastError);
         w.end_object();
@@ -355,8 +382,11 @@ struct BadRangeMapFileEntry {
         models::detail::read(obj, "RelativePath", e.RelativePath);
         models::detail::read(obj, "SourceLength", e.SourceLength);
         models::detail::read(obj, "LastWriteUtcTicks", e.LastWriteUtcTicks);
+        models::detail::read(obj, "SourceFileIndex", e.SourceFileIndex);
+        models::detail::read(obj, "SourceVolumeSerial", e.SourceVolumeSerial);
         models::detail::read(obj, "FileFingerprint", e.FileFingerprint);
         detail::read_range_array(obj, "BadRanges", e.BadRanges);
+        models::detail::read(obj, "ConfirmationCount", e.ConfirmationCount);
         models::detail::read(obj, "LastScanUtc", e.LastScanUtc);
         models::detail::read(obj, "LastError", e.LastError);
         return e;

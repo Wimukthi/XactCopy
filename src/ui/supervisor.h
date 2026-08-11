@@ -2,8 +2,9 @@
 // File: src\ui\supervisor.h
 // Purpose: Native port of WorkerSupervisor — spawns XactCopyExecutive, drives
 //          jobs over the named-pipe IPC contract, monitors heartbeats and job
-//          activity, and restarts/resumes the worker after stalls, exits, or
-//          channel loss (auto-recovery forces resume-from-journal).
+//          activity, reports healthy-but-idle jobs, and restarts/resumes after
+//          heartbeat loss, process exit, or channel loss (auto-recovery forces
+//          resume-from-journal).
 // -----------------------------------------------------------------------------
 
 #pragma once
@@ -26,6 +27,23 @@ namespace xact::ui {
 using models::CopyJobOptions;
 using models::CopyJobResult;
 using models::CopyProgressSnapshot;
+
+namespace supervisor_detail {
+
+inline constexpr int MaximumAutomaticRecoveries = 3;
+inline constexpr ULONGLONG CancelGracePeriodMs = 5'000;
+
+inline bool cancel_grace_expired(ULONGLONG requested_tick, ULONGLONG now,
+                                 ULONGLONG grace_ms = CancelGracePeriodMs) noexcept {
+    return requested_tick != 0 && now >= requested_tick && now - requested_tick >= grace_ms;
+}
+
+inline bool try_claim_automatic_recovery(std::atomic<int>& attempts, int& claimed_attempt) {
+    claimed_attempt = attempts.fetch_add(1, std::memory_order_acq_rel) + 1;
+    return claimed_attempt <= MaximumAutomaticRecoveries;
+}
+
+} // namespace supervisor_detail
 
 class WorkerSupervisor {
 public:
@@ -61,8 +79,12 @@ public:
         }
         job_running_.store(true);
         cancel_requested_.store(false);
+        cancel_requested_tick_.store(0);
+        cancel_escalation_queued_.store(false);
         set_paused_state(false);
         auto_recover_.store(true);
+        automatic_recovery_attempts_.store(0);
+        activity_stall_reported_.store(false);
         mark_job_activity(true);
 
         try {
@@ -70,7 +92,7 @@ public:
             send_start_job_command();
         } catch (...) {
             // Roll back so the UI can retry instead of being wedged "running".
-            job_running_.store(false);
+            complete_job_state();
             throw;
         }
         raise_state("Job running");
@@ -79,7 +101,15 @@ public:
     void cancel_job(const std::string& reason) {
         if (!job_running_.load()) return;
         auto_recover_.store(false);
-        cancel_requested_.store(true);
+        if (cancel_requested_.exchange(true)) {
+            if (!cancel_escalation_queued_.exchange(true)) {
+                raise_log("[Supervisor] A second Cancel request is forcing the isolated worker to stop.");
+                queue_recovery("Forced stop requested after cancellation did not complete.");
+            }
+            return;
+        }
+        cancel_requested_tick_.store(GetTickCount64());
+        cancel_escalation_queued_.store(false);
         set_paused_state(false);
 
         ipc::CancelJobCommand command;
@@ -87,6 +117,7 @@ public:
         command.Reason = reason.empty() ? "User requested cancellation." : reason;
         try_send(ipc::message_types::CancelJobCommand,
                  [&command](json::Writer& w) { command.to_json(w); });
+        raise_state("Cancelling (force stop available)");
     }
 
     void pause_job(const std::string& reason) {
@@ -118,6 +149,7 @@ public:
 
         stopping_.store(true);
         auto_recover_.store(false);
+        join_recovery_thread();
         job_running_.store(false);
         cancel_requested_.store(false);
         set_paused_state(false);
@@ -141,9 +173,10 @@ public:
     // Called by the UI once per second (or from the built-in timer thread).
     void check_heartbeat() {
         if (stopping_.load() || stopped_.load()) return;
+        const ULONGLONG now = GetTickCount64();
+        check_cancel_escalation(now);
         if (!pipe_connected_.load()) return;
 
-        ULONGLONG now = GetTickCount64();
         ULONGLONG last_heartbeat = last_heartbeat_tick_.load();
         if (last_heartbeat != 0 && now - last_heartbeat <= HeartbeatTimeoutMs) {
             check_for_job_activity_stall(now);
@@ -164,12 +197,14 @@ private:
     std::mutex restart_lock_;
     std::mutex send_lock_;
     std::mutex state_lock_;
+    std::mutex recovery_thread_lock_;
 
     pipe::MessagePipe pipe_;
     pipe::CancellationEvent pipe_cancel_;
     std::atomic<bool> pipe_connected_{false};
     std::thread receive_thread_;
     std::thread heartbeat_thread_;
+    std::thread recovery_thread_;
     std::atomic<bool> heartbeat_stop_{false};
 
     HANDLE worker_process_ = nullptr;
@@ -180,11 +215,15 @@ private:
     std::atomic<bool> job_running_{false};
     std::atomic<bool> job_paused_{false};
     std::atomic<bool> cancel_requested_{false};
+    std::atomic<ULONGLONG> cancel_requested_tick_{0};
+    std::atomic<bool> cancel_escalation_queued_{false};
     std::atomic<bool> auto_recover_{false};
     std::atomic<bool> stopping_{false};
     std::atomic<bool> stopped_{false};
     std::atomic<int> recovery_in_flight_{0};
+    std::atomic<int> automatic_recovery_attempts_{0};
     std::atomic<int> consecutive_malformed_{0};
+    std::atomic<bool> activity_stall_reported_{false};
 
     std::atomic<ULONGLONG> last_heartbeat_tick_{0};
     std::atomic<ULONGLONG> last_job_activity_tick_{0};
@@ -212,40 +251,15 @@ private:
         return storage::fsutil::get_directory_name(path);
     }
 
-    // Port of EnumerateWorkerCandidateDirectories: base dir + win-x64 +
-    // publish, then up to four parent levels with the same suffixes.
+    // Release and development builds place the worker beside the UI. Searching
+    // parent directories made a missing worker binary an executable-search
+    // vulnerability for another same-user process, so only exact siblings are
+    // accepted.
     static std::wstring resolve_worker_executable() {
-        std::vector<std::wstring> candidates;
-        auto add = [&candidates](const std::wstring& dir) {
-            if (dir.empty()) return;
-            for (const auto& existing : candidates) {
-                if (storage::fsutil::to_upper_invariant(existing) ==
-                    storage::fsutil::to_upper_invariant(dir)) {
-                    return;
-                }
-            }
-            candidates.push_back(dir);
-        };
-
         std::wstring base = own_directory();
-        add(base);
-        add(base + L"\\win-x64");
-        add(base + L"\\publish");
-        std::wstring cursor = base;
-        for (int depth = 0; depth < 5; ++depth) {
-            std::wstring parent = storage::fsutil::get_directory_name(cursor);
-            if (parent.empty() || parent == cursor) break;
-            add(parent);
-            add(parent + L"\\win-x64");
-            add(parent + L"\\publish");
-            cursor = parent;
-        }
-
-        for (const auto& directory : candidates) {
-            for (const wchar_t* name : {L"XactCopyExecutive.exe", L"XactCopy.Worker.exe"}) {
-                std::wstring candidate = directory + L"\\" + name;
-                if (storage::fsutil::file_exists(candidate)) return candidate;
-            }
+        for (const wchar_t* name : {L"XactCopyExecutive.exe", L"XactCopy.Worker.exe"}) {
+            std::wstring candidate = base + L"\\" + name;
+            if (storage::fsutil::file_exists(candidate)) return candidate;
         }
         return std::wstring();
     }
@@ -262,7 +276,9 @@ private:
                 "so it sits next to the UI executable.");
         }
 
-        std::wstring command_line = L"\"" + worker_path + L"\" --pipe \"" + pipe_name + L"\"";
+        std::wstring command_line = L"\"" + worker_path + L"\" --pipe \"" + pipe_name +
+                                    L"\" --parent-pid " +
+                                    std::to_wstring(GetCurrentProcessId());
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
         startup.dwFlags = STARTF_USESHOWWINDOW;
@@ -281,6 +297,13 @@ private:
 
         pipe_cancel_.reset();
         pipe_ = pipe::MessagePipe::connect_client(pipe_name, 15'000);
+        ULONG server_pid = 0;
+        if (!GetNamedPipeServerProcessId(pipe_.native_handle(), &server_pid) ||
+            server_pid != worker_pid_) {
+            pipe_.close();
+            TerminateProcess(worker_process_, 1);
+            throw std::runtime_error("Connected named-pipe server is not the worker process that XactCopy started.");
+        }
         pipe_connected_.store(true);
         last_heartbeat_tick_.store(GetTickCount64());
         consecutive_malformed_.store(0);
@@ -371,9 +394,6 @@ private:
             auto [header, payload] = ipc::parse_envelope(raw);
             auto heartbeat = ipc::WorkerHeartbeatEvent::from_json(payload);
             last_heartbeat_tick_.store(GetTickCount64());
-            if (!(heartbeat.LastProgressUtc == time::DateTimeOffset::min_value())) {
-                last_worker_progress_tick_.store(GetTickCount64());
-            }
             set_paused_state(heartbeat.IsJobPaused);
             return;
         }
@@ -426,6 +446,8 @@ private:
         set_paused_state(false);
         auto_recover_.store(false);
         cancel_requested_.store(false);
+        cancel_requested_tick_.store(0);
+        cancel_escalation_queued_.store(false);
         {
             std::lock_guard<std::mutex> guard(state_lock_);
             current_job_id_.clear();
@@ -433,12 +455,24 @@ private:
         }
         last_job_activity_tick_.store(0);
         last_worker_progress_tick_.store(0);
+        automatic_recovery_attempts_.store(0);
+        activity_stall_reported_.store(false);
     }
 
     void mark_job_activity(bool mark_progress) {
         ULONGLONG now = GetTickCount64();
         last_job_activity_tick_.store(now);
         if (mark_progress) last_worker_progress_tick_.store(now);
+        activity_stall_reported_.store(false);
+    }
+
+    void check_cancel_escalation(ULONGLONG now) {
+        if (!job_running_.load() || !cancel_requested_.load()) return;
+        if (!supervisor_detail::cancel_grace_expired(cancel_requested_tick_.load(), now)) return;
+        if (cancel_escalation_queued_.exchange(true)) return;
+        raise_log("[Supervisor] Cancellation grace period expired; force-stopping the isolated worker. "
+                  "Published destination files remain intact and resumable staging state is retained.");
+        queue_recovery("Worker did not complete cancellation within the grace period.");
     }
 
     // ---- Stall detection + recovery ---------------------------------------
@@ -479,24 +513,64 @@ private:
         double progress_seconds = last_progress == 0
                                       ? activity_seconds
                                       : static_cast<double>(now - last_progress) / 1000.0;
-        char text[128];
+        if (activity_stall_reported_.exchange(true)) return;
+
+        char text[256];
         std::snprintf(text, sizeof(text),
-                      "Worker activity stalled for %.1fs (last progress %.1fs ago).",
+                      "No job activity for %.1fs (last progress %.1fs ago), but the worker "
+                      "heartbeat is healthy. The operation remains running; use Cancel if "
+                      "the underlying Windows I/O does not return.",
                       activity_seconds, progress_seconds);
-        queue_recovery(text);
+        raise_log("[Supervisor] " + std::string(text));
     }
 
     void queue_recovery(const std::string& reason) {
+        if (stopping_.load() || stopped_.load()) return;
         int expected = 0;
         if (!recovery_in_flight_.compare_exchange_strong(expected, 1)) return;
-        std::thread([this, reason]() {
-            try {
-                recover_worker(reason);
-            } catch (const std::exception& ex) {
-                raise_log("[Supervisor] Recovery failed: " + std::string(ex.what()));
+
+        std::thread previous;
+        {
+            std::lock_guard<std::mutex> guard(recovery_thread_lock_);
+            if (recovery_thread_.joinable()) previous = std::move(recovery_thread_);
+        }
+        if (previous.joinable()) previous.join();
+
+        {
+            std::lock_guard<std::mutex> guard(recovery_thread_lock_);
+            if (stopping_.load() || stopped_.load()) {
+                recovery_in_flight_.store(0);
+                return;
             }
-            recovery_in_flight_.store(0);
-        }).detach();
+            recovery_thread_ = std::thread([this, reason]() {
+                try {
+                    recover_worker(reason);
+                } catch (const std::exception& ex) {
+                    const std::string failure =
+                        "Automatic worker recovery failed: " + std::string(ex.what());
+                    auto_recover_.store(false);
+                    if (!stopping_.load() && !stopped_.load()) {
+                        try {
+                            (void)shutdown_worker(true);
+                        } catch (...) {
+                        }
+                        complete_active_job_after_channel_loss(failure);
+                    }
+                }
+                recovery_in_flight_.store(0);
+            });
+        }
+    }
+
+    void join_recovery_thread() {
+        std::thread pending;
+        {
+            std::lock_guard<std::mutex> guard(recovery_thread_lock_);
+            if (recovery_thread_.joinable()) pending = std::move(recovery_thread_);
+        }
+        if (pending.joinable() && pending.get_id() != std::this_thread::get_id()) {
+            pending.join();
+        }
     }
 
     void recover_worker(const std::string& reason) {
@@ -513,7 +587,21 @@ private:
             return;
         }
 
-        raise_log("[Supervisor] " + reason + " Restarting worker and resuming from journal.");
+        int recovery_attempt = 0;
+        if (!supervisor_detail::try_claim_automatic_recovery(
+                automatic_recovery_attempts_, recovery_attempt)) {
+            auto_recover_.store(false);
+            (void)shutdown_worker(true);
+            complete_active_job_after_channel_loss(
+                reason + " Automatic recovery stopped after " +
+                std::to_string(supervisor_detail::MaximumAutomaticRecoveries) +
+                " unsuccessful worker restarts.");
+            return;
+        }
+
+        raise_log("[Supervisor] " + reason + " Restarting worker and resuming from journal "
+                  "(automatic recovery " + std::to_string(recovery_attempt) + "/" +
+                  std::to_string(supervisor_detail::MaximumAutomaticRecoveries) + ").");
         if (!shutdown_worker(true)) {
             auto_recover_.store(false);
             complete_active_job_after_channel_loss(
@@ -521,6 +609,8 @@ private:
                          "to prevent duplicate stuck workers.");
             return;
         }
+
+        if (stopping_.load() || stopped_.load() || !job_running_.load()) return;
 
         ensure_worker_connected();
         mark_job_activity(true);
@@ -582,8 +672,14 @@ private:
                 TerminateProcess(worker_process_, 1);
                 if (WaitForSingleObject(worker_process_, 3000) != WAIT_OBJECT_0 && pid != 0) {
                     // taskkill /T catches any children TerminateProcess missed.
-                    std::wstring kill_command =
-                        L"taskkill.exe /PID " + std::to_wstring(pid) + L" /T /F";
+                    wchar_t system_directory[MAX_PATH]{};
+                    UINT system_length = GetSystemDirectoryW(system_directory, MAX_PATH);
+                    std::wstring taskkill_path =
+                        system_length > 0 && system_length < MAX_PATH
+                            ? std::wstring(system_directory, system_length) + L"\\taskkill.exe"
+                            : L"C:\\Windows\\System32\\taskkill.exe";
+                    std::wstring kill_command = L"\"" + taskkill_path + L"\" /PID " +
+                                                std::to_wstring(pid) + L" /T /F";
                     STARTUPINFOW startup{};
                     startup.cb = sizeof(startup);
                     startup.dwFlags = STARTF_USESHOWWINDOW;
@@ -591,7 +687,7 @@ private:
                     PROCESS_INFORMATION process{};
                     std::vector<wchar_t> mutable_command(kill_command.begin(), kill_command.end());
                     mutable_command.push_back(L'\0');
-                    if (CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE,
+                    if (CreateProcessW(taskkill_path.c_str(), mutable_command.data(), nullptr, nullptr, FALSE,
                                        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
                         WaitForSingleObject(process.hProcess, 3000);
                         CloseHandle(process.hThread);

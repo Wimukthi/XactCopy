@@ -9,7 +9,9 @@
 #pragma once
 
 #include <mutex>
+#include <functional>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -22,7 +24,7 @@ namespace xact::ui {
 struct LaunchOptions {
     bool is_recovery_autostart = false;
     bool force_resume_prompt = false;
-    bool explorer_scan_mode = false; // launched via the "Scan for Bad Blocks" verb
+    bool explorer_scan_mode = false; // launched via the readability-assessment verb
     std::string explorer_folder_path;
     std::vector<std::string> explorer_source_paths;
 };
@@ -121,14 +123,39 @@ public:
     explicit RecoveryStateStore(std::wstring path = default_path()) : path_(std::move(path)) {}
 
     const std::wstring& state_path() const noexcept { return path_; }
+    const std::string& load_warning() const noexcept { return load_warning_; }
 
     RecoveryState load() const {
-        auto bytes = storage::fsutil::read_all_bytes(path_);
-        if (!bytes.has_value() || bytes->empty()) return RecoveryState{};
+        load_warning_.clear();
+        auto bytes = storage::fsutil::read_all_bytes(path_, 16ULL * 1024 * 1024);
+        if (!bytes.has_value()) {
+            const DWORD read_error = GetLastError();
+            if (GetFileAttributesW(path_.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                load_warning_ =
+                    "Crash-recovery state exists but could not be read (Win32 " +
+                    std::to_string(read_error) + ").";
+            }
+            return RecoveryState{};
+        }
         try {
+            if (bytes->empty()) throw std::runtime_error("recovery-state file is empty");
             std::string_view text(reinterpret_cast<const char*>(bytes->data()), bytes->size());
-            return RecoveryState::from_json(json::parse(text));
+            json::Value parsed = json::parse(text);
+            if (!parsed.is_object()) {
+                throw std::runtime_error("recovery-state root must be a JSON object");
+            }
+            return RecoveryState::from_json(parsed);
         } catch (const std::exception&) {
+            const std::wstring preserved =
+                path_ + L".corrupt-" + std::to_wstring(GetTickCount64());
+            if (MoveFileExW(path_.c_str(), preserved.c_str(), MOVEFILE_WRITE_THROUGH)) {
+                load_warning_ =
+                    "Invalid crash-recovery state was preserved as " +
+                    storage::fsutil::wide_to_utf8(preserved) + ".";
+            } else {
+                load_warning_ =
+                    "Crash-recovery state is invalid and could not be preserved for inspection.";
+            }
             return RecoveryState{};
         }
     }
@@ -141,25 +168,21 @@ public:
         state.to_json(w);
         std::string text = w.take();
 
-        // Matches the .NET store's fixed ".tmp" temp name + replace move.
-        std::wstring temp_path = path_ + L".tmp";
-        DeleteFileW(temp_path.c_str());
-        if (storage::fsutil::write_file_raw(temp_path,
-                                            reinterpret_cast<const unsigned char*>(text.data()),
-                                            text.size(), false, true)) {
-            MoveFileExW(temp_path.c_str(), path_.c_str(), MOVEFILE_REPLACE_EXISTING);
+        if (!storage::fsutil::write_atomic_bytes(path_, text)) {
+            throw std::runtime_error("Unable to durably save crash-recovery state.");
         }
     }
 
 private:
     std::wstring path_;
+    mutable std::string load_warning_;
 };
 
 // RunOnce registration so an interrupted session relaunches the UI once after
 // a crash/reboot (port of WindowsStartupService).
 class WindowsStartupService {
 public:
-    void register_recovery_run_once() {
+    bool register_recovery_run_once() {
         wchar_t module_path[MAX_PATH];
         DWORD length = GetModuleFileNameW(nullptr, module_path, MAX_PATH);
         std::wstring command = L"\"" + std::wstring(module_path, length) + L"\" --recovery-autostart";
@@ -167,21 +190,26 @@ public:
         if (RegOpenKeyExW(HKEY_CURRENT_USER,
                           L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce", 0,
                           KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
-            RegSetValueExW(key, L"XactCopyRecovery", 0, REG_SZ,
-                           reinterpret_cast<const BYTE*>(command.c_str()),
-                           static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+            LSTATUS result = RegSetValueExW(
+                key, L"XactCopyRecovery", 0, REG_SZ,
+                reinterpret_cast<const BYTE*>(command.c_str()),
+                static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
             RegCloseKey(key);
+            return result == ERROR_SUCCESS;
         }
+        return false;
     }
 
-    void clear_recovery_run_once() {
+    bool clear_recovery_run_once() {
         HKEY key = nullptr;
         if (RegOpenKeyExW(HKEY_CURRENT_USER,
                           L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce", 0,
                           KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
-            RegDeleteValueW(key, L"XactCopyRecovery");
+            LSTATUS result = RegDeleteValueW(key, L"XactCopyRecovery");
             RegCloseKey(key);
+            return result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND;
         }
+        return false;
     }
 };
 
@@ -197,16 +225,24 @@ struct RecoveryStartupInfo {
 
 class RecoveryService {
 public:
+    std::function<void(const std::string&)> on_persistence_warning;
+
     explicit RecoveryService(RecoveryStateStore store = RecoveryStateStore{},
                              bool manage_run_once = true)
         : store_(std::move(store)), manage_run_once_(manage_run_once) {
         state_ = store_.load();
+        pending_load_warning_ = store_.load_warning();
     }
 
     RecoveryStartupInfo initialize_session(const AppSettings& settings,
                                            const LaunchOptions& launch) {
         std::lock_guard<std::mutex> guard(lock_);
+        if (!pending_load_warning_.empty()) {
+            report_warning(pending_load_warning_);
+            pending_load_warning_.clear();
+        }
         state_ = store_.load();
+        if (!store_.load_warning().empty()) report_warning(store_.load_warning());
 
         RecoveryStartupInfo info;
         bool has_pending = state_.ActiveRun.has_value() && state_.PendingResumePrompt;
@@ -223,9 +259,21 @@ public:
 
         bool force_prompt = launch.is_recovery_autostart || launch.force_resume_prompt;
         bool prompt_pending = info.has_interrupted_run() && state_.PendingResumePrompt;
-        info.should_auto_resume = prompt_pending && settings.auto_resume_after_crash();
+        const bool unattended_safe = !info.interrupted_run.has_value() ||
+                                     info.interrupted_run->Options.has_safe_unattended_policy();
+        info.should_auto_resume = prompt_pending && settings.auto_resume_after_crash() &&
+                                  unattended_safe;
+        // Missing identities turn an auto-resume request into a mandatory
+        // confirmation. Establishing a fresh baseline without a person present
+        // could bind the old destination to an unrelated removable volume.
         info.should_prompt = !info.should_auto_resume && prompt_pending &&
-                             (force_prompt || settings.prompt_resume_after_crash());
+                             (!unattended_safe || force_prompt ||
+                              settings.prompt_resume_after_crash());
+        if (prompt_pending && !unattended_safe) {
+            if (!info.interruption_reason.empty()) info.interruption_reason += " ";
+            info.interruption_reason +=
+                "Automatic resume was blocked because the saved run lacks confirmed media identities or uses attended-only integrity settings.";
+        }
         info.was_recovery_autostart = launch.is_recovery_autostart;
 
         state_.ProcessSessionId = storage::detail::new_guid_n();
@@ -271,8 +319,12 @@ public:
 
         save_no_throw();
         if (manage_run_once_) {
-            if (settings.enable_recovery_autostart()) startup_.register_recovery_run_once();
-            else startup_.clear_recovery_run_once();
+            const bool startup_saved = settings.enable_recovery_autostart()
+                                           ? startup_.register_recovery_run_once()
+                                           : startup_.clear_recovery_run_once();
+            if (!startup_saved) {
+                report_warning("Windows recovery startup registration could not be updated.");
+            }
         }
     }
 
@@ -291,6 +343,29 @@ public:
         save_no_throw();
     }
 
+    void update_media_identities(const std::string& run_id,
+                                 const std::string& source_identity,
+                                 const std::string& destination_identity) {
+        if (source_identity.empty() && destination_identity.empty()) return;
+        std::lock_guard<std::mutex> guard(lock_);
+        if (!state_.ActiveRun.has_value() ||
+            !models::detail::equals_ignore_case(state_.ActiveRun->RunId, run_id)) {
+            return;
+        }
+        bool changed = false;
+        if (!source_identity.empty() &&
+            state_.ActiveRun->Options.ExpectedSourceIdentity != source_identity) {
+            state_.ActiveRun->Options.ExpectedSourceIdentity = source_identity;
+            changed = true;
+        }
+        if (!destination_identity.empty() &&
+            state_.ActiveRun->Options.ExpectedDestinationIdentity != destination_identity) {
+            state_.ActiveRun->Options.ExpectedDestinationIdentity = destination_identity;
+            changed = true;
+        }
+        if (changed) save_no_throw();
+    }
+
     void mark_job_ended(const std::string& run_id) {
         std::lock_guard<std::mutex> guard(lock_);
         if (state_.ActiveRun.has_value() &&
@@ -300,7 +375,9 @@ public:
             state_.LastInterruptionReason.clear();
             save_no_throw();
         }
-        if (manage_run_once_) startup_.clear_recovery_run_once();
+        if (manage_run_once_ && !startup_.clear_recovery_run_once()) {
+            report_warning("Windows recovery startup registration could not be cleared.");
+        }
     }
 
     void mark_run_interrupted(const std::string& reason) {
@@ -317,7 +394,9 @@ public:
         state_.CleanShutdown = true;
         state_.LastExitUtc = time::DateTimeOffset::now_utc();
         save_no_throw();
-        if (manage_run_once_) startup_.clear_recovery_run_once();
+        if (manage_run_once_ && !startup_.clear_recovery_run_once()) {
+            report_warning("Windows recovery startup registration could not be cleared.");
+        }
     }
 
     std::optional<RecoveryActiveRun> get_pending_interrupted_run() {
@@ -331,14 +410,20 @@ private:
     bool manage_run_once_;
     std::mutex lock_;
     RecoveryState state_;
+    std::string pending_load_warning_;
     ULONGLONG last_touch_tick_ = 0;
     ULONGLONG touch_interval_ms_ = 2000;
 
     void save_no_throw() {
         try {
             store_.save(state_);
-        } catch (const std::exception&) {
+        } catch (const std::exception& ex) {
+            report_warning(std::string("Crash-recovery state could not be saved: ") + ex.what());
         }
+    }
+
+    void report_warning(const std::string& message) {
+        if (on_persistence_warning) on_persistence_warning(message);
     }
 };
 

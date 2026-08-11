@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <string>
+#include <vector>
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -16,6 +17,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <commctrl.h>
 #include <dwmapi.h>
 #include <gdiplus.h>
 
@@ -323,6 +325,213 @@ inline void apply_combo_theme(HWND combo, bool dark) {
     wimukthi::win32_theme::apply_combo_box(combo);
 }
 
+// One tooltip window per top-level UI surface. Tool text is supplied as stable
+// string literals, so TOOLINFO can safely retain the pointer for the lifetime
+// of the associated control. TTF_SUBCLASS keeps every dialog from needing its
+// own mouse-relay plumbing.
+class TooltipManager {
+public:
+    TooltipManager() = default;
+    ~TooltipManager() { destroy(); }
+
+    TooltipManager(const TooltipManager&) = delete;
+    TooltipManager& operator=(const TooltipManager&) = delete;
+
+    bool create(HWND owner, UINT layout_dpi, bool dark) {
+        destroy();
+        if (owner == nullptr) return false;
+        owner_ = owner;
+        hwnd_ = CreateWindowExW(
+            WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+            owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (hwnd_ == nullptr) return false;
+        SetWindowSubclass(owner_, &TooltipManager::owner_subclass_proc,
+                          reinterpret_cast<UINT_PTR>(this),
+                          reinterpret_cast<DWORD_PTR>(this));
+        SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SendMessageW(hwnd_, TTM_SETDELAYTIME, TTDT_INITIAL, 500);
+        SendMessageW(hwnd_, TTM_SETDELAYTIME, TTDT_RESHOW, 100);
+        SendMessageW(hwnd_, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
+        update_dpi(layout_dpi);
+        apply_control_theme(hwnd_, dark);
+        return true;
+    }
+
+    bool add(HWND control, const wchar_t* text) {
+        if (hwnd_ == nullptr || control == nullptr || text == nullptr || *text == L'\0') {
+            return false;
+        }
+        // Plain STATIC controls normally return HTTRANSPARENT, so the parent
+        // receives their mouse input and TTF_SUBCLASS never sees a hover. The
+        // notify style makes labels, status text, and owner-drawn progress bars
+        // behave as real tooltip tools without changing their painting.
+        wchar_t class_name[32]{};
+        if (GetClassNameW(control, class_name, static_cast<int>(std::size(class_name))) > 0 &&
+            lstrcmpiW(class_name, L"STATIC") == 0) {
+            const LONG_PTR style = GetWindowLongPtrW(control, GWL_STYLE);
+            SetWindowLongPtrW(control, GWL_STYLE, style | SS_NOTIFY);
+        }
+        TOOLINFOW tool{};
+        tool.cbSize = sizeof(tool);
+        tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        tool.hwnd = owner_;
+        tool.uId = reinterpret_cast<UINT_PTR>(control);
+        tool.lpszText = const_cast<wchar_t*>(text);
+        const bool child_tool_added =
+            SendMessageW(hwnd_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool)) != FALSE;
+
+        // A disabled child cannot activate an HWND-based tooltip. Register a
+        // second tool as a rectangle on the enabled owner; the owner subclass
+        // relays mouse input to this tool only when the child does not receive
+        // it itself. This keeps Pause/Cancel and other disabled controls useful.
+        ToolEntry entry{control, overlay_id(control)};
+        TOOLINFOW overlay{};
+        overlay.cbSize = sizeof(overlay);
+        overlay.hwnd = owner_;
+        overlay.uId = entry.id;
+        overlay.lpszText = const_cast<wchar_t*>(text);
+        update_rect(overlay, control);
+        const bool overlay_added =
+            SendMessageW(hwnd_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&overlay)) != FALSE;
+        if (overlay_added) tools_.push_back(entry);
+        return child_tool_added || overlay_added;
+    }
+
+    void remove(HWND control) {
+        if (hwnd_ == nullptr || control == nullptr) return;
+        TOOLINFOW tool{};
+        tool.cbSize = sizeof(tool);
+        tool.uFlags = TTF_IDISHWND;
+        tool.hwnd = owner_;
+        tool.uId = reinterpret_cast<UINT_PTR>(control);
+        SendMessageW(hwnd_, TTM_DELTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+        auto entry = std::find_if(tools_.begin(), tools_.end(),
+                                  [control](const ToolEntry& value) {
+                                      return value.control == control;
+                                  });
+        if (entry != tools_.end()) {
+            TOOLINFOW overlay{};
+            overlay.cbSize = sizeof(overlay);
+            overlay.hwnd = owner_;
+            overlay.uId = entry->id;
+            SendMessageW(hwnd_, TTM_DELTOOLW, 0, reinterpret_cast<LPARAM>(&overlay));
+            tools_.erase(entry);
+        }
+    }
+
+    void update_dpi(UINT layout_dpi) {
+        if (hwnd_ == nullptr) return;
+        const UINT dpi = layout_dpi == 0 ? 96 : layout_dpi;
+        SendMessageW(hwnd_, TTM_SETMAXTIPWIDTH, 0,
+                     static_cast<LPARAM>(MulDiv(460, static_cast<int>(dpi), 96)));
+        update_layout();
+    }
+
+    void update_layout() {
+        if (hwnd_ == nullptr || owner_ == nullptr) return;
+        for (const ToolEntry& entry : tools_) {
+            TOOLINFOW overlay{};
+            overlay.cbSize = sizeof(overlay);
+            overlay.hwnd = owner_;
+            overlay.uId = entry.id;
+            update_rect(overlay, entry.control);
+            SendMessageW(hwnd_, TTM_NEWTOOLRECTW, 0,
+                         reinterpret_cast<LPARAM>(&overlay));
+        }
+    }
+
+    void apply_theme(bool dark) {
+        if (hwnd_ != nullptr) apply_control_theme(hwnd_, dark);
+    }
+
+    void destroy() {
+        if (owner_ != nullptr && IsWindow(owner_)) {
+            RemoveWindowSubclass(owner_, &TooltipManager::owner_subclass_proc,
+                                 reinterpret_cast<UINT_PTR>(this));
+        }
+        if (hwnd_ != nullptr && IsWindow(hwnd_)) DestroyWindow(hwnd_);
+        hwnd_ = nullptr;
+        owner_ = nullptr;
+        tools_.clear();
+    }
+
+private:
+    struct ToolEntry {
+        HWND control;
+        UINT_PTR id;
+    };
+
+    static UINT_PTR overlay_id(HWND control) {
+        constexpr UINT_PTR HighBit =
+            static_cast<UINT_PTR>(1) << (sizeof(UINT_PTR) * 8 - 1);
+        return reinterpret_cast<UINT_PTR>(control) ^ HighBit;
+    }
+
+    void update_rect(TOOLINFOW& tool, HWND control) const {
+        RECT rect{};
+        if (control != nullptr && IsWindow(control) &&
+            (GetWindowLongPtrW(control, GWL_STYLE) & WS_VISIBLE) != 0 &&
+            GetWindowRect(control, &rect)) {
+            MapWindowPoints(HWND_DESKTOP, owner_, reinterpret_cast<POINT*>(&rect), 2);
+        }
+        tool.rect = rect;
+    }
+
+    static LRESULT CALLBACK owner_subclass_proc(HWND hwnd, UINT message, WPARAM wparam,
+                                                LPARAM lparam, UINT_PTR subclass_id,
+                                                DWORD_PTR reference) {
+        auto* self = reinterpret_cast<TooltipManager*>(reference);
+        if (message == WM_NCDESTROY) {
+            RemoveWindowSubclass(hwnd, &TooltipManager::owner_subclass_proc,
+                                 subclass_id);
+            if (self != nullptr) self->owner_ = nullptr;
+            return DefSubclassProc(hwnd, message, wparam, lparam);
+        }
+        if (message == WM_SIZE) {
+            const LRESULT result = DefSubclassProc(hwnd, message, wparam, lparam);
+            if (self != nullptr) self->update_layout();
+            return result;
+        }
+        if (self != nullptr && self->hwnd_ != nullptr && IsWindow(self->hwnd_)) {
+            switch (message) {
+                // Disabled child windows route these messages to their parent.
+                // Relaying them lets the tooltip control hit-test its registered
+                // HWND tools even when the child itself cannot be subclassed.
+                case WM_MOUSEMOVE:
+                case WM_LBUTTONDOWN:
+                case WM_LBUTTONUP:
+                case WM_RBUTTONDOWN:
+                case WM_RBUTTONUP:
+                case WM_MBUTTONDOWN:
+                case WM_MBUTTONUP: {
+                    MSG relay{};
+                    relay.hwnd = hwnd;
+                    relay.message = message;
+                    relay.wParam = wparam;
+                    relay.lParam = lparam;
+                    relay.time = static_cast<DWORD>(GetMessageTime());
+                    const DWORD cursor = GetMessagePos();
+                    relay.pt.x = static_cast<short>(LOWORD(cursor));
+                    relay.pt.y = static_cast<short>(HIWORD(cursor));
+                    SendMessageW(self->hwnd_, TTM_RELAYEVENT, 0,
+                                 reinterpret_cast<LPARAM>(&relay));
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+        return DefSubclassProc(hwnd, message, wparam, lparam);
+    }
+
+    HWND hwnd_ = nullptr;
+    HWND owner_ = nullptr;
+    std::vector<ToolEntry> tools_;
+};
+
 // ---------------------------------------------------------------------------
 // Owner-drawn control painting (BS_OWNERDRAW / CBS_OWNERDRAWFIXED)
 // ---------------------------------------------------------------------------
@@ -368,7 +577,8 @@ inline void draw_button(const DRAWITEMSTRUCT& draw, const ThemePalette& theme) {
     const ButtonIcon icon = icon_for_button(draw.hwndItem);
     bool drew_with_icon = false;
     if (icon != ButtonIcon::None) {
-        const UINT dpi = GetDpiForWindow(draw.hwndItem);
+        const UINT dpi = ui_layout_dpi(GetDpiForWindow(draw.hwndItem),
+                                       theme.density_percent, theme.scale_percent);
         auto scale = [dpi](int v) { return MulDiv(v, static_cast<int>(dpi), 96); };
         SIZE text_size{};
         GetTextExtentPoint32W(draw.hDC, text, static_cast<int>(wcslen(text)), &text_size);
@@ -435,7 +645,8 @@ inline void draw_checkbox(const DRAWITEMSTRUCT& draw, const ThemePalette& theme,
     const bool focused = (draw.itemState & ODS_FOCUS) != 0;
     fill_rect(draw.hDC, draw.rcItem, theme.window);
 
-    const UINT dpi = GetDpiForWindow(draw.hwndItem);
+    const UINT dpi = ui_layout_dpi(GetDpiForWindow(draw.hwndItem),
+                                   theme.density_percent, theme.scale_percent);
     auto scale = [dpi](int value) { return MulDiv(value, static_cast<int>(dpi), 96); };
     const int box_size = scale(15);
     RECT box{
@@ -477,7 +688,8 @@ inline void draw_combo_item(const DRAWITEMSTRUCT& draw, const ThemePalette& them
                          reinterpret_cast<LPARAM>(text.data()));
             text.resize(static_cast<std::size_t>(length));
 
-            const UINT dpi = GetDpiForWindow(draw.hwndItem);
+            const UINT dpi = ui_layout_dpi(GetDpiForWindow(draw.hwndItem),
+                                           theme.density_percent, theme.scale_percent);
             HFONT font = reinterpret_cast<HFONT>(SendMessageW(draw.hwndItem, WM_GETFONT, 0, 0));
             HGDIOBJ old_font = font != nullptr ? SelectObject(draw.hDC, font) : nullptr;
             SetBkMode(draw.hDC, TRANSPARENT);

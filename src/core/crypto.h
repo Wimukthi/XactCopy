@@ -236,7 +236,7 @@ inline void fill_random(std::vector<unsigned char>& buffer) {
 }
 
 // ---------------------------------------------------------------------------
-// DPAPI (CurrentUser scope, no UI) — used for the bad-range-map HMAC key file.
+// DPAPI (CurrentUser scope, no UI) — used for map/catalog HMAC key files.
 // ---------------------------------------------------------------------------
 
 inline std::vector<unsigned char> dpapi_protect(const std::vector<unsigned char>& data) {

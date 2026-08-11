@@ -7,7 +7,7 @@ Quick Start in the [README](../README.md) is enough.
 
 - [The main window](#the-main-window)
 - [Copy mode](#copy-mode)
-- [Scan Bad Blocks mode](#scan-bad-blocks-mode)
+- [Assess Readable Files mode](#assess-readable-files-mode)
 - [Resilience options](#resilience-options)
 - [Verification](#verification)
 - [Bad-range maps](#bad-range-maps)
@@ -32,8 +32,10 @@ than a whole folder, a summary line appears under the source box — for example
 **Clear** button. Choosing a source folder with *Browse* clears the selection and
 copies the whole folder again.
 
-Below the paths are the four mode combos (**Mode**, **Engine**, **Overwrite**,
-**Verify**), the resilience toggles, and the numeric tuning fields.
+Below the paths are four mode-sensitive combos. Copy mode shows **Profile**,
+conflict policy, and verification; assessment mode shows scan profile, read
+backend, and whether findings are saved. The resilience toggles and numeric
+tuning fields follow.
 
 The main-window values are per-run overrides. Click **Save defaults**, or use
 **Tools -> Save Current Settings as Defaults**, to persist the reusable engine,
@@ -55,20 +57,21 @@ The operations log has vertical and horizontal scroll bars, so long paths,
 journal details, and diagnostic messages can be inspected without being
 truncated.
 
-**Start**, **Pause**, and **Cancel** are always available; the input controls
-lock during a run so the job cannot be changed underneath itself.
+During a run, **Pause** and **Cancel** remain available while job inputs lock.
+The first Cancel requests cooperative shutdown; a second click force-stops a
+worker that is stuck inside a Windows or device I/O call.
 
 ## Copy mode
 
 Copies everything under **Source** into **Destination**, resiliently.
 
-**Engine** selects the copy strategy:
+**Profile** applies a coherent starting policy:
 
-| Engine | Behaviour |
+| Profile | Behaviour |
 | --- | --- |
-| **Auto** *(default)* | Starts fast and escalates to the rescue engine on the first error. Best for most situations. |
-| **Native Fast** | A straight, high-throughput copy for healthy media. |
-| **Managed Rescue** | The full damaged-media engine from the start. Use it when you already know the source is failing. |
+| **Verified Copy** *(default)* | Full verification, conservative retries, and no synthetic salvage or continue-on-error policy. |
+| **Recover Media** | Managed rescue, fragile/adaptive behavior, map updates, and non-exact sidecar publication for failing media. |
+| **Custom** | Uses the detailed engine and policy defaults from Settings. Editing a profile-controlled main-window option switches the run to Custom. |
 
 **Overwrite** controls what happens when a destination file already exists:
 
@@ -77,17 +80,29 @@ Copies everything under **Source** into **Destination**, resiliently.
 | **Overwrite** | Always replace the destination file |
 | **Skip existing** | Never touch an existing destination file |
 | **Overwrite if newer** | Replace only when the source is newer |
-| **Ask** | Prompt for each conflict |
+| **Stop on conflict** | Leave the existing file untouched and report the run as incomplete. |
 
-## Scan Bad Blocks mode
+## Assess Readable Files mode
 
-Reads the **Source** without writing anything and records which regions are
-unreadable. Use it to survey a suspect drive, or to build a bad-range map before
-a copy. No destination is required.
+Reads allocated files beneath **Source** without writing a destination and
+records unreadable file-relative ranges. It does not inspect free space or
+unallocated sectors and is not a whole-disk health verdict. No destination is
+required.
+
+On actively deteriorating hardware, recover the highest-value data first. An
+assessment performs an additional pass over the source and may spend limited
+device life without copying any bytes. Assess first only when the medium is
+stable enough and the map will be reused across later recovery passes.
 
 Scanning runs in a precise profile or a faster parallel one (**Settings →
 Performance → Scan profile**); the fast profile falls back to precise reads
 around any fault it finds, so the resulting map stays accurate.
+
+The three assessment combos choose **Auto/Fast/Precise**, **Standard file
+reads/Raw NTFS extents**, and whether this run updates the bad-range map. Raw
+extent reads require administrator access; choosing them without elevation
+produces a visible fallback to standard file reads rather than a false raw-scan
+claim.
 
 ## Resilience options
 
@@ -95,18 +110,21 @@ These toggles shape how XactCopy handles trouble.
 
 | Option | What it does |
 | --- | --- |
-| **Salvage unreadable blocks** | When a region can't be read cleanly, recover as much of it as possible — down to the sector — instead of discarding the whole block. Unreadable bytes are filled with a known pattern and accounted for. |
+| **Salvage unreadable blocks** | When a region can't be read cleanly, preserve readable ranges and fill isolated unreadable ranges deterministically. The run is **Incomplete**, not successful. Non-exact output preserves the original extension and receives an adjacent `.recovery.json` manifest unless the expert overwrite override is enabled. |
 | **Resume from journal** | Continue an interrupted job from its journal instead of restarting. On by default; every job is journaled either way. |
-| **Use bad-range map** | Consult, and update, a saved map of known-bad regions for this source. See [Bad-range maps](#bad-range-maps). |
-| **Skip known-bad ranges** | With a map loaded, don't re-read regions already known to be bad. This is what makes a second pass fast. |
+| **Use bad-range map** | Consult a saved map of known-bad regions for this source. Updating the map is a separate default under Settings. See [Bad-range maps](#bad-range-maps). |
+| **Skip known-bad ranges** | Don't re-read ranges that have the same file/media identity and were observed bad in at least two matching scans. This makes a later pass faster without trusting a one-off error. |
 | **Adaptive buffer** | Size the read buffer dynamically from measured throughput and latency, backing off on slow or high-latency media. |
-| **Continue on error** | Keep going past a file that ultimately can't be copied, instead of stopping the whole job. |
+| **Continue on error** | Keep going past a file that ultimately can't be copied. Earlier files may already have been atomically published, so the destination can contain a mixed, incomplete generation; the run cannot be a clean success. |
 | **Wait for media** | If the source or destination disappears — a drive spins down, a disc is ejected — pause and wait for it to come back rather than failing. |
 | **Fragile-media mode** | Minimise stress on a dying drive: gentler retry timing and access patterns, trading speed for a better chance of getting the data off before the drive fails completely. |
 
-**Buffer (MB)**, **Retries**, and **Timeout (s)** set the read buffer size, how
-many times a failed read is retried, and how long an operation may stall before
-it counts as failed.
+**Buffer (MB)**, **Retries**, and **Timeout (s)** set the read buffer size, the
+number of XactCopy-level retries, and how long an operation may stall before it
+counts as failed. Windows, the filesystem, and the storage device may already
+perform lower-level retries before an API call returns an error; XactCopy's
+retry count is additional work. The safe default is 2 and the enforced maximum
+is 32. Keep the count low on mechanically failing or heat-sensitive media.
 
 ### Rescue passes
 
@@ -123,24 +141,45 @@ remain, and the bytes still outstanding.
 
 | Mode | Behaviour |
 | --- | --- |
-| **None** | No verification. Fastest. |
-| **Sampled** | Hash a representative sample of each file. |
-| **Full** | Hash the entire file. |
+| **None** | No post-copy content check. This is an attended-only choice because a successful Windows copy call is not proof against every source, cable, RAM, or destination corruption mode. |
+| **Sampled** | Hash representative ranges. Faster, but corruption outside the samples can be missed; this is also attended-only. |
+| **Full** | Hash the complete default data stream and copied alternate data streams. This is the integrity-first default and is required for unattended copy/resume. |
 
 The hash algorithm (SHA-256 or SHA-512) and the sampling chunk size and count are
 set under **Settings → Verification**. Verification runs after the data is
 written, and any mismatch is reported in the log and the job summary.
 
+## Publication and filesystem fidelity
+
+Each destination file is built beside its final path, verified and flushed,
+then published with a same-volume atomic rename. A failed read, write, flush, or
+verification therefore leaves an existing destination file intact. This is a
+**per-file** transaction, not a transaction for the whole folder: if a later
+file fails, earlier verified files remain committed. Continue on error makes
+that mixed-generation outcome more likely and always produces an incomplete
+run when any source item is lost.
+
+XactCopy preserves file timestamps, basic attributes, DACLs, alternate data
+streams, and (when enabled) child-directory timestamps/basic attributes/DACLs.
+Owner/group and SACL preservation can require privileges and is reported when
+incomplete. EFS encryption is preserved or the file fails unless plaintext was
+explicitly allowed. NTFS hard-linked names currently become independent exact
+files, and directory alternate streams are not copied; both limitations are
+reported. Managed Rescue also reports filesystem features such as sparse or
+compressed layout that it cannot reproduce exactly.
+
 ## Bad-range maps
 
-A **bad-range map** records which byte ranges of a particular source are
-unreadable. Build one with **Scan Bad Blocks**, or let a copy populate it as it
+A **bad-range map** records which byte ranges of a particular source file are
+unreadable. Build one with **Assess Readable Files**, or let a copy populate it as it
 goes. On later runs, enable **Use bad-range map** and **Skip known-bad ranges** so
 XactCopy spends its effort on recoverable data instead of grinding on sectors it
 already knows are dead.
 
-Maps are bound to the source they were made for and are integrity-protected on
-disk, so a map can never be applied to the wrong media. **Settings → Copy
+Maps are signed, age-limited, and bound to the source volume plus each file's
+identity, size, last-write time, NTFS change time, and fingerprint. A skip hint
+is trusted only after the same bad range is observed twice. Synthetic
+salvage-filled ranges are not promoted into future skip hints. **Settings → Copy
 Defaults** controls whether runs update the map and how old a map may be before
 it is ignored.
 
@@ -155,10 +194,16 @@ run history in one grid.
   Current Options As Job…**), then run, rename, duplicate, or delete it.
 - **Queue** — line jobs up to run back-to-back; reorder with Top/Up/Down/Bottom,
   or clear the queue. Queued jobs can run automatically at startup (**Settings →
-  Recovery & Startup**).
+  Recovery & Startup**). Automatic execution requires bound source/destination
+  media identities, full verification, Continue on error off, and both
+  recovered-overwrite/plaintext expert overrides off. Jobs outside that policy
+  remain available for a reviewed manual run.
 - **History** — every run is recorded with its type, state (Running, Completed,
   Failed, Cancelled, Interrupted…), timings, source and destination, and a
-  summary. **Open Journal** opens the run's journal.
+  summary. **Open Journal** validates the run's journal, exports a readable JSON
+  view, and opens that view. Large resumable journals use XactCopy's compressed
+  `XCJZ` container internally even though their compatibility filename ends in
+  `.json`; this is expected, not encryption or corruption.
 
 Filter with the **View** and **Run Status** combos or the **Search** box. The
 grid refreshes automatically; double-click a run to open its journal, and use
@@ -174,7 +219,8 @@ interrupted run and offers to **Resume** it — continuing from the journal —
 **Settings → Recovery & Startup** controls whether you are prompted, whether
 interrupted runs resume automatically, whether the prompt keeps reappearing until
 resolved, and whether XactCopy restarts itself at the next logon after an
-interruption.
+interruption. Auto-resume uses the same strict unattended policy as the queue;
+otherwise XactCopy requires a person to review and confirm the run.
 
 ## Explorer integration
 
@@ -184,7 +230,7 @@ Enable **Settings → Explorer Integration** to add XactCopy to the Windows shel
   selected item is shown as the exact source and only that item is copied.
   Multi-select copies the selected items together from their shared source
   folder. The folder-background command copies the whole folder.
-- **Scan for Bad Blocks with XactCopy** — on folders and drives; opens XactCopy
+- **Assess Readable Files with XactCopy** — on folders and drives; opens XactCopy
   ready to scan that target.
 - **Open with / drag-and-drop** — XactCopy is registered as an application, so
   you can drop files onto it or pick it from *Open with*.
@@ -203,12 +249,14 @@ jobs; the main window's controls override them per run.
 
 ### Appearance
 
-Theme mode (Dark, System, Classic), accent source (Auto, System, Custom) and a
-custom accent colour, and window chrome (themed or standard title bar). Layout
-covers UI density and scale. The Operations Log section sets the log font, size,
-and severity colouring. Grid Appearance covers alternating rows, row height, and
+Theme mode (Dark, Light, System, Classic), accent source (Auto, System, Custom)
+and a custom accent colour, and window chrome (themed or standard title bar).
+Layout covers UI density and 50–250% application scale in addition to each
+monitor's Windows DPI. The Operations Log section sets the log font, size, and
+severity colouring. Grid Appearance covers alternating rows, row height, and
 header style. Status & Progress toggles the buffer and rescue status rows,
-percentage text on progress bars, and the progress-bar style.
+percentage text on progress bars, and distinct thin, standard, or thick progress
+bars.
 
 ### Copy Defaults
 
@@ -216,12 +264,21 @@ Default run behaviour — resume from journal, salvage, continue on file errors,
 preserve source timestamps, copy empty directories, wait for source/destination,
 wait for lock release, and whether *Access Denied* counts as contention.
 
-Policies — overwrite policy, symlink handling (skip or follow), and the fill
-pattern used for unrecoverable bytes (zero, `0xFF`, or random).
+Policies — overwrite policy, symlink handling (skip or follow), and the
+deterministic fill pattern used for unrecoverable bytes (zero or `0xFF`). Legacy
+jobs that request random fill are rejected because non-deterministic bytes make
+recovery boundaries harder to audit.
+
+Expert integrity overrides permit synthetic recovered bytes to replace an
+existing destination or permit an EFS-encrypted source to become plaintext.
+Both are off by default, require confirmation for a manual run, and are blocked
+for unattended execution. Without the first override, recovery output always
+uses a visibly named sidecar. Without the second, EFS encryption must be
+preserved or the file fails safely.
 
 Bad Range Map — whether maps are used and updated, whether known-bad ranges are
-skipped, and the maximum age of a map before it is ignored. **Experimental raw
-disk scan backend** reads allocated file extents directly from a local NTFS
+skipped, and the maximum age of a map before it is ignored. **Raw volume scan**
+reads allocated file extents directly from a local NTFS
 volume when XactCopy is running elevated. It remains scan-only, does not scan
 free or unallocated space, and automatically falls back to standard file reads
 for unsupported layouts or unavailable raw access.
@@ -232,6 +289,9 @@ Transfer tuning — adaptive buffer, transfer engine policy, scan profile, worke
 process priority, manual buffer size, retry count, operation and per-file
 timeouts, a throughput cap, small-file worker count and threshold, and scan
 worker count.
+With worker count set to `0` (Auto), seek-based disks use one worker while
+non-seek storage uses up to eight based on processor count. Explicit values up
+to 64 remain available for measured expert tuning.
 
 Fragile Media Guard — enable fragile mode by default, skip a file on the first
 read error, persist those skips across a resume, and the failure window,
@@ -268,7 +328,10 @@ A single switch for the shell entries described in
 [Explorer integration](#explorer-integration).
 
 Settings are stored as JSON. Unknown keys are preserved, so a newer and an older
-build can share the same file without either losing settings.
+build can share the same file without either losing settings. Existing explicit
+values are not silently rewritten during an upgrade. If they reduce integrity
+(for example Verify: None or Continue on error), XactCopy shows an attended-run
+confirmation and prevents them from being used by automatic queue/recovery.
 
 ## Updates
 
@@ -290,13 +353,23 @@ version. **View Release** opens the release page in your browser instead.
 
 XactCopy will not install a package it cannot check: if no SHA-256 is published
 for the release asset, the update is refused rather than applied unverified.
+Release feeds and assets must use HTTPS, truncated/oversized downloads are
+rejected, and only an exact XactCopy Windows x64 installer or portable package
+is eligible. Portable ZIPs are path-validated, version-checked, backed up at the
+package-file level, and rolled back if replacement or post-copy validation
+fails. Packages larger than 2 GiB, archive path traversal, Windows reserved
+device names, trailing-dot/space aliases, and case-insensitive duplicate paths
+are rejected. Downloads and extraction use a random private temporary folder
+that is removed without traversing reparse points. Portable application also
+refuses reparse points beneath the install folder and verifies every installed
+package file against the extracted SHA-256 before restarting.
 
 ## Menu reference
 
 | Menu | Items |
 | --- | --- |
-| **File** | Start / Pause / Resume / Cancel Copy · Open Journal Folder · Open Crash Folder · Exit |
-| **Tools** | Scan for Bad Blocks… · Settings… · Save Current Settings as Defaults · Check for Updates… |
+| **File** | Start / Pause / Resume / Cancel Operation · Open Journal Folder · Open Crash Folder · Exit |
+| **Tools** | Assess Readable Files… · Inspect/Clear Source Bad-Range Map… · Settings… · Save Current Settings as Defaults · Check for Updates… |
 | **Jobs** | Save Current Options As Job… · Job Manager… · Resume Interrupted Job · Run Next Queued Job |
 | **Help** | About XactCopy |
 
@@ -311,7 +384,7 @@ interface.
 | `--source <path>` | Set the source folder. |
 | `--from-explorer <path> [<path>…]` | Copy exactly these items. Their shared parent becomes the internal copy root. |
 | `--from-explorer-folder <path>` | Copy the whole folder (what the folder-background verb uses). |
-| `--scan-from-explorer <path> [<path>…]` | Open in Scan Bad Blocks mode targeting these items. |
+| `--scan-from-explorer <path> [<path>…]` | Open in Assess Readable Files mode targeting these items. |
 | `--resume-interrupted` | Show the resume prompt for an interrupted run on launch. Also accepted as `--force-resume-prompt`. |
 | `--recovery-autostart` | Marks the launch as the post-interruption auto-start. Set by XactCopy itself; not meant to be typed. |
 
@@ -330,13 +403,15 @@ Everything lives under `%LOCALAPPDATA%\XactCopy\`:
 
 | Path | Contents |
 | --- | --- |
-| `journals\` | Per-run journals, their rotating backups, and mirrors |
+| `journals\` | Per-run journals, their rotating backups, and mirrors; snapshots over 64 KB may be compressed XCJZ containers |
+| `journal-views\` | Readable JSON views exported on demand by Job Manager's **Open Journal** action |
 | `badmaps\` | Bad-range maps |
-| `jobs\catalog.json` | Saved jobs, the queue, and run history |
+| `jobs\catalog.json` / `jobs-mirror\` | Signed saved jobs, queue, run history, rotations, and mirror |
 | `runtime\recovery-state.json` | The active run and clean-shutdown marker |
-| `security\` | HMAC keys — the journal key as raw bytes, the map key DPAPI-protected for the current user |
+| `security\` | HMAC keys — legacy-compatible raw journal key; current-user DPAPI-protected map/catalog keys |
 | `settings.json` | Application settings |
 
 **File → Open Journal Folder** opens `journals\` and **File → Open Crash Folder**
-opens `runtime\`. Journals are HMAC-signed and hash-chained, so tampering is
-detectable; see [ARCHITECTURE.md](ARCHITECTURE.md) for the formats.
+opens `runtime\`. Journals are HMAC-signed and hash-chained; bad-range maps and
+the saved-job catalog use signed envelopes and trusted fallback snapshots. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the formats.

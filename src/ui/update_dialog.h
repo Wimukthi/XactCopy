@@ -75,6 +75,9 @@ private:
     HWND download_btn_ = nullptr;
     HWND view_btn_ = nullptr;
     HWND close_btn_ = nullptr;
+    UINT monitor_dpi_ = 0;
+    UINT layout_dpi_ = 0;
+    TooltipManager tooltips_;
 
     // Notes, pre-wrapped to the list width. Parallel heading flags.
     std::vector<std::string> notes_lines_;
@@ -100,6 +103,7 @@ private:
     ~UpdateDialog() {
         cancel_flag_ = true;
         if (worker_.joinable()) worker_.join();
+        if (!apply_launched_) remove_private_temp_tree(temp_root_);
         if (font_ != nullptr) DeleteObject(font_);
         if (bold_font_ != nullptr) DeleteObject(bold_font_);
         if (window_brush_ != nullptr) DeleteObject(window_brush_);
@@ -126,10 +130,11 @@ private:
     // --- font helpers -------------------------------------------------------
 
     void build_fonts(UINT dpi) {
+        layout_dpi_ = dpi == 0 ? 96 : dpi;
         if (font_ != nullptr) DeleteObject(font_);
         if (bold_font_ != nullptr) DeleteObject(bold_font_);
-        auto make = [dpi](int pt, int weight) {
-            return CreateFontW(-MulDiv(pt, static_cast<int>(dpi), 72), 0, 0, 0, weight, FALSE, FALSE,
+        auto make = [this](int pt, int weight) {
+            return CreateFontW(-MulDiv(pt, static_cast<int>(layout_dpi_), 72), 0, 0, 0, weight, FALSE, FALSE,
                                FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
         };
@@ -147,7 +152,8 @@ private:
         hwnd_ = hwnd;
         window_brush_ = CreateSolidBrush(theme_.window);
         edit_brush_ = CreateSolidBrush(theme_.edit);
-        UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
+        monitor_dpi_ = GetDpiForWindow(hwnd);
+        UINT dpi = ui_layout_dpi(monitor_dpi_, theme_.density_percent,
                                  theme_.scale_percent);
         build_fonts(dpi);
         HINSTANCE inst = GetModuleHandleW(nullptr);
@@ -217,6 +223,19 @@ private:
 
         int line_height = MulDiv(18, static_cast<int>(dpi), 96);
         SendMessageW(notes_list_, LB_SETITEMHEIGHT, 0, MAKELPARAM(line_height, 0));
+
+        tooltips_.create(hwnd, layout_dpi_, theme_.dark);
+        tooltips_.add(title_label_, L"A newer XactCopy release is available. Review the version, package, and release notes before installing.");
+        tooltips_.add(current_label_, L"The XactCopy version currently installed on this computer.");
+        tooltips_.add(latest_label_, L"The newest published release detected by the update service.");
+        tooltips_.add(package_label_, L"The installer package selected for this Windows architecture. Its published SHA-256 checksum is verified before launch.");
+        tooltips_.add(notes_list_, L"Scrollable release notes supplied with the selected release.");
+        tooltips_.add(progress_bar_, L"Download and checksum-verification progress for the update package.");
+        tooltips_.add(status_label_, L"Current update phase, such as ready, downloading, verifying, launching, cancelled, or failed.");
+        tooltips_.add(detail_label_, L"Downloaded bytes, total package size, transfer speed, or a detailed update result.");
+        tooltips_.add(download_btn_, L"Download the selected installer, verify its published SHA-256 checksum, and launch it after confirmation.");
+        tooltips_.add(view_btn_, L"Open this release's GitHub page in your default browser without downloading it.");
+        tooltips_.add(close_btn_, L"Close this window. During a download, this button requests cancellation instead.");
 
         // Lay out first so the notes list has its real width, then wrap.
         relayout(hwnd);
@@ -340,10 +359,7 @@ private:
         return w > MulDiv(80, dpi(), 96) ? w : MulDiv(80, dpi(), 96);
     }
 
-    UINT dpi() {
-        return ui_layout_dpi(hwnd_ != nullptr ? GetDpiForWindow(hwnd_) : 96,
-                             theme_.density_percent, theme_.scale_percent);
-    }
+    UINT dpi() const { return layout_dpi_ == 0 ? 96 : layout_dpi_; }
 
     // --- layout -------------------------------------------------------------
 
@@ -352,8 +368,7 @@ private:
         GetClientRect(hwnd, &client);
         const int w = client.right;
         const int h = client.bottom;
-        UINT d = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
-                               theme_.scale_percent);
+        const UINT d = dpi();
         auto s = [d](int v) { return MulDiv(v, static_cast<int>(d), 96); };
         const int pad = s(14);
         const int line = s(20);
@@ -398,6 +413,7 @@ private:
                                                      : notes_top;
         if (notes_bottom < notes_top + line) notes_bottom = notes_top + line;
         MoveWindow(notes_list_, x, notes_top, cw, notes_bottom - notes_top, TRUE);
+        tooltips_.update_layout();
         InvalidateRect(hwnd, nullptr, TRUE);
     }
 
@@ -468,8 +484,18 @@ private:
         SetWindowTextW(detail_label_, L"");
         InvalidateRect(progress_bar_, nullptr, FALSE);
 
+        remove_private_temp_tree(temp_root_);
+        temp_root_.clear();
+        download_path_.clear();
         temp_root_ = create_temp_root();
-        create_directory_tree(temp_root_);
+        if (temp_root_.empty()) {
+            phase_ = Phase::Idle;
+            SetWindowTextW(close_btn_, L"Close");
+            EnableWindow(download_btn_, TRUE);
+            EnableWindow(view_btn_, !release_.html_url.empty());
+            set_status(L"Update failed: a private temporary folder could not be created.");
+            return;
+        }
         download_path_ = temp_root_ + L"\\" + storage::fsutil::utf8_to_wide(asset_->name);
 
         UpdateReleaseInfo release = release_;
@@ -480,46 +506,57 @@ private:
 
         if (worker_.joinable()) worker_.join();
         worker_ = std::thread([this, hwnd, release, asset, dest, total]() {
-            auto on_progress = [this, hwnd](const DownloadProgress& p) {
-                {
-                    std::lock_guard<std::mutex> lock(progress_mutex_);
-                    latest_progress_ = p;
-                }
-                if (!progress_posted_.exchange(true)) {
-                    PostMessageW(hwnd, WM_APP_DL_PROGRESS, 0, 0);
-                }
-            };
-            auto cancelled = [this]() { return cancel_flag_.load(); };
+            try {
+                auto on_progress = [this, hwnd](const DownloadProgress& p) {
+                    {
+                        std::lock_guard<std::mutex> lock(progress_mutex_);
+                        latest_progress_ = p;
+                    }
+                    if (!progress_posted_.exchange(true)) {
+                        PostMessageW(hwnd, WM_APP_DL_PROGRESS, 0, 0);
+                    }
+                };
+                auto cancelled = [this]() { return cancel_flag_.load(); };
 
-            std::string actual = UpdateService::download_asset(asset.download_url, dest, total,
-                                                              on_progress, cancelled);
-            if (cancel_flag_.load()) {
-                post_done(hwnd, Outcome::Cancelled, "Download canceled.");
-                return;
-            }
-            if (actual.empty()) {
-                post_done(hwnd, Outcome::Failed, "Download failed.");
-                return;
-            }
-            // Verify.
-            std::string expected = UpdateService::resolve_asset_sha256(release, asset);
-            if (expected.empty()) {
+                std::string actual = UpdateService::download_asset(
+                    asset.download_url, dest, total, on_progress, cancelled);
+                if (cancel_flag_.load()) {
+                    post_done(hwnd, Outcome::Cancelled, "Download canceled.");
+                    return;
+                }
+                if (actual.empty()) {
+                    post_done(hwnd, Outcome::Failed, "Download failed.");
+                    return;
+                }
+                // Verify against a release-published digest before any package
+                // is launched or extracted.
+                std::string expected = UpdateService::resolve_asset_sha256(release, asset);
+                if (expected.empty()) {
+                    post_done(hwnd, Outcome::Failed,
+                              "Update package checksum is unavailable for this release.");
+                    return;
+                }
+                if (!update_detail::equals_hex_ci(expected, actual)) {
+                    post_done(hwnd, Outcome::Failed,
+                              "Update package integrity check failed.");
+                    return;
+                }
+                post_done(hwnd, Outcome::Ok, std::string());
+            } catch (const std::exception& ex) {
                 post_done(hwnd, Outcome::Failed,
-                          "Update package checksum is unavailable for this release.");
-                return;
+                          std::string("Update processing failed: ") + ex.what());
+            } catch (...) {
+                post_done(hwnd, Outcome::Failed, "Update processing failed unexpectedly.");
             }
-            if (!update_detail::equals_hex_ci(expected, actual)) {
-                post_done(hwnd, Outcome::Failed, "Update package integrity check failed.");
-                return;
-            }
-            post_done(hwnd, Outcome::Ok, std::string());
         });
     }
 
     static void post_done(HWND hwnd, Outcome outcome, const std::string& message) {
         auto* msg = new std::string(message);
-        PostMessageW(hwnd, WM_APP_DL_DONE, static_cast<WPARAM>(outcome),
-                     reinterpret_cast<LPARAM>(msg));
+        if (!PostMessageW(hwnd, WM_APP_DL_DONE, static_cast<WPARAM>(outcome),
+                          reinterpret_cast<LPARAM>(msg))) {
+            delete msg;
+        }
     }
 
     void on_progress_message() {
@@ -571,7 +608,7 @@ private:
         if (apply_update(error)) {
             apply_launched_ = true;
             phase_ = Phase::Done;
-            DestroyWindow(hwnd_); // returns to caller, which exits the app
+            host_.destroy(); // returns to caller, which exits the app
         } else {
             phase_ = Phase::Idle;
             set_status(L"Update failed: " + error);
@@ -594,14 +631,12 @@ private:
         std::wstring target_dir = directory_of(exe_path);
         std::wstring exe_name = file_name_of(exe_path);
 
-        if (!folder_writable(target_dir)) {
-            error = L"The application folder is not writable. Run XactCopy with write access to "
-                    L"install updates.";
-            return false;
-        }
-
         std::wstring ext = to_lower_w(extension_of(download_path_));
         if (ext == L".exe") {
+            if (!file_version_matches(download_path_, release_.version)) {
+                error = L"The installer version does not match the selected release.";
+                return false;
+            }
             HINSTANCE rc = ShellExecuteW(nullptr, L"open", download_path_.c_str(), nullptr, nullptr,
                                          SW_SHOWNORMAL);
             if (reinterpret_cast<INT_PTR>(rc) <= 32) {
@@ -612,6 +647,11 @@ private:
         }
         if (ext != L".zip") {
             error = L"Unsupported update package format.";
+            return false;
+        }
+        if (!folder_writable(target_dir)) {
+            error = L"The portable application folder is not writable. Use the installer package "
+                    L"or move the portable copy to a writable folder.";
             return false;
         }
         return launch_update_script(target_dir, exe_name, error);
@@ -629,6 +669,11 @@ private:
         std::wstring payload = temp_root_ + L"\\payload";
         std::wstring log = temp_root_ + L"\\update.log";
         std::wstring executable = normalized + L"\\" + exe_name;
+        std::wstring expected_version =
+            std::to_wstring(release_.version.major) + L"." +
+            std::to_wstring(release_.version.minor) + L"." +
+            std::to_wstring(std::max(0, release_.version.build)) + L"." +
+            std::to_wstring(std::max(0, release_.version.revision));
         DWORD pid = GetCurrentProcessId();
 
         auto q = [](std::wstring s) {
@@ -641,7 +686,7 @@ private:
         };
 
         std::wstring script;
-        script += L"$ErrorActionPreference = 'Continue'\r\n";
+        script += L"$ErrorActionPreference = 'Stop'\r\n";
         script += L"$TargetPid  = " + std::to_wstring(pid) + L"\r\n";
         script += L"$Zip        = '" + q(download_path_) + L"'\r\n";
         script += L"$Target     = '" + q(normalized) + L"'\r\n";
@@ -650,7 +695,22 @@ private:
         script += L"$Log        = '" + q(log) + L"'\r\n";
         script += L"$TempRoot   = '" + q(temp_root_) + L"'\r\n";
         script += L"$Executable = '" + q(executable) + L"'\r\n";
-        script += L"$ExeName    = '" + q(exe_name) + L"'\r\n\r\n";
+        script += L"$ExeName    = '" + q(exe_name) + L"'\r\n";
+        script += L"$ExpectedVersion = [Version]'" + q(expected_version) + L"'\r\n";
+        script += L"$PackageRelative = @()\r\n";
+        script += L"$UpdateCopyStarted = $false\r\n\r\n";
+        script += L"function Assert-SafeTargetPath([string]$Relative) {\r\n";
+        script += L"    $parts = @($Relative -split '\\\\')\r\n";
+        script += L"    $cursor = $Target\r\n";
+        script += L"    for ($index = 0; $index -lt $parts.Count; $index++) {\r\n";
+        script += L"        $cursor = Join-Path $cursor $parts[$index]\r\n";
+        script += L"        if (Test-Path -LiteralPath $cursor) {\r\n";
+        script += L"            $existing = Get-Item -LiteralPath $cursor -Force\r\n";
+        script += L"            if (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw ('Refusing target reparse point: ' + $Relative) }\r\n";
+        script += L"            if ($index -lt ($parts.Count - 1) -and -not $existing.PSIsContainer) { throw ('File/directory conflict: ' + $Relative) }\r\n";
+        script += L"        }\r\n";
+        script += L"    }\r\n";
+        script += L"}\r\n\r\n";
         script += L"'XactCopy update log' | Out-File -LiteralPath $Log -Encoding UTF8\r\n";
         script += L"while ($null -ne (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue)) { "
                   L"Start-Sleep -Milliseconds 500 }\r\n";
@@ -661,25 +721,77 @@ private:
                   L"-Recurse -Force }\r\n";
         script += L"$null = New-Item -ItemType Directory -Path $Payload -Force\r\n";
         script += L"Add-Type -AssemblyName System.IO.Compression.FileSystem\r\n";
-        script += L"try { [System.IO.Compression.ZipFile]::ExtractToDirectory($Zip, $Payload) } "
-                  L"catch { $_ | Out-File -LiteralPath $Log -Append -Encoding UTF8; return }\r\n\r\n";
-        script += L"$Source = $Payload\r\n";
-        script += L"$found = Get-ChildItem -LiteralPath $Payload -Filter $ExeName -Recurse -File | "
-                  L"Select-Object -First 1\r\n";
-        script += L"if ($found) { $Source = $found.DirectoryName }\r\n\r\n";
-        script += L"if (Test-Path -LiteralPath $Backup) { Remove-Item -LiteralPath $Backup "
-                  L"-Recurse -Force }\r\n";
-        script += L"$null = New-Item -ItemType Directory -Path $Backup -Force\r\n";
-        script += L"robocopy $Target $Backup /E /COPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >> "
-                  L"$Log\r\n\r\n";
-        script += L"robocopy $Source $Target /E /COPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >> "
-                  L"$Log\r\n";
-        script += L"$copyRc = $LASTEXITCODE\r\n";
-        script += L"if ($copyRc -ge 8) {\r\n";
-        script += L"    'Update copy failed. Restoring backup.' | Out-File -LiteralPath $Log "
-                  L"-Append -Encoding UTF8\r\n";
-        script += L"    robocopy $Backup $Target /E /COPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >> "
-                  L"$Log\r\n";
+        script += L"try {\r\n";
+        script += L"    $PayloadRoot = [IO.Path]::GetFullPath($Payload + [IO.Path]::DirectorySeparatorChar)\r\n";
+        script += L"    $archive = [System.IO.Compression.ZipFile]::OpenRead($Zip)\r\n";
+        script += L"    try {\r\n";
+        script += L"        $entryPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)\r\n";
+        script += L"        foreach ($entry in $archive.Entries) {\r\n";
+        script += L"            $entryName = $entry.FullName.Replace('/', '\\')\r\n";
+        script += L"            if ([string]::IsNullOrWhiteSpace($entryName) -or [IO.Path]::IsPathRooted($entryName) -or $entryName -match '(^|\\\\)\\.\\.(\\\\|$)') { throw 'Unsafe path in update archive.' }\r\n";
+        script += L"            $trimmedEntry = $entryName.TrimEnd('\\')\r\n";
+        script += L"            $segments = @($trimmedEntry -split '\\\\')\r\n";
+        script += L"            if ($segments.Count -eq 0) { throw 'Empty path in update archive.' }\r\n";
+        script += L"            foreach ($segment in $segments) {\r\n";
+        script += L"                if ([string]::IsNullOrWhiteSpace($segment) -or $segment.EndsWith('.') -or $segment.EndsWith(' ') -or $segment.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or $segment -match '^(?i:con|prn|aux|nul|com[1-9]|lpt[1-9])(\\..*)?$') { throw 'Unsupported Windows path in update archive.' }\r\n";
+        script += L"            }\r\n";
+        script += L"            $candidate = [IO.Path]::GetFullPath((Join-Path $Payload $entryName))\r\n";
+        script += L"            if (-not $candidate.StartsWith($PayloadRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe path in update archive.' }\r\n";
+        script += L"            if (-not $entryPaths.Add($candidate.TrimEnd('\\'))) { throw 'Duplicate path in update archive.' }\r\n";
+        script += L"        }\r\n";
+        script += L"    } finally { $archive.Dispose() }\r\n";
+        script += L"    [System.IO.Compression.ZipFile]::ExtractToDirectory($Zip, $Payload)\r\n";
+        script += L"    $matches = @(Get-ChildItem -LiteralPath $Payload -Filter $ExeName -Recurse -File)\r\n";
+        script += L"    if ($matches.Count -ne 1) { throw 'Portable package must contain exactly one application executable.' }\r\n";
+        script += L"    $found = $matches[0]\r\n";
+        script += L"    $actualVersion = [Version]([regex]::Match($found.VersionInfo.FileVersion, '\\d+(\\.\\d+){1,3}').Value)\r\n";
+        script += L"    if ($actualVersion -ne $ExpectedVersion) { throw ('Package version mismatch: ' + $actualVersion) }\r\n";
+        script += L"    $Source = $found.DirectoryName\r\n";
+        script += L"    if (-not (Test-Path -LiteralPath (Join-Path $Source 'XactCopyExecutive.exe') -PathType Leaf)) { throw 'Portable package is missing XactCopyExecutive.exe.' }\r\n";
+        script += L"    $packageItems = @(Get-ChildItem -LiteralPath $Source -Recurse -Force)\r\n";
+        script += L"    $packageFiles = @($packageItems | Where-Object { -not $_.PSIsContainer })\r\n";
+        script += L"    if ($packageFiles.Count -eq 0) { throw 'Portable package contains no files.' }\r\n";
+        script += L"    if (@($packageItems | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 }).Count -ne 0) { throw 'Portable package contains a reparse point.' }\r\n";
+        script += L"    foreach ($directory in @($packageItems | Where-Object { $_.PSIsContainer })) {\r\n";
+        script += L"        $relativeDirectory = $directory.FullName.Substring($Source.Length).TrimStart('\\')\r\n";
+        script += L"        if (-not [string]::IsNullOrWhiteSpace($relativeDirectory)) { Assert-SafeTargetPath $relativeDirectory }\r\n";
+        script += L"    }\r\n";
+        script += L"    if (Test-Path -LiteralPath $Backup) { Remove-Item -LiteralPath $Backup -Recurse -Force }\r\n";
+        script += L"    $null = New-Item -ItemType Directory -Path $Backup -Force\r\n";
+        script += L"    foreach ($file in $packageFiles) {\r\n";
+        script += L"        $relative = $file.FullName.Substring($Source.Length).TrimStart('\\')\r\n";
+        script += L"        if ([string]::IsNullOrWhiteSpace($relative)) { throw 'Invalid package file path.' }\r\n";
+        script += L"        Assert-SafeTargetPath $relative\r\n";
+        script += L"        $PackageRelative += $relative\r\n";
+        script += L"        $targetFile = Join-Path $Target $relative\r\n";
+        script += L"        if (Test-Path -LiteralPath $targetFile) {\r\n";
+        script += L"            if ((Get-Item -LiteralPath $targetFile -Force).PSIsContainer) { throw ('File/directory conflict: ' + $relative) }\r\n";
+        script += L"            $backupFile = Join-Path $Backup $relative\r\n";
+        script += L"            $null = New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($backupFile)) -Force\r\n";
+        script += L"            Copy-Item -LiteralPath $targetFile -Destination $backupFile -Force -ErrorAction Stop\r\n";
+        script += L"        }\r\n";
+        script += L"    }\r\n";
+        script += L"    $UpdateCopyStarted = $true\r\n";
+        script += L"    robocopy $Source $Target /E /COPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >> $Log\r\n";
+        script += L"    if ($LASTEXITCODE -ge 8) { throw ('Robocopy failed with exit code ' + $LASTEXITCODE) }\r\n";
+        script += L"    foreach ($relative in $PackageRelative) {\r\n";
+        script += L"        $sourceFile = Join-Path $Source $relative\r\n";
+        script += L"        $installedFile = Join-Path $Target $relative\r\n";
+        script += L"        if (-not (Test-Path -LiteralPath $installedFile -PathType Leaf)) { throw ('Installed package file is missing: ' + $relative) }\r\n";
+        script += L"        $sourceHash = (Get-FileHash -LiteralPath $sourceFile -Algorithm SHA256).Hash\r\n";
+        script += L"        $installedHash = (Get-FileHash -LiteralPath $installedFile -Algorithm SHA256).Hash\r\n";
+        script += L"        if ($sourceHash -ne $installedHash) { throw ('Installed package hash mismatch: ' + $relative) }\r\n";
+        script += L"    }\r\n";
+        script += L"    $installedVersion = [Version]([regex]::Match((Get-Item -LiteralPath $Executable).VersionInfo.FileVersion, '\\d+(\\.\\d+){1,3}').Value)\r\n";
+        script += L"    if ($installedVersion -ne $ExpectedVersion) { throw ('Installed version validation failed: ' + $installedVersion) }\r\n";
+        script += L"} catch {\r\n";
+        script += L"    $_ | Out-File -LiteralPath $Log -Append -Encoding UTF8\r\n";
+        script += L"    if ($UpdateCopyStarted) {\r\n";
+        script += L"        foreach ($relative in $PackageRelative) { Remove-Item -LiteralPath (Join-Path $Target $relative) -Force -ErrorAction SilentlyContinue }\r\n";
+        script += L"        robocopy $Backup $Target /E /COPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >> $Log\r\n";
+        script += L"    }\r\n";
+        script += L"    if (Test-Path -LiteralPath $Executable -PathType Leaf) { Start-Process -FilePath $Executable }\r\n";
+        script += L"    return\r\n";
         script += L"}\r\n\r\n";
         script += L"Start-Process -FilePath $Executable\r\n";
         script += L"Start-Sleep -Seconds 10\r\n";
@@ -695,7 +807,15 @@ private:
                             script_path + L"\"";
         // UseShellExecute equivalent: ShellExecuteW starts PowerShell outside this
         // process's job object, so it survives our exit.
-        HINSTANCE rc = ShellExecuteW(nullptr, L"open", L"powershell.exe", args.c_str(), nullptr,
+        wchar_t system_directory[MAX_PATH]{};
+        UINT system_length = GetSystemDirectoryW(system_directory, MAX_PATH);
+        if (system_length == 0 || system_length >= MAX_PATH) {
+            error = L"Could not locate Windows PowerShell.";
+            return false;
+        }
+        std::wstring powershell = std::wstring(system_directory, system_length) +
+                                  L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+        HINSTANCE rc = ShellExecuteW(nullptr, L"open", powershell.c_str(), args.c_str(), nullptr,
                                      SW_HIDE);
         if (reinterpret_cast<INT_PTR>(rc) <= 32) {
             error = L"Could not start the update process.";
@@ -708,22 +828,61 @@ private:
 
     static std::wstring create_temp_root() {
         wchar_t temp[MAX_PATH]{};
-        GetTempPathW(MAX_PATH, temp);
+        DWORD length = GetTempPathW(MAX_PATH, temp);
+        if (length == 0 || length >= MAX_PATH) return std::wstring();
         std::wstring base = std::wstring(temp) + L"XactCopyUpdate";
-        wchar_t suffix[32];
-        swprintf(suffix, 32, L"%08X%08X", static_cast<unsigned>(GetCurrentProcessId()),
-                 static_cast<unsigned>(GetTickCount()));
-        return base + L"\\" + suffix;
+        storage::fsutil::create_directories(base);
+        DWORD attributes = GetFileAttributesW(base.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES ||
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+            (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            return std::wstring();
+        }
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            std::wstring candidate =
+                base + L"\\" + storage::fsutil::random_temp_suffix();
+            if (CreateDirectoryW(candidate.c_str(), nullptr)) return candidate;
+            if (GetLastError() != ERROR_ALREADY_EXISTS) return std::wstring();
+        }
+        return std::wstring();
     }
 
-    static void create_directory_tree(const std::wstring& path) {
-        std::wstring accum;
-        for (std::size_t i = 0; i < path.size(); ++i) {
-            accum.push_back(path[i]);
-            if (path[i] == L'\\' || i + 1 == path.size()) {
-                if (accum.size() > 3) CreateDirectoryW(accum.c_str(), nullptr);
-            }
+    // Never follow a junction/symbolic link while cleaning the private update
+    // directory. This routine is used only for the cryptographically random
+    // directory created above, not for a caller-supplied path.
+    static void remove_private_temp_tree(const std::wstring& path) {
+        if (path.empty()) return;
+        DWORD root_attributes = GetFileAttributesW(path.c_str());
+        if (root_attributes == INVALID_FILE_ATTRIBUTES) return;
+        if ((root_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) return;
+        if ((root_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            RemoveDirectoryW(path.c_str());
+            return;
         }
+
+        WIN32_FIND_DATAW data{};
+        HANDLE find = FindFirstFileExW((path + L"\\*").c_str(), FindExInfoBasic, &data,
+                                       FindExSearchNameMatch, nullptr, 0);
+        if (find != INVALID_HANDLE_VALUE) {
+            do {
+                const std::wstring name = data.cFileName;
+                if (name.empty() || name == L"." || name == L"..") continue;
+                const std::wstring child = path + L"\\" + name;
+                if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                    if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                        RemoveDirectoryW(child.c_str());
+                    } else {
+                        remove_private_temp_tree(child);
+                    }
+                } else {
+                    SetFileAttributesW(child.c_str(), FILE_ATTRIBUTE_NORMAL);
+                    DeleteFileW(child.c_str());
+                }
+            } while (FindNextFileW(find, &data));
+            FindClose(find);
+        }
+        SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+        RemoveDirectoryW(path.c_str());
     }
 
     static bool folder_writable(const std::wstring& folder) {
@@ -735,16 +894,32 @@ private:
         return true;
     }
 
+    static bool file_version_matches(const std::wstring& path,
+                                     const AppVersion& expected) {
+        DWORD ignored = 0;
+        DWORD size = GetFileVersionInfoSizeW(path.c_str(), &ignored);
+        if (size == 0) return false;
+        std::vector<unsigned char> data(size);
+        if (!GetFileVersionInfoW(path.c_str(), 0, size, data.data())) return false;
+        VS_FIXEDFILEINFO* info = nullptr;
+        UINT info_size = 0;
+        if (!VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&info),
+                            &info_size) || info == nullptr ||
+            info_size < sizeof(VS_FIXEDFILEINFO) ||
+            info->dwSignature != 0xFEEF04BD) {
+            return false;
+        }
+        return static_cast<int>(HIWORD(info->dwFileVersionMS)) == expected.major &&
+               static_cast<int>(LOWORD(info->dwFileVersionMS)) == expected.minor &&
+               static_cast<int>(HIWORD(info->dwFileVersionLS)) ==
+                   std::max(0, expected.build) &&
+               static_cast<int>(LOWORD(info->dwFileVersionLS)) ==
+                   std::max(0, expected.revision);
+    }
+
     static bool write_utf8_no_bom(const std::wstring& path, const std::wstring& text) {
         std::string utf8 = storage::fsutil::wide_to_utf8(text);
-        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                               FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) return false;
-        DWORD written = 0;
-        bool ok = WriteFile(h, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr) &&
-                  written == utf8.size();
-        CloseHandle(h);
-        return ok;
+        return storage::fsutil::write_atomic_bytes(path, utf8);
     }
 
     static std::wstring directory_of(const std::wstring& path) {
@@ -778,7 +953,7 @@ private:
             set_status(L"Applying update. XactCopy will close and restart automatically.");
             return;
         }
-        DestroyWindow(hwnd_);
+        host_.destroy();
     }
 
     // --- window proc --------------------------------------------------------
@@ -790,15 +965,18 @@ private:
                 return on_create(hwnd);
             case WM_SIZE:
                 if (hwnd_ != nullptr) {
-                    rebuild_notes();
                     relayout(hwnd);
+                    rebuild_notes();
                 }
                 handled = true;
                 return 0;
             case WM_GETMINMAXINFO: {
                 auto* mmi = reinterpret_cast<MINMAXINFO*>(lparam);
-                UINT d = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
-                                       theme_.scale_percent);
+                const UINT d = layout_dpi_ == 0
+                                   ? ui_layout_dpi(GetDpiForWindow(hwnd),
+                                                   theme_.density_percent,
+                                                   theme_.scale_percent)
+                                   : layout_dpi_;
                 mmi->ptMinTrackSize.x = MulDiv(560, static_cast<int>(d), 96);
                 mmi->ptMinTrackSize.y = MulDiv(460, static_cast<int>(d), 96);
                 handled = true;
@@ -857,7 +1035,8 @@ private:
                 return 0;
             }
             case WM_DPICHANGED: {
-                UINT d = ui_layout_dpi(HIWORD(wparam), theme_.density_percent,
+                monitor_dpi_ = HIWORD(wparam) != 0 ? HIWORD(wparam) : LOWORD(wparam);
+                UINT d = ui_layout_dpi(monitor_dpi_, theme_.density_percent,
                                        theme_.scale_percent);
                 build_fonts(d);
                 for (HWND h : {title_label_, current_label_, latest_label_, package_label_,
@@ -870,8 +1049,12 @@ private:
                 RECT* r = reinterpret_cast<RECT*>(lparam);
                 SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                              SWP_NOZORDER | SWP_NOACTIVATE);
-                rebuild_notes();
                 relayout(hwnd);
+                rebuild_notes();
+                tooltips_.update_dpi(layout_dpi_);
+                apply_window_icons(hwnd);
+                RedrawWindow(hwnd, nullptr, nullptr,
+                             RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
                 handled = true;
                 return 0;
             }

@@ -27,7 +27,7 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "Wimukthi Bandara"
-            VALUE "FileDescription", "XactCopy resilient file mover and bad-block scanner"
+            VALUE "FileDescription", "XactCopy verified file copier and recovery tool"
             VALUE "FileVersion", XACTCOPY_VERSION_STRING
             VALUE "InternalName", "XactCopy"
             VALUE "OriginalFilename", "XactCopy.exe"

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 #include "../core/json.h"
@@ -34,9 +35,18 @@ public:
 
     void load() {
         root_ = json::Object{};
-        auto bytes = storage::fsutil::read_all_bytes(path_);
-        if (!bytes.has_value() || bytes->empty()) return;
+        load_warning_.clear();
+        auto bytes = storage::fsutil::read_all_bytes(path_, 16ULL * 1024 * 1024);
+        if (!bytes.has_value()) {
+            const DWORD read_error = GetLastError();
+            if (GetFileAttributesW(path_.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                load_warning_ = "Settings file exists but could not be read; defaults were loaded "
+                                "(Win32 " + std::to_string(read_error) + ").";
+            }
+            return;
+        }
         try {
+            if (bytes->empty()) throw std::runtime_error("settings file is empty");
             std::string_view text(reinterpret_cast<const char*>(bytes->data()), bytes->size());
             // Tolerate a UTF-8 BOM (some editors add one); the JSON parser would
             // otherwise choke and the whole file would silently reset to defaults.
@@ -46,21 +56,64 @@ public:
                 text.remove_prefix(3);
             }
             json::Value parsed = json::parse(text);
-            if (const auto* obj = parsed.as_object()) root_ = *obj;
-        } catch (const std::exception&) {
+            const auto* obj = parsed.as_object();
+            if (obj == nullptr) throw std::runtime_error("settings root must be a JSON object");
+            root_ = *obj;
+        } catch (const std::exception& ex) {
             root_ = json::Object{};
+            const std::wstring quarantine =
+                path_ + L".corrupt-" + std::to_wstring(GetTickCount64());
+            bool preserved = MoveFileExW(path_.c_str(), quarantine.c_str(),
+                                         MOVEFILE_WRITE_THROUGH) != FALSE;
+            if (!preserved) {
+                preserved = CopyFileW(path_.c_str(), quarantine.c_str(), TRUE) != FALSE;
+            }
+            load_warning_ = "Settings JSON was invalid and defaults were loaded (" +
+                            std::string(ex.what()) + ").";
+            if (preserved) {
+                load_warning_ += " The original file was preserved as " +
+                                 storage::fsutil::wide_to_utf8(quarantine) + ".";
+            }
         }
     }
 
-    void save() {
+    bool save() {
+        last_save_error_.clear();
         json::Writer w(/*indented*/ true);
         write_object(w, root_);
         std::string text = w.take();
 
         std::wstring directory = storage::fsutil::get_directory_name(path_);
         if (!directory.empty()) storage::fsutil::create_directories(directory);
-        storage::fsutil::write_atomic_bytes(path_, text);
+        if (!storage::fsutil::write_atomic_bytes(path_, text)) {
+            last_save_error_ = "Unable to save settings atomically to " +
+                               storage::fsutil::wide_to_utf8(path_) +
+                               " (Win32 " + std::to_string(GetLastError()) + ").";
+            return false;
+        }
+        return true;
     }
+
+    // Apply a group of related settings as one in-memory/durable transaction.
+    // A later unrelated save (for example window placement) must not persist
+    // values from an earlier failed or cancelled settings operation.
+    template <typename Update>
+    bool update_and_save(Update&& update) {
+        json::Object previous = root_;
+        try {
+            update(*this);
+        } catch (...) {
+            root_ = std::move(previous);
+            throw;
+        }
+        if (save()) return true;
+        root_ = std::move(previous);
+        return false;
+    }
+
+    const std::string& load_warning() const noexcept { return load_warning_; }
+    const std::string& last_save_error() const noexcept { return last_save_error_; }
+    const std::wstring& path() const noexcept { return path_; }
 
     // ---- Typed access ------------------------------------------------------
 
@@ -79,7 +132,9 @@ public:
                          std::int32_t fallback) const {
         const json::Value* value = root_.find(key);
         if (value == nullptr || !value->is_number()) return fallback;
-        return std::clamp(value->as_int32(), minimum, maximum);
+        const std::int64_t parsed = value->as_int64(fallback);
+        return static_cast<std::int32_t>(
+            std::clamp<std::int64_t>(parsed, minimum, maximum));
     }
 
     bool get_bool(std::string_view key, bool fallback) const {
@@ -87,6 +142,8 @@ public:
         if (value == nullptr || !value->is_bool()) return fallback;
         return value->as_bool();
     }
+
+    bool contains(std::string_view key) const noexcept { return root_.find(key) != nullptr; }
 
     void set_string(const std::string& key, const std::string& value) {
         set_value(key, json::Value(value));
@@ -117,7 +174,12 @@ public:
             TransferEnginePolicy::Auto);
         options.SymlinkHandling = parse_kebab<SymlinkHandlingMode>(
             get_string("DefaultSymlinkHandling", "skip"),
-            {{"follow", SymlinkHandlingMode::Follow}}, SymlinkHandlingMode::Skip);
+            {{"follow-internal", SymlinkHandlingMode::FollowInternal},
+             {"follow", SymlinkHandlingMode::Follow}}, SymlinkHandlingMode::Skip);
+        options.AllowRecoveredOverwriteExisting =
+            get_bool("DefaultAllowRecoveredOverwriteExisting", false);
+        options.AllowDecryptedDestination =
+            get_bool("DefaultAllowDecryptedDestination", false);
         options.VerificationModeValue = parse_kebab<VerificationMode>(
             get_string("DefaultVerificationMode", "full"),
             {{"sampled", VerificationMode::Sampled}, {"full", VerificationMode::Full}},
@@ -145,16 +207,19 @@ public:
             WorkerTelemetryProfile::Normal);
 
         options.ResumeFromJournal = get_bool("DefaultResumeFromJournal", true);
-        options.SalvageUnreadableBlocks = get_bool("DefaultSalvageUnreadableBlocks", true);
-        options.ContinueOnFileError = get_bool("DefaultContinueOnFileError", true);
-        options.VerifyAfterCopy = get_bool("DefaultVerifyAfterCopy", false);
-        options.UseBadRangeMap = get_bool("DefaultUseBadRangeMap", true);
+        // Missing settings use an integrity-first profile. Existing keys are
+        // read verbatim, so this changes new-install fallbacks without
+        // silently rewriting a user's saved policy.
+        options.SalvageUnreadableBlocks = get_bool("DefaultSalvageUnreadableBlocks", false);
+        options.ContinueOnFileError = get_bool("DefaultContinueOnFileError", false);
+        options.VerifyAfterCopy = get_bool("DefaultVerifyAfterCopy", true);
+        options.UseBadRangeMap = get_bool("DefaultUseBadRangeMap", false);
         // Skipping a known range only has meaning when the map is enabled. Keep
         // the in-memory defaults coherent even if an older settings file has
         // the two independent keys set to a contradictory combination.
         options.SkipKnownBadRanges =
-            options.UseBadRangeMap && get_bool("DefaultSkipKnownBadRanges", true);
-        options.UpdateBadRangeMapFromRun = get_bool("DefaultUpdateBadRangeMapFromRun", true);
+            options.UseBadRangeMap && get_bool("DefaultSkipKnownBadRanges", false);
+        options.UpdateBadRangeMapFromRun = get_bool("DefaultUpdateBadRangeMapFromRun", false);
         options.BadRangeMapMaxAgeDays = get_int("DefaultBadRangeMapMaxAgeDays", 0, 3650, 30);
         options.UseExperimentalRawDiskScan = get_bool("DefaultUseExperimentalRawDiskScan", false);
         options.UseAdaptiveBufferSizing = get_bool("DefaultUseAdaptiveBuffer", false);
@@ -172,7 +237,7 @@ public:
         options.FragileFailureThreshold = get_int("DefaultFragileFailureThreshold", 1, 1000, 3);
         options.FragileCooldownSeconds = get_int("DefaultFragileCooldownSeconds", 0, 600, 6);
         options.BufferSizeBytes = get_int("DefaultBufferSizeMb", 1, 256, 4) * 1024 * 1024;
-        options.MaxRetries = get_int("DefaultMaxRetries", 0, 1000, 12);
+        options.MaxRetries = get_int("DefaultMaxRetries", 0, 32, 2);
         options.OperationTimeout =
             time::TimeSpan::from_seconds(get_int("DefaultOperationTimeoutSeconds", 1, 3600, 10));
         options.PerFileTimeout =
@@ -198,9 +263,9 @@ public:
         options.RescueScrapeChunkBytes = get_int("DefaultRescueScrapeChunkKb", 0, 262144, 0) * 1024;
         options.RescueRetryChunkBytes = get_int("DefaultRescueRetryChunkKb", 0, 262144, 0) * 1024;
         options.RescueSplitMinimumBytes = get_int("DefaultRescueSplitMinimumKb", 0, 65536, 0) * 1024;
-        options.RescueFastScanRetries = get_int("DefaultRescueFastScanRetries", 0, 1000, 0);
-        options.RescueTrimRetries = get_int("DefaultRescueTrimRetries", 0, 1000, 1);
-        options.RescueScrapeRetries = get_int("DefaultRescueScrapeRetries", 0, 1000, 2);
+        options.RescueFastScanRetries = get_int("DefaultRescueFastScanRetries", 0, 32, 0);
+        options.RescueTrimRetries = get_int("DefaultRescueTrimRetries", 0, 32, 1);
+        options.RescueScrapeRetries = get_int("DefaultRescueScrapeRetries", 0, 32, 2);
         options.SampleVerificationChunkBytes =
             get_int("DefaultSampleVerificationChunkKb", 32, 4096, 128) * 1024;
         options.SampleVerificationChunkCount =
@@ -211,8 +276,9 @@ public:
     // Persist only the options represented by the main-window run controls.
     // Paths, operation mode, journal identity, and recovery state deliberately
     // remain per-run/per-job instead of becoming global defaults.
-    void save_run_defaults(const models::CopyJobOptions& options) {
+    bool save_run_defaults(const models::CopyJobOptions& options) {
         using namespace models;
+        json::Object previous = root_;
 
         auto overwrite_name = [](OverwritePolicy value) {
             switch (value) {
@@ -232,41 +298,55 @@ public:
             }
         };
 
-        set_string("DefaultOverwritePolicy", overwrite_name(options.OverwritePolicyValue));
-        set_string("DefaultTransferEnginePolicy",
-                   engine_name(options.TransferEnginePolicyValue));
+        if (options.OperationMode == JobOperationMode::Copy) {
+            set_string("DefaultOverwritePolicy", overwrite_name(options.OverwritePolicyValue));
+            set_string("DefaultTransferEnginePolicy",
+                       engine_name(options.TransferEnginePolicyValue));
+            set_bool("DefaultSalvageUnreadableBlocks", options.SalvageUnreadableBlocks);
+
+            const bool verify = options.VerifyAfterCopy &&
+                                options.VerificationModeValue != VerificationMode::None;
+            set_bool("DefaultVerifyAfterCopy", verify);
+            // Disabling verification preserves the selected mode so turning it
+            // back on restores the user's last comparison policy.
+            if (verify) {
+                set_string("DefaultVerificationMode",
+                           options.VerificationModeValue == VerificationMode::Sampled
+                               ? "sampled"
+                               : "full");
+            }
+        } else {
+            const char* scan_profile =
+                options.ScanPerformanceProfileValue == ScanPerformanceProfile::Fast
+                    ? "fast"
+                    : options.ScanPerformanceProfileValue == ScanPerformanceProfile::Precise
+                          ? "precise"
+                          : "auto";
+            set_string("DefaultScanPerformanceProfile", scan_profile);
+            set_bool("DefaultUseExperimentalRawDiskScan", options.UseExperimentalRawDiskScan);
+        }
         set_bool("DefaultResumeFromJournal", options.ResumeFromJournal);
-        set_bool("DefaultSalvageUnreadableBlocks", options.SalvageUnreadableBlocks);
         set_bool("DefaultContinueOnFileError", options.ContinueOnFileError);
         set_bool("DefaultUseBadRangeMap", options.UseBadRangeMap);
         set_bool("DefaultSkipKnownBadRanges",
                  options.UseBadRangeMap && options.SkipKnownBadRanges);
+        set_bool("DefaultUpdateBadRangeMapFromRun", options.UpdateBadRangeMapFromRun);
         set_bool("DefaultUseAdaptiveBuffer", options.UseAdaptiveBufferSizing);
         set_bool("DefaultWaitForMediaAvailability", options.WaitForMediaAvailability);
         set_bool("DefaultFragileMediaMode", options.FragileMediaMode);
-
-        const bool verify = options.VerifyAfterCopy &&
-                            options.VerificationModeValue != VerificationMode::None;
-        set_bool("DefaultVerifyAfterCopy", verify);
-        // The Settings dialog intentionally has no "None" mode; disabling
-        // verification is represented by DefaultVerifyAfterCopy=false. Keep
-        // the selected hash mode intact so re-enabling verification restores it.
-        if (verify) {
-            set_string("DefaultVerificationMode",
-                       options.VerificationModeValue == VerificationMode::Sampled ? "sampled"
-                                                                                   : "full");
-        }
 
         const std::int32_t buffer_mb = std::clamp(
             options.BufferSizeBytes / (1024 * 1024), static_cast<std::int32_t>(1),
             static_cast<std::int32_t>(256));
         set_int("DefaultBufferSizeMb", buffer_mb);
-        set_int("DefaultMaxRetries", std::clamp(options.MaxRetries, 0, 1000));
+        set_int("DefaultMaxRetries", std::clamp(options.MaxRetries, 0, 32));
         const std::int64_t timeout_seconds = options.OperationTimeout.ticks / 10000000LL;
         set_int("DefaultOperationTimeoutSeconds",
                 static_cast<std::int32_t>(std::clamp<std::int64_t>(
                     timeout_seconds, 1, 3600)));
-        save();
+        if (save()) return true;
+        root_ = std::move(previous);
+        return false;
     }
 
     bool prompt_resume_after_crash() const { return get_bool("PromptResumeAfterCrash", true); }
@@ -282,6 +362,8 @@ public:
 private:
     std::wstring path_;
     json::Object root_;
+    std::string load_warning_;
+    std::string last_save_error_;
 
     void set_value(const std::string& key, json::Value value) {
         for (auto& member : root_.members) {

@@ -1,10 +1,9 @@
 // Job catalog models + JobCatalogStore (port of XactCopy.Storage
 // Infrastructure\JobCatalogStore.vb and the ManagedJob* models).
 //
-// Unlike the journal/map stores the catalog is plain System.Text.Json:
-// WriteIndented = true, JsonStringEnumConverter, PropertyNameCaseInsensitive
-// reads, no HMAC/ledger hardening. Persistence is an atomic ".tmp" +
-// move-with-overwrite into %LOCALAPPDATA%\XactCopy\jobs\catalog.json.
+// Saved jobs can run unattended, so the catalog uses a signed snapshot envelope
+// with rotations and a mirror. Legacy plain System.Text.Json catalogs remain
+// readable and are upgraded on the next successful save.
 #pragma once
 
 #include "../core/models.h"
@@ -25,6 +24,7 @@ enum class ManagedJobRunStatus : std::int32_t {
     Failed = 4,
     Cancelled = 5,
     Interrupted = 6,
+    Incomplete = 7,
 };
 
 inline constexpr models::detail::EnumEntry<ManagedJobRunStatus> ManagedJobRunStatus_Table[] = {
@@ -35,6 +35,7 @@ inline constexpr models::detail::EnumEntry<ManagedJobRunStatus> ManagedJobRunSta
     {ManagedJobRunStatus::Failed, "Failed"},
     {ManagedJobRunStatus::Cancelled, "Cancelled"},
     {ManagedJobRunStatus::Interrupted, "Interrupted"},
+    {ManagedJobRunStatus::Incomplete, "Incomplete"},
 };
 
 inline std::string_view to_string(ManagedJobRunStatus v) {
@@ -280,55 +281,81 @@ struct JobCatalog {
 class JobCatalogStore {
 public:
     static constexpr std::int32_t CurrentSchemaVersion = 2;
+    static constexpr std::int32_t CurrentEnvelopeSchemaVersion = 1;
+    static constexpr int BackupGenerationCount = 2;
 
     explicit JobCatalogStore(std::wstring catalog_path = std::wstring()) {
         if (catalog_path.empty()) {
             catalog_path_ = fsutil::local_app_data() + L"\\XactCopy\\jobs\\catalog.json";
+            mirror_path_ =
+                detail::build_mirror_path(catalog_path_, L"jobs-mirror", L"catalog");
         } else {
             catalog_path_ = std::move(catalog_path);
+            // Tests and callers with an explicit catalog keep all artifacts in
+            // their selected directory; the default production store uses an
+            // independent LocalAppData mirror directory.
+            mirror_path_ = catalog_path_ + L".mirror";
         }
     }
 
     const std::wstring& catalog_path() const noexcept { return catalog_path_; }
+    const std::wstring& mirror_path() const noexcept { return mirror_path_; }
 
     JobCatalog load() const {
-        if (!fsutil::file_exists(catalog_path_)) return JobCatalog();
-        auto bytes = fsutil::read_all_bytes(catalog_path_);
-        if (!bytes) return JobCatalog();
-        std::string text(reinterpret_cast<const char*>(bytes->data()), bytes->size());
-        // File.ReadAllText detects/strips a UTF-8 BOM.
-        if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
-            static_cast<unsigned char>(text[1]) == 0xBB && static_cast<unsigned char>(text[2]) == 0xBF) {
-            text.erase(0, 3);
+        const std::vector<std::wstring> candidates = build_candidates();
+        const detail::SecurityContext context = create_security_context();
+        for (const auto& candidate : candidates) {
+            if (auto catalog = try_load_envelope(candidate, context)) return *catalog;
         }
-        try {
-            json::Value parsed = json::parse(text);
-            JobCatalog catalog = JobCatalog::from_json(parsed);
-            normalize(catalog);
-            return catalog;
-        } catch (const json::ParseError&) {
-            return JobCatalog();
+        // Migration path for catalogs written before signed envelopes. A
+        // signed backup/mirror always wins, so a damaged primary cannot be
+        // downgraded to an unauthenticated payload while a trusted copy exists.
+        for (const auto& candidate : candidates) {
+            if (auto catalog = try_load_legacy(candidate)) return *catalog;
         }
+        return JobCatalog();
     }
 
     bool save(JobCatalog& catalog) const {
-        normalize(catalog);
-        std::wstring directory = fsutil::get_directory_name(catalog_path_);
-        if (!directory.empty()) {
-            fsutil::create_directories(directory);
-        }
+        try {
+            normalize(catalog);
+            const std::string payload = serialize_catalog(catalog);
+            const std::string payload_sha = crypto::sha256_hex(payload);
+            const std::int64_t saved_ticks = DateTimeOffset::now_utc().utc_ticks();
+            const detail::SecurityContext context = create_security_context();
+            const std::string signature =
+                compute_envelope_signature(payload_sha, saved_ticks, context);
 
-        json::Writer w(/*indented*/ true);
-        catalog.to_json(w);
-        std::string text = w.take();
+            json::Writer writer(/*indented*/ true);
+            writer.begin_object();
+            writer.key("EnvelopeSchemaVersion");
+            writer.value(CurrentEnvelopeSchemaVersion);
+            writer.key("SavedUtcTicks");
+            writer.value(saved_ticks);
+            writer.key("PayloadSha256");
+            writer.value(payload_sha);
+            writer.key("Signature");
+            writer.value(signature);
+            writer.key("Payload");
+            catalog.to_json(writer);
+            writer.end_object();
+            const std::string envelope = writer.take();
 
-        std::wstring temp_path = catalog_path_ + L".tmp";
-        if (!fsutil::write_file_raw(temp_path, reinterpret_cast<const unsigned char*>(text.data()),
-                                    text.size(), /*write_through*/ false, /*fail_if_exists*/ false)) {
+            const std::wstring primary_directory = fsutil::get_directory_name(catalog_path_);
+            const std::wstring mirror_directory = fsutil::get_directory_name(mirror_path_);
+            if (!primary_directory.empty()) fsutil::create_directories(primary_directory);
+            if (!mirror_directory.empty()) fsutil::create_directories(mirror_directory);
+            detail::rotate_backups(catalog_path_, BackupGenerationCount);
+            if (!fsutil::write_atomic_bytes(catalog_path_, envelope)) return false;
+            detail::rotate_backups(mirror_path_, BackupGenerationCount);
+            // The primary is authoritative. A failed mirror refresh must not
+            // turn a successfully committed catalog update into a false save
+            // failure; the previous mirror rotation remains a load candidate.
+            (void)fsutil::write_atomic_bytes(mirror_path_, envelope);
+            return true;
+        } catch (const std::exception&) {
             return false;
         }
-        return MoveFileExW(temp_path.c_str(), catalog_path_.c_str(),
-                           MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) != FALSE;
     }
 
     // Mirrors JobCatalogStore.NormalizeCatalog (defaults, legacy queue
@@ -359,6 +386,100 @@ public:
     }
 
 private:
+    static std::string serialize_catalog(const JobCatalog& catalog) {
+        json::Writer writer(/*indented*/ true);
+        catalog.to_json(writer);
+        return writer.take();
+    }
+
+    detail::SecurityContext create_security_context() const {
+        detail::SecurityContext context;
+        context.path_fingerprint = detail::fingerprint_for_path(catalog_path_);
+        context.hmac_key = detail::catalog_key_cache().get_or_create();
+        return context;
+    }
+
+    static std::string compute_envelope_signature(
+        const std::string& payload_sha, std::int64_t saved_ticks,
+        const detail::SecurityContext& context) {
+        const std::string authenticated =
+            payload_sha + "|" + std::to_string(saved_ticks) + "|" + context.path_fingerprint;
+        return crypto::to_base64(crypto::hmac_sha256(context.hmac_key, authenticated));
+    }
+
+    std::vector<std::wstring> build_candidates() const {
+        std::vector<std::wstring> candidates;
+        detail::add_unique_path(candidates, catalog_path_);
+        for (int generation = 1; generation <= BackupGenerationCount; ++generation) {
+            detail::add_unique_path(candidates, detail::backup_path(catalog_path_, generation));
+        }
+        detail::add_unique_path(candidates, mirror_path_);
+        for (int generation = 1; generation <= BackupGenerationCount; ++generation) {
+            detail::add_unique_path(candidates, detail::backup_path(mirror_path_, generation));
+        }
+        return candidates;
+    }
+
+    static std::optional<json::Value> read_json(const std::wstring& path) {
+        auto bytes = fsutil::read_all_bytes(path, 128ULL * 1024 * 1024);
+        if (!bytes.has_value() || bytes->empty()) return std::nullopt;
+        std::string text(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+        if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
+            static_cast<unsigned char>(text[1]) == 0xBB &&
+            static_cast<unsigned char>(text[2]) == 0xBF) {
+            text.erase(0, 3);
+        }
+        try {
+            return json::parse(text);
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    }
+
+    static std::optional<JobCatalog> try_load_envelope(
+        const std::wstring& path, const detail::SecurityContext& context) {
+        auto parsed = read_json(path);
+        const json::Object* object = parsed.has_value() ? parsed->as_object() : nullptr;
+        if (object == nullptr) return std::nullopt;
+
+        std::int32_t envelope_schema = 0;
+        std::int64_t saved_ticks = 0;
+        std::string payload_sha;
+        std::string signature;
+        models::detail::read(object, "EnvelopeSchemaVersion", envelope_schema);
+        models::detail::read(object, "SavedUtcTicks", saved_ticks);
+        models::detail::read(object, "PayloadSha256", payload_sha);
+        models::detail::read(object, "Signature", signature);
+        const json::Value* payload_value = object->find("Payload");
+        if (envelope_schema != CurrentEnvelopeSchemaVersion || saved_ticks <= 0 ||
+            payload_sha.empty() || signature.empty() || payload_value == nullptr ||
+            !payload_value->is_object()) {
+            return std::nullopt;
+        }
+
+        JobCatalog catalog = JobCatalog::from_json(*payload_value);
+        const std::string actual_sha = crypto::sha256_hex(serialize_catalog(catalog));
+        if (!crypto::secure_equals(actual_sha, payload_sha)) return std::nullopt;
+        const std::string expected_signature =
+            compute_envelope_signature(actual_sha, saved_ticks, context);
+        if (!crypto::secure_equals(expected_signature, signature)) return std::nullopt;
+        normalize(catalog);
+        return catalog;
+    }
+
+    static std::optional<JobCatalog> try_load_legacy(const std::wstring& path) {
+        auto parsed = read_json(path);
+        const json::Object* object = parsed.has_value() ? parsed->as_object() : nullptr;
+        if (object == nullptr || object->find("EnvelopeSchemaVersion") != nullptr ||
+            (object->find("Jobs") == nullptr && object->find("Runs") == nullptr &&
+             object->find("QueueEntries") == nullptr && object->find("QueuedJobIds") == nullptr)) {
+            return std::nullopt;
+        }
+        JobCatalog catalog = JobCatalog::from_json(*parsed);
+        normalize(catalog);
+        return catalog;
+    }
+
     static void migrate_legacy_queue(JobCatalog& catalog) {
         if (!catalog.QueueEntries.empty()) return;
         if (catalog.QueuedJobIds.empty()) return;
@@ -400,6 +521,7 @@ private:
     }
 
     std::wstring catalog_path_;
+    std::wstring mirror_path_;
 };
 
 } // namespace xact::storage

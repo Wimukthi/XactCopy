@@ -27,6 +27,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
 #include <windows.h>
 
 #include "../core/dotnet_time.h"
@@ -179,6 +182,19 @@ struct ExistingFileMetadata {
     std::int64_t last_write_utc_ticks = 0; // .NET DateTime UTC ticks
 };
 
+struct FileIdentity {
+    std::uint64_t file_index = 0;
+    DWORD volume_serial = 0;
+};
+
+struct FileStabilitySnapshot {
+    FileIdentity identity;
+    std::uint32_t link_count = 1;
+    std::int64_t length = 0;
+    std::int64_t last_write_utc_ticks = 0;
+    std::int64_t change_utc_ticks = 0;
+};
+
 inline std::int64_t filetime_to_ticks(DWORD low, DWORD high) {
     std::uint64_t filetime = (static_cast<std::uint64_t>(high) << 32) | low;
     if (filetime == 0) return 0; // DateTime.MinValue
@@ -205,6 +221,92 @@ inline bool try_get_existing_file_metadata(const std::wstring& path, ExistingFil
     return true;
 }
 
+inline bool try_get_file_identity(const std::wstring& path, FileIdentity& identity) {
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION info{};
+    BOOL ok = GetFileInformationByHandle(handle, &info);
+    CloseHandle(handle);
+    if (!ok) return false;
+    identity.file_index = (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32) |
+                          info.nFileIndexLow;
+    identity.volume_serial = info.dwVolumeSerialNumber;
+    return identity.file_index != 0 || identity.volume_serial != 0;
+}
+
+inline bool try_get_file_stability(HANDLE handle, FileStabilitySnapshot& snapshot) {
+    if (handle == nullptr || handle == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION legacy{};
+    FILE_BASIC_INFO basic{};
+    FILE_STANDARD_INFO standard{};
+    BOOL legacy_ok = GetFileInformationByHandle(handle, &legacy);
+    BOOL basic_ok = GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic));
+    BOOL standard_ok =
+        GetFileInformationByHandleEx(handle, FileStandardInfo, &standard, sizeof(standard));
+    if (!legacy_ok || !basic_ok || !standard_ok || standard.Directory) return false;
+    snapshot.identity.file_index =
+        (static_cast<std::uint64_t>(legacy.nFileIndexHigh) << 32) | legacy.nFileIndexLow;
+    snapshot.identity.volume_serial = legacy.dwVolumeSerialNumber;
+    snapshot.link_count = legacy.nNumberOfLinks;
+    snapshot.length = standard.EndOfFile.QuadPart;
+    snapshot.last_write_utc_ticks = basic.LastWriteTime.QuadPart + time::FileTimeEpochTicks;
+    snapshot.change_utc_ticks = basic.ChangeTime.QuadPart + time::FileTimeEpochTicks;
+    return true;
+}
+
+inline bool try_get_file_stability(const std::wstring& path,
+                                   FileStabilitySnapshot& snapshot) {
+    HANDLE handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    const bool ok = try_get_file_stability(handle, snapshot);
+    CloseHandle(handle);
+    return ok;
+}
+
+inline bool file_stability_matches(const FileStabilitySnapshot& expected,
+                                   const FileStabilitySnapshot& current) noexcept {
+    return current.identity.file_index == expected.identity.file_index &&
+           current.identity.volume_serial == expected.identity.volume_serial &&
+           current.length == expected.length &&
+           current.last_write_utc_ticks == expected.last_write_utc_ticks &&
+           current.change_utc_ticks == expected.change_utc_ticks;
+}
+
+// Destination data must be durable before the copy engine publishes a staged
+// file over the previous destination. The journal is already write-through,
+// but that alone cannot make the destination bytes survive a power loss.
+inline void flush_file_path(const std::wstring& path) {
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        DWORD write_error = GetLastError();
+        // A source READONLY attribute is applied only after all data and
+        // metadata are complete. Still, native CopyFileEx can carry that bit
+        // onto the stage before the final flush. A read handle is sufficient
+        // for FlushFileBuffers on Windows and avoids making a correct staged
+        // file unflushable solely because it is read-only.
+        handle = CreateFileW(path.c_str(), GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            throw IoError::from_win32("Unable to open destination for durable flush.", write_error);
+        }
+    }
+    BOOL ok = FlushFileBuffers(handle);
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(handle);
+    if (!ok) {
+        throw IoError::from_win32("Unable to flush destination data.", error);
+    }
+}
+
 inline std::int64_t get_existing_file_length(const std::wstring& path) {
     ExistingFileMetadata metadata;
     if (!try_get_existing_file_metadata(path, metadata)) return 0;
@@ -225,6 +327,177 @@ inline bool set_last_write_time_utc(const std::wstring& path, std::int64_t ticks
     BOOL ok = SetFileTime(handle, nullptr, nullptr, &write_time);
     CloseHandle(handle);
     return ok != FALSE;
+}
+
+inline bool set_file_times_utc(const std::wstring& path, const FILETIME& creation_time,
+                               const FILETIME& access_time, const FILETIME& write_time) {
+    HANDLE handle = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    BOOL ok = SetFileTime(handle, &creation_time, &access_time, &write_time);
+    CloseHandle(handle);
+    return ok != FALSE;
+}
+
+// These flags are safe to reproduce on a normal destination file. Compressed,
+// encrypted, sparse, and reparse attributes are filesystem features rather than
+// cosmetic bits; setting them blindly can change how a destination stores data,
+// so the copy engine leaves those features to the native CopyFileEx path.
+inline constexpr DWORD CopyableFileAttributes =
+    FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM |
+    FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_OFFLINE |
+    FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_ATTRIBUTE_NORMAL;
+
+inline bool set_copyable_file_attributes(const std::wstring& path, DWORD source_attributes) {
+    DWORD attributes = source_attributes & CopyableFileAttributes;
+    if (attributes == 0) attributes = FILE_ATTRIBUTE_NORMAL;
+    return SetFileAttributesW(path.c_str(), attributes) != FALSE;
+}
+
+struct FileSecuritySnapshot {
+    std::vector<unsigned char> descriptor;
+    SECURITY_INFORMATION information = 0;
+    bool sacl_omitted = false;
+};
+
+// Capture the source security descriptor before a managed copy starts. DACLs
+// are always required. SACLs are included when the process has the security
+// privilege; ordinary desktop users commonly do not, so that limitation is
+// returned explicitly and surfaced as a copy warning instead of being hidden.
+inline FileSecuritySnapshot capture_file_security(const std::wstring& path) {
+    constexpr SECURITY_INFORMATION basic_information =
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    constexpr SECURITY_INFORMATION all_information =
+        basic_information | SACL_SECURITY_INFORMATION;
+
+    auto read_descriptor = [&path](SECURITY_INFORMATION information,
+                                   std::vector<unsigned char>& output) -> DWORD {
+        DWORD required = 0;
+        if (GetFileSecurityW(path.c_str(), information, nullptr, 0, &required)) {
+            return ERROR_INVALID_DATA;
+        }
+        DWORD error = GetLastError();
+        if (error != ERROR_INSUFFICIENT_BUFFER || required == 0) return error;
+        output.resize(required);
+        if (!GetFileSecurityW(path.c_str(), information,
+                              reinterpret_cast<PSECURITY_DESCRIPTOR>(output.data()),
+                              required, &required)) {
+            return GetLastError();
+        }
+        output.resize(required);
+        return ERROR_SUCCESS;
+    };
+
+    FileSecuritySnapshot snapshot;
+    DWORD error = read_descriptor(all_information, snapshot.descriptor);
+    if (error == ERROR_SUCCESS) {
+        snapshot.information = all_information;
+        return snapshot;
+    }
+
+    if (error != ERROR_ACCESS_DENIED && error != ERROR_PRIVILEGE_NOT_HELD &&
+        error != ERROR_INVALID_PARAMETER && error != ERROR_INVALID_FUNCTION) {
+        throw IoError::from_win32("Unable to read source security descriptor.", error);
+    }
+
+    snapshot.descriptor.clear();
+    error = read_descriptor(basic_information, snapshot.descriptor);
+    if (error != ERROR_SUCCESS) {
+        throw IoError::from_win32("Unable to read source security descriptor.", error);
+    }
+    snapshot.information = basic_information;
+    snapshot.sacl_omitted = true;
+    return snapshot;
+}
+
+struct FileSecurityApplyResult {
+    bool owner_group_preserved = false;
+    bool sacl_preserved = false;
+};
+
+inline FileSecurityApplyResult apply_file_security(const std::wstring& path,
+                                                   const FileSecuritySnapshot& snapshot) {
+    if (snapshot.descriptor.empty()) return {};
+
+    auto* descriptor = reinterpret_cast<PSECURITY_DESCRIPTOR>(
+        const_cast<unsigned char*>(snapshot.descriptor.data()));
+    if (SetFileSecurityW(path.c_str(), snapshot.information, descriptor)) {
+        return FileSecurityApplyResult{
+            (snapshot.information & (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION)) != 0,
+            (snapshot.information & SACL_SECURITY_INFORMATION) != 0};
+    }
+
+    DWORD full_error = GetLastError();
+    // Setting an owner or group usually requires a privilege that a normal
+    // user does not have. Preserve the DACL rather than silently retaining the
+    // destination directory's permissions; the caller records the limitation.
+    if (!SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, descriptor)) {
+        throw IoError::from_win32("Unable to apply source file permissions to staged destination.",
+                                  GetLastError());
+    }
+    (void)full_error;
+    return {};
+}
+
+struct NamedStreamDescriptor {
+    std::wstring name; // Includes the leading ':', e.g. ":Zone.Identifier:$DATA".
+    std::int64_t length = 0;
+};
+
+struct NamedStreamEnumeration {
+    std::vector<NamedStreamDescriptor> streams;
+    bool supported = true;
+};
+
+inline bool is_default_data_stream(std::wstring_view name) {
+    constexpr std::wstring_view default_name = L"::$DATA";
+    return name.size() == default_name.size() &&
+           CompareStringOrdinal(name.data(), static_cast<int>(name.size()),
+                                default_name.data(), static_cast<int>(default_name.size()), TRUE) ==
+               CSTR_EQUAL;
+}
+
+inline NamedStreamEnumeration enumerate_named_streams(const std::wstring& path) {
+    NamedStreamEnumeration result;
+    WIN32_FIND_STREAM_DATA stream_data{};
+    HANDLE find = FindFirstStreamW(path.c_str(), FindStreamInfoStandard, &stream_data, 0);
+    if (find == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        if (error == ERROR_INVALID_FUNCTION || error == ERROR_NOT_SUPPORTED ||
+            error == ERROR_INVALID_PARAMETER) {
+            result.supported = false;
+            return result;
+        }
+        if (error == ERROR_HANDLE_EOF) return result;
+        throw IoError::from_win32("Unable to enumerate file data streams.", error);
+    }
+
+    bool closed = false;
+    try {
+        do {
+            std::wstring name = stream_data.cStreamName;
+            if (!name.empty() && !is_default_data_stream(name)) {
+                const std::int64_t length = stream_data.StreamSize.QuadPart;
+                if (length < 0) {
+                    throw IoError("File data stream has an invalid negative length.");
+                }
+                result.streams.push_back(NamedStreamDescriptor{std::move(name), length});
+            }
+        } while (FindNextStreamW(find, &stream_data));
+
+        DWORD error = GetLastError();
+        FindClose(find);
+        closed = true;
+        if (error != ERROR_HANDLE_EOF) {
+            throw IoError::from_win32("Unable to finish enumerating file data streams.", error);
+        }
+    } catch (...) {
+        if (!closed) FindClose(find);
+        throw;
+    }
+    return result;
 }
 
 // Matches the VB FormatBytes helper ("{value} B", then "0.##" KB/MB/GB/TB/PB).
@@ -262,11 +535,17 @@ struct SourceFileDescriptor {
     std::wstring full_path;
     std::int64_t length = 0;
     std::int64_t last_write_utc_ticks = 0;
+    DWORD attributes = FILE_ATTRIBUTE_NORMAL;
+    FILETIME creation_time{};
+    FILETIME last_access_time{};
+    FILETIME last_write_time{};
 };
 
 struct SourceScanResult {
     std::vector<SourceFileDescriptor> files;
     std::vector<std::string> directories; // relative, sorted
+    bool complete = true;
+    std::vector<std::string> errors;
 };
 
 namespace detail {
@@ -318,9 +597,7 @@ inline std::wstring resolve_final_path(const std::wstring& path) {
     DWORD length = GetFinalPathNameByHandleW(handle, buffer, 1024, FILE_NAME_NORMALIZED);
     CloseHandle(handle);
     if (length == 0 || length >= 1024) return std::wstring();
-    std::wstring result(buffer, length);
-    if (result.rfind(L"\\\\?\\", 0) == 0) result = result.substr(4);
-    return result;
+    return storage::fsutil::strip_extended_path_prefix(std::wstring(buffer, length));
 }
 
 } // namespace detail
@@ -354,8 +631,25 @@ public:
                 if (relative.empty()) return SelectionFilter();
             }
 
-            // Reject traversal escapes.
-            if (relative.find("..") != std::string::npos) {
+            // Reject an actual parent-directory component, not harmless names
+            // such as "report..txt". normalize_relative_path uses backslashes,
+            // but accept either separator for forward-compatible IPC input.
+            bool has_parent_component = false;
+            std::size_t component_start = 0;
+            while (component_start <= relative.size()) {
+                std::size_t component_end = relative.find_first_of("\\/", component_start);
+                std::string_view component(
+                    relative.data() + component_start,
+                    (component_end == std::string::npos ? relative.size() : component_end) -
+                        component_start);
+                if (component == "..") {
+                    has_parent_component = true;
+                    break;
+                }
+                if (component_end == std::string::npos) break;
+                component_start = component_end + 1;
+            }
+            if (has_parent_component) {
                 if (log) log("Ignored selected relative path outside source root: " + relative);
                 continue;
             }
@@ -412,15 +706,42 @@ inline SourceScanResult scan_source(
     models::SymlinkHandlingMode symlink_handling,
     bool copy_empty_directories,
     const std::function<void(const std::string&)>& log,
-    const std::function<bool()>& should_cancel = nullptr) {
+    const std::function<bool()>& should_cancel = nullptr,
+    // Test-only hook: return a Win32 error to simulate enumeration start
+    // (at_start=true) or FindNextFile end (at_start=false). Production callers
+    // leave this null; the hook keeps partial-enumeration behavior testable
+    // without changing the filesystem or relying on ACL tricks.
+    const std::function<DWORD(const std::wstring&, bool at_start)>&
+        enumeration_fault = nullptr,
+    const std::wstring& excluded_root = std::wstring()) {
 
     std::wstring normalized_root = storage::fsutil::get_full_path(root_path);
+    std::wstring resolved_root = detail::resolve_final_path(normalized_root);
+    const std::wstring source_scope_upper = storage::fsutil::to_upper_invariant(
+        detail::trim_trailing_separators(
+            resolved_root.empty() ? normalized_root : resolved_root));
+    std::wstring resolved_excluded = excluded_root.empty()
+                                         ? std::wstring()
+                                         : storage::fsutil::resolve_final_path(excluded_root);
+    const std::wstring excluded_root_upper = excluded_root.empty()
+        ? std::wstring()
+        : storage::fsutil::to_upper_invariant(detail::trim_trailing_separators(
+              resolved_excluded.empty() ? storage::fsutil::get_full_path(excluded_root)
+                                        : resolved_excluded));
+    auto path_is_within = [](const std::wstring& candidate,
+                             const std::wstring& root) {
+        if (root.empty()) return false;
+        if (candidate == root) return true;
+        return candidate.size() > root.size() && candidate.compare(0, root.size(), root) == 0 &&
+               (candidate[root.size()] == L'\\' || candidate[root.size()] == L'/');
+    };
     SourceScanResult result;
     std::vector<std::string> discovered_dirs;
-    // Ordinal-ignore-case dedup sets (the .NET DirectoryScanner uses
-    // HashSet(OrdinalIgnoreCase)); a linear scan here is O(n^2) and turns a
-    // whole-drive enumeration into an apparent hang.
-    std::unordered_set<std::wstring> visited_identities;
+    // File-path dedup remains global, while directory target identities are
+    // tracked per traversal branch. A global target set prevents cycles but
+    // also silently drops legitimate aliases (for example both a real folder
+    // and an internal link to it); branch ancestry prevents loops while still
+    // preserving each logical source path.
     std::unordered_set<std::string> discovered_file_keys;
     std::size_t enumerated_files = 0;
     ULONGLONG last_heartbeat_tick = GetTickCount64();
@@ -439,7 +760,8 @@ inline SourceScanResult scan_source(
     auto directory_identity = [&](const std::wstring& path) -> std::wstring {
         std::wstring normalized =
             storage::fsutil::to_upper_invariant(detail::trim_trailing_separators(storage::fsutil::get_full_path(path)));
-        if (symlink_handling != models::SymlinkHandlingMode::Follow || !detail::is_reparse_point(path)) {
+        if (symlink_handling == models::SymlinkHandlingMode::Skip ||
+            !detail::is_reparse_point(path)) {
             return normalized;
         }
         std::wstring target = detail::resolve_final_path(path);
@@ -451,7 +773,6 @@ inline SourceScanResult scan_source(
     };
 
     SelectionFilter filter = SelectionFilter::create(normalized_root, selected_relative_paths, log);
-    visited_identities.insert(directory_identity(normalized_root));
 
     std::wstring root_prefix = detail::trim_trailing_separators(normalized_root) + L"\\";
     auto relative_of = [&](const std::wstring& full) -> std::string {
@@ -461,13 +782,18 @@ inline SourceScanResult scan_source(
         return std::string();
     };
 
-    std::vector<std::wstring> pending;
-    pending.push_back(normalized_root);
+    struct PendingDirectory {
+        std::wstring path;
+        std::vector<std::wstring> ancestor_identities;
+    };
+    std::vector<PendingDirectory> pending;
+    pending.push_back({normalized_root, {directory_identity(normalized_root)}});
 
     while (!pending.empty()) {
         pump(false);
-        std::wstring current = pending.back();
+        PendingDirectory pending_directory = std::move(pending.back());
         pending.pop_back();
+        const std::wstring& current = pending_directory.path;
 
         std::string current_relative = relative_of(current);
         if (copy_empty_directories && !current_relative.empty() &&
@@ -476,12 +802,25 @@ inline SourceScanResult scan_source(
         }
 
         std::wstring search = detail::trim_trailing_separators(current) + L"\\*";
+        if (enumeration_fault) {
+            DWORD injected = enumeration_fault(current, true);
+            if (injected != ERROR_SUCCESS) {
+                result.complete = false;
+                result.errors.push_back("Directory enumeration failed for " + wide_to_utf8(current) +
+                                        " (Win32 " + std::to_string(injected) + ").");
+                if (log) {
+                    log("Directory skipped: " + wide_to_utf8(current) +
+                        " (Injected enumeration failure (" + std::to_string(injected) + ").)");
+                }
+                continue;
+            }
+        }
         WIN32_FIND_DATAW find_data{};
         HANDLE find = FindFirstFileExW(search.c_str(), FindExInfoBasic, &find_data,
                                        FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
         if (find == INVALID_HANDLE_VALUE) {
             DWORD error = GetLastError();
-            if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND || error == ERROR_NO_MORE_FILES) {
+            if (error == ERROR_FILE_NOT_FOUND || error == ERROR_NO_MORE_FILES) {
                 continue;
             }
             if (log) {
@@ -489,6 +828,9 @@ inline SourceScanResult scan_source(
                 log("Directory skipped: " + dir_text + " (Native enumeration failed (" + std::to_string(error) + ").)");
                 log("Files skipped in: " + dir_text + " (Native enumeration failed (" + std::to_string(error) + ").)");
             }
+            result.complete = false;
+            result.errors.push_back("Directory enumeration failed for " + wide_to_utf8(current) +
+                                    " (Win32 " + std::to_string(error) + ").");
             continue;
         }
 
@@ -500,19 +842,57 @@ inline SourceScanResult scan_source(
             bool is_directory = (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
             bool is_reparse = (find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 
+            if (is_reparse) {
+                if (symlink_handling == models::SymlinkHandlingMode::Skip) {
+                    if (log) log("Skipping symbolic link: " + wide_to_utf8(full_path));
+                    continue;
+                }
+                std::wstring resolved = detail::resolve_final_path(full_path);
+                if (resolved.empty()) {
+                    if (log) log("Skipping unresolved symbolic-link target: " +
+                                 wide_to_utf8(full_path));
+                    result.complete = false;
+                    result.errors.push_back("Unable to resolve symbolic-link target for " +
+                                            wide_to_utf8(full_path) + ".");
+                    continue;
+                }
+                const std::wstring resolved_upper = storage::fsutil::to_upper_invariant(
+                    detail::trim_trailing_separators(resolved));
+                if (path_is_within(resolved_upper, excluded_root_upper)) {
+                    if (log) log("Skipping symbolic link into the destination tree: " +
+                                 wide_to_utf8(full_path) + " -> " + wide_to_utf8(resolved));
+                    continue;
+                }
+                const bool internal = path_is_within(resolved_upper, source_scope_upper);
+                if (symlink_handling == models::SymlinkHandlingMode::FollowInternal && !internal) {
+                    if (log) log("Skipping external symbolic-link target: " +
+                                 wide_to_utf8(full_path) + " -> " + wide_to_utf8(resolved));
+                    continue;
+                }
+                if (!internal && log) {
+                    log("WARNING: Following external symbolic-link target: " +
+                        wide_to_utf8(full_path) + " -> " + wide_to_utf8(resolved));
+                }
+            }
+
             if (is_directory) {
                 std::string relative_dir = relative_of(full_path);
                 if (!filter.should_traverse_directory(relative_dir)) continue;
-                if (is_reparse && symlink_handling == models::SymlinkHandlingMode::Skip) {
-                    if (log) log("Skipping symbolic-link directory: " + wide_to_utf8(full_path));
-                    continue;
-                }
                 std::wstring identity = directory_identity(full_path);
-                if (!visited_identities.insert(identity).second) {
-                    if (log) log("Skipping already visited directory target: " + wide_to_utf8(full_path));
+                const bool cycle = std::find(
+                    pending_directory.ancestor_identities.begin(),
+                    pending_directory.ancestor_identities.end(), identity) !=
+                    pending_directory.ancestor_identities.end();
+                if (cycle) {
+                    if (log) {
+                        log("Skipping symbolic-link directory cycle: " +
+                            wide_to_utf8(full_path));
+                    }
                     continue;
                 }
-                pending.push_back(full_path);
+                auto ancestors = pending_directory.ancestor_identities;
+                ancestors.push_back(std::move(identity));
+                pending.push_back({std::move(full_path), std::move(ancestors)});
                 continue;
             }
 
@@ -543,9 +923,28 @@ inline SourceScanResult scan_source(
                                     : static_cast<std::int64_t>(raw_length);
             descriptor.last_write_utc_ticks = filetime_to_ticks(
                 find_data.ftLastWriteTime.dwLowDateTime, find_data.ftLastWriteTime.dwHighDateTime);
+            descriptor.attributes = find_data.dwFileAttributes;
+            descriptor.creation_time = find_data.ftCreationTime;
+            descriptor.last_access_time = find_data.ftLastAccessTime;
+            descriptor.last_write_time = find_data.ftLastWriteTime;
             result.files.push_back(std::move(descriptor));
         } while (FindNextFileW(find, &find_data));
+        DWORD enumeration_error = GetLastError();
+        if (enumeration_fault) {
+            DWORD injected = enumeration_fault(current, false);
+            if (injected != ERROR_SUCCESS) enumeration_error = injected;
+        }
         FindClose(find);
+        if (enumeration_error != ERROR_NO_MORE_FILES) {
+            result.complete = false;
+            result.errors.push_back("Directory enumeration ended unexpectedly for " +
+                                    wide_to_utf8(current) + " (Win32 " +
+                                    std::to_string(enumeration_error) + ").");
+            if (log) {
+                log("Directory enumeration ended unexpectedly: " + wide_to_utf8(current) +
+                    " (Native enumeration failed (" + std::to_string(enumeration_error) + ").)");
+            }
+        }
     }
 
     // Sort by relative path, ordinal-ignore-case (same order the journal is
@@ -787,6 +1186,13 @@ inline Outcome wait_for_completion(HANDLE file, OVERLAPPED& overlapped, DWORD& t
             }
             return Outcome::Success;
         }
+        if (wait_result == WAIT_FAILED) {
+            throw IoError::from_win32("Waiting for positional I/O failed.", GetLastError());
+        }
+        if (wait_result != WAIT_TIMEOUT) {
+            throw IoError("Waiting for positional I/O returned an unexpected state.",
+                          ERROR_INVALID_STATE, IoErrorKind::General);
+        }
     }
 }
 
@@ -819,7 +1225,10 @@ inline std::int32_t read_at(HANDLE file, std::int64_t offset, unsigned char* buf
             } else if (!ok) {
                 throw IoError::from_win32("ReadFile failed.", error);
             } else {
-                GetOverlappedResult(file, &overlapped, &transferred, TRUE);
+                if (!GetOverlappedResult(file, &overlapped, &transferred, TRUE)) {
+                    throw IoError::from_win32("Completing positional read failed.",
+                                              GetLastError());
+                }
             }
         } catch (...) {
             CloseHandle(overlapped.hEvent);
@@ -860,7 +1269,10 @@ inline void write_at(HANDLE file, std::int64_t offset, const unsigned char* buff
             } else if (!ok) {
                 throw IoError::from_win32("WriteFile failed.", error);
             } else {
-                GetOverlappedResult(file, &overlapped, &transferred, TRUE);
+                if (!GetOverlappedResult(file, &overlapped, &transferred, TRUE)) {
+                    throw IoError::from_win32("Completing positional write failed.",
+                                              GetLastError());
+                }
             }
         } catch (...) {
             CloseHandle(overlapped.hEvent);
@@ -898,7 +1310,7 @@ public:
     HANDLE source_handle() {
         if (source_ == INVALID_HANDLE_VALUE) {
             source_ = CreateFileW(source_path_.c_str(), GENERIC_READ,
-                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                  FILE_SHARE_READ, nullptr,
                                   OPEN_EXISTING,
                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN,
                                   nullptr);

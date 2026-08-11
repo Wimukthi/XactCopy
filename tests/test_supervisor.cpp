@@ -101,6 +101,16 @@ struct EventSink {
                                [this] { return progress_events.load() > 0; });
     }
 
+    bool wait_for_log(const std::string& fragment, int timeout_seconds) {
+        std::unique_lock<std::mutex> guard(lock);
+        return signal.wait_for(guard, std::chrono::seconds(timeout_seconds), [this, &fragment] {
+            for (const auto& line : logs) {
+                if (line.find(fragment) != std::string::npos) return true;
+            }
+            return false;
+        });
+    }
+
     bool any_log_contains(const std::string& fragment) {
         std::lock_guard<std::mutex> guard(lock);
         for (const auto& line : logs) {
@@ -120,6 +130,22 @@ struct EventSink {
         return false;
     }
 };
+
+void test_automatic_recovery_budget() {
+    std::printf("--- supervisor: bounded automatic recovery policy ---\n");
+    std::atomic<int> attempts{0};
+    for (int expected = 1; expected <= ui::supervisor_detail::MaximumAutomaticRecoveries;
+         ++expected) {
+        int claimed = 0;
+        check(ui::supervisor_detail::try_claim_automatic_recovery(attempts, claimed) &&
+                  claimed == expected,
+              "automatic recovery attempt " + std::to_string(expected) + " is permitted");
+    }
+    int rejected = 0;
+    check(!ui::supervisor_detail::try_claim_automatic_recovery(attempts, rejected) &&
+              rejected == ui::supervisor_detail::MaximumAutomaticRecoveries + 1,
+          "automatic recovery stops after the configured budget");
+}
 
 void test_clean_job() {
     std::printf("--- supervisor: clean job ---\n");
@@ -219,6 +245,51 @@ void test_kill_recovery() {
     check(true, "supervisor stopped cleanly after recovery");
 }
 
+void test_stop_joins_in_flight_recovery() {
+    std::printf("--- supervisor: shutdown joins in-flight recovery ---\n");
+    std::wstring work = make_work_dir();
+    std::wstring source = work + L"\\src";
+    std::wstring destination = work + L"\\dst";
+    storage::fsutil::create_directories(source);
+    write_pattern_file(source + L"\\big.bin", 8 * 1024 * 1024, 44);
+
+    ui::WorkerSupervisor supervisor;
+    EventSink sink;
+    sink.attach(supervisor);
+
+    models::CopyJobOptions options;
+    options.SourceRoot = storage::fsutil::wide_to_utf8(source);
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(destination);
+    options.TransferEnginePolicyValue = models::TransferEnginePolicy::ManagedRescue;
+    options.MaxThroughputBytesPerSecond = 1024 * 1024;
+    options.ResumeFromJournal = true;
+    supervisor.start_job(options);
+    check(sink.wait_for_progress(30), "progress observed before shutdown-race kill");
+
+    std::string connected_state;
+    check(sink.any_state_contains("Worker connected (PID", &connected_state),
+          "shutdown-race worker PID state available");
+    DWORD pid = 0;
+    if (std::size_t open = connected_state.find("PID "); open != std::string::npos) {
+        pid = static_cast<DWORD>(std::strtoul(connected_state.c_str() + open + 4, nullptr, 10));
+    }
+    HANDLE process = pid == 0 ? nullptr : OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    check(process != nullptr, "shutdown-race worker opened for kill");
+    if (process != nullptr) {
+        TerminateProcess(process, 9);
+        CloseHandle(process);
+    }
+
+    check(sink.wait_for_log("Restarting worker and resuming from journal", 30),
+          "automatic recovery entered before supervisor shutdown");
+    auto started = std::chrono::steady_clock::now();
+    supervisor.stop();
+    double seconds = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - started)
+                         .count();
+    check(seconds < 15.0, "shutdown joins recovery without a deadlock or detached callback");
+}
+
 void test_recovery_service() {
     std::printf("--- recovery service: state round-trip ---\n");
     std::wstring work = make_work_dir();
@@ -258,6 +329,84 @@ void test_recovery_service() {
         ui::RecoveryService service{ui::RecoveryStateStore(state_path), false};
         ui::RecoveryStartupInfo info = service.initialize_session(settings, launch);
         check(!info.has_interrupted_run(), "clean shutdown leaves no interrupted run");
+    }
+
+    settings.set_bool("AutoResumeAfterCrash", true);
+    settings.save();
+    {
+        ui::RecoveryService service{ui::RecoveryStateStore(state_path), false};
+        models::CopyJobOptions options;
+        options.SourceRoot = "D:\\Recover\\Src";
+        options.DestinationRoot = "E:\\Recover\\Dst";
+        service.mark_job_started("run-unbound", "Unbound recovery", options,
+                                 "C:\\journal.json", settings);
+    }
+    {
+        ui::RecoveryService service{ui::RecoveryStateStore(state_path), false};
+        ui::RecoveryStartupInfo info = service.initialize_session(settings, launch);
+        check(info.has_interrupted_run() && !info.should_auto_resume && info.should_prompt,
+              "auto-resume is blocked when persisted media identity is missing");
+        service.mark_job_ended("run-unbound");
+        service.mark_clean_shutdown();
+    }
+    {
+        ui::RecoveryService service{ui::RecoveryStateStore(state_path), false};
+        models::CopyJobOptions options;
+        options.SourceRoot = "D:\\Recover\\Src";
+        options.DestinationRoot = "E:\\Recover\\Dst";
+        service.mark_job_started("run-bound", "Bound recovery", options,
+                                 "C:\\journal.json", settings);
+        service.update_media_identities("run-bound", "vol:SOURCE:00000001",
+                                        "vol:DESTINATION:00000002");
+    }
+    {
+        ui::RecoveryService service{ui::RecoveryStateStore(state_path), false};
+        ui::RecoveryStartupInfo info = service.initialize_session(settings, launch);
+        check(info.has_interrupted_run() && info.should_auto_resume &&
+                  info.interrupted_run->Options.ExpectedSourceIdentity ==
+                      "vol:SOURCE:00000001" &&
+                  info.interrupted_run->Options.ExpectedDestinationIdentity ==
+                      "vol:DESTINATION:00000002",
+              "worker-confirmed media identities make auto-resume eligible");
+        service.mark_job_ended("run-bound");
+        service.mark_clean_shutdown();
+    }
+    {
+        ui::RecoveryService service{ui::RecoveryStateStore(state_path), false};
+        models::CopyJobOptions options;
+        options.SourceRoot = "D:\\Recover\\Src";
+        options.DestinationRoot = "E:\\Recover\\Dst";
+        options.ContinueOnFileError = true;
+        service.mark_job_started("run-risky", "Risky recovery", options,
+                                 "C:\\journal.json", settings);
+        service.update_media_identities("run-risky", "vol:SOURCE:00000001",
+                                        "vol:DESTINATION:00000002");
+    }
+    {
+        ui::RecoveryService service{ui::RecoveryStateStore(state_path), false};
+        ui::RecoveryStartupInfo info = service.initialize_session(settings, launch);
+        check(info.has_interrupted_run() && !info.should_auto_resume && info.should_prompt,
+              "attended-only integrity settings block automatic crash recovery");
+        service.mark_job_ended("run-risky");
+        service.mark_clean_shutdown();
+    }
+
+    const std::string invalid_state = "{ invalid recovery state";
+    check(storage::fsutil::write_atomic_bytes(state_path, invalid_state),
+          "recovery corruption fixture is written");
+    {
+        ui::RecoveryService service{ui::RecoveryStateStore(state_path), false};
+        std::vector<std::string> warnings;
+        service.on_persistence_warning =
+            [&warnings](const std::string& warning) { warnings.push_back(warning); };
+        ui::RecoveryStartupInfo info = service.initialize_session(settings, launch);
+        WIN32_FIND_DATAW preserved{};
+        HANDLE search = FindFirstFileW((state_path + L".corrupt-*").c_str(), &preserved);
+        const bool corrupt_preserved = search != INVALID_HANDLE_VALUE;
+        if (search != INVALID_HANDLE_VALUE) FindClose(search);
+        check(!info.has_interrupted_run() && !warnings.empty() && corrupt_preserved,
+              "invalid recovery state is preserved and reported instead of silently discarded");
+        service.mark_clean_shutdown();
     }
 }
 
@@ -303,6 +452,41 @@ void test_settings_preservation() {
     (void)future;
 }
 
+void test_settings_failure_reporting() {
+    std::printf("--- settings: corruption and save failures ---\n");
+    std::wstring work = make_work_dir();
+    std::wstring corrupt_path = work + L"\\corrupt-settings.json";
+    const std::string invalid = "[]";
+    check(storage::fsutil::write_atomic_bytes(corrupt_path, invalid),
+          "non-object settings fixture is written");
+
+    ui::AppSettings corrupt(corrupt_path);
+    WIN32_FIND_DATAW preserved{};
+    HANDLE search = FindFirstFileW((corrupt_path + L".corrupt-*").c_str(), &preserved);
+    const bool found_preserved_copy = search != INVALID_HANDLE_VALUE;
+    if (search != INVALID_HANDLE_VALUE) FindClose(search);
+    check(!corrupt.load_warning().empty() && found_preserved_copy,
+          "non-object settings are reported and preserved before defaults are used");
+
+    const std::wstring parent_file = work + L"\\not-a-directory";
+    const unsigned char marker = 0x5A;
+    check(storage::fsutil::write_file_raw(parent_file, &marker, 1, false, false),
+          "save failure fixture is written");
+    ui::AppSettings unwritable(parent_file + L"\\settings.json");
+    const bool transaction_saved = unwritable.update_and_save([](ui::AppSettings& target) {
+        target.set_string("Theme", "light");
+    });
+    check(!transaction_saved && !unwritable.last_save_error().empty() &&
+              unwritable.theme() == "dark",
+          "atomic settings save failure is diagnosed and rolls back in-memory edits");
+
+    models::CopyJobOptions failed_defaults;
+    failed_defaults.BufferSizeBytes = 16 * 1024 * 1024;
+    check(!unwritable.save_run_defaults(failed_defaults) &&
+              unwritable.get_int("DefaultBufferSizeMb", 1, 256, 4) == 4,
+          "failed Save Defaults cannot leak into a later unrelated settings save");
+}
+
 void test_settings_option_mapping() {
     std::printf("--- settings: complete option mapping ---\n");
     std::wstring work = make_work_dir();
@@ -335,6 +519,8 @@ void test_settings_option_mapping() {
     settings.set_bool("DefaultPersistFragileSkipsAcrossResume", false);
     settings.set_bool("DefaultPreserveTimestamps", false);
     settings.set_bool("DefaultCopyEmptyDirectories", false);
+    settings.set_bool("DefaultAllowRecoveredOverwriteExisting", true);
+    settings.set_bool("DefaultAllowDecryptedDestination", true);
 
     settings.set_int("DefaultBadRangeMapMaxAgeDays", 7);
     settings.set_int("DefaultLockContentionProbeIntervalMs", 750);
@@ -403,7 +589,8 @@ void test_settings_option_mapping() {
           "contention and raw-scan booleans map");
     check(options.FragileMediaMode && !options.SkipFileOnFirstReadError &&
               !options.PersistFragileSkipAcrossResume && !options.PreserveTimestamps &&
-              !options.CopyEmptyDirectories,
+              !options.CopyEmptyDirectories && options.AllowRecoveredOverwriteExisting &&
+              options.AllowDecryptedDestination,
           "fragile and copy behavior booleans map");
 
     check(options.BadRangeMapMaxAgeDays == 7 &&
@@ -435,7 +622,14 @@ void test_settings_option_mapping() {
           "sample verification settings map");
 
     ui::AppSettings auto_settings(work + L"\\auto-settings.json");
-    check(auto_settings.build_default_options().ParallelSmallFileWorkers == 0,
+    const models::CopyJobOptions safe_defaults = auto_settings.build_default_options();
+    check(!safe_defaults.SalvageUnreadableBlocks && !safe_defaults.ContinueOnFileError &&
+              safe_defaults.VerifyAfterCopy && !safe_defaults.UseBadRangeMap &&
+              !safe_defaults.SkipKnownBadRanges && !safe_defaults.UpdateBadRangeMapFromRun &&
+              !safe_defaults.AllowRecoveredOverwriteExisting &&
+              !safe_defaults.AllowDecryptedDestination && safe_defaults.MaxRetries == 2,
+          "missing settings use the integrity-first safety profile");
+    check(safe_defaults.ParallelSmallFileWorkers == 0,
           "zero small-file workers remains the documented auto value");
 }
 
@@ -524,11 +718,15 @@ void test_job_catalog_store() {
     storage::JobCatalogStore::normalize(dupes);
     check(dupes.QueueEntries.size() == 1, "duplicate queue entries removed");
 
-    // Corrupted file falls back to a default catalog like the .NET store.
+    // A corrupted primary recovers from the independently committed mirror.
     std::string garbage = "{ not json";
     storage::fsutil::write_file_raw(path, reinterpret_cast<const unsigned char*>(garbage.data()),
                                     garbage.size(), false, false);
-    check(store.load().Jobs.empty(), "corrupted catalog loads default");
+    check(store.load().Jobs.size() == 1 && store.load().Jobs[0].Name == "Nightly Backup",
+          "corrupted catalog primary loads the trusted mirror");
+    storage::fsutil::delete_file(store.mirror_path());
+    check(store.load().Jobs.empty(),
+          "catalog defaults safely when no authenticated snapshot remains");
 }
 
 void test_job_manager_service() {
@@ -548,9 +746,12 @@ void test_job_manager_service() {
 
     auto saved = manager.save_job("  Weekly Sync  ", options);
     check(saved.has_value() && saved->Name == "Weekly Sync", "save_job trims name");
-    check(saved.has_value() && saved->Options.ExpectedSourceIdentity.empty() &&
-              saved->Options.ResumeJournalPathHint.empty() && !saved->Options.AllowJournalRootRemap,
-          "save_job scrubs per-run template fields");
+    check(saved.has_value() &&
+              saved->Options.ExpectedSourceIdentity == "identity-src" &&
+              saved->Options.ExpectedDestinationIdentity == "identity-dst" &&
+              saved->Options.ResumeJournalPathHint.empty() &&
+              !saved->Options.AllowJournalRootRemap,
+          "save_job retains unattended media binding and scrubs transient journal fields");
 
     check(!manager.save_job("   ", options).has_value(), "blank name rejected");
 
@@ -569,6 +770,16 @@ void test_job_manager_service() {
     auto queue = manager.get_queue_entries();
     check(queue.size() == 3 && queue[0].Position == 1 && queue[0].JobName == "Weekly Sync",
           "queue views ordered with positions");
+    check(manager.mark_queue_entry_blocked(queue[0].QueueEntryId,
+                                           "full verification is required"),
+          "blocked unattended queue entry records its reason");
+    auto blocked_queue = manager.get_queue_entries();
+    check(blocked_queue.size() == 3 &&
+              blocked_queue[0].LastErrorMessage.find("full verification") != std::string::npos,
+          "blocked unattended queue entry remains queued and visible");
+    check(!manager.mark_queue_entry_blocked(queue[0].QueueEntryId,
+                                            "full verification is required"),
+          "repeated unattended deferral does not rewrite an unchanged queue record");
 
     check(manager.move_queue_entry(queue[2].QueueEntryId, ui::QueueMoveDirection::Top), "move to top");
     auto moved = manager.get_queue_entries();
@@ -603,6 +814,39 @@ void test_job_manager_service() {
           "completion summary text matches .NET format");
     check(runs[0].FinishedUtc.has_value(), "completed run has FinishedUtc");
 
+    models::CopyJobResult assessment_result;
+    assessment_result.Succeeded = true;
+    assessment_result.TotalFiles = 10;
+    assessment_result.CompletedFiles = 10;
+    assessment_result.RecoveredFiles = 2;
+    assessment_result.BytesRead = 1024;
+    auto assessment_run = manager.create_ad_hoc_run(options, "Readability Assessment", "scan");
+    manager.mark_run_running(assessment_run.RunId, "");
+    manager.mark_run_completed(assessment_run.RunId, assessment_result);
+    auto runs_after_assessment = manager.get_recent_runs();
+    check(!runs_after_assessment.empty() &&
+              runs_after_assessment[0].Status == storage::ManagedJobRunStatus::Completed &&
+              runs_after_assessment[0].Summary.find("completed with findings") !=
+                  std::string::npos &&
+              runs_after_assessment[0].Summary.find("unreadable ranges in 2") !=
+                  std::string::npos,
+          "successful assessment history distinguishes unreadable findings from recovery output");
+
+    models::CopyJobResult incomplete_result;
+    incomplete_result.TotalFiles = 10;
+    incomplete_result.CompletedFiles = 9;
+    incomplete_result.FailedFiles = 1;
+    incomplete_result.ErrorMessage = "one file failed";
+    check(incomplete_result.is_incomplete(), "partial result is classified as incomplete");
+    auto incomplete_run = manager.create_ad_hoc_run(options, "Partial Copy", "manual");
+    manager.mark_run_running(incomplete_run.RunId, "");
+    manager.mark_run_completed(incomplete_run.RunId, incomplete_result);
+    auto runs_after_incomplete = manager.get_recent_runs();
+    check(!runs_after_incomplete.empty() &&
+              runs_after_incomplete[0].Status == storage::ManagedJobRunStatus::Incomplete &&
+              runs_after_incomplete[0].Summary.rfind("Incomplete:", 0) == 0,
+          "partial run is persisted with a distinct incomplete status");
+
     auto interrupted = manager.create_ad_hoc_run(options, "Manual Copy", "manual");
     manager.mark_run_running(interrupted.RunId, "");
     check(manager.mark_any_running_runs_interrupted("Application closed.") == 1,
@@ -613,7 +857,7 @@ void test_job_manager_service() {
               manager.get_queue_entries()[0].JobId != duplicate->JobId,
           "delete job drops its queue entries");
 
-    check(manager.clear_run_history() == 2, "clear history removes runs");
+    check(manager.clear_run_history() == 4, "clear history removes runs");
     check(manager.get_recent_runs().empty(), "history empty after clear");
 
     // A fresh service instance sees the persisted state.
@@ -625,13 +869,16 @@ void test_job_manager_service() {
 } // namespace
 
 int main() {
+    test_automatic_recovery_budget();
     test_settings_preservation();
+    test_settings_failure_reporting();
     test_settings_option_mapping();
     test_recovery_service();
     test_job_catalog_store();
     test_job_manager_service();
     test_clean_job();
     test_kill_recovery();
+    test_stop_joins_in_flight_recovery();
 
     if (g_failures == 0) {
         std::printf("SUPERVISOR PASS: %d checks\n", g_checks);

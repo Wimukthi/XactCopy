@@ -2,7 +2,7 @@
 
 # XactCopy
 
-**A resilient file mover and bad-block scanner for unstable media.**
+**A verified file copier and recovery tool for unstable media.**
 
 [![Release](https://img.shields.io/github/v/release/Wimukthi/XactCopy?label=release)](https://github.com/Wimukthi/XactCopy/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/Wimukthi/XactCopy/total?label=downloads)](https://github.com/Wimukthi/XactCopy/releases)
@@ -19,15 +19,20 @@ readable data as possible instead of aborting at the first error.
 
 ## Why XactCopy
 
-When a normal copy hits an unreadable sector it stops, and you lose the whole
+When a normal copy hits an unreadable region it stops, and you lose the whole
 transfer. XactCopy treats bad media as the expected case:
 
-- **It keeps going.** Unreadable regions are retried, worked around, and logged —
-  the rest of the file, and the rest of the job, still gets copied.
+- **It recovers deliberately.** Unreadable regions are retried, worked around,
+  and logged. Recover Media can preserve the readable portions of a file, and
+  Continue on error can move on to later files; either policy is reported as
+  non-exact whenever data was lost or skipped.
 - **It resumes.** Every job is journaled, so an interrupted or crashed transfer
   picks up where it left off instead of starting over.
 - **It tells the truth.** Copied data can be verified with SHA-256/512, and a
-  bad-block scan maps exactly which regions of a drive are failing.
+  readability assessment records which allocated file ranges could not be read.
+  It is not a whole-disk surface diagnostic. Recovered,
+  skipped, or partially enumerated output is reported as incomplete rather than
+  being presented as an exact copy.
 
 ## Features
 
@@ -35,19 +40,20 @@ transfer. XactCopy treats bad media as the expected case:
   over damaged regions, best-effort *salvage* of partially readable blocks,
   configurable retry/back-off, and a *fragile-media* mode that treats a dying
   drive gently rather than pushing it over the edge.
-- **Bad-block scanning** — survey a drive or folder for unreadable sectors
-  without copying anything, in a precise or a fast parallel profile, and save the
+- **Readability assessment** — read a drive's allocated files or a selected
+  folder without creating a destination, record unreadable file ranges, and save the
   result as a **bad-range map** so later copies skip known-bad regions instead of
   re-reading them. An optional elevated raw-volume backend reads allocated file
   extents directly on local NTFS volumes and falls back safely when unsupported.
-- **Integrity verification** — verify copied data with SHA-256/512, either in
-  full or sampled for speed.
-- **Job Manager** — save copy/scan jobs, queue them, and review run history with
+- **Integrity verification** — full SHA-256 verification is the safe default;
+  sampled and unverified modes remain available as attended-only choices.
+- **Job Manager** — save copy/scan jobs in a signed, rotating catalog, queue
+  integrity-safe jobs for unattended execution, and review run history with
   per-run status and journal links.
 - **Crash recovery** — if XactCopy or the machine goes down mid-transfer, the
   next launch offers to resume the interrupted run.
 - **Explorer integration** — right-click any file, folder, or drive to *Copy with
-  XactCopy* or *Scan for Bad Blocks*, plus Open-with, Send-to, and Run-dialog
+  XactCopy* or *Assess Readable Files*, plus Open-with, Send-to, and Run-dialog
   entries.
 - **In-app updates** — checks GitHub for new releases, then downloads, verifies
   (SHA-256), and installs them in place.
@@ -73,8 +79,8 @@ file next to every asset so you can verify the download.
 
 1. Launch **XactCopy** and pick a **Source** and a **Destination**.
 2. Choose a **Mode**:
-   - **Copy** — move data from source to destination.
-   - **Scan Bad Blocks** — read the source and map unreadable regions (no
+   - **Verified Copy / Recovery** — copy data from source to destination.
+   - **Assess Readable Files** — read allocated source files and map unreadable regions (no
      destination needed).
 3. Adjust options if you like — the defaults are sensible — then press **Start**.
    Progress, throughput, ETA, and a live log update as it runs; **Pause** and
@@ -84,18 +90,22 @@ The main-window choices are per-run overrides. Use **Save defaults** when you
 want the reusable options to seed future runs; use a saved job when the mode,
 paths, and complete option set must be retained together.
 
-For a failing drive, the recommended recipe is **Scan Bad Blocks** first to build
-a bad-range map, then **Copy** with *Use bad-range map* and *Salvage* enabled so
-the copy spends its time on recoverable data.
+For an actively failing drive, copy the irreplaceable data first with **Recover
+Media** and **Fragile-media mode**. A full assessment reads the source once
+without rescuing data and can consume part of a dying device's remaining life.
+Use **Assess Readable Files** before repeated recovery passes only when the media
+is stable enough and the saved map will reduce later reads. A skip hint is
+trusted only after two matching observations; non-exact recovery output keeps
+its original extension and receives an adjacent `.recovery.json` manifest.
 
 ## Options at a glance
 
 | Control | Choices | Purpose |
 | --- | --- | --- |
-| **Mode** | Copy · Scan Bad Blocks | Move data, or just map bad regions |
-| **Engine** | Auto · Managed Rescue · Native Fast | Trade raw speed for damaged-media resilience |
-| **Overwrite** | Overwrite · Skip existing · Overwrite if newer · Ask | How existing destination files are handled |
-| **Verify** | None · Sampled · Full | Post-copy SHA-256/512 integrity check |
+| **Mode** | Verified Copy / Recovery · Assess Readable Files | Copy data, or assess allocated source files without a destination |
+| **Profile** | Verified Copy · Recover Media · Custom | Apply a coherent safe-copy or recovery preset, or use expert defaults |
+| **Conflict** | Overwrite · Skip existing · Overwrite if newer · Stop on conflict | How existing destination files are handled |
+| **Verify** | None · Sampled · Full | Post-copy SHA-256/512 integrity check; Full is the safe default |
 | **Salvage · Resume · Bad-range map · Adaptive buffer** | toggles | Core resilience behaviours |
 | **Continue on error · Skip known-bad · Wait for media · Fragile mode** | toggles | Error-handling behaviour |
 | **Buffer (MB) · Retries · Timeout (s)** | numbers | Performance and persistence tuning |

@@ -207,6 +207,53 @@ void verify_map(const std::optional<storage::BadRangeMap>& map, const std::strin
     }
 }
 
+void test_source_identity_fields() {
+    storage::JobJournal journal;
+    journal.JobId = "identity-journal";
+    storage::JournalFileEntry journal_entry;
+    journal_entry.RelativePath = "same-metadata.bin";
+    journal_entry.SourceChangeUtcTicks = 638123456789000000LL;
+    journal_entry.SourceFileIndex = 123456;
+    journal_entry.SourceVolumeSerial = 987654;
+    journal.Files.set("same-metadata.bin", journal_entry);
+
+    json::Writer journal_writer(true);
+    journal.to_json(journal_writer);
+    std::string journal_payload = journal_writer.take();
+    check(journal_payload.find("\"SourceFileIndex\": 123456") != std::string::npos,
+          "identity fields: journal file index serialized");
+    check(journal_payload.find("\"SourceVolumeSerial\": 987654") != std::string::npos,
+          "identity fields: journal volume serial serialized");
+    check(journal_payload.find("\"SourceChangeUtcTicks\": 638123456789000000") !=
+              std::string::npos,
+          "identity fields: journal change time serialized");
+    storage::JobJournal journal_round_trip = storage::JobJournal::from_json(json::parse(journal_payload));
+    const auto* loaded_journal_entry = journal_round_trip.Files.find("same-metadata.bin");
+    check(loaded_journal_entry != nullptr &&
+              loaded_journal_entry->SourceChangeUtcTicks == 638123456789000000LL &&
+              loaded_journal_entry->SourceFileIndex == 123456 &&
+              loaded_journal_entry->SourceVolumeSerial == 987654,
+          "identity fields: journal round-trip preserves identity and change time");
+
+    storage::BadRangeMap map;
+    storage::BadRangeMapFileEntry map_entry;
+    map_entry.RelativePath = "same-metadata.bin";
+    map_entry.SourceFileIndex = 123456;
+    map_entry.SourceVolumeSerial = 987654;
+    map_entry.BadRanges.push_back({0, 4096});
+    map.Files.set("same-metadata.bin", map_entry);
+    std::string map_payload = storage::BadRangeMapStore::serialize_map(map);
+    check(map_payload.find("\"SourceFileIndex\": 123456") != std::string::npos,
+          "identity fields: bad-range map file index serialized");
+    check(map_payload.find("\"SourceVolumeSerial\": 987654") != std::string::npos,
+          "identity fields: bad-range map volume serial serialized");
+    storage::BadRangeMap map_round_trip = storage::BadRangeMap::from_json(json::parse(map_payload));
+    const auto* loaded_map_entry = map_round_trip.Files.find("same-metadata.bin");
+    check(loaded_map_entry != nullptr && loaded_map_entry->SourceFileIndex == 123456 &&
+              loaded_map_entry->SourceVolumeSerial == 987654,
+          "identity fields: bad-range map round-trip preserves identity");
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -332,7 +379,11 @@ storage::JobJournal build_golden_journal() {
 
 bool entries_equivalent(const storage::JournalFileEntry& a, const storage::JournalFileEntry& b) {
     if (a.RelativePath != b.RelativePath || a.SourceLength != b.SourceLength ||
-        a.SourceLastWriteUtcTicks != b.SourceLastWriteUtcTicks || a.BytesCopied != b.BytesCopied ||
+        a.SourceLastWriteUtcTicks != b.SourceLastWriteUtcTicks ||
+        a.SourceFileIndex != b.SourceFileIndex ||
+        a.SourceVolumeSerial != b.SourceVolumeSerial ||
+        a.SourceChangeUtcTicks != b.SourceChangeUtcTicks ||
+        a.BytesCopied != b.BytesCopied ||
         a.State != b.State || a.LastError != b.LastError || a.DoNotRetry != b.DoNotRetry ||
         a.LastRescuePass != b.LastRescuePass ||
         a.RecoveredRanges.size() != b.RecoveredRanges.size() ||
@@ -449,6 +500,82 @@ void test_storage_goldens(const std::string& golden_dir) {
     }
 }
 
+void test_fsutil_bounded_reads(const std::wstring& work_dir) {
+    std::printf("--- filesystem helpers: durable atomic write + bounded read ---\n");
+    storage::fsutil::create_directories(work_dir);
+    const std::wstring path = work_dir + L"\\bounded-read.bin";
+    const std::string payload = "abcd";
+    check(storage::fsutil::write_atomic_bytes(path, payload),
+          "fsutil: write-through atomic file is published");
+
+    SetLastError(ERROR_SUCCESS);
+    auto rejected = storage::fsutil::read_all_bytes(path, payload.size() - 1);
+    const DWORD size_error = GetLastError();
+    check(!rejected.has_value() && size_error == ERROR_FILE_TOO_LARGE,
+          "fsutil: bounded read rejects an oversized file with a stable error");
+
+    auto accepted = storage::fsutil::read_all_bytes(path, payload.size());
+    check(accepted.has_value() &&
+              std::string(reinterpret_cast<const char*>(accepted->data()), accepted->size()) ==
+                  payload,
+          "fsutil: bounded read accepts the exact configured limit");
+    storage::fsutil::delete_file(path);
+}
+
+void test_hmac_key_persistence() {
+    std::printf("--- authentication keys: migration and corruption safety ---\n");
+    const std::wstring security_root =
+        storage::fsutil::local_app_data() + L"\\XactCopy\\security";
+    storage::fsutil::create_directories(security_root);
+
+    const std::wstring suffix = storage::fsutil::random_temp_suffix().substr(0, 16);
+    const std::wstring migration_name = L"test-migrate-" + suffix + L".key";
+    const std::wstring migration_path = security_root + L"\\" + migration_name;
+    std::vector<unsigned char> raw_key(32);
+    for (std::size_t i = 0; i < raw_key.size(); ++i) {
+        raw_key[i] = static_cast<unsigned char>(i + 1);
+    }
+    check(storage::fsutil::write_file_raw(migration_path, raw_key.data(), raw_key.size(),
+                                          true, true),
+          "key cache: legacy raw key fixture is durable");
+    storage::detail::HmacKeyCache migration_cache(migration_name.c_str(), true);
+    auto loaded_key = migration_cache.get_or_create();
+    check(loaded_key == raw_key, "key cache: migration preserves the authentication key");
+    auto protected_key = storage::fsutil::read_all_bytes(migration_path, 1024 * 1024);
+    bool migration_valid = false;
+    if (protected_key.has_value() && protected_key->size() != raw_key.size()) {
+        try {
+            migration_valid = crypto::dpapi_unprotect(*protected_key) == raw_key;
+        } catch (const std::exception&) {
+            migration_valid = false;
+        }
+    }
+    check(migration_valid, "key cache: legacy raw key migrates to a valid DPAPI blob");
+    storage::fsutil::delete_file(migration_path);
+
+    const std::wstring invalid_name = L"test-invalid-" + suffix + L".key";
+    const std::wstring invalid_path = security_root + L"\\" + invalid_name;
+    const std::string invalid_payload = "not-a-valid-authentication-key";
+    check(storage::fsutil::write_file_raw(
+              invalid_path, reinterpret_cast<const unsigned char*>(invalid_payload.data()),
+              invalid_payload.size(), true, true),
+          "key cache: invalid existing key fixture is durable");
+    storage::detail::HmacKeyCache invalid_cache(invalid_name.c_str(), true);
+    bool refused_invalid = false;
+    try {
+        (void)invalid_cache.get_or_create();
+    } catch (const std::exception&) {
+        refused_invalid = true;
+    }
+    check(refused_invalid, "key cache: invalid existing key is refused instead of replaced");
+    auto preserved = storage::fsutil::read_all_bytes(invalid_path, 1024 * 1024);
+    check(preserved.has_value() &&
+              std::string(reinterpret_cast<const char*>(preserved->data()), preserved->size()) ==
+                  invalid_payload,
+          "key cache: refusal preserves the existing bytes for recovery");
+    storage::fsutil::delete_file(invalid_path);
+}
+
 // Journal snapshots are compressed above a size threshold. The container must
 // round-trip, small journals must stay plain JSON, and — the one that actually
 // matters for upgrades — a plain-JSON journal already on disk must still load.
@@ -522,6 +649,26 @@ void test_journal_compression(const std::wstring& work_dir) {
                       entry->RelativePath == "folder\\subfolder\\file-1234.bin",
                   "compression: entry contents and key-derived path are intact");
         }
+
+        std::wstring readable_path = work_dir + L"\\job-large-readable.json";
+        std::string export_error;
+        check(store.export_readable_json(path, readable_path, &export_error),
+              "compression: trusted container exports as readable JSON (" + export_error + ")");
+        auto readable = storage::fsutil::read_all_bytes(readable_path);
+        check(readable.has_value() && !readable->empty() && (*readable)[0] == '{',
+              "compression: exported journal begins with a JSON object");
+        if (readable.has_value()) {
+            try {
+                storage::JobJournal exported = storage::JobJournal::from_json(
+                    json::parse(std::string(reinterpret_cast<const char*>(readable->data()),
+                                            readable->size())));
+                check(exported.JobId == "large" && exported.Files.size() == 4000,
+                      "compression: readable export preserves the trusted journal");
+            } catch (const std::exception& ex) {
+                check(false, "compression: readable export parses (" + std::string(ex.what()) + ")");
+            }
+        }
+        storage::fsutil::delete_file(readable_path);
         storage::JobJournalStore::remove_journal_set(path);
     }
 
@@ -645,8 +792,10 @@ void test_native_store_roundtrip(const std::wstring& work_dir) {
     std::wstring map_path = work_dir + L"\\rt-map.json";
 
     storage::JobJournalStore journal_store;
-    journal_store.save(journal_path, build_journal_v1());
-    journal_store.save(journal_path, build_journal_v2());
+    check(journal_store.save(journal_path, build_journal_v1()),
+          "native journal first save commits both durable sets");
+    check(journal_store.save(journal_path, build_journal_v2()),
+          "native journal second save commits both durable sets");
     verify_journal(journal_store.load(journal_path), "native-roundtrip");
 
     auto records = journal_store.read_ledger(journal_path);
@@ -657,8 +806,10 @@ void test_native_store_roundtrip(const std::wstring& work_dir) {
     }
 
     storage::BadRangeMapStore map_store;
-    map_store.save(map_path, build_map_v1());
-    map_store.save(map_path, build_map_v2());
+    check(map_store.save(map_path, build_map_v1()),
+          "native bad-range map first save commits both durable sets");
+    check(map_store.save(map_path, build_map_v2()),
+          "native bad-range map second save commits both durable sets");
     verify_map(map_store.load(map_path), "native-roundtrip");
 
     // Tamper: overwrite primaries with parseable-but-wrong content; trusted
@@ -682,6 +833,58 @@ void test_native_store_roundtrip(const std::wstring& work_dir) {
     check(recovered_map.has_value() && recovered_map->SourceIdentity != "TAMPERED",
           "native tamper: map fell back to signed snapshot");
     verify_map_v1(recovered_map, "native-tamper");
+
+    // A parseable journal that is not named by an existing valid ledger must
+    // never be accepted as a legacy downgrade.
+    const std::wstring downgrade_path = work_dir + L"\\downgrade-journal.json";
+    storage::JobJournalStore downgrade_store;
+    check(downgrade_store.save(downgrade_path, build_journal_v1()),
+          "journal downgrade fixture is durably saved");
+    const std::wstring downgrade_mirror = storage::detail::build_mirror_path(
+        downgrade_path, L"journals-mirror", L"journal");
+    for (const std::wstring& base : {downgrade_path, downgrade_mirror}) {
+        storage::fsutil::delete_file(base);
+        for (int generation = 1;
+             generation <= storage::JobJournalStore::BackupGenerationCount; ++generation) {
+            storage::fsutil::delete_file(storage::detail::backup_path(base, generation));
+        }
+    }
+    json::Writer downgrade_json(true);
+    tampered_journal.to_json(downgrade_json);
+    storage::fsutil::write_atomic_bytes(downgrade_path, downgrade_json.take());
+    check(!downgrade_store.load(downgrade_path).has_value(),
+          "journal refuses an untrusted parseable snapshot when a valid ledger exists");
+    storage::fsutil::delete_file(storage::JobJournalStore::ledger_path(downgrade_path));
+    storage::fsutil::delete_file(storage::JobJournalStore::ledger_path(downgrade_mirror));
+    check(!downgrade_store.load(downgrade_path).has_value(),
+          "journal trust anchors prevent downgrade after ledger loss");
+    storage::JobJournalStore::remove_journal_set(downgrade_path);
+
+    // A restart repairs a partial trailing ledger frame before appending the
+    // next checkpoint, keeping both trust chains readable.
+    const std::wstring repair_path = work_dir + L"\\repair-journal.json";
+    {
+        storage::JobJournalStore writer;
+        check(writer.save(repair_path, build_journal_v1()),
+              "ledger repair fixture first checkpoint saves");
+        check(writer.save(repair_path, build_journal_v2()),
+              "ledger repair fixture second checkpoint saves");
+    }
+    const unsigned char torn_frame[] = {0x4c, 0x4a, 0x43};
+    HANDLE torn = CreateFileW(storage::JobJournalStore::ledger_path(repair_path).c_str(),
+                              FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (torn != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(torn, torn_frame, sizeof(torn_frame), &written, nullptr);
+        CloseHandle(torn);
+    }
+    storage::JobJournalStore repaired_store;
+    check(repaired_store.save(repair_path, build_journal_v2()),
+          "journal save repairs a torn trailing ledger frame after restart");
+    check(repaired_store.read_ledger(repair_path).size() == 3,
+          "repaired primary ledger retains its full authenticated chain");
+    storage::JobJournalStore::remove_journal_set(repair_path);
 }
 
 // --- Job catalog round-trip ------------------------------------------------
@@ -822,15 +1025,69 @@ void verify_canonical_catalog(const storage::JobCatalog& catalog, const std::str
 void test_catalog_roundtrip(const std::wstring& work_dir) {
     std::printf("--- job catalog: canonical content round-trip ---\n");
     storage::fsutil::create_directories(work_dir);
+    const std::string existing_media_identity =
+        storage::fsutil::resolve_media_identity(work_dir);
+    const std::string future_child_media_identity =
+        storage::fsutil::resolve_media_identity(
+            work_dir + L"\\not-created\\destination");
+    check(!existing_media_identity.empty() &&
+              existing_media_identity == future_child_media_identity,
+          "media identity resolves a future destination through its nearest existing ancestor");
     std::wstring path = work_dir + L"\\rt-catalog.json";
 
     storage::JobCatalogStore store(path);
-    // save() normalizes in place, so it takes a mutable reference.
     storage::JobCatalog catalog = build_canonical_catalog();
+    json::Writer legacy_writer(/*indented*/ true);
+    catalog.to_json(legacy_writer);
+    check(storage::fsutil::write_atomic_bytes(path, legacy_writer.take()),
+          "catalog migration: seed a legacy plain catalog");
+    verify_canonical_catalog(store.load(), "catalog legacy migration");
+
+    // save() normalizes in place, so it takes a mutable reference and upgrades
+    // the legacy payload to the signed snapshot envelope.
     check(store.save(catalog), "catalog round-trip: save");
     verify_canonical_catalog(store.load(), "catalog round-trip");
 
+    auto primary_bytes = storage::fsutil::read_all_bytes(path);
+    bool signed_envelope = false;
+    std::string primary_text;
+    if (primary_bytes.has_value()) {
+        primary_text.assign(reinterpret_cast<const char*>(primary_bytes->data()),
+                            primary_bytes->size());
+        try {
+            json::Value root = json::parse(primary_text);
+            const json::Object* object = root.as_object();
+            signed_envelope = object != nullptr &&
+                              object->find("EnvelopeSchemaVersion") != nullptr &&
+                              object->find("PayloadSha256") != nullptr &&
+                              object->find("Signature") != nullptr &&
+                              object->find("Payload") != nullptr;
+        } catch (const std::exception&) {
+        }
+    }
+    check(signed_envelope, "catalog round-trip: saved jobs use a signed envelope");
+
+    const std::string original_id = "cat-job-0001";
+    const std::string tampered_id = "cat-job-9999";
+    std::size_t id_position = primary_text.find(original_id);
+    if (id_position != std::string::npos) {
+        primary_text.replace(id_position, original_id.size(), tampered_id);
+    }
+    check(id_position != std::string::npos &&
+              storage::fsutil::write_atomic_bytes(path, primary_text),
+          "catalog tamper fixture rewrites the primary payload without resigning");
+    storage::JobCatalog recovered = store.load();
+    check(recovered.Jobs.size() == 1 && recovered.Jobs[0].JobId == original_id,
+          "catalog tamper falls back to the trusted mirror snapshot");
+
     storage::fsutil::delete_file(path);
+    storage::fsutil::delete_file(store.mirror_path());
+    for (int generation = 1;
+         generation <= storage::JobCatalogStore::BackupGenerationCount; ++generation) {
+        storage::fsutil::delete_file(storage::detail::backup_path(path, generation));
+        storage::fsutil::delete_file(
+            storage::detail::backup_path(store.mirror_path(), generation));
+    }
 }
 
 void test_main_window_run_defaults(const std::wstring& work_dir) {
@@ -859,17 +1116,23 @@ void test_main_window_run_defaults(const std::wstring& work_dir) {
     options.FragileMediaMode = true;
     options.VerifyAfterCopy = true;
     options.VerificationModeValue = models::VerificationMode::Sampled;
+    options.ScanPerformanceProfileValue = models::ScanPerformanceProfile::Precise;
+    options.UseExperimentalRawDiskScan = false;
+    options.UpdateBadRangeMapFromRun = true;
     options.BufferSizeBytes = 32 * 1024 * 1024;
     options.MaxRetries = 7;
     options.OperationTimeout = time::TimeSpan::from_seconds(45);
-    settings.save_run_defaults(options);
+    check(settings.save_run_defaults(options), "run defaults: scan defaults save succeeds");
 
     ui::AppSettings loaded(path);
     models::CopyJobOptions defaults = loaded.build_default_options();
-    check(defaults.OverwritePolicyValue == models::OverwritePolicy::Ask,
-          "run defaults: overwrite policy persisted");
-    check(defaults.TransferEnginePolicyValue == models::TransferEnginePolicy::NativeFast,
-          "run defaults: transfer engine persisted");
+    check(defaults.OverwritePolicyValue == models::OverwritePolicy::Overwrite &&
+              defaults.TransferEnginePolicyValue == models::TransferEnginePolicy::Auto &&
+              defaults.VerificationModeValue == models::VerificationMode::Full,
+          "run defaults: scan save does not overwrite copy-only defaults");
+    check(defaults.ScanPerformanceProfileValue == models::ScanPerformanceProfile::Precise &&
+              !defaults.UseExperimentalRawDiskScan && defaults.UpdateBadRangeMapFromRun,
+          "run defaults: scan profile, backend, and findings policy persist together");
     check(!defaults.ResumeFromJournal && !defaults.SalvageUnreadableBlocks &&
               !defaults.ContinueOnFileError,
           "run defaults: safety checkboxes persisted");
@@ -879,24 +1142,40 @@ void test_main_window_run_defaults(const std::wstring& work_dir) {
               defaults.FragileMediaMode,
           "run defaults: tuning checkboxes persisted");
     check(defaults.VerifyAfterCopy &&
-              defaults.VerificationModeValue == models::VerificationMode::Sampled,
-          "run defaults: verification mode persisted");
+              defaults.VerificationModeValue == models::VerificationMode::Full,
+          "run defaults: scan save preserves the copy verification policy");
     check(defaults.BufferSizeBytes == 32 * 1024 * 1024 && defaults.MaxRetries == 7 &&
               defaults.OperationTimeout.ticks == time::TimeSpan::from_seconds(45).ticks,
           "run defaults: numeric controls persisted");
-    check(loaded.get_bool("DefaultUseExperimentalRawDiskScan", false),
-          "run defaults: raw-disk default preserved");
-    check(!loaded.get_bool("DefaultUpdateBadRangeMapFromRun", true),
-          "run defaults: unrelated default preserved");
+    check(!loaded.get_bool("DefaultUseExperimentalRawDiskScan", true),
+          "run defaults: raw-disk scan backend persisted");
+    check(loaded.get_bool("DefaultUpdateBadRangeMapFromRun", false),
+          "run defaults: map findings policy persisted");
     check(loaded.get_string("KeepMe", "") == "untouched",
           "run defaults: unrelated settings preserved");
     check(loaded.get_string("OperationMode", "missing") == "missing" &&
               loaded.get_string("SourceRoot", "missing") == "missing",
           "run defaults: operation and paths are not globalized");
 
+    options.OperationMode = models::JobOperationMode::Copy;
+    options.SalvageUnreadableBlocks = true;
+    check(settings.save_run_defaults(options), "run defaults: copy defaults save succeeds");
+    ui::AppSettings copy_settings(path);
+    models::CopyJobOptions copy_defaults = copy_settings.build_default_options();
+    check(copy_defaults.OverwritePolicyValue == models::OverwritePolicy::Ask &&
+              copy_defaults.TransferEnginePolicyValue == models::TransferEnginePolicy::NativeFast,
+          "run defaults: copy conflict and transfer policies persist");
+    check(copy_defaults.SalvageUnreadableBlocks && copy_defaults.VerifyAfterCopy &&
+              copy_defaults.VerificationModeValue == models::VerificationMode::Sampled,
+          "run defaults: copy recovery and verification policies persist");
+    check(copy_defaults.ScanPerformanceProfileValue == models::ScanPerformanceProfile::Precise &&
+              !copy_defaults.UseExperimentalRawDiskScan,
+          "run defaults: copy save preserves scan-only defaults");
+
     options.VerifyAfterCopy = false;
     options.VerificationModeValue = models::VerificationMode::None;
-    settings.save_run_defaults(options);
+    check(settings.save_run_defaults(options),
+          "run defaults: disabled verification save succeeds");
     ui::AppSettings disabled_verification(path);
     models::CopyJobOptions disabled = disabled_verification.build_default_options();
     check(!disabled.VerifyAfterCopy &&
@@ -912,6 +1191,7 @@ int main(int argc, char** argv) {
     test_crypto_vectors();
     test_indented_writer_basics();
     test_ordered_file_map_scale();
+    test_source_identity_fields();
 
     std::string golden_dir = argc > 1 ? argv[1] : "tests/golden";
     test_storage_goldens(golden_dir);
@@ -920,6 +1200,8 @@ int main(int argc, char** argv) {
     GetTempPathW(MAX_PATH, temp_root);
     std::wstring work_dir = std::wstring(temp_root) + L"xactcopy-storage-test-" +
                             storage::fsutil::random_temp_suffix().substr(0, 12);
+    test_fsutil_bounded_reads(work_dir);
+    test_hmac_key_persistence();
     test_native_store_roundtrip(work_dir);
     test_journal_compression(work_dir);
     test_journal_maintenance(work_dir);

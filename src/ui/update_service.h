@@ -1,7 +1,5 @@
-// UpdateService (port of the check portion of XactCopy.UI UpdateService.vb):
-// fetches the latest GitHub release over WinHTTP and compares versions. The
-// download/apply/elevation flow is intentionally out of scope here — the UI
-// offers "open the release page" instead.
+// Fetches release metadata and packages over WinHTTP, validates bounded HTTPS
+// responses and SHA-256 metadata, and supplies the update dialog's apply flow.
 #pragma once
 
 #ifndef NOMINMAX
@@ -16,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -77,6 +76,12 @@ struct UpdateReleaseInfo {
 
 namespace update_detail {
 
+// Release packages are expected to be tens of megabytes. A generous ceiling
+// prevents a compromised or malformed release feed from exhausting the system
+// drive before checksum verification can reject the download.
+inline constexpr std::int64_t kMaximumUpdatePackageBytes =
+    2LL * 1024LL * 1024LL * 1024LL;
+
 // Mirrors ParseVersionSafe/NormalizeVersionText: strip a leading v/version,
 // keep the leading dotted-number run.
 inline AppVersion parse_version(const std::string& text) {
@@ -90,14 +95,15 @@ inline AppVersion parse_version(const std::string& text) {
     }
     AppVersion v;
     int part = 0;
-    int value = 0;
+    std::int64_t value = 0;
     bool has_digit = false;
+    bool overflowed = false;
     auto commit = [&] {
         switch (part) {
-            case 0: v.major = value; break;
-            case 1: v.minor = value; break;
-            case 2: v.build = value; break;
-            case 3: v.revision = value; break;
+            case 0: v.major = static_cast<int>(value); break;
+            case 1: v.minor = static_cast<int>(value); break;
+            case 2: v.build = static_cast<int>(value); break;
+            case 3: v.revision = static_cast<int>(value); break;
             default: break;
         }
         value = 0;
@@ -109,10 +115,15 @@ inline AppVersion parse_version(const std::string& text) {
             commit();
             if (part > 3) break;
         } else {
+            if (value > (std::numeric_limits<int>::max() - (c - '0')) / 10) {
+                overflowed = true;
+                break;
+            }
             value = value * 10 + (c - '0');
             has_digit = true;
         }
     }
+    if (overflowed) return AppVersion{};
     if (has_digit && part <= 3) commit();
     return v;
 }
@@ -161,10 +172,61 @@ inline bool ends_with(const std::string& s, const std::string& suffix) {
     return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+inline bool is_https_url(const std::wstring& url) {
+    if (url.empty()) return false;
+    URL_COMPONENTS components{};
+    components.dwStructSize = sizeof(components);
+    components.dwSchemeLength = static_cast<DWORD>(-1);
+    components.dwHostNameLength = static_cast<DWORD>(-1);
+    components.dwUserNameLength = static_cast<DWORD>(-1);
+    components.dwPasswordLength = static_cast<DWORD>(-1);
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &components)) return false;
+    return components.nScheme == INTERNET_SCHEME_HTTPS && components.dwHostNameLength > 0 &&
+           components.dwUserNameLength == 0 && components.dwPasswordLength == 0;
+}
+
+inline bool is_https_url(const std::string& url) {
+    return is_https_url(storage::fsutil::utf8_to_wide(url));
+}
+
 // File name after the last '/' or '\\'.
 inline std::string base_name(const std::string& path) {
     std::size_t slash = path.find_last_of("/\\");
     return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+inline bool is_safe_asset_name(const std::string& name) {
+    if (name.empty() || name.size() > 240 || base_name(name) != name ||
+        name == "." || name == "..") {
+        return false;
+    }
+    for (unsigned char c : name) {
+        if (c < 0x20 || c == ':' || c == '"' || c == '<' || c == '>' || c == '|') return false;
+    }
+    return true;
+}
+
+inline std::string dotted_version(const AppVersion& version) {
+    return std::to_string(std::max(0, version.major)) + "." +
+           std::to_string(std::max(0, version.minor)) + "." +
+           std::to_string(std::max(0, version.build)) + "." +
+           std::to_string(std::max(0, version.revision));
+}
+
+// Accept only the documented release package stems for the selected release.
+// Optional "v" variants keep existing published assets compatible without
+// allowing a merely similar asset name to win the install score.
+inline bool is_eligible_package_name(const std::string& name, const AppVersion& version,
+                                     const std::string& arch) {
+    const std::string lower = to_lower_ascii(name);
+    const std::string release = dotted_version(version);
+    const std::array<std::string, 4> allowed{
+        "xactcopysetup-v" + release + "-win-" + arch + ".exe",
+        "xactcopysetup-" + release + "-win-" + arch + ".exe",
+        "xactcopy-v" + release + "-win-" + arch + ".zip",
+        "xactcopy-" + release + "-win-" + arch + ".zip",
+    };
+    return std::find(allowed.begin(), allowed.end(), lower) != allowed.end();
 }
 
 // Mirrors IsChecksumAssetName.
@@ -267,16 +329,27 @@ inline std::string parse_sha256_from_checksum_text(const std::string& text,
 
 // WinHTTP GET returning the response body (empty optional on any failure).
 inline std::optional<std::string> https_get(const std::wstring& url,
-                                            const std::wstring& user_agent) {
+                                            const std::wstring& user_agent,
+                                            std::size_t maximum_bytes = 8 * 1024 * 1024) {
+    if (!is_https_url(url)) return std::nullopt;
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
     wchar_t host[256]{};
     wchar_t path[2048]{};
+    wchar_t extra[2048]{};
     uc.lpszHostName = host;
     uc.dwHostNameLength = std::size(host);
     uc.lpszUrlPath = path;
     uc.dwUrlPathLength = std::size(path);
+    uc.lpszExtraInfo = extra;
+    uc.dwExtraInfoLength = std::size(extra);
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return std::nullopt;
+    std::wstring request_target(path, uc.dwUrlPathLength);
+    request_target.append(extra, uc.dwExtraInfoLength);
+    if (std::size_t fragment = request_target.find(L'#'); fragment != std::wstring::npos) {
+        request_target.erase(fragment);
+    }
+    if (request_target.empty()) request_target = L"/";
 
     HINTERNET session = WinHttpOpen(user_agent.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -287,10 +360,14 @@ inline std::optional<std::string> https_get(const std::wstring& url,
     std::optional<std::string> result;
     HINTERNET connect = WinHttpConnect(session, host, uc.nPort, 0);
     if (connect != nullptr) {
-        DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-        HINTERNET request = WinHttpOpenRequest(connect, L"GET", path, nullptr, WINHTTP_NO_REFERER,
+        DWORD flags = WINHTTP_FLAG_SECURE;
+        HINTERNET request = WinHttpOpenRequest(connect, L"GET", request_target.c_str(), nullptr,
+                                               WINHTTP_NO_REFERER,
                                                WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
         if (request != nullptr) {
+            DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+            WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &redirect_policy,
+                             sizeof(redirect_policy));
             static const wchar_t* accept = L"Accept: application/vnd.github+json\r\n";
             WinHttpAddRequestHeaders(request, accept, static_cast<DWORD>(-1),
                                      WINHTTP_ADDREQ_FLAG_ADD);
@@ -305,16 +382,28 @@ inline std::optional<std::string> https_get(const std::wstring& url,
                                     WINHTTP_NO_HEADER_INDEX);
                 if (status == 200) {
                     std::string body;
-                    DWORD available = 0;
-                    while (WinHttpQueryDataAvailable(request, &available) && available > 0) {
+                    bool complete = true;
+                    for (;;) {
+                        DWORD available = 0;
+                        if (!WinHttpQueryDataAvailable(request, &available)) {
+                            complete = false;
+                            break;
+                        }
+                        if (available == 0) break;
+                        if (body.size() > maximum_bytes ||
+                            available > maximum_bytes - body.size()) {
+                            complete = false;
+                            break;
+                        }
                         std::vector<char> chunk(available);
                         DWORD read = 0;
                         if (!WinHttpReadData(request, chunk.data(), available, &read) || read == 0) {
+                            complete = false;
                             break;
                         }
                         body.append(chunk.data(), read);
                     }
-                    result = std::move(body);
+                    if (complete) result = std::move(body);
                 }
             }
             WinHttpCloseHandle(request);
@@ -336,7 +425,7 @@ public:
         return latest.compare(current) > 0;
     }
 
-    // Mirrors SelectBestAsset: prefer Windows + this arch + zip/exe.
+    // Prefer the exact documented installer over the exact portable package.
     static const UpdateAssetInfo* select_best_asset(const UpdateReleaseInfo& release) {
         const UpdateAssetInfo* best = nullptr;
         int best_score = -1;
@@ -344,11 +433,18 @@ public:
         for (const auto& asset : release.assets) {
             std::string lower = asset.name;
             for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            int score = 0;
-            if (lower.find("win") != std::string::npos) score += 2;
-            if (lower.find(arch) != std::string::npos) score += 3;
-            if (lower.size() >= 4 && lower.compare(lower.size() - 4, 4, ".zip") == 0) score += 3;
-            else if (lower.size() >= 4 && lower.compare(lower.size() - 4, 4, ".exe") == 0) score += 2;
+            const bool zip = update_detail::ends_with(lower, ".zip");
+            const bool exe = update_detail::ends_with(lower, ".exe");
+            if ((!zip && !exe) || update_detail::is_checksum_asset_name(lower) ||
+                !update_detail::is_safe_asset_name(asset.name) ||
+                !update_detail::is_eligible_package_name(asset.name, release.version, arch) ||
+                !update_detail::is_https_url(asset.download_url) ||
+                asset.size <= 0 ||
+                asset.size > update_detail::kMaximumUpdatePackageBytes) {
+                continue;
+            }
+            int score = exe ? 20 : 10;
+            if (exe) score += 10;
             if (score > best_score) {
                 best_score = score;
                 best = &asset;
@@ -368,7 +464,8 @@ public:
         // Rank candidate checksum assets, best first.
         std::vector<const UpdateAssetInfo*> candidates;
         for (const auto& c : release.assets) {
-            if (!c.download_url.empty() && update_detail::is_checksum_asset_name(c.name)) {
+            if (update_detail::is_https_url(c.download_url) &&
+                update_detail::is_checksum_asset_name(c.name)) {
                 candidates.push_back(&c);
             }
         }
@@ -379,7 +476,7 @@ public:
                          });
         for (const UpdateAssetInfo* c : candidates) {
             auto text = update_detail::https_get(storage::fsutil::utf8_to_wide(c->download_url),
-                                                 kNativeUserAgent);
+                                                 kNativeUserAgent, 1024 * 1024);
             if (!text.has_value()) continue;
             std::string parsed = update_detail::parse_sha256_from_checksum_text(*text, asset.name);
             if (!parsed.empty()) return parsed;
@@ -408,29 +505,49 @@ public:
                                       const std::function<void(const DownloadProgress&)>& on_progress,
                                       const std::function<bool()>& cancelled) {
         std::wstring url = storage::fsutil::utf8_to_wide(download_url);
+        if (!update_detail::is_https_url(url) || expected_total <= 0 ||
+            expected_total > update_detail::kMaximumUpdatePackageBytes) {
+            return std::string();
+        }
         URL_COMPONENTS uc{};
         uc.dwStructSize = sizeof(uc);
         wchar_t host[256]{};
         wchar_t path[4096]{};
+        wchar_t extra[4096]{};
         uc.lpszHostName = host;
         uc.dwHostNameLength = std::size(host);
         uc.lpszUrlPath = path;
         uc.dwUrlPathLength = std::size(path);
+        uc.lpszExtraInfo = extra;
+        uc.dwExtraInfoLength = std::size(extra);
         if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return std::string();
+        std::wstring request_target(path, uc.dwUrlPathLength);
+        request_target.append(extra, uc.dwExtraInfoLength);
+        if (std::size_t fragment = request_target.find(L'#'); fragment != std::wstring::npos) {
+            request_target.erase(fragment);
+        }
+        if (request_target.empty()) request_target = L"/";
 
         HINTERNET session = WinHttpOpen(kNativeUserAgent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (session == nullptr) return std::string();
-        DWORD to = 600000;
+        // Synchronous WinHTTP calls cannot observe the dialog's cancel flag
+        // while blocked inside a receive. Keep the per-read bound finite so
+        // Cancel/close cannot wait for the former ten-minute timeout.
+        DWORD to = 30000;
         WinHttpSetTimeouts(session, 20000, 20000, to, to);
 
         std::string digest;
         HINTERNET connect = WinHttpConnect(session, host, uc.nPort, 0);
         if (connect != nullptr) {
-            DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-            HINTERNET request = WinHttpOpenRequest(connect, L"GET", path, nullptr, WINHTTP_NO_REFERER,
+            DWORD flags = WINHTTP_FLAG_SECURE;
+            HINTERNET request = WinHttpOpenRequest(connect, L"GET", request_target.c_str(), nullptr,
+                                                   WINHTTP_NO_REFERER,
                                                    WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
             if (request != nullptr) {
+                DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+                WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &redirect_policy,
+                                 sizeof(redirect_policy));
                 if (WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                        WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
                     WinHttpReceiveResponse(request, nullptr)) {
@@ -466,12 +583,24 @@ private:
         ULONGLONG start = GetTickCount64();
         std::vector<char> buffer(64 * 1024);
         bool ok = true;
-        DWORD available = 0;
-        while (WinHttpQueryDataAvailable(request, &available) && available > 0) {
+        for (;;) {
             if (cancelled && cancelled()) { ok = false; break; }
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(request, &available)) {
+                ok = false;
+                break;
+            }
+            if (available == 0) break;
             DWORD want = std::min<DWORD>(available, static_cast<DWORD>(buffer.size()));
             DWORD read = 0;
-            if (!WinHttpReadData(request, buffer.data(), want, &read) || read == 0) break;
+            if (!WinHttpReadData(request, buffer.data(), want, &read) || read == 0) {
+                ok = false;
+                break;
+            }
+            if (static_cast<std::int64_t>(read) > expected_total - received) {
+                ok = false;
+                break;
+            }
             hash.update(reinterpret_cast<const unsigned char*>(buffer.data()), read);
             DWORD written = 0;
             if (!WriteFile(file, buffer.data(), read, &written, nullptr) || written != read) {
@@ -488,8 +617,9 @@ private:
                 on_progress(p);
             }
         }
+        if (ok && !FlushFileBuffers(file)) ok = false;
         CloseHandle(file);
-        if (!ok) {
+        if (!ok || (expected_total > 0 && received != expected_total)) {
             DeleteFileW(destination.c_str());
             return std::string();
         }
@@ -503,6 +633,10 @@ public:
         UpdateReleaseInfo info;
         if (release_url.empty()) {
             info.error = "Update release URL is not configured.";
+            return info;
+        }
+        if (!update_detail::is_https_url(release_url)) {
+            info.error = "Update release URL must use HTTPS.";
             return info;
         }
         std::wstring url = storage::fsutil::utf8_to_wide(release_url);
@@ -521,7 +655,8 @@ public:
             info.tag_name = update_detail::json_string(obj, "tag_name");
             info.title = update_detail::json_string(obj, "name");
             info.notes = update_detail::json_string(obj, "body");
-            info.html_url = update_detail::json_string(obj, "html_url");
+            std::string html_url = update_detail::json_string(obj, "html_url");
+            if (update_detail::is_https_url(html_url)) info.html_url = std::move(html_url);
             info.version = update_detail::parse_version(info.tag_name);
             if (const json::Value* assets = obj->find("assets");
                 assets != nullptr && assets->as_array() != nullptr) {
@@ -536,7 +671,9 @@ public:
                     }
                     asset.expected_sha256_hex =
                         update_detail::parse_sha256_candidate(update_detail::json_string(a, "digest"));
-                    if (!asset.name.empty() && !asset.download_url.empty()) {
+                    if (update_detail::is_safe_asset_name(asset.name) && asset.size > 0 &&
+                        asset.size <= update_detail::kMaximumUpdatePackageBytes &&
+                        update_detail::is_https_url(asset.download_url)) {
                         info.assets.push_back(std::move(asset));
                     }
                 }

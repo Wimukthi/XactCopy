@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -49,14 +50,27 @@ struct QueuedJobWorkItem {
 
 class JobManagerService {
 public:
+    std::function<void(const std::string&)> on_persistence_warning;
+
     static constexpr std::int32_t MaximumRunHistory = 1000;
 
     explicit JobManagerService(std::wstring catalog_path = std::wstring())
         : store_(std::move(catalog_path)) {
-        catalog_ = store_.load();
+        try {
+            catalog_ = store_.load();
+            last_durable_catalog_ = catalog_;
+        } catch (const std::exception& ex) {
+            catalog_ = storage::JobCatalog{};
+            last_durable_catalog_ = catalog_;
+            load_warning_ =
+                "The saved-job catalog could not be authenticated or loaded: " +
+                std::string(ex.what()) +
+                " Saved jobs are unavailable and catalog changes will remain disabled until the storage problem is resolved.";
+        }
     }
 
     const storage::JobCatalogStore& store() const noexcept { return store_; }
+    const std::string& load_warning() const noexcept { return load_warning_; }
 
     std::vector<storage::ManagedJob> get_jobs() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -145,15 +159,14 @@ public:
 
         job->Name = trimmed_name;
         models::CopyJobOptions template_options = options;
-        template_options.ExpectedSourceIdentity.clear();
-        template_options.ExpectedDestinationIdentity.clear();
         template_options.ResumeJournalPathHint.clear();
         template_options.AllowJournalRootRemap = false;
         job->Options = std::move(template_options);
         job->UpdatedUtc = now_utc;
 
-        save_catalog_locked();
-        return *job;
+        storage::ManagedJob saved = *job;
+        if (!save_catalog_locked()) return std::nullopt;
+        return saved;
     }
 
     bool rename_job(const std::string& job_id, const std::string& new_name) {
@@ -165,8 +178,7 @@ public:
 
         job->Name = storage::catalog_detail::trim_copy(new_name);
         job->UpdatedUtc = DateTimeOffset::now_utc();
-        save_catalog_locked();
-        return true;
+        return save_catalog_locked();
     }
 
     std::optional<storage::ManagedJob> duplicate_job(const std::string& job_id, const std::string& new_name) {
@@ -185,7 +197,7 @@ public:
         duplicate.UpdatedUtc = now_utc;
 
         catalog_.Jobs.push_back(duplicate);
-        save_catalog_locked();
+        if (!save_catalog_locked()) return std::nullopt;
         return duplicate;
     }
 
@@ -206,8 +218,7 @@ public:
             return models::detail::equals_ignore_case(queued_id, job_id);
         });
 
-        save_catalog_locked();
-        return true;
+        return save_catalog_locked();
     }
 
     bool queue_job(const std::string& job_id, bool allow_duplicate = false,
@@ -239,8 +250,7 @@ public:
         entry.LastErrorMessage.clear();
 
         catalog_.QueueEntries.push_back(std::move(entry));
-        save_catalog_locked();
-        return true;
+        return save_catalog_locked();
     }
 
     bool remove_queued_job(const std::string& queue_entry_id_or_job_id) {
@@ -263,8 +273,7 @@ public:
             removed = catalog_.QueueEntries.size() != before;
         }
 
-        if (removed) save_catalog_locked();
-        return removed;
+        return removed && save_catalog_locked();
     }
 
     bool move_queue_entry(const std::string& queue_entry_id, QueueMoveDirection direction) {
@@ -297,8 +306,7 @@ public:
         catalog_.QueueEntries.erase(catalog_.QueueEntries.begin() + current_index);
         entry.LastUpdatedUtc = DateTimeOffset::now_utc();
         catalog_.QueueEntries.insert(catalog_.QueueEntries.begin() + target_index, std::move(entry));
-        save_catalog_locked();
-        return true;
+        return save_catalog_locked();
     }
 
     std::int32_t clear_queue() {
@@ -306,8 +314,7 @@ public:
         std::int32_t removed_count = static_cast<std::int32_t>(catalog_.QueueEntries.size());
         if (removed_count == 0) return 0;
         catalog_.QueueEntries.clear();
-        save_catalog_locked();
-        return removed_count;
+        return save_catalog_locked() ? removed_count : 0;
     }
 
     bool try_dequeue_next_job(QueuedJobWorkItem& work_item) {
@@ -317,6 +324,24 @@ public:
     bool try_dequeue_queued_entry(const std::string& queue_entry_id, QueuedJobWorkItem& work_item) {
         if (storage::catalog_detail::is_blank(queue_entry_id)) return false;
         return try_dequeue_internal(storage::catalog_detail::trim_copy(queue_entry_id), work_item);
+    }
+
+    // Records why an unattended entry was deferred without consuming it. A
+    // blocked item stays visible in the queue so the user can review/edit it;
+    // later safe entries are still eligible to run.
+    bool mark_queue_entry_blocked(const std::string& queue_entry_id,
+                                  const std::string& reason) {
+        if (storage::catalog_detail::is_blank(queue_entry_id)) return false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& entry : catalog_.QueueEntries) {
+            if (!models::detail::equals_ignore_case(entry.QueueEntryId, queue_entry_id)) continue;
+            const std::string message = "Automatic run blocked: " + reason + ".";
+            if (entry.LastErrorMessage == message) return false;
+            entry.LastErrorMessage = message;
+            entry.LastUpdatedUtc = DateTimeOffset::now_utc();
+            return save_catalog_locked();
+        }
+        return false;
     }
 
     std::optional<storage::ManagedJobRun> create_run_for_job(const std::string& job_id, const std::string& trigger,
@@ -332,7 +357,7 @@ public:
             job->JobId,
             storage::catalog_detail::is_blank(job->Name) ? std::string("Saved Job") : job->Name,
             job->Options, trigger, queue_entry_id, queue_attempt);
-        save_catalog_locked();
+        if (!save_catalog_locked()) return std::nullopt;
         return run;
     }
 
@@ -343,7 +368,7 @@ public:
                                                                                     : display_name;
         storage::ManagedJobRun run = create_run_locked(std::string(), resolved_name, options, trigger,
                                                        std::string(), 0);
-        save_catalog_locked();
+        if (!save_catalog_locked()) return storage::ManagedJobRun{};
         return run;
     }
 
@@ -390,13 +415,32 @@ public:
             run->Summary = "Cancelled by user.";
         } else if (result->Succeeded) {
             run->Status = storage::ManagedJobRunStatus::Completed;
-            run->Summary = "Completed: " + std::to_string(result->CompletedFiles) + "/" +
-                           std::to_string(result->TotalFiles) + " files" + format_result_speed_suffix(*result) + ".";
+            if (result->RecoveredFiles > 0) {
+                // A successful copy cannot contain recovered files; the engine
+                // reserves this successful shape for a completed read-only
+                // assessment whose findings include unreadable ranges.
+                run->Summary =
+                    "Assessment completed with findings: unreadable ranges in " +
+                    std::to_string(result->RecoveredFiles) + " of " +
+                    std::to_string(result->TotalFiles) + " files" +
+                    format_result_speed_suffix(*result) + ".";
+            } else {
+                run->Summary = "Completed: " + std::to_string(result->CompletedFiles) + "/" +
+                               std::to_string(result->TotalFiles) + " files" + format_result_speed_suffix(*result) +
+                               ((result->ErrorMessage.empty() && result->IntegrityNotice.empty() &&
+                                 result->MetadataNotice.empty())
+                                    ? "."
+                                    : " with notices.");
+            }
+        } else if (result->is_incomplete()) {
+            run->Status = storage::ManagedJobRunStatus::Incomplete;
+            run->Summary = "Incomplete: failed " + std::to_string(result->FailedFiles) +
+                           ", recovered " + std::to_string(result->RecoveredFiles) +
+                           ", skipped " + std::to_string(result->SkippedFiles) +
+                           format_result_speed_suffix(*result) + ".";
         } else {
             run->Status = storage::ManagedJobRunStatus::Failed;
-            run->Summary = "Completed with failures: failed " + std::to_string(result->FailedFiles) +
-                           ", recovered " + std::to_string(result->RecoveredFiles) +
-                           format_result_speed_suffix(*result) + ".";
+            run->Summary = "Failed" + format_result_speed_suffix(*result) + ".";
         }
 
         save_catalog_locked();
@@ -418,8 +462,7 @@ public:
                 run->FinishedUtc = DateTimeOffset::now_utc();
                 run->ErrorMessage = storage::catalog_detail::is_blank(reason) ? std::string("Run interrupted.") : reason;
                 run->Summary = run->ErrorMessage;
-                save_catalog_locked();
-                return true;
+                return save_catalog_locked();
             }
             default:
                 return false;
@@ -441,7 +484,7 @@ public:
                 ++count;
             }
         }
-        if (count > 0) save_catalog_locked();
+        if (count > 0 && !save_catalog_locked()) return 0;
         return count;
     }
 
@@ -454,8 +497,7 @@ public:
             return models::detail::equals_ignore_case(run.RunId, run_id);
         });
         bool removed = catalog_.Runs.size() != before;
-        if (removed) save_catalog_locked();
-        return removed;
+        return removed && save_catalog_locked();
     }
 
     std::int32_t clear_run_history(std::int32_t keep_latest = 0) {
@@ -465,8 +507,7 @@ public:
 
         std::int32_t removed = static_cast<std::int32_t>(catalog_.Runs.size() - safe_keep);
         catalog_.Runs.resize(safe_keep);
-        save_catalog_locked();
-        return removed;
+        return save_catalog_locked() ? removed : 0;
     }
 
     static std::string format_bytes(std::int64_t value) {
@@ -539,7 +580,7 @@ private:
             taken.LastAttemptUtc = now_utc;
             taken.LastUpdatedUtc = now_utc;
 
-            save_catalog_locked();
+            if (!save_catalog_locked()) return false;
 
             work_item.QueueEntryId = taken.QueueEntryId;
             work_item.Trigger = storage::catalog_detail::is_blank(taken.Trigger) ? std::string("queued") : taken.Trigger;
@@ -550,7 +591,7 @@ private:
             return true;
         }
 
-        if (mutated) save_catalog_locked();
+        if (mutated) (void)save_catalog_locked();
         return false;
     }
 
@@ -639,13 +680,29 @@ private:
 
         if (catalog_.QueueEntries.size() != sanitized.size()) {
             catalog_.QueueEntries = sanitized;
-            save_catalog_locked();
+            if (!save_catalog_locked()) return {};
         }
 
         return sanitized;
     }
 
-    void save_catalog_locked() { store_.save(catalog_); }
+    bool save_catalog_locked() {
+        if (load_warning_.empty() && store_.save(catalog_)) {
+            last_durable_catalog_ = catalog_;
+            return true;
+        }
+        // Do not let an in-memory queue mutation proceed after its durable
+        // record failed. Restoring the last in-memory durable snapshot avoids
+        // a second disk read that may fail for the same reason and prevents
+        // duplicate dequeue/run behavior after a restart.
+        catalog_ = last_durable_catalog_;
+        if (on_persistence_warning) {
+            on_persistence_warning(load_warning_.empty()
+                ? "Job Manager changes could not be saved; the last durable catalog was restored."
+                : load_warning_);
+        }
+        return false;
+    }
 
     static std::string format_result_speed_suffix(const models::CopyJobResult& result) {
         if (result.AverageBytesPerSecond <= 0) return std::string();
@@ -655,6 +712,8 @@ private:
     std::mutex mutex_;
     storage::JobCatalogStore store_;
     storage::JobCatalog catalog_;
+    storage::JobCatalog last_durable_catalog_;
+    std::string load_warning_;
 };
 
 } // namespace xact::ui

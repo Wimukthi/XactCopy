@@ -11,6 +11,7 @@
 #include <charconv>
 #include <cmath>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -62,12 +63,29 @@ public:
 
     std::int64_t as_int64(std::int64_t fallback = 0) const noexcept {
         if (kind_ == Kind::Int64) return int_;
-        if (kind_ == Kind::Double) return static_cast<std::int64_t>(double_);
+        if (kind_ == Kind::Double) {
+            // A direct floating-to-integer cast outside the destination range
+            // is undefined behavior. JSON written by XactCopy uses integer
+            // tokens for these fields; accept an exactly integral double only
+            // when it is safely representable.
+            constexpr double Int64Lower = -9223372036854775808.0;
+            constexpr double Int64UpperExclusive = 9223372036854775808.0;
+            if (!std::isfinite(double_) || double_ < Int64Lower ||
+                double_ >= Int64UpperExclusive || std::trunc(double_) != double_) {
+                return fallback;
+            }
+            return static_cast<std::int64_t>(double_);
+        }
         return fallback;
     }
 
     std::int32_t as_int32(std::int32_t fallback = 0) const noexcept {
-        return static_cast<std::int32_t>(as_int64(fallback));
+        const std::int64_t value = as_int64(fallback);
+        if (value < std::numeric_limits<std::int32_t>::min() ||
+            value > std::numeric_limits<std::int32_t>::max()) {
+            return fallback;
+        }
+        return static_cast<std::int32_t>(value);
     }
 
     double as_double(double fallback = 0.0) const noexcept {

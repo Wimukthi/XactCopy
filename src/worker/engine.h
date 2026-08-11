@@ -54,6 +54,316 @@ inline constexpr std::int32_t AdaptiveAutoParallelScanBufferBudget = 128 * 1024 
 
 enum class BufferPurpose { Copy, PreciseScan, FastHealthScan };
 
+// A copy is built beside the final path and published only after the bytes
+// have been verified and flushed. Keeping the temporary in the destination
+// directory makes MoveFileExW a same-volume replacement, so a failed read,
+// write, verification, or flush leaves the previous destination untouched.
+class DestinationStage {
+public:
+    DestinationStage(std::wstring final_path, const CancelContext& cancel)
+        : final_path_(std::move(final_path)), cancel_(&cancel) {
+        working_path_ = final_path_ + L".xactcopy-stage." + storage::fsutil::random_temp_suffix();
+        lock_path_ = working_path_ + L".lock";
+        lock_handle_ = CreateFileW(lock_path_.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                   FILE_SHARE_READ, nullptr, CREATE_NEW,
+                                   FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (lock_handle_ == INVALID_HANDLE_VALUE) {
+            throw IoError::from_win32("Unable to reserve destination staging path.", GetLastError());
+        }
+    }
+
+    ~DestinationStage() {
+        if (!committed_) {
+            SetFileAttributesW(working_path_.c_str(), FILE_ATTRIBUTE_NORMAL);
+            DeleteFileW(working_path_.c_str());
+        }
+        if (lock_handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(lock_handle_);
+            lock_handle_ = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    DestinationStage(const DestinationStage&) = delete;
+    DestinationStage& operator=(const DestinationStage&) = delete;
+
+    const std::wstring& working_path() const noexcept { return working_path_; }
+    const std::wstring& final_path() const noexcept { return final_path_; }
+
+    bool final_exists_now() const noexcept {
+        DWORD attributes = GetFileAttributesW(final_path_.c_str());
+        return attributes != INVALID_FILE_ATTRIBUTES &&
+               (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    }
+
+    DWORD post_publish_attribute_error() const noexcept {
+        return post_publish_attribute_error_;
+    }
+
+    const std::wstring& published_path() const noexcept { return published_path_; }
+
+    void make_writable() {
+        DWORD attributes = GetFileAttributesW(working_path_.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            throw IoError::from_win32("Unable to inspect staged destination attributes.", GetLastError());
+        }
+        if ((attributes & FILE_ATTRIBUTE_READONLY) == 0) return;
+        attributes &= ~FILE_ATTRIBUTE_READONLY;
+        if (attributes == 0) attributes = FILE_ATTRIBUTE_NORMAL;
+        if (!SetFileAttributesW(working_path_.c_str(), attributes)) {
+            throw IoError::from_win32("Unable to make staged destination writable.", GetLastError());
+        }
+    }
+
+    void clone_existing_if_present() {
+        DWORD attributes = GetFileAttributesW(final_path_.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            DWORD error = GetLastError();
+            if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return;
+            throw IoError::from_win32("Unable to inspect existing destination before staging.", error);
+        }
+        if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            throw IoError("Destination path is a directory, not a file.");
+        }
+
+        StageCopyState state{cancel_};
+        BOOL cancel_flag = FALSE;
+        BOOL ok = CopyFileExW(final_path_.c_str(), working_path_.c_str(),
+                              stage_copy_progress, &state, &cancel_flag,
+                              COPY_FILE_FAIL_IF_EXISTS);
+        if (!ok) {
+            if (cancel_->is_cancelled()) throw OperationCanceled{true};
+            if (cancel_->deadline_passed()) throw OperationCanceled{false};
+            throw IoError::from_win32("Unable to stage the existing destination.", GetLastError());
+        }
+        make_writable();
+    }
+
+    void commit() { commit_to(final_path_, true); }
+
+    std::wstring commit_recovered_sidecar() {
+        const std::wstring marker = L".xactcopy-recovered." +
+                                    storage::fsutil::random_temp_suffix();
+        const std::size_t separator = final_path_.find_last_of(L"\\/");
+        const std::size_t extension = final_path_.find_last_of(L'.');
+        const bool has_extension = extension != std::wstring::npos &&
+                                   (separator == std::wstring::npos || extension > separator + 1);
+        std::wstring sidecar = has_extension
+                                   ? final_path_.substr(0, extension) + marker +
+                                         final_path_.substr(extension)
+                                   : final_path_ + marker;
+        commit_to(sidecar, false);
+        return sidecar;
+    }
+
+private:
+    void commit_to(const std::wstring& publish_path, bool replace_existing) {
+        DWORD staged_attributes = GetFileAttributesW(working_path_.c_str());
+        if (staged_attributes == INVALID_FILE_ATTRIBUTES) {
+            throw IoError::from_win32("Unable to inspect staged destination before publish.",
+                                      GetLastError());
+        }
+        const bool staged_readonly = (staged_attributes & FILE_ATTRIBUTE_READONLY) != 0;
+
+        DWORD final_attributes = GetFileAttributesW(publish_path.c_str());
+        bool final_exists = final_attributes != INVALID_FILE_ATTRIBUTES &&
+                            (final_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+        if (!replace_existing && final_exists) {
+            throw IoError("Recovered-output sidecar already exists.");
+        }
+        if (!final_exists && final_attributes == INVALID_FILE_ATTRIBUTES) {
+            DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+                throw IoError::from_win32("Unable to inspect existing destination before publish.",
+                                          error);
+            }
+            final_attributes = FILE_ATTRIBUTE_NORMAL;
+        }
+        const bool final_readonly = final_exists &&
+                                    (final_attributes & FILE_ATTRIBUTE_READONLY) != 0;
+        bool published = false;
+
+        // READONLY is a final-file policy, not a staging policy. Windows can
+        // reject the durable flush or replacement while the bit is set, so
+        // clear it only across the flush/publish boundary and put the exact
+        // source attributes back after the atomic replacement.
+        try {
+            if (staged_readonly) {
+                DWORD writable_attributes = staged_attributes & ~FILE_ATTRIBUTE_READONLY;
+                if (writable_attributes == 0) writable_attributes = FILE_ATTRIBUTE_NORMAL;
+                if (!SetFileAttributesW(working_path_.c_str(), writable_attributes)) {
+                    throw IoError::from_win32("Unable to prepare read-only stage for publish.",
+                                              GetLastError());
+                }
+            }
+            flush_file_path(working_path_);
+
+            if (final_readonly) {
+                DWORD writable_attributes = final_attributes & ~FILE_ATTRIBUTE_READONLY;
+                if (writable_attributes == 0) writable_attributes = FILE_ATTRIBUTE_NORMAL;
+                if (!SetFileAttributesW(publish_path.c_str(), writable_attributes)) {
+                    throw IoError::from_win32("Unable to prepare read-only destination for publish.",
+                                              GetLastError());
+                }
+            }
+            DWORD move_flags = MOVEFILE_WRITE_THROUGH |
+                               (replace_existing ? MOVEFILE_REPLACE_EXISTING : 0);
+            if (!MoveFileExW(working_path_.c_str(), publish_path.c_str(), move_flags)) {
+                throw IoError::from_win32("Unable to publish staged destination.", GetLastError());
+            }
+            published = true;
+            committed_ = true;
+            published_path_ = publish_path;
+            wchar_t injected_attribute_failure[2]{};
+            const bool fail_attribute_restore_for_test =
+                GetEnvironmentVariableW(L"XACTCOPY_DEV_FAIL_POST_PUBLISH_ATTRIBUTES",
+                                        injected_attribute_failure,
+                                        static_cast<DWORD>(std::size(injected_attribute_failure))) > 0;
+            if (staged_readonly &&
+                (fail_attribute_restore_for_test ||
+                 !SetFileAttributesW(publish_path.c_str(), staged_attributes))) {
+                // Publication is already durable and cannot be rolled back by
+                // pretending this was a pre-commit failure. Surface the
+                // metadata problem separately while keeping the byte result.
+                post_publish_attribute_error_ = fail_attribute_restore_for_test
+                                                    ? ERROR_ACCESS_DENIED
+                                                    : GetLastError();
+            }
+        } catch (...) {
+            if (!published && final_readonly &&
+                GetFileAttributesW(publish_path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                SetFileAttributesW(publish_path.c_str(), final_attributes);
+            }
+            if (!published && staged_readonly &&
+                GetFileAttributesW(working_path_.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                SetFileAttributesW(working_path_.c_str(), staged_attributes);
+            }
+            throw;
+        }
+    }
+    struct StageCopyState {
+        const CancelContext* cancel;
+    };
+
+    static DWORD CALLBACK stage_copy_progress(
+        LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER,
+        DWORD, DWORD, HANDLE, HANDLE, LPVOID context) {
+        auto* state = static_cast<StageCopyState*>(context);
+        if (state != nullptr && state->cancel != nullptr &&
+            (state->cancel->is_cancelled() || state->cancel->deadline_passed())) {
+            return PROGRESS_CANCEL;
+        }
+        return PROGRESS_QUIET;
+    }
+
+    std::wstring final_path_;
+    std::wstring working_path_;
+    std::wstring lock_path_;
+    std::wstring published_path_;
+    DWORD post_publish_attribute_error_ = ERROR_SUCCESS;
+    const CancelContext* cancel_ = nullptr;
+    HANDLE lock_handle_ = INVALID_HANDLE_VALUE;
+    bool committed_ = false;
+};
+
+inline bool is_generated_stage_file_name(std::wstring_view name) {
+    constexpr std::wstring_view marker = L".xactcopy-stage.";
+    constexpr std::size_t suffix_length = 32;
+    const std::size_t marker_position = name.rfind(marker);
+    if (marker_position == std::wstring_view::npos ||
+        name.size() != marker_position + marker.size() + suffix_length) {
+        return false;
+    }
+    for (wchar_t ch : name.substr(marker_position + marker.size())) {
+        if (!((ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'f'))) return false;
+    }
+    return true;
+}
+
+// A process crash can leave a staged file beside a destination. Stages have a
+// per-file lock marker while an active copy owns them; cleanup only considers
+// the generated name, ignores recent files, and probes the file exclusively
+// before removing it. This keeps a concurrent job's live stage out of the
+// cleanup sweep while reclaiming abandoned work on the next run.
+inline void cleanup_abandoned_staging_files(
+    const std::wstring& destination_root,
+    const std::function<void(const std::string&)>& log = nullptr,
+    const CancelContext* cancel = nullptr) {
+    std::wstring normalized = storage::fsutil::get_full_path(destination_root);
+    if (normalized.empty()) return;
+
+    constexpr std::uint64_t stale_after_100ns = 60ULL * 60ULL * 10000000ULL;
+    FILETIME now_filetime{};
+    GetSystemTimeAsFileTime(&now_filetime);
+    const std::uint64_t now = (static_cast<std::uint64_t>(now_filetime.dwHighDateTime) << 32) |
+                              now_filetime.dwLowDateTime;
+
+    std::vector<std::wstring> pending{normalized};
+    while (!pending.empty()) {
+        std::wstring current = std::move(pending.back());
+        pending.pop_back();
+
+        std::wstring search = detail::trim_trailing_separators(current) + L"\\*";
+        WIN32_FIND_DATAW data{};
+        HANDLE find = FindFirstFileExW(search.c_str(), FindExInfoBasic, &data,
+                                       FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        if (find == INVALID_HANDLE_VALUE) continue;
+
+        do {
+            if (cancel != nullptr) {
+                try {
+                    cancel->throw_if_cancelled();
+                } catch (...) {
+                    FindClose(find);
+                    throw;
+                }
+            }
+            std::wstring name = data.cFileName;
+            if (name.empty() || name == L"." || name == L"..") continue;
+            std::wstring full = detail::trim_trailing_separators(current) + L"\\" + name;
+            bool is_directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            bool is_reparse = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+            if (is_directory) {
+                if (!is_reparse) pending.push_back(std::move(full));
+                continue;
+            }
+
+            // Only the exact 128-bit lowercase-hex suffix generated by
+            // DestinationTransaction is eligible. Merely containing the
+            // marker must never make an ordinary user file disposable.
+            if (!is_generated_stage_file_name(name)) continue;
+
+            const std::uint64_t written =
+                (static_cast<std::uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) |
+                data.ftLastWriteTime.dwLowDateTime;
+            if (written == 0 || now <= written || now - written < stale_after_100ns) continue;
+            std::wstring lock_path = full + L".lock";
+            if (GetFileAttributesW(lock_path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                // FILE_FLAG_DELETE_ON_CLOSE removes this marker on a normal
+                // process exit. If power loss left only the directory entry,
+                // an exclusive probe proves no live staging owner remains.
+                HANDLE lock_probe = CreateFileW(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                                0, nullptr, OPEN_EXISTING,
+                                                FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (lock_probe == INVALID_HANDLE_VALUE) continue;
+                CloseHandle(lock_probe);
+                SetFileAttributesW(lock_path.c_str(), FILE_ATTRIBUTE_NORMAL);
+                DeleteFileW(lock_path.c_str());
+            }
+
+            HANDLE probe = CreateFileW(full.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (probe == INVALID_HANDLE_VALUE) continue;
+            CloseHandle(probe);
+
+            SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
+            if (DeleteFileW(full.c_str()) && log) {
+                log("Removed abandoned destination stage: " + wide_to_utf8(full));
+            }
+        } while (FindNextFileW(find, &data));
+        FindClose(find);
+    }
+}
+
 struct BufferDecision {
     bool changed = false;
     std::int32_t previous_size = 0;
@@ -225,10 +535,28 @@ public:
         native_fallback_files_ = 0;
         created_directories_.clear();
         fragile_failure_timestamps_.clear();
+        integrity_warning_.clear();
+        metadata_notice_.clear();
+        source_enumeration_incomplete_ = false;
+        source_enumeration_error_.clear();
         raw_disk_scan_context_.reset();
         raw_scan_fallback_logged_paths_.clear();
         throttle_window_start_tick_ = 0;
         throttle_window_bytes_ = 0;
+        bytes_read_.store(0);
+        bytes_written_.store(0);
+        bytes_verified_.store(0);
+
+        if (options_.OperationMode == models::JobOperationMode::Copy) {
+            const models::VerificationMode verification = resolve_verification_mode();
+            if (verification == models::VerificationMode::None) {
+                add_integrity_warning(
+                    "Destination content verification was disabled for this attended run.");
+            } else if (verification == models::VerificationMode::Sampled) {
+                add_integrity_warning(
+                    "Only sampled destination verification was requested; corruption outside sampled ranges may be missed.");
+            }
+        }
 
         if (fault_injector_.has_value()) {
             emit_log("[DevFault] Enabled: " + fault_injector_->description());
@@ -241,9 +569,14 @@ public:
         initialize_media_identity_expectations(source_root, destination_root);
         wait_for_media_availability(source_root, destination_root, cancel);
         ensure_media_identity_integrity(source_root, destination_root, !scan_only, true);
+        validate_resolved_root_relationship(source_root, destination_root, scan_only);
+        emit_media_identity_snapshot();
         initialize_raw_disk_scan_context(scan_only, source_root);
         if (!scan_only) {
             storage::fsutil::create_directories(destination_root);
+            cleanup_abandoned_staging_files(
+                destination_root,
+                [this](const std::string& message) { emit_log(message); }, &cancel);
         }
 
         initialize_bad_range_map(source_root);
@@ -252,7 +585,21 @@ public:
         auto log_fn = [this](const std::string& text) { emit_log(text); };
         SourceScanResult scan = scan_source(source_root, options_.SelectedRelativePaths,
                                             options_.SymlinkHandling, options_.CopyEmptyDirectories, log_fn,
-                                            [&cancel] { return cancel.is_cancelled(); });
+                                            [&cancel] { return cancel.is_cancelled(); }, nullptr,
+                                            scan_only ? std::wstring() : destination_root);
+        if (!scan.complete) {
+            source_enumeration_incomplete_ = true;
+            source_enumeration_error_ = "Source enumeration was incomplete";
+            if (!scan.errors.empty()) {
+                source_enumeration_error_ += ": " + scan.errors.front();
+            }
+            emit_log("ERROR: " + source_enumeration_error_ + ".");
+            if (!options_.ContinueOnFileError) {
+                throw IoError(source_enumeration_error_ + ".");
+            }
+            emit_log("Continue on error is enabled; the partial source listing will be copied, "
+                     "but the run cannot be reported as an exact success.");
+        }
         std::int64_t total_bytes = 0;
         for (const auto& file : scan.files) total_bytes += file.length;
         const std::int32_t parallel_small_file_workers =
@@ -260,7 +607,7 @@ public:
         emit_log("Scan complete. " + std::to_string(scan.files.size()) + " file(s), " +
                  format_bytes(total_bytes) + " total.");
         if (scan_only) {
-            emit_log("Operation mode: Scan only (read-only bad-block detection).");
+            emit_log("Operation mode: Read-only allocated-file readability assessment.");
             emit_log("Scan performance profile: " +
                      std::string(models::to_string(resolve_scan_performance_profile())) +
                      "; workers=" +
@@ -269,6 +616,11 @@ public:
         } else {
             emit_destination_capacity_warning(destination_root, total_bytes);
             emit_log("Transfer engine policy: " + std::string(models::to_string(options_.TransferEnginePolicyValue)) + ".");
+            if (options_.TransferEnginePolicyValue == models::TransferEnginePolicy::NativeFast &&
+                options_.MaxRetries > 0) {
+                emit_log("NativeFast performs one CopyFileEx attempt per file; managed retry settings "
+                         "apply only after native fallback.");
+            }
             emit_log("Small-file acceleration: workers=" + std::to_string(parallel_small_file_workers) +
                      ", threshold=" + format_bytes(options_.SmallFileThresholdBytes) + ".");
         }
@@ -290,6 +642,7 @@ public:
 
         std::optional<JobJournal> existing;
         if (options_.ResumeFromJournal) {
+            emit_log("Loading resume journal candidates.");
             for (const auto& candidate : journal_load_candidates(default_journal_path, journal_path)) {
                 existing = journal_store_.load(candidate);
                 if (existing.has_value()) {
@@ -302,11 +655,46 @@ public:
             emit_log("Resume disabled. Starting with a fresh state.");
         }
 
+        emit_log("Preparing journal state for " + std::to_string(scan.files.size()) + " source file(s).");
         JobJournal journal = merge_journal(existing, scan.files,
-                                           wide_to_utf8(source_root), wide_to_utf8(destination_root), job_id);
-        // Priming save: also measures what a save of this journal costs, so the
-        // very first throttled flush is already priced correctly.
-        save_journal_now(journal_path, journal);
+                                           wide_to_utf8(source_root), wide_to_utf8(destination_root), job_id,
+                                           cancel);
+        emit_log("Journal state prepared.");
+
+        // A fresh fast scan can contain tens of thousands of files. Saving the
+        // complete journal synchronously here serializes, compresses, hashes,
+        // mirrors, and appends the ledger before the first health read starts.
+        // That made the UI look hung and, more seriously, left Cancel unable to
+        // reach the scan workers while the large snapshot was being written.
+        // Keep the checkpoint, but take a copy and write it in the background
+        // while the read-only scan starts. Fast-scan workers do not flush the
+        // live journal, so the two journal instances cannot race; the final
+        // save below joins this thread before publishing the result.
+        std::thread deferred_initial_journal_save;
+        std::string deferred_initial_journal_error;
+        const bool defer_initial_scan_checkpoint =
+            scan_only && resolve_scan_performance_profile() == models::ScanPerformanceProfile::Fast &&
+            scan.files.size() >= 2048;
+        if (defer_initial_scan_checkpoint) {
+            emit_log("Large fast scan: writing the initial journal checkpoint in the background.");
+            JobJournal checkpoint = journal;
+            deferred_initial_journal_save = std::thread(
+                [this, journal_path, checkpoint = std::move(checkpoint),
+                 &deferred_initial_journal_error]() mutable {
+                    try {
+                        if (!journal_store_.save(journal_path, std::move(checkpoint))) {
+                            deferred_initial_journal_error =
+                                "checkpoint saved with reduced snapshot/ledger redundancy";
+                        }
+                    } catch (const std::exception& ex) {
+                        deferred_initial_journal_error = ex.what();
+                    }
+                });
+        } else {
+            emit_log("Saving initial journal checkpoint.");
+            save_journal_now(journal_path, journal);
+            emit_log("Initial journal checkpoint saved.");
+        }
 
         ProgressAccumulator progress;
         progress.total_files = static_cast<std::int32_t>(scan.files.size());
@@ -315,8 +703,26 @@ public:
         // Fast scan profile: parallel healthy-file reads with precise fallback.
         if (scan_only &&
             resolve_scan_performance_profile() == models::ScanPerformanceProfile::Fast) {
-            std::string fast_error = run_fast_scan_mode(scan.files, source_root, progress, journal,
-                                                        journal_path, cancel);
+            std::string fast_error;
+            try {
+                fast_error = run_fast_scan_mode(scan.files, source_root, progress, journal,
+                                                journal_path, cancel);
+            } catch (...) {
+                // A joinable thread must be joined before the exception leaves
+                // this scope. The background checkpoint is independent of the
+                // read-only work, so it is safe to wait for its final write.
+                if (deferred_initial_journal_save.joinable()) {
+                    deferred_initial_journal_save.join();
+                }
+                throw;
+            }
+            if (deferred_initial_journal_save.joinable()) {
+                deferred_initial_journal_save.join();
+            }
+            if (!deferred_initial_journal_error.empty()) {
+                emit_log("Initial journal checkpoint warning; the final checkpoint will retry full redundancy: " +
+                         deferred_initial_journal_error);
+            }
             flush_bad_range_map();
             save_journal_now(journal_path, journal);
             CopyJobResult fast_result = create_result(
@@ -329,10 +735,14 @@ public:
         // Parallel small-file bulk phase (copy mode only; mirrors the .NET
         // eligibility gates — sequential loop later treats these as completed).
         std::vector<std::string> parallel_completed;
-        if (!scan_only && is_native_acceleration_allowed() && parallel_small_file_workers > 1 &&
+        if (!scan_only && options_.TransferEnginePolicyValue == models::TransferEnginePolicy::NativeFast &&
+            is_native_acceleration_allowed() && parallel_small_file_workers > 1 &&
             !options_.FragileMediaMode && !options_.WaitForFileLockRelease &&
             options_.MaxThroughputBytesPerSecond <= 0 &&
-            resolve_verification_mode() == models::VerificationMode::None &&
+            // The parallel path has no managed rescue loop. Require a full
+            // content check before publication so NativeFast parallelism
+            // cannot turn an unchecked CopyFileExW result into a clean copy.
+            resolve_verification_mode() == models::VerificationMode::Full &&
             !(options_.UseBadRangeMap && options_.SkipKnownBadRanges)) {
 
             std::vector<SourceFileDescriptor> eligible;
@@ -341,10 +751,11 @@ public:
                 if (candidate.length <= 0 || candidate.length > threshold) continue;
                 JournalFileEntry* candidate_entry = journal.Files.find(candidate.relative_path);
                 if (candidate_entry == nullptr) continue;
-                if (is_already_completed(*candidate_entry, candidate, destination_root)) continue;
+                if (is_already_completed(*candidate_entry, candidate, destination_root, cancel)) continue;
                 if (should_skip_failed_entry_for_fragile_resume(*candidate_entry)) continue;
                 std::string parallel_skip_reason;
-                if (should_skip_by_overwrite_policy(candidate, destination_root, parallel_skip_reason)) {
+                if (decide_overwrite_policy(candidate, destination_root, parallel_skip_reason) !=
+                    ExistingDestinationDecision::Copy) {
                     continue;
                 }
                 eligible.push_back(candidate);
@@ -378,27 +789,52 @@ public:
             // Overwrite/existing-destination semantics are copy-only; scan
             // mode always attempts source reads to discover bad ranges.
             if (!scan_only) {
-                std::string skip_reason;
-                if (should_skip_by_overwrite_policy(descriptor, destination_root, skip_reason)) {
+                std::string overwrite_reason;
+                ExistingDestinationDecision overwrite_decision =
+                    decide_overwrite_policy(descriptor, destination_root, overwrite_reason);
+                if (overwrite_decision == ExistingDestinationDecision::Reject) {
+                    progress.failed_files += 1;
+                    entry->State = FileCopyState::Failed;
+                    entry->LastError = overwrite_reason;
+                    entry->DoNotRetry = false;
+                    emit_log("Failed: " + descriptor.relative_path + " (" + overwrite_reason + ")");
+                    flush_journal(journal_path, journal, true);
+                    if (!options_.ContinueOnFileError) {
+                        save_journal_now(journal_path, journal);
+                        return create_result(progress, journal_path, false, false, overwrite_reason);
+                    }
+                    continue;
+                }
+                if (overwrite_decision == ExistingDestinationDecision::Skip) {
                     progress.skipped_files += 1;
                     progress.total_bytes_copied += descriptor.length;
-                    emit_log("Skipped: " + descriptor.relative_path + " (" + skip_reason + ")");
+                    progress.bytes_skipped += descriptor.length;
+                    emit_log("Skipped: " + descriptor.relative_path + " (" + overwrite_reason + ")");
                     emit_progress(progress, descriptor.relative_path, descriptor.length,
                                   descriptor.length, 0,
                                   resolve_buffer_size_for_file(descriptor.length));
                     continue;
                 }
 
-                if (is_already_completed(*entry, descriptor, destination_root)) {
-                    if (take_parallel_completed(descriptor.relative_path)) {
-                        progress.completed_files += 1;
-                    } else {
-                        progress.skipped_files += 1;
-                    }
+                if (take_parallel_completed(descriptor.relative_path)) {
+                    progress.completed_files += 1;
                     progress.total_bytes_copied += descriptor.length;
-                    if (entry->State == FileCopyState::CompletedWithRecovery) {
-                        progress.recovered_files += 1;
-                    }
+                    emit_progress(progress, descriptor.relative_path, descriptor.length,
+                                  descriptor.length, 0,
+                                  resolve_buffer_size_for_file(descriptor.length),
+                                  "ParallelNativeFast", 0, 0);
+                    continue;
+                }
+
+                if (is_already_completed(*entry, descriptor, destination_root, cancel)) {
+                    // A journal reuse is an exact, full-validated completion,
+                    // not an omitted source file. Keep it in CompletedFiles
+                    // so a clean resume remains a clean success; policy
+                    // skips (SkipExisting/IfSourceNewer) are handled above.
+                    progress.completed_files += 1;
+                    progress.total_bytes_copied += descriptor.length;
+                    progress.bytes_reused += descriptor.length;
+                    emit_log("Reused: " + descriptor.relative_path + " (verified journal completion).");
                     emit_progress(progress, descriptor.relative_path, descriptor.length,
                                   descriptor.length, 0,
                                   resolve_buffer_size_for_file(descriptor.length),
@@ -415,7 +851,9 @@ public:
                     progress.skipped_files += 1;
                     std::int64_t scan_already = entry->BytesCopied > 0 ? entry->BytesCopied : 0;
                     std::int64_t scan_remaining = descriptor.length - scan_already;
-                    progress.total_bytes_copied += scan_remaining > 0 ? scan_remaining : 0;
+                    const std::int64_t skipped = scan_remaining > 0 ? scan_remaining : 0;
+                    progress.total_bytes_copied += skipped;
+                    progress.bytes_skipped += skipped;
                     emit_log("Skipped scan: " + descriptor.relative_path + " (persisted fragile skip).");
                     emit_progress(progress, descriptor.relative_path, descriptor.length,
                                   descriptor.length, 0,
@@ -442,7 +880,9 @@ public:
             if (should_skip_failed_entry_for_fragile_resume(*entry)) {
                 progress.skipped_files += 1;
                 std::int64_t remaining = descriptor.length - (entry->BytesCopied > 0 ? entry->BytesCopied : 0);
-                progress.total_bytes_copied += remaining > 0 ? remaining : 0;
+                const std::int64_t skipped = remaining > 0 ? remaining : 0;
+                progress.total_bytes_copied += skipped;
+                progress.bytes_skipped += skipped;
                 emit_log("Skipped: " + descriptor.relative_path + " (persisted fragile skip).");
                 emit_progress(progress, descriptor.relative_path, descriptor.length, descriptor.length, 0,
                               resolve_buffer_size_for_file(descriptor.length));
@@ -476,7 +916,9 @@ public:
                                              journal, journal_path, file_cancel);
             } catch (const SourceMutationSkipped& ex) {
                 progress.skipped_files += 1;
-                entry->State = FileCopyState::Pending;
+                progress.total_bytes_copied += descriptor.length;
+                progress.bytes_skipped += descriptor.length;
+                entry->State = FileCopyState::Failed;
                 entry->LastError = ex.what();
                 entry->DoNotRetry = false;
                 emit_log("Skipped: " + descriptor.relative_path + " (" + ex.what() + ")");
@@ -532,10 +974,20 @@ public:
             }
         }
 
+        std::string directory_metadata_error;
+        if (!scan_only && options_.CopyEmptyDirectories && !scan.directories.empty()) {
+            directory_metadata_error = preserve_directory_metadata(
+                source_root, destination_root, scan.directories, cancel);
+            if (!directory_metadata_error.empty()) {
+                emit_log("ERROR: " + directory_metadata_error);
+            }
+        }
         flush_bad_range_map();
         save_journal_now(journal_path, journal);
         CopyJobResult final_result = create_result(progress, journal_path,
-                                                   progress.failed_files == 0, false, std::string());
+                                                   progress.failed_files == 0 &&
+                                                       directory_metadata_error.empty(),
+                                                   false, directory_metadata_error);
         emit_run_summary(final_result);
         return final_result;
     }
@@ -549,6 +1001,39 @@ private:
         std::int32_t skipped_files = 0;
         std::int64_t total_bytes = 0;
         std::int64_t total_bytes_copied = 0;
+        std::int64_t bytes_skipped = 0;
+        std::int64_t bytes_reused = 0;
+    };
+
+    // Captures the source hash during an ordinary sequential managed read. If
+    // resume coverage or a rescue pass makes reads non-sequential, validation
+    // falls back to hashing the source again rather than trusting a partial
+    // digest. Healthy managed copies therefore avoid a second source pass.
+    class CopyVerificationTracker {
+    public:
+        explicit CopyVerificationTracker(bool sha512) : hasher_(sha512) {}
+
+        void observe(std::int64_t offset, const unsigned char* data, std::int32_t count) {
+            if (!valid_ || count <= 0) return;
+            if (offset != next_offset_) {
+                valid_ = false;
+                return;
+            }
+            hasher_.update(data, static_cast<std::size_t>(count));
+            next_offset_ += count;
+        }
+
+        void invalidate() noexcept { valid_ = false; }
+
+        std::optional<std::vector<unsigned char>> finish(std::int64_t expected_length) {
+            if (!valid_ || next_offset_ != expected_length) return std::nullopt;
+            return hasher_.finish();
+        }
+
+    private:
+        crypto::detail::StreamingHash hasher_;
+        std::int64_t next_offset_ = 0;
+        bool valid_ = true;
     };
 
     struct RescuePassDefinition {
@@ -583,17 +1068,29 @@ private:
     std::int64_t throttle_window_bytes_ = 0;
     std::string expected_source_identity_;
     std::string expected_destination_identity_;
+    std::mutex media_identity_lock_;
     std::atomic<ULONGLONG> last_source_identity_probe_tick_{0};
     std::atomic<ULONGLONG> last_destination_identity_probe_tick_{0};
     std::atomic<ULONGLONG> last_source_mismatch_log_tick_{0};
     std::atomic<ULONGLONG> last_destination_mismatch_log_tick_{0};
+    std::atomic<bool> source_media_identity_accepted_{true};
+    std::atomic<bool> destination_media_identity_accepted_{true};
     std::vector<std::wstring> created_directories_;
     std::deque<ULONGLONG> fragile_failure_timestamps_;
     std::atomic<std::int32_t> native_fast_path_files_{0};
     std::atomic<std::int32_t> parallel_native_fast_path_files_{0};
     std::atomic<std::int32_t> managed_copy_files_{0};
     std::atomic<std::int32_t> native_fallback_files_{0};
+    std::atomic<std::int64_t> bytes_read_{0};
+    std::atomic<std::int64_t> bytes_written_{0};
+    std::atomic<std::int64_t> bytes_verified_{0};
     std::mt19937 retry_jitter_{0xC0FFEE};
+    std::mutex retry_jitter_lock_;
+    bool source_enumeration_incomplete_ = false;
+    std::string source_enumeration_error_;
+    std::mutex metadata_warning_lock_;
+    std::string integrity_warning_;
+    std::string metadata_notice_;
 
     // Bad-range map state (InitializeBadRangeMapAsync et al).
     std::optional<storage::BadRangeMap> bad_range_map_;
@@ -617,7 +1114,7 @@ private:
         try {
             auto context = RawDiskScanContext::try_create(source_root, reason);
             if (context) {
-                emit_log("Scan backend: Raw disk (experimental) enabled. Sector size " +
+                emit_log("Assessment backend: Raw volume direct reads enabled. Sector size " +
                          format_bytes(context->sector_size_bytes()) + ", cluster size " +
                          format_bytes(context->cluster_size_bytes()) + ".");
                 raw_disk_scan_context_ = std::move(context);
@@ -628,7 +1125,7 @@ private:
         }
 
         if (reason.empty()) reason = "unsupported source or media.";
-        emit_log("Scan backend: Raw disk unavailable (" + reason +
+        emit_log("Assessment backend: Raw volume unavailable (" + reason +
                  "); using standard file reads.");
     }
 
@@ -644,7 +1141,7 @@ private:
         if (!raw_scan_fallback_logged_paths_.insert(folded).second) return;
         std::string detail = reason.empty() ? "unsupported source layout" : reason;
         if (detail.empty() || detail.back() != '.') detail.push_back('.');
-        emit_log("Raw disk scan fallback for '" + key + "': " + detail);
+        emit_log("Raw-volume assessment fallback for '" + key + "': " + detail);
     }
 
     // ---- Options validation ----------------------------------------------
@@ -668,31 +1165,128 @@ private:
         if (!scan_only && source_norm == dest_norm) {
             fail("Source and destination cannot be the same path.");
         }
+        if (!scan_only && dest_norm.size() > source_norm.size() &&
+            dest_norm.compare(0, source_norm.size(), source_norm) == 0 &&
+            dest_norm[source_norm.size()] == L'\\') {
+            fail("Destination cannot be inside the source tree; choose a sibling or separate volume.");
+        }
+        if (options_.AllowJournalRootRemap) {
+            fail("AllowJournalRootRemap is disabled because it can apply coverage to unrelated data.");
+        }
+        if (options_.TreatAccessDeniedAsContention && options_.SalvageUnreadableBlocks) {
+            fail("TreatAccessDeniedAsContention cannot be combined with SalvageUnreadableBlocks; "
+                 "permission failures must remain visible.");
+        }
 
-        if (options_.BufferSizeBytes < 4096) fail("BufferSizeBytes must be at least 4096.");
+        if (options_.BufferSizeBytes < CopyJobOptions::MinimumBufferSizeBytes) {
+            fail("BufferSizeBytes must be at least 1 MiB.");
+        }
+        if (options_.BufferSizeBytes > CopyJobOptions::MaximumBufferSizeBytes) {
+            fail("BufferSizeBytes cannot exceed 256 MiB.");
+        }
         if (options_.MaxRetries < 0) fail("MaxRetries cannot be negative.");
+        if (options_.MaxRetries > CopyJobOptions::MaximumRetries) {
+            fail("MaxRetries cannot exceed the safety limit of 32.");
+        }
         if (options_.OperationTimeout.ticks <= 0) fail("OperationTimeout must be greater than zero.");
+        if (options_.OperationTimeout.total_seconds() >
+            CopyJobOptions::MaximumOperationTimeoutSeconds) {
+            fail("OperationTimeout cannot exceed 3600 seconds.");
+        }
         if (options_.PerFileTimeout.ticks < 0) fail("PerFileTimeout cannot be negative.");
-        if (options_.LockContentionProbeInterval.ticks <= 0) fail("LockContentionProbeInterval must be greater than zero.");
+        if (options_.PerFileTimeout.total_seconds() >
+            CopyJobOptions::MaximumPerFileTimeoutSeconds) {
+            fail("PerFileTimeout cannot exceed 86400 seconds.");
+        }
+        if (options_.InitialRetryDelay.ticks <= 0) {
+            fail("InitialRetryDelay must be greater than zero.");
+        }
+        if (options_.MaxRetryDelay.ticks < options_.InitialRetryDelay.ticks) {
+            fail("MaxRetryDelay cannot be shorter than InitialRetryDelay.");
+        }
+        if (options_.MaxRetryDelay.total_seconds() >
+            CopyJobOptions::MaximumRetryDelaySeconds) {
+            fail("MaxRetryDelay cannot exceed 86400 seconds.");
+        }
+        const double lock_probe_ms = options_.LockContentionProbeInterval.total_milliseconds();
+        if (lock_probe_ms < CopyJobOptions::MinimumLockProbeIntervalMilliseconds ||
+            lock_probe_ms > CopyJobOptions::MaximumLockProbeIntervalMilliseconds) {
+            fail("LockContentionProbeInterval must be from 100 to 10000 milliseconds.");
+        }
         if (options_.MaxThroughputBytesPerSecond < 0) fail("MaxThroughputBytesPerSecond cannot be negative.");
         if (options_.SampleVerificationChunkBytes <= 0) fail("SampleVerificationChunkBytes must be greater than zero.");
+        if (options_.SampleVerificationChunkBytes >
+            CopyJobOptions::MaximumSampleVerificationChunkBytes) {
+            fail("SampleVerificationChunkBytes cannot exceed 4 MiB.");
+        }
         if (options_.SampleVerificationChunkCount <= 0) fail("SampleVerificationChunkCount must be greater than zero.");
+        if (options_.SampleVerificationChunkCount >
+            CopyJobOptions::MaximumSampleVerificationChunkCount) {
+            fail("SampleVerificationChunkCount cannot exceed 64.");
+        }
         if (options_.BadRangeMapMaxAgeDays < 0) fail("BadRangeMapMaxAgeDays cannot be negative.");
+        if (options_.BadRangeMapMaxAgeDays > CopyJobOptions::MaximumBadRangeMapAgeDays) {
+            fail("BadRangeMapMaxAgeDays cannot exceed 3650.");
+        }
         if (options_.RescueFastScanChunkBytes < 0 || options_.RescueTrimChunkBytes < 0 ||
             options_.RescueScrapeChunkBytes < 0 || options_.RescueRetryChunkBytes < 0 ||
             options_.RescueSplitMinimumBytes < 0) {
             fail("Rescue chunk/split tuning values cannot be negative.");
         }
+        if (options_.RescueFastScanChunkBytes > CopyJobOptions::MaximumRescueChunkBytes ||
+            options_.RescueTrimChunkBytes > CopyJobOptions::MaximumRescueChunkBytes ||
+            options_.RescueScrapeChunkBytes > CopyJobOptions::MaximumRescueChunkBytes ||
+            options_.RescueRetryChunkBytes > CopyJobOptions::MaximumRescueChunkBytes ||
+            options_.RescueSplitMinimumBytes > CopyJobOptions::MaximumRescueSplitBytes) {
+            fail("Rescue chunk/split tuning exceeds the supported memory bounds.");
+        }
         if (options_.RescueFastScanRetries < 0 || options_.RescueTrimRetries < 0 ||
             options_.RescueScrapeRetries < 0) {
             fail("Rescue pass retries cannot be negative.");
         }
+        if (options_.RescueFastScanRetries > 32 || options_.RescueTrimRetries > 32 ||
+            options_.RescueScrapeRetries > 32) {
+            fail("Rescue pass retries cannot exceed the safety limit of 32.");
+        }
+        if (options_.SalvageUnreadableBlocks &&
+            options_.SalvageFillPatternValue == models::SalvageFillPattern::Random) {
+            fail("Random salvage fill is disabled because non-deterministic bytes obscure recovery boundaries. Use zero or 0xFF fill.");
+        }
         if (options_.ParallelSmallFileWorkers < 0) fail("ParallelSmallFileWorkers cannot be negative.");
         if (options_.ParallelScanWorkers < 0) fail("ParallelScanWorkers cannot be negative.");
+        if (options_.ParallelSmallFileWorkers > CopyJobOptions::MaximumParallelWorkers ||
+            options_.ParallelScanWorkers > CopyJobOptions::MaximumParallelWorkers) {
+            fail("Parallel worker counts cannot exceed 64.");
+        }
         if (options_.SmallFileThresholdBytes < MinimumRescueBlockSize) fail("SmallFileThresholdBytes must be at least 4096.");
+        if (options_.SmallFileThresholdBytes >
+            CopyJobOptions::MaximumSmallFileThresholdBytes) {
+            fail("SmallFileThresholdBytes cannot exceed 1 GiB.");
+        }
         if (options_.FragileFailureWindowSeconds <= 0) fail("FragileFailureWindowSeconds must be greater than zero.");
         if (options_.FragileFailureThreshold <= 0) fail("FragileFailureThreshold must be greater than zero.");
         if (options_.FragileCooldownSeconds < 0) fail("FragileCooldownSeconds cannot be negative.");
+        if (options_.FragileFailureWindowSeconds >
+                CopyJobOptions::MaximumFragileFailureWindowSeconds ||
+            options_.FragileFailureThreshold >
+                CopyJobOptions::MaximumFragileFailureThreshold ||
+            options_.FragileCooldownSeconds >
+                CopyJobOptions::MaximumFragileCooldownSeconds) {
+            fail("Fragile-media guard values exceed the supported bounds.");
+        }
+
+        if (options_.MaxRetries > CopyJobOptions::MaximumNormalRetries) {
+            emit_log("WARNING: application retry count exceeds 3; each attempt is additional to any device or Windows storage-stack retries.");
+        }
+        if (options_.ParallelScanWorkers > 8 && !options_.FragileMediaMode) {
+            emit_log("WARNING: more than 8 scan workers can sharply increase seek pressure on unstable media.");
+        }
+        if (options_.SalvageUnreadableBlocks && options_.AllowRecoveredOverwriteExisting) {
+            emit_log("WARNING: expert override allows synthetic recovery bytes to replace an existing destination.");
+        }
+        if (!scan_only && resolve_verification_mode() == models::VerificationMode::None) {
+            emit_log("WARNING: destination content verification is disabled.");
+        }
     }
 
     static bool is_blank(const std::string& text) {
@@ -717,7 +1311,7 @@ private:
     JobJournal merge_journal(std::optional<JobJournal>& existing,
                              const std::vector<SourceFileDescriptor>& source_files,
                              const std::string& source_root, const std::string& destination_root,
-                             const std::string& job_id) {
+                             const std::string& job_id, const CancelContext& cancel) {
         bool can_reuse = existing.has_value() &&
                          roots_equivalent(existing->SourceRoot, source_root) &&
                          roots_equivalent(existing->DestinationRoot, destination_root);
@@ -738,7 +1332,20 @@ private:
         journal.SourceRoot = source_root;
         journal.DestinationRoot = destination_root;
 
-        for (const auto& descriptor : source_files) {
+        ULONGLONG last_prepare_log_tick = GetTickCount64();
+        auto pump_prepare = [&](std::size_t index, std::string_view phase) {
+            cancel.throw_if_cancelled();
+            ULONGLONG now = GetTickCount64();
+            if (now - last_prepare_log_tick >= 1000 || index + 1 >= source_files.size()) {
+                last_prepare_log_tick = now;
+                emit_log("Preparing journal " + std::string(phase) + ": " +
+                         std::to_string(std::min(index + 1, source_files.size())) + "/" +
+                         std::to_string(source_files.size()) + ".");
+            }
+        };
+
+        for (std::size_t index = 0; index < source_files.size(); ++index) {
+            const auto& descriptor = source_files[index];
             JournalFileEntry* entry = journal.Files.find(descriptor.relative_path);
             if (entry == nullptr) {
                 JournalFileEntry fresh;
@@ -751,10 +1358,59 @@ private:
 
             bool source_changed = entry->SourceLength != descriptor.length ||
                                   entry->SourceLastWriteUtcTicks != descriptor.last_write_utc_ticks;
+            bool source_identity_changed = false;
+            // Fresh journal entries are seeded from the already collected
+            // enumeration metadata. Opening a handle for every file here made
+            // a new scan pay an unnecessary per-file identity lookup cost. An
+            // identity is required only when an existing entry actually has
+            // one to compare; copy paths record the identity they capture
+            // before publishing, so future resume runs retain this protection.
+            const bool identity_required = entry->SourceFileIndex != 0 ||
+                                            entry->SourceVolumeSerial != 0;
+            const bool stability_required = entry->SourceChangeUtcTicks != 0;
+            FileIdentity source_identity;
+            bool source_identity_valid = false;
+            FileStabilitySnapshot source_stability;
+            bool source_stability_valid = false;
+            if (stability_required) {
+                pump_prepare(index, "source change times");
+                source_stability_valid =
+                    try_get_file_stability(descriptor.full_path, source_stability);
+                source_identity_valid = source_stability_valid;
+                if (source_stability_valid) source_identity = source_stability.identity;
+                source_identity_changed =
+                    !source_stability_valid ||
+                    entry->SourceFileIndex !=
+                        static_cast<std::int64_t>(source_stability.identity.file_index) ||
+                    entry->SourceVolumeSerial !=
+                        static_cast<std::int64_t>(source_stability.identity.volume_serial) ||
+                    entry->SourceChangeUtcTicks != source_stability.change_utc_ticks ||
+                    source_stability.length != descriptor.length ||
+                    source_stability.last_write_utc_ticks != descriptor.last_write_utc_ticks;
+                source_changed = source_changed || source_identity_changed;
+            } else if (identity_required) {
+                pump_prepare(index, "source identities");
+                source_identity_valid = try_get_file_identity(descriptor.full_path, source_identity);
+                source_identity_changed = !source_identity_valid ||
+                                          entry->SourceFileIndex != static_cast<std::int64_t>(source_identity.file_index) ||
+                                          entry->SourceVolumeSerial != static_cast<std::int64_t>(source_identity.volume_serial);
+                source_changed = source_changed || source_identity_changed;
+            }
             entry->SourceLength = descriptor.length;
             entry->SourceLastWriteUtcTicks = descriptor.last_write_utc_ticks;
+            if (source_identity_valid) {
+                entry->SourceFileIndex = static_cast<std::int64_t>(source_identity.file_index);
+                entry->SourceVolumeSerial = static_cast<std::int64_t>(source_identity.volume_serial);
+            }
+            if (source_stability_valid) {
+                entry->SourceChangeUtcTicks = source_stability.change_utc_ticks;
+            }
 
             if (source_changed) {
+                if (source_identity_changed) {
+                    emit_log("Journal source binding changed; resetting coverage for " +
+                             descriptor.relative_path + ".");
+                }
                 entry->BytesCopied = 0;
                 entry->State = FileCopyState::Pending;
                 entry->LastError.clear();
@@ -781,17 +1437,44 @@ private:
             }
         }
 
+        if (options_.OperationMode != models::JobOperationMode::ScanOnly && options_.ResumeFromJournal) {
+            // Partial rescue ranges describe work in a temporary destination
+            // that may never have been published. Reusing those ranges against
+            // the final file can skip corrupt bytes after a crash, so only a
+            // fully completed entry that passes the later full-hash gate may
+            // retain coverage.
+            std::size_t index = 0;
+            for (auto& item : journal.Files.entries) {
+                pump_prepare(index++, "resume coverage");
+                JournalFileEntry& entry = item.second;
+                if (entry.State == FileCopyState::CompletedWithRecovery) {
+                    entry.State = FileCopyState::Pending;
+                    entry.LastError = "Previous recovered coverage requires a fresh exact copy.";
+                    entry.DoNotRetry = false;
+                }
+                if (entry.State == FileCopyState::Completed) continue;
+                entry.BytesCopied = 0;
+                entry.RecoveredRanges.clear();
+                entry.RescueRanges.clear();
+                entry.LastRescuePass.clear();
+            }
+        }
+
         // Drop journal entries for files no longer present in the source. Use a
         // folded-key set for O(n) membership instead of an O(n*m) nested scan
         // (a whole-drive journal has 100k+ entries and files).
         std::unordered_set<std::string> source_keys;
         source_keys.reserve(source_files.size());
-        for (const auto& descriptor : source_files) {
+        for (std::size_t index = 0; index < source_files.size(); ++index) {
+            const auto& descriptor = source_files[index];
+            pump_prepare(index, "source index");
             source_keys.insert(fold_relative_path(descriptor.relative_path));
         }
         std::vector<std::pair<std::string, JournalFileEntry>> retained;
         retained.reserve(journal.Files.size());
+        std::size_t retained_index = 0;
         for (auto& [key, entry] : journal.Files.entries) {
+            pump_prepare(retained_index++, "journal entries");
             if (source_keys.count(fold_relative_path(key)) != 0) {
                 retained.emplace_back(key, std::move(entry));
             }
@@ -862,7 +1545,9 @@ private:
     // phase end, failure exits) where the snapshot must land regardless.
     void save_journal_now(const std::wstring& journal_path, JobJournal& journal) {
         ULONGLONG started = GetTickCount64();
-        journal_store_.save(journal_path, journal);
+        if (!journal_store_.save(journal_path, journal)) {
+            emit_log("WARNING: Journal checkpoint was committed with reduced snapshot/ledger redundancy.");
+        }
         last_journal_save_cost_ms_ = GetTickCount64() - started;
         last_journal_flush_tick_ = GetTickCount64();
     }
@@ -900,17 +1585,107 @@ private:
 
     // ---- Per-file gates ---------------------------------------------------
 
-    bool is_already_completed(const JournalFileEntry& entry, const SourceFileDescriptor& descriptor,
-                              const std::wstring& destination_root) const {
+    bool is_already_completed(JournalFileEntry& entry, const SourceFileDescriptor& descriptor,
+                              const std::wstring& destination_root,
+                              const CancelContext& cancel) {
         if (entry.State != FileCopyState::Completed &&
             entry.State != FileCopyState::CompletedWithRecovery) {
             return false;
         }
-        ExistingFileMetadata metadata;
-        if (!try_get_existing_file_metadata(destination_path_for(destination_root, descriptor), metadata)) {
+        if (entry.State == FileCopyState::CompletedWithRecovery) {
+            reset_journal_coverage_for_retry(entry);
             return false;
         }
-        return metadata.length == descriptor.length;
+        FileStabilitySnapshot source_stability;
+        FileIdentity source_identity;
+        if (try_get_file_stability(descriptor.full_path, source_stability)) {
+            source_identity = source_stability.identity;
+            note_hard_link_topology(source_stability);
+        } else if (!try_get_file_identity(descriptor.full_path, source_identity)) {
+            reset_journal_coverage_for_retry(entry);
+            return false;
+        }
+        const std::wstring destination_path = destination_path_for(destination_root, descriptor);
+        ExistingFileMetadata metadata;
+        if (!try_get_existing_file_metadata(destination_path, metadata)) {
+            reset_journal_coverage_for_retry(entry);
+            return false;
+        }
+        if (metadata.length != descriptor.length) {
+            reset_journal_coverage_for_retry(entry);
+            return false;
+        }
+        FileIdentity destination_identity;
+        if (!try_get_file_identity(destination_path, destination_identity)) {
+            reset_journal_coverage_for_retry(entry);
+            return false;
+        }
+
+        // A journal entry is not proof that the destination bytes survived a
+        // crash or were not replaced by another file. Only a full source/
+        // destination hash comparison permits the engine to skip a completed
+        // file; otherwise the staged copy path below reconstructs it safely.
+        if (resolve_verification_mode() != models::VerificationMode::Full) {
+            reset_journal_coverage_for_retry(entry);
+            return false;
+        }
+        try {
+            verify_file_with_retries(descriptor.full_path,
+                                     destination_path,
+                                     descriptor.relative_path,
+                                     models::VerificationMode::Full, cancel);
+            ensure_source_identity_unchanged(descriptor, source_identity, true);
+            FileIdentity current_destination_identity;
+            if (!try_get_file_identity(destination_path, current_destination_identity) ||
+                current_destination_identity.file_index != destination_identity.file_index ||
+                current_destination_identity.volume_serial != destination_identity.volume_serial) {
+                throw IoError("Destination file identity changed during journal validation: " +
+                              descriptor.relative_path + ".");
+            }
+            return true;
+        } catch (const std::exception& ex) {
+            emit_log("Journal completion rejected for " + descriptor.relative_path + ": " +
+                     ex.what() + "; copying again.");
+            reset_journal_coverage_for_retry(entry);
+            return false;
+        }
+    }
+
+    static void validate_resolved_root_relationship(const std::wstring& source_root,
+                                                    const std::wstring& destination_root,
+                                                    bool scan_only) {
+        if (scan_only) return;
+        auto trim_separators = [](std::wstring value) {
+            while (value.size() > 3 && !value.empty() &&
+                   (value.back() == L'\\' || value.back() == L'/')) {
+                value.pop_back();
+            }
+            return value;
+        };
+        std::wstring source = trim_separators(storage::fsutil::resolve_final_path(source_root));
+        std::wstring destination =
+            trim_separators(storage::fsutil::resolve_final_path(destination_root));
+        if (source.empty() || destination.empty()) return;
+        source = storage::fsutil::to_upper_invariant(source);
+        destination = storage::fsutil::to_upper_invariant(destination);
+        if (source == destination) {
+            throw IoError("Source and destination resolve to the same physical path.");
+        }
+        if (destination.size() > source.size() &&
+            destination.compare(0, source.size(), source) == 0 &&
+            destination[source.size()] == L'\\') {
+            throw IoError("Destination resolves inside the source tree through a junction, mount point, or path alias.");
+        }
+    }
+
+    static void reset_journal_coverage_for_retry(JournalFileEntry& entry) {
+        entry.BytesCopied = 0;
+        entry.State = FileCopyState::Pending;
+        entry.LastError.clear();
+        entry.DoNotRetry = false;
+        entry.RecoveredRanges.clear();
+        entry.RescueRanges.clear();
+        entry.LastRescuePass.clear();
     }
 
     bool should_skip_failed_entry_for_fragile_resume(const JournalFileEntry& entry) const {
@@ -918,26 +1693,31 @@ private:
                (options_.PersistFragileSkipAcrossResume || options_.FragileMediaMode);
     }
 
-    bool should_skip_by_overwrite_policy(const SourceFileDescriptor& descriptor,
-                                         const std::wstring& destination_root,
-                                         std::string& reason) const {
+    enum class ExistingDestinationDecision : std::uint8_t { Copy, Skip, Reject };
+
+    ExistingDestinationDecision decide_overwrite_policy(const SourceFileDescriptor& descriptor,
+                                                        const std::wstring& destination_root,
+                                                        std::string& reason) const {
         reason.clear();
         ExistingFileMetadata metadata;
         if (!try_get_existing_file_metadata(destination_path_for(destination_root, descriptor), metadata)) {
-            return false;
+            return ExistingDestinationDecision::Copy;
         }
         switch (options_.OverwritePolicyValue) {
             case models::OverwritePolicy::SkipExisting:
                 reason = "destination already exists";
-                return true;
+                return ExistingDestinationDecision::Skip;
             case models::OverwritePolicy::OverwriteIfSourceNewer:
                 if (descriptor.last_write_utc_ticks <= metadata.last_write_utc_ticks) {
                     reason = "destination is newer or same age";
-                    return true;
+                    return ExistingDestinationDecision::Skip;
                 }
-                return false;
+                return ExistingDestinationDecision::Copy;
+            case models::OverwritePolicy::Ask:
+                reason = "overwrite policy 'Ask' requires explicit confirmation; refusing to overwrite an existing destination";
+                return ExistingDestinationDecision::Reject;
             default:
-                return false;
+                return ExistingDestinationDecision::Copy;
         }
     }
 
@@ -955,7 +1735,9 @@ private:
         std::int64_t already = entry.BytesCopied > 0 ? entry.BytesCopied : 0;
         std::int64_t remaining = descriptor.length - already;
         progress.skipped_files += 1;
-        progress.total_bytes_copied += remaining > 0 ? remaining : 0;
+        const std::int64_t skipped = remaining > 0 ? remaining : 0;
+        progress.total_bytes_copied += skipped;
+        progress.bytes_skipped += skipped;
 
         entry.State = FileCopyState::Failed;
         entry.LastError = message;
@@ -998,6 +1780,329 @@ private:
 
     // ---- Single-file copy pipeline ---------------------------------------
 
+    static bool stream_names_equal(const std::wstring& left, const std::wstring& right) {
+        return CompareStringOrdinal(left.c_str(), static_cast<int>(left.size()),
+                                    right.c_str(), static_cast<int>(right.size()), TRUE) ==
+               CSTR_EQUAL;
+    }
+
+    static const NamedStreamDescriptor* find_stream(
+        const std::vector<NamedStreamDescriptor>& streams, const std::wstring& name) {
+        for (const auto& stream : streams) {
+            if (stream_names_equal(stream.name, name)) return &stream;
+        }
+        return nullptr;
+    }
+
+    static bool path_is_encrypted(const std::wstring& path) {
+        DWORD attributes = GetFileAttributesW(path.c_str());
+        return attributes != INVALID_FILE_ATTRIBUTES &&
+               (attributes & FILE_ATTRIBUTE_ENCRYPTED) != 0;
+    }
+
+    void prepare_managed_encryption(const SourceFileDescriptor& descriptor,
+                                    const std::wstring& working_path) {
+        if ((descriptor.attributes & FILE_ATTRIBUTE_ENCRYPTED) == 0 ||
+            options_.AllowDecryptedDestination || path_is_encrypted(working_path)) {
+            return;
+        }
+        if (!EncryptFileW(working_path.c_str()) || !path_is_encrypted(working_path)) {
+            DWORD error = GetLastError();
+            throw IoError::from_win32(
+                "Unable to preserve EFS encryption on the staged destination. Enable the explicit plaintext override only when decrypted output is intended.",
+                error);
+        }
+    }
+
+    void enforce_encryption_result(const SourceFileDescriptor& descriptor,
+                                   const std::wstring& working_path) {
+        if ((descriptor.attributes & FILE_ATTRIBUTE_ENCRYPTED) == 0 ||
+            path_is_encrypted(working_path)) {
+            return;
+        }
+        if (!options_.AllowDecryptedDestination) {
+            throw IoError("Encrypted source would be published as plaintext: " +
+                          descriptor.relative_path + ".");
+        }
+        add_integrity_warning(
+            "EFS encryption was explicitly removed from one or more destination files.");
+    }
+
+    void add_integrity_warning(const std::string& warning) {
+        if (warning.empty()) return;
+        std::lock_guard<std::mutex> guard(metadata_warning_lock_);
+        if (integrity_warning_.find(warning) != std::string::npos) return;
+        if (!integrity_warning_.empty()) integrity_warning_ += " ";
+        integrity_warning_ += warning;
+    }
+
+    void add_metadata_notice(const std::string& notice) {
+        if (notice.empty()) return;
+        std::lock_guard<std::mutex> guard(metadata_warning_lock_);
+        if (metadata_notice_.find(notice) != std::string::npos) return;
+        if (!metadata_notice_.empty()) metadata_notice_ += " ";
+        metadata_notice_ += notice;
+    }
+
+    void note_hard_link_topology(const FileStabilitySnapshot& snapshot) {
+        if (snapshot.link_count > 1) {
+            add_metadata_notice(
+                "NTFS hard-link topology was not preserved; linked source names were copied as independent destination files.");
+        }
+    }
+
+    void copy_named_streams(const SourceFileDescriptor& descriptor,
+                            const std::wstring& working_path,
+                            const NamedStreamEnumeration& source_streams,
+                            const CancelContext& cancel,
+                            bool verify_stream_content) {
+        NamedStreamEnumeration destination_streams = enumerate_named_streams(working_path);
+        if (source_streams.supported && !destination_streams.supported &&
+            !source_streams.streams.empty()) {
+            throw IoError("Destination filesystem does not support alternate data streams for " +
+                          descriptor.relative_path + ".");
+        }
+
+        // The stage may have been cloned from an older destination. Remove
+        // streams absent from the current source so stale Zone.Identifier or
+        // application metadata cannot survive a successful replacement.
+        for (const auto& destination_stream : destination_streams.streams) {
+            if (find_stream(source_streams.streams, destination_stream.name) != nullptr) continue;
+            std::wstring stale_path = working_path + destination_stream.name;
+            if (!DeleteFileW(stale_path.c_str())) {
+                throw IoError::from_win32("Unable to remove stale destination data stream.",
+                                          GetLastError());
+            }
+        }
+
+        if (!source_streams.supported) return;
+        std::int32_t stream_buffer_size = std::min<std::int32_t>(
+            1024 * 1024, std::max<std::int32_t>(MinimumRescueBlockSize, options_.BufferSizeBytes));
+        std::vector<unsigned char> buffer(static_cast<std::size_t>(stream_buffer_size));
+
+        for (const auto& source_stream : source_streams.streams) {
+            cancel.throw_if_cancelled();
+            std::wstring source_stream_path = descriptor.full_path + source_stream.name;
+            std::wstring destination_stream_path = working_path + source_stream.name;
+            HANDLE create = CreateFileW(destination_stream_path.c_str(), GENERIC_WRITE,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                         nullptr, CREATE_ALWAYS,
+                                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+            if (create == INVALID_HANDLE_VALUE) {
+                throw IoError::from_win32("Unable to create destination alternate data stream.",
+                                          GetLastError());
+            }
+            CloseHandle(create);
+
+            emit_log("Copying alternate stream " + descriptor.relative_path +
+                     " [" + wide_to_utf8(source_stream.name) + "].");
+            FileTransferSession session(source_stream_path, destination_stream_path);
+            std::int64_t offset = 0;
+            std::string stream_label = descriptor.relative_path + " " +
+                                       wide_to_utf8(source_stream.name);
+            while (offset < source_stream.length) {
+                cancel.throw_if_cancelled();
+                std::int32_t count = static_cast<std::int32_t>(std::min<std::int64_t>(
+                    stream_buffer_size, source_stream.length - offset));
+                std::int32_t read = read_chunk_with_retries(
+                    source_stream_path, stream_label, offset, count, session, buffer.data(),
+                    cancel, std::max(0, options_.MaxRetries), false);
+                if (read != count) {
+                    throw IoError("Short read while copying alternate data stream " + stream_label + ".");
+                }
+                write_chunk_with_retries(stream_label, offset, buffer.data(), count, session, cancel);
+                offset += count;
+            }
+            session.invalidate_source();
+            session.invalidate_destination();
+        }
+
+        NamedStreamEnumeration after = enumerate_named_streams(descriptor.full_path);
+        if (after.supported != source_streams.supported ||
+            after.streams.size() != source_streams.streams.size()) {
+            throw IoError("Source alternate data streams changed during copy of " +
+                          descriptor.relative_path + ".");
+        }
+        for (const auto& before : source_streams.streams) {
+            const auto* current = find_stream(after.streams, before.name);
+            if (current == nullptr || current->length != before.length) {
+                throw IoError("Source alternate data streams changed during copy of " +
+                              descriptor.relative_path + ".");
+            }
+        }
+        if (verify_stream_content) {
+            for (const auto& stream : source_streams.streams) {
+                cancel.throw_if_cancelled();
+                emit_log("Verifying alternate stream " + descriptor.relative_path +
+                         " [" + wide_to_utf8(stream.name) + "].");
+                std::wstring source_stream_path = descriptor.full_path + stream.name;
+                std::wstring destination_stream_path = working_path + stream.name;
+                if (compute_file_hash(source_stream_path, cancel) !=
+                    compute_file_hash(destination_stream_path, cancel)) {
+                    throw IoError("Alternate data stream verification mismatch: " +
+                                  descriptor.relative_path + " [" +
+                                  wide_to_utf8(stream.name) + "].");
+                }
+            }
+        }
+    }
+
+    void preserve_file_metadata(const SourceFileDescriptor& descriptor,
+                                const std::wstring& working_path,
+                                const FileSecuritySnapshot& source_security,
+                                const NamedStreamEnumeration& source_streams,
+                                const CancelContext& cancel,
+                                models::VerificationMode verification_mode) {
+        cancel.throw_if_cancelled();
+        if ((descriptor.attributes & ~(CopyableFileAttributes | FILE_ATTRIBUTE_ENCRYPTED)) != 0) {
+            add_metadata_notice(
+                "Filesystem-specific attributes (compression, sparse, or reparse) "
+                "were not fully preserved for one or more files.");
+        }
+        enforce_encryption_result(descriptor, working_path);
+        copy_named_streams(descriptor, working_path, source_streams, cancel,
+                           verification_mode == models::VerificationMode::Full);
+
+        FileSecurityApplyResult security_result =
+            apply_file_security(working_path, source_security);
+        if (source_security.sacl_omitted || !security_result.sacl_preserved) {
+            add_metadata_notice("Security audit entries (SACLs) were not fully preserved for one or more files.");
+        }
+        if (!security_result.owner_group_preserved) {
+            add_metadata_notice("Security owner/group were not fully preserved for one or more files; "
+                                "the source DACL was applied.");
+        }
+
+        if (options_.PreserveTimestamps &&
+            !set_file_times_utc(working_path, descriptor.creation_time,
+                                descriptor.last_access_time, descriptor.last_write_time)) {
+            throw IoError::from_win32("Unable to preserve source file timestamps.", GetLastError());
+        }
+
+        // Apply READONLY last so all stream, security, timestamp, and durability
+        // operations above still have write access to the stage.
+        if (!set_copyable_file_attributes(working_path, descriptor.attributes)) {
+            throw IoError::from_win32("Unable to preserve source file attributes.", GetLastError());
+        }
+    }
+
+    void write_recovery_manifest(const std::wstring& manifest_path,
+                                 const std::wstring& recovered_path,
+                                 const DestinationStage& stage,
+                                 const SourceFileDescriptor& descriptor,
+                                 const JournalFileEntry* entry) {
+        json::Writer writer(/*indented*/ true);
+        writer.begin_object();
+        writer.key("SchemaVersion"); writer.value(1);
+        writer.key("CreatedUtc"); writer.value_literal_string(time::DateTimeOffset::now_utc().to_string());
+        writer.key("SourcePath"); writer.value(wide_to_utf8(descriptor.full_path));
+        writer.key("SourceRelativePath"); writer.value(descriptor.relative_path);
+        writer.key("SourceMediaIdentity"); writer.value(expected_media_identity(true));
+        writer.key("IntendedDestinationPath"); writer.value(wide_to_utf8(stage.final_path()));
+        writer.key("RecoveredOutputPath"); writer.value(wide_to_utf8(recovered_path));
+        writer.key("SourceLength"); writer.value(descriptor.length);
+        writer.key("FillPattern"); writer.value(describe_salvage_fill());
+        writer.key("SyntheticRanges");
+        writer.begin_array();
+        if (entry != nullptr) {
+            for (const RescueRange& range : entry->RescueRanges) {
+                if (range.State != RescueRangeState::Recovered || range.Length <= 0) continue;
+                writer.begin_object();
+                writer.key("Offset"); writer.value(range.Offset);
+                writer.key("Length"); writer.value(range.Length);
+                writer.end_object();
+            }
+        }
+        writer.end_array();
+        writer.end_object();
+        if (!storage::fsutil::write_atomic_bytes(manifest_path, writer.take())) {
+            throw IoError("Unable to write recovered-output manifest.");
+        }
+    }
+
+    void remove_owned_recovery_manifest(const std::wstring& recovered_path) {
+        const std::wstring manifest_path = recovered_path + L".recovery.json";
+        auto bytes = storage::fsutil::read_all_bytes(manifest_path, 4ULL * 1024 * 1024);
+        if (!bytes.has_value()) return;
+        bool owned = false;
+        try {
+            const std::string text(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+            json::Value value = json::parse(text);
+            const json::Object* object = value.as_object();
+            std::string recorded_path;
+            if (object != nullptr) {
+                models::detail::read(object, "RecoveredOutputPath", recorded_path);
+                owned = models::detail::equals_ignore_case(
+                    recorded_path, wide_to_utf8(recovered_path));
+            }
+        } catch (const std::exception&) {
+            return; // Never delete an unrecognized adjacent user file.
+        }
+        if (owned && !DeleteFileW(manifest_path.c_str())) {
+            DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND) {
+                add_metadata_notice(
+                    "An obsolete XactCopy recovery manifest could not be removed after an exact replacement.");
+            }
+        }
+    }
+
+    void publish_stage(DestinationStage& stage, const SourceFileDescriptor& descriptor,
+                       bool contains_synthetic_bytes,
+                       const JournalFileEntry* entry = nullptr) {
+        if (contains_synthetic_bytes && !options_.AllowRecoveredOverwriteExisting) {
+            const bool existing_destination_preserved = stage.final_exists_now();
+            std::wstring sidecar = stage.commit_recovered_sidecar();
+            std::wstring manifest = sidecar + L".recovery.json";
+            bool manifest_written = false;
+            try {
+                write_recovery_manifest(manifest, sidecar, stage, descriptor, entry);
+                manifest_written = true;
+            } catch (const std::exception& ex) {
+                std::string notice =
+                    "Recovered bytes were preserved, but their recovery manifest could not be written: " +
+                    std::string(ex.what());
+                add_metadata_notice(notice);
+                emit_log("WARNING: " + notice);
+            }
+            emit_log("RECOVERED OUTPUT: " +
+                     std::string(existing_destination_preserved
+                                     ? "existing destination preserved for "
+                                     : "non-exact bytes withheld from the normal destination for ") +
+                     descriptor.relative_path + "; recovery bytes published to " +
+                     wide_to_utf8(sidecar) +
+                     (manifest_written ? "; manifest " + wide_to_utf8(manifest) : std::string()) + ".");
+        } else {
+            stage.commit();
+            if (contains_synthetic_bytes) {
+                std::wstring manifest = stage.published_path() + L".recovery.json";
+                try {
+                    write_recovery_manifest(manifest, stage.published_path(), stage,
+                                            descriptor, entry);
+                    emit_log("RECOVERED OUTPUT OVERRIDE: synthetic bytes replaced the normal "
+                             "destination for " + descriptor.relative_path + "; manifest " +
+                             wide_to_utf8(manifest) + ".");
+                } catch (const std::exception& ex) {
+                    std::string notice =
+                        "Recovered destination bytes were published, but their recovery manifest could not be written: " +
+                        std::string(ex.what());
+                    add_metadata_notice(notice);
+                    emit_log("WARNING: " + notice);
+                }
+            } else {
+                remove_owned_recovery_manifest(stage.published_path());
+            }
+        }
+        if (stage.post_publish_attribute_error() != ERROR_SUCCESS) {
+            std::string warning =
+                "Published file attributes could not be fully restored for " +
+                descriptor.relative_path + " (Win32 " +
+                std::to_string(stage.post_publish_attribute_error()) + ").";
+            add_metadata_notice(warning);
+            emit_log("WARNING: " + warning);
+        }
+    }
+
     bool copy_single_file(const SourceFileDescriptor& descriptor, JournalFileEntry& entry,
                           const std::wstring& destination_root, ProgressAccumulator& progress,
                           JobJournal& journal, const std::wstring& journal_path,
@@ -1007,6 +2112,28 @@ private:
         if (!destination_directory.empty() && add_created_directory(destination_directory)) {
             storage::fsutil::create_directories(destination_directory);
         }
+
+        FileStabilitySnapshot source_stability;
+        const bool source_stability_valid =
+            try_get_file_stability(descriptor.full_path, source_stability);
+        if (source_stability_valid) note_hard_link_topology(source_stability);
+        if (source_stability_valid &&
+            (source_stability.length != descriptor.length ||
+             source_stability.last_write_utc_ticks != descriptor.last_write_utc_ticks)) {
+            throw IoError("Source changed after enumeration: " + descriptor.relative_path + ".");
+        }
+        FileIdentity source_identity = source_stability.identity;
+        const bool source_identity_valid = source_stability_valid ||
+                                           try_get_file_identity(descriptor.full_path, source_identity);
+        if (source_identity_valid) {
+            entry.SourceFileIndex = static_cast<std::int64_t>(source_identity.file_index);
+            entry.SourceVolumeSerial = static_cast<std::int64_t>(source_identity.volume_serial);
+        }
+        if (source_stability_valid) {
+            entry.SourceChangeUtcTicks = source_stability.change_utc_ticks;
+        }
+        FileSecuritySnapshot source_security = capture_file_security(descriptor.full_path);
+        NamedStreamEnumeration source_streams = enumerate_named_streams(descriptor.full_path);
 
         std::int64_t destination_length = get_existing_file_length(destination_path);
         bool has_persisted_coverage = false;
@@ -1021,23 +2148,32 @@ private:
         bool preserve_existing = options_.ResumeFromJournal && destination_length > 0 &&
                                  (entry.BytesCopied > 0 || has_persisted_coverage);
 
-        prepare_destination_file(destination_path, descriptor.length, destination_length, preserve_existing);
-        destination_length = get_existing_file_length(destination_path);
+        DestinationStage stage(destination_path, cancel);
+        if (preserve_existing) stage.clone_existing_if_present();
+        const std::wstring& working_path = stage.working_path();
+        prepare_destination_file(working_path, descriptor.length, destination_length, preserve_existing);
+        destination_length = get_existing_file_length(working_path);
 
         // Native CopyFileEx fast path.
         std::int64_t native_baseline = progress.total_bytes_copied;
         NativeAttempt native = try_copy_with_native_fast_path(
-            descriptor, entry, destination_path, destination_length, has_persisted_coverage,
+            descriptor, entry, working_path, destination_length, has_persisted_coverage,
             progress, journal, journal_path, cancel);
         if (native.attempted) {
             if (native.succeeded) {
-                if (options_.PreserveTimestamps) {
-                    set_last_write_time_utc(destination_path, descriptor.last_write_utc_ticks);
-                }
+                ensure_source_identity_unchanged(descriptor, source_identity, source_identity_valid);
+                ensure_media_identity_integrity(utf8_to_wide(options_.SourceRoot), destination_root,
+                                                true, true);
+                stage.make_writable();
                 if (resolve_verification_mode() != models::VerificationMode::None) {
-                    verify_file_with_retries(descriptor.full_path, destination_path,
+                    verify_file_with_retries(descriptor.full_path, working_path,
                                              descriptor.relative_path, resolve_verification_mode(), cancel);
                 }
+                preserve_file_metadata(descriptor, working_path, source_security, source_streams,
+                                       cancel, resolve_verification_mode());
+                ensure_source_stability_unchanged(descriptor, source_stability,
+                                                  source_stability_valid);
+                publish_stage(stage, descriptor, false);
                 return false;
             }
             progress.total_bytes_copied = native_baseline;
@@ -1047,10 +2183,12 @@ private:
                 emit_log("Native fast-path fallback on " + descriptor.relative_path + ": " +
                          native.fallback_reason);
             }
-            prepare_destination_file(destination_path, descriptor.length,
-                                     get_existing_file_length(destination_path), false);
-            destination_length = get_existing_file_length(destination_path);
+            prepare_destination_file(working_path, descriptor.length,
+                                     get_existing_file_length(working_path), false);
+            destination_length = get_existing_file_length(working_path);
         }
+
+        prepare_managed_encryption(descriptor, working_path);
 
         AdaptiveBufferController controller =
             create_buffer_controller(descriptor.length, BufferPurpose::Copy);
@@ -1058,13 +2196,18 @@ private:
         std::vector<unsigned char> io_buffer(
             static_cast<std::size_t>(std::max(controller.maximum_size(), MinimumRescueBlockSize)));
 
-        FileTransferSession session(descriptor.full_path, destination_path);
+        FileTransferSession session(descriptor.full_path, working_path);
         entry.RescueRanges = build_rescue_ranges(entry, descriptor.length, destination_length);
         std::int64_t mapped_unreadable = apply_known_bad_ranges_from_map(descriptor, entry);
         entry.LastRescuePass = "Init";
 
         std::int64_t already_satisfied = rescue_bytes(
             entry.RescueRanges, {RescueRangeState::Good, RescueRangeState::Recovered});
+        std::optional<CopyVerificationTracker> verification_tracker;
+        if (resolve_verification_mode() == models::VerificationMode::Full) {
+            verification_tracker.emplace(use_sha512());
+            if (preserve_existing || already_satisfied > 0) verification_tracker->invalidate();
+        }
         entry.BytesCopied = already_satisfied;
         progress.total_bytes_copied += already_satisfied;
         emit_progress(progress, descriptor.relative_path,
@@ -1078,9 +2221,10 @@ private:
                               mapped_unreadable <= 0;
         if (use_small_fast) {
             entry.LastRescuePass = "SmallFileFast";
-            recovered_any = copy_small_file_fast(descriptor, entry, destination_path, session,
+            recovered_any = copy_small_file_fast(descriptor, entry, working_path, session,
                                                  io_buffer, controller, progress, journal,
-                                                 journal_path, cancel);
+                                                 journal_path, cancel,
+                                                 verification_tracker ? &*verification_tracker : nullptr);
         } else {
             std::vector<RescuePassDefinition> pass_plan = build_rescue_pass_plan(active_buffer_size);
             double bad_density = rescue_bad_density(entry.RescueRanges, descriptor.length);
@@ -1092,7 +2236,7 @@ private:
                 RescuePassOutcome outcome = execute_rescue_pass(
                     pass, descriptor, entry, session, io_buffer, progress, journal, journal_path,
                     cancel, /*write_recovered*/ true, /*count_failed_as_processed*/ false,
-                    &controller);
+                    &controller, verification_tracker ? &*verification_tracker : nullptr);
 
                 std::int32_t remaining_bad = unreadable_region_count(entry.RescueRanges);
                 std::int64_t remaining_bad_bytes = rescue_bytes(
@@ -1134,16 +2278,15 @@ private:
                                                          controller.current_size(), progress,
                                                          journal, journal_path, cancel);
                 recovered_any = salvaged || recovered_any;
+                if (verification_tracker) verification_tracker->invalidate();
                 sync_entry_bytes_copied(entry);
                 entry.RecoveredRanges = merge_byte_ranges(entry.RecoveredRanges);
                 flush_journal(journal_path, journal, true);
             }
         }
 
-        if (options_.PreserveTimestamps) {
-            session.invalidate_destination(); // release write handle before touching times
-            set_last_write_time_utc(destination_path, descriptor.last_write_utc_ticks);
-        }
+        ensure_source_identity_unchanged(descriptor, source_identity, source_identity_valid);
+        session.invalidate_destination(); // release the staged write handle before metadata/commit
 
         models::VerificationMode verification = resolve_verification_mode();
         if (verification != models::VerificationMode::None) {
@@ -1152,13 +2295,50 @@ private:
             } else {
                 session.invalidate_source();
                 session.invalidate_destination();
-                verify_file_with_retries(descriptor.full_path, destination_path,
-                                         descriptor.relative_path, verification, cancel);
+                std::optional<std::vector<unsigned char>> copied_source_hash;
+                if (verification_tracker) {
+                    copied_source_hash = verification_tracker->finish(descriptor.length);
+                }
+                verify_file_with_retries(descriptor.full_path, working_path,
+                                         descriptor.relative_path, verification, cancel,
+                                         copied_source_hash);
             }
         }
 
+        preserve_file_metadata(descriptor, working_path, source_security, source_streams, cancel,
+                               recovered_any ? models::VerificationMode::None : verification);
+        ensure_source_stability_unchanged(descriptor, source_stability,
+                                          source_stability_valid);
+
+        ensure_media_identity_integrity(utf8_to_wide(options_.SourceRoot), destination_root,
+                                        true, true);
+        publish_stage(stage, descriptor, recovered_any, &entry);
         managed_copy_files_ += 1;
         return recovered_any;
+    }
+
+    static void ensure_source_identity_unchanged(const SourceFileDescriptor& descriptor,
+                                                 const FileIdentity& expected,
+                                                 bool expected_valid) {
+        if (!expected_valid) return;
+        FileIdentity current;
+        if (!try_get_file_identity(descriptor.full_path, current) ||
+            current.file_index != expected.file_index ||
+            current.volume_serial != expected.volume_serial) {
+            throw IoError("Source file identity changed during copy: " + descriptor.relative_path + ".");
+        }
+    }
+
+    static void ensure_source_stability_unchanged(
+        const SourceFileDescriptor& descriptor, const FileStabilitySnapshot& expected,
+        bool expected_valid) {
+        if (!expected_valid) return;
+        FileStabilitySnapshot current;
+        if (!try_get_file_stability(descriptor.full_path, current) ||
+            !file_stability_matches(expected, current)) {
+            throw IoError("Source content or metadata changed during copy: " +
+                          descriptor.relative_path + ".");
+        }
     }
 
     bool add_created_directory(const std::wstring& directory) {
@@ -1210,7 +2390,95 @@ private:
     bool is_native_acceleration_allowed() const {
         if (options_.TransferEnginePolicyValue == models::TransferEnginePolicy::ManagedRescue) return false;
         if (fault_injector_.has_value()) return false;
+        // Auto must honor the configured managed retry/rescue policy. Native
+        // acceleration remains available as an explicit NativeFast choice.
+        if (options_.TransferEnginePolicyValue == models::TransferEnginePolicy::Auto &&
+            (options_.MaxRetries > 0 || options_.SalvageUnreadableBlocks)) {
+            return false;
+        }
+        // CopyFileExW is a single opaque operation: it cannot participate in
+        // the managed media-identity, lock-wait, fragile-media, or source-
+        // mutation policies. Those options must force the retry-aware path.
+        if (options_.FragileMediaMode || options_.WaitForMediaAvailability ||
+            options_.WaitForFileLockRelease || options_.TreatAccessDeniedAsContention ||
+            options_.SourceMutationPolicyValue != models::SourceMutationPolicy::FailFile) {
+            return false;
+        }
         return true;
+    }
+
+    std::string preserve_directory_metadata(
+        const std::wstring& source_root, const std::wstring& destination_root,
+        const std::vector<std::string>& relative_directories,
+        const CancelContext& cancel) {
+        std::vector<std::string> deepest_first = relative_directories;
+        std::stable_sort(deepest_first.begin(), deepest_first.end(),
+                         [](const std::string& left, const std::string& right) {
+                             const auto depth = [](const std::string& path) {
+                                 return static_cast<std::size_t>(
+                                     std::count(path.begin(), path.end(), '\\'));
+                             };
+                             const std::size_t left_depth = depth(left);
+                             const std::size_t right_depth = depth(right);
+                             if (left_depth != right_depth) return left_depth > right_depth;
+                             return left.size() > right.size();
+                         });
+
+        for (const auto& relative : deepest_first) {
+            try {
+                cancel.throw_if_cancelled();
+                if (control_ != nullptr) control_->wait_if_paused(cancel);
+                const std::wstring source_path =
+                    detail::trim_trailing_separators(source_root) + L"\\" + utf8_to_wide(relative);
+                const std::wstring destination_path =
+                    detail::trim_trailing_separators(destination_root) + L"\\" + utf8_to_wide(relative);
+
+                WIN32_FILE_ATTRIBUTE_DATA source_data{};
+                if (!GetFileAttributesExW(source_path.c_str(), GetFileExInfoStandard,
+                                          &source_data) ||
+                    (source_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                    throw IoError::from_win32(
+                        "Unable to inspect source directory metadata.", GetLastError());
+                }
+                NamedStreamEnumeration directory_streams =
+                    enumerate_named_streams(source_path);
+                if (directory_streams.supported && !directory_streams.streams.empty()) {
+                    add_metadata_notice(
+                        "Alternate data streams attached to directories were not copied.");
+                }
+
+                if (options_.PreserveTimestamps &&
+                    !set_file_times_utc(destination_path, source_data.ftCreationTime,
+                                        source_data.ftLastAccessTime,
+                                        source_data.ftLastWriteTime)) {
+                    throw IoError::from_win32(
+                        "Unable to preserve source directory timestamps.", GetLastError());
+                }
+                if (!set_copyable_file_attributes(destination_path,
+                                                  source_data.dwFileAttributes)) {
+                    throw IoError::from_win32(
+                        "Unable to preserve source directory attributes.", GetLastError());
+                }
+                // Apply permissions only after timestamp work. A restrictive
+                // source DACL can legitimately deny further metadata writes.
+                FileSecuritySnapshot security = capture_file_security(source_path);
+                FileSecurityApplyResult security_result =
+                    apply_file_security(destination_path, security);
+                if (security.sacl_omitted || !security_result.sacl_preserved) {
+                    add_metadata_notice(
+                        "Security audit entries (SACLs) were not fully preserved for one or more directories.");
+                }
+                if (!security_result.owner_group_preserved) {
+                    add_metadata_notice(
+                        "Security owner/group were not fully preserved for one or more directories; the source DACL was applied.");
+                }
+            } catch (const OperationCanceled&) {
+                throw;
+            } catch (const std::exception& ex) {
+                return "Directory metadata failed for " + relative + ": " + ex.what();
+            }
+        }
+        return std::string();
     }
 
     bool should_use_native_copy_fast_path(std::int64_t file_length, std::int64_t destination_length,
@@ -1259,6 +2527,13 @@ private:
         std::int64_t chunk = bounded - state->last_transferred;
         if (chunk < 0) chunk = 0;
         state->last_transferred = bounded;
+        if (chunk > 0) {
+            // CopyFileEx reports bytes as it completes them. Count those real
+            // source reads/stage writes even if the opaque native attempt later
+            // fails and falls back to Managed Rescue.
+            state->engine->bytes_read_.fetch_add(chunk);
+            state->engine->bytes_written_.fetch_add(chunk);
+        }
         state->entry->BytesCopied = bounded;
         state->progress->total_bytes_copied = state->baseline_bytes + bounded;
         state->engine->emit_progress(
@@ -1284,7 +2559,9 @@ private:
         NativeCallbackState state{this, &descriptor, &entry, &progress, &cancel,
                                   progress.total_bytes_copied, 0, false};
 
-        DWORD flags = COPY_FILE_ALLOW_DECRYPTED_DESTINATION;
+        DWORD flags = options_.AllowDecryptedDestination
+                          ? COPY_FILE_ALLOW_DECRYPTED_DESTINATION
+                          : 0;
         if (descriptor.length >= 16LL * 1024 * 1024) flags |= COPY_FILE_NO_BUFFERING;
 
         BOOL cancel_flag = FALSE;
@@ -1294,6 +2571,12 @@ private:
 
         if (ok) {
             result.succeeded = true;
+            const std::int64_t unreported =
+                std::max<std::int64_t>(0, descriptor.length - state.last_transferred);
+            if (unreported > 0) {
+                bytes_read_.fetch_add(unreported);
+                bytes_written_.fetch_add(unreported);
+            }
             progress.total_bytes_copied = state.baseline_bytes + descriptor.length;
             entry.BytesCopied = descriptor.length;
             entry.LastError.clear();
@@ -1726,9 +3009,10 @@ private:
                                           ProgressAccumulator& progress, JobJournal& journal,
                                           const std::wstring& journal_path,
                                           const CancelContext& cancel,
-                                          bool write_recovered = true,
-                                          bool count_failed_as_processed = false,
-                                          AdaptiveBufferController* controller = nullptr) {
+                                           bool write_recovered = true,
+                                           bool count_failed_as_processed = false,
+                                           AdaptiveBufferController* controller = nullptr,
+                                           CopyVerificationTracker* verification_tracker = nullptr) {
         RescuePassOutcome outcome;
         const bool adaptive_pass = models::detail::equals_ignore_case(pass.name, "FastScan");
         std::vector<ByteRange> targets = snapshot_by_state(entry.RescueRanges, {pass.target_state});
@@ -1785,6 +3069,9 @@ private:
 
                 if (bytes_read > 0) {
                     if (write_recovered) {
+                        if (verification_tracker != nullptr) {
+                            verification_tracker->observe(segment.Offset, io_buffer.data(), bytes_read);
+                        }
                         write_chunk_with_retries(descriptor.relative_path, segment.Offset,
                                                  io_buffer.data(), bytes_read, session, cancel);
                     }
@@ -1908,7 +3195,8 @@ private:
                               std::vector<unsigned char>& io_buffer,
                               AdaptiveBufferController& controller, ProgressAccumulator& progress,
                               JobJournal& journal, const std::wstring& journal_path,
-                              const CancelContext& cancel) {
+                              const CancelContext& cancel,
+                              CopyVerificationTracker* verification_tracker = nullptr) {
         (void)destination_path;
         entry.RescueRanges.clear();
         append_range(entry.RescueRanges, 0, descriptor.length, RescueRangeState::Pending);
@@ -1937,6 +3225,7 @@ private:
             bool read_succeeded = bytes_read > 0;
             if (bytes_read <= 0) {
                 controller.report_failure();
+                if (verification_tracker != nullptr) verification_tracker->invalidate();
                 if (!options_.SalvageUnreadableBlocks) {
                     throw IoError("Read failed on " + descriptor.relative_path + " at offset " +
                                   std::to_string(offset) + ".");
@@ -1951,6 +3240,9 @@ private:
                          describe_salvage_fill() + "-filled).");
             }
 
+            if (read_succeeded && verification_tracker != nullptr) {
+                verification_tracker->observe(offset, io_buffer.data(), bytes_read);
+            }
             write_chunk_with_retries(descriptor.relative_path, offset, io_buffer.data(), bytes_read,
                                      session, cancel);
             if (read_succeeded) {
@@ -1997,7 +3289,7 @@ private:
 
         while (attempt <= effective_max) {
             cancel.throw_if_cancelled();
-            throw_if_media_identity_mismatch_throttled(source_path, expected_source_identity_, true);
+            throw_if_media_identity_mismatch_throttled(source_path, true);
 
             try {
                 if (fault_injector_.has_value()) {
@@ -2029,6 +3321,7 @@ private:
                     throw IoError("Short read at offset " + std::to_string(offset) + ". Expected " +
                                   std::to_string(length) + ", got " + std::to_string(bytes_read) + ".");
                 }
+                bytes_read_.fetch_add(bytes_read);
                 return bytes_read;
             } catch (const IoError& ex) {
                 if (ex.kind == IoErrorKind::Timeout) {
@@ -2119,7 +3412,7 @@ private:
 
         while (attempt <= options_.MaxRetries) {
             cancel.throw_if_cancelled();
-            throw_if_media_identity_mismatch_throttled(destination_root, expected_destination_identity_, false);
+            throw_if_media_identity_mismatch_throttled(destination_root, false);
 
             try {
                 if (fault_injector_.has_value()) {
@@ -2129,6 +3422,7 @@ private:
                 }
                 timed_io::write_at(session.destination_handle(), offset, buffer, count,
                                    operation_timeout_ms(), cancel);
+                bytes_written_.fetch_add(count);
                 return;
             } catch (const IoError& ex) {
                 if (ex.kind == IoErrorKind::Timeout) {
@@ -2193,7 +3487,12 @@ private:
         double base_ms = options_.InitialRetryDelay.total_milliseconds() *
                          std::pow(2.0, bounded - 1);
         double capped = std::min(options_.MaxRetryDelay.total_milliseconds(), base_ms);
-        double jitter_unit = (static_cast<double>(retry_jitter_() % 10000) / 5000.0) - 1.0;
+        std::uint32_t jitter_seed = 0;
+        {
+            std::lock_guard<std::mutex> guard(retry_jitter_lock_);
+            jitter_seed = retry_jitter_();
+        }
+        double jitter_unit = (static_cast<double>(jitter_seed % 10000) / 5000.0) - 1.0;
         double jitter = capped * 0.25 * jitter_unit;
         std::int64_t delay_ms = static_cast<std::int64_t>(std::max(1.0, capped + jitter));
         cancel.delay(delay_ms);
@@ -2215,7 +3514,9 @@ private:
 
     void verify_file_with_retries(const std::wstring& source_path, const std::wstring& destination_path,
                                   const std::string& relative_path,
-                                  models::VerificationMode mode, const CancelContext& cancel) {
+                                  models::VerificationMode mode, const CancelContext& cancel,
+                                  const std::optional<std::vector<unsigned char>>& copied_source_hash =
+                                      std::nullopt) {
         if (mode == models::VerificationMode::Sampled) {
             emit_log("Verifying (sampled): " + relative_path);
             verify_sampled(source_path, destination_path, relative_path, cancel);
@@ -2223,7 +3524,12 @@ private:
         }
         if (mode == models::VerificationMode::Full) {
             emit_log("Verifying (full hash): " + relative_path);
-            auto source_hash = compute_file_hash(source_path, cancel);
+            auto source_hash = copied_source_hash.has_value()
+                                   ? *copied_source_hash
+                                   : compute_file_hash(source_path, cancel);
+            if (copied_source_hash.has_value()) {
+                emit_log("Using source hash captured during copy: " + relative_path);
+            }
             auto destination_hash = compute_file_hash(destination_path, cancel);
             if (source_hash != destination_hash) {
                 throw IoError("Verification hash mismatch: " + relative_path);
@@ -2280,7 +3586,7 @@ private:
                                                    std::vector<unsigned char>& buffer,
                                                    const CancelContext& cancel) {
         HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ,
-                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                    FILE_SHARE_READ, nullptr,
                                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
         if (handle == INVALID_HANDLE_VALUE) {
             throw IoError::from_win32("Unable to open file for verification.", GetLastError());
@@ -2297,24 +3603,19 @@ private:
             throw IoError("Short read while sampling verification chunk. Expected " +
                           std::to_string(count) + ", got " + std::to_string(read) + ".");
         }
+        bytes_verified_.fetch_add(read);
         return crypto::hash_buffer(buffer.data(), static_cast<std::size_t>(count), use_sha512());
     }
 
     std::vector<unsigned char> compute_file_hash(const std::wstring& path, const CancelContext& cancel) {
         HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ,
-                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                    FILE_SHARE_READ, nullptr,
                                     OPEN_EXISTING,
                                     FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN,
                                     nullptr);
         if (handle == INVALID_HANDLE_VALUE) {
             throw IoError::from_win32("Unable to open file for hashing.", GetLastError());
         }
-
-        // Dynamic timeout like EstimateHashTimeout: assume >= 8 MB/s + 10 s pad.
-        std::int64_t length = get_existing_file_length(path);
-        std::int64_t estimated_seconds = length / (8LL * 1024 * 1024) + 1;
-        std::int64_t timeout_seconds = std::clamp<std::int64_t>(estimated_seconds + 10, 30, 3600);
-        CancelContext hash_cancel = cancel.with_deadline(timeout_seconds * 1000);
 
         crypto::detail::StreamingHash hasher(use_sha512());
         std::vector<unsigned char> buffer(1 << 20);
@@ -2323,9 +3624,10 @@ private:
             while (true) {
                 std::int32_t read = timed_io::read_at(handle, offset, buffer.data(),
                                                       static_cast<std::int32_t>(buffer.size()),
-                                                      timeout_seconds * 1000, hash_cancel);
+                                                      operation_timeout_ms(), cancel);
                 if (read <= 0) break;
                 hasher.update(buffer.data(), static_cast<std::size_t>(read));
+                bytes_verified_.fetch_add(read);
                 offset += read;
                 if (read < static_cast<std::int32_t>(buffer.size())) break;
             }
@@ -2436,11 +3738,13 @@ private:
         return trimmed;
     }
 
-    static std::string build_file_fingerprint(const SourceFileDescriptor& descriptor) {
-        char text[40];
-        std::snprintf(text, sizeof(text), "%016llX:%016llX",
+    static std::string build_file_fingerprint(const SourceFileDescriptor& descriptor,
+                                              std::int64_t change_utc_ticks) {
+        char text[64];
+        std::snprintf(text, sizeof(text), "%016llX:%016llX:%016llX",
                       static_cast<unsigned long long>(descriptor.length),
-                      static_cast<unsigned long long>(descriptor.last_write_utc_ticks));
+                      static_cast<unsigned long long>(descriptor.last_write_utc_ticks),
+                      static_cast<unsigned long long>(change_utc_ticks));
         return text;
     }
 
@@ -2464,6 +3768,11 @@ private:
 
         std::wstring normalized_root = normalize_root_path(source_root);
         bad_range_map_path_ = storage::BadRangeMapStore::get_default_map_path(normalized_root);
+        if (options_.UseBadRangeMap && options_.SkipKnownBadRanges &&
+            options_.BadRangeMapMaxAgeDays <= 0) {
+            emit_log("WARNING: bad-range map hints are configured to never expire; "
+                     "file identity checks still apply, but review this advanced setting regularly.");
+        }
 
         std::optional<storage::BadRangeMap> loaded;
         try {
@@ -2474,6 +3783,7 @@ private:
         }
 
         bool allow_read_hints = false;
+        const std::string source_media_identity = expected_media_identity(true);
         if (loaded.has_value()) {
             std::wstring map_source = normalize_root_path(utf8_to_wide(loaded->SourceRoot));
             if (!map_source.empty() &&
@@ -2482,20 +3792,26 @@ private:
                 emit_log("Bad-range map source root mismatch; ignoring existing map payload.");
                 loaded.reset();
             }
+            if (loaded.has_value() && !trim_ascii(loaded->SourceIdentity).empty() &&
+                (source_media_identity.empty() ||
+                 !identities_equivalent(loaded->SourceIdentity, source_media_identity))) {
+                emit_log("Bad-range map source media identity mismatch; ignoring existing map payload.");
+                loaded.reset();
+            }
         }
 
         if (!loaded.has_value()) {
             storage::BadRangeMap fresh;
             fresh.SchemaVersion = 1;
             fresh.SourceRoot = wide_to_utf8(normalized_root);
-            fresh.SourceIdentity = expected_source_identity_;
+            fresh.SourceIdentity = source_media_identity;
             fresh.UpdatedUtc = time::DateTimeOffset::now_utc();
             loaded = std::move(fresh);
             emit_log("Bad-range map: initialized new map for this source.");
         } else {
             loaded->SourceRoot = wide_to_utf8(normalized_root);
             if (loaded->SchemaVersion <= 0) loaded->SchemaVersion = 1;
-            if (!expected_source_identity_.empty()) loaded->SourceIdentity = expected_source_identity_;
+            if (!source_media_identity.empty()) loaded->SourceIdentity = source_media_identity;
             allow_read_hints = is_bad_range_map_fresh(*loaded);
             if (allow_read_hints) {
                 std::size_t count = loaded->Files.size();
@@ -2520,23 +3836,43 @@ private:
             map_entry.LastWriteUtcTicks != descriptor.last_write_utc_ticks) {
             return false;
         }
+        // Legacy entries do not carry a file identity. Their size/time and
+        // fingerprint can still match a replacement, so they are readable
+        // but are never trusted as skip hints after identity hardening.
+        if (map_entry.SourceFileIndex == 0 || map_entry.SourceVolumeSerial == 0) return false;
+        FileStabilitySnapshot current;
+        if (!try_get_file_stability(descriptor.full_path, current) ||
+            current.length != descriptor.length ||
+            current.last_write_utc_ticks != descriptor.last_write_utc_ticks) {
+            return false;
+        }
+        if (map_entry.SourceFileIndex !=
+                static_cast<std::int64_t>(current.identity.file_index) ||
+            map_entry.SourceVolumeSerial !=
+                static_cast<std::int64_t>(current.identity.volume_serial)) {
+            return false;
+        }
         std::string fingerprint = trim_ascii(map_entry.FileFingerprint);
-        if (fingerprint.empty()) return true;
-        return models::detail::equals_ignore_case(fingerprint, build_file_fingerprint(descriptor));
+        if (fingerprint.empty()) return false;
+        return models::detail::equals_ignore_case(
+            fingerprint, build_file_fingerprint(descriptor, current.change_utc_ticks));
     }
 
-    const storage::BadRangeMapFileEntry* try_get_bad_range_map_entry(
+    std::optional<storage::BadRangeMapFileEntry> try_get_bad_range_map_entry(
         const SourceFileDescriptor& descriptor) {
         std::lock_guard<std::mutex> guard(map_lock_);
-        if (!bad_range_map_.has_value()) return nullptr;
+        if (!bad_range_map_.has_value()) return std::nullopt;
 
         std::string relative = detail::normalize_relative_path(descriptor.relative_path);
-        if (relative.empty()) return nullptr;
+        if (relative.empty()) return std::nullopt;
 
         const storage::BadRangeMapFileEntry* candidate = bad_range_map_->Files.find(relative);
-        if (candidate == nullptr || candidate->BadRanges.empty()) return nullptr;
-        if (!is_bad_range_map_entry_compatible(descriptor, *candidate)) return nullptr;
-        return candidate;
+        if (candidate == nullptr || candidate->BadRanges.empty() ||
+            candidate->ConfirmationCount < 2) {
+            return std::nullopt;
+        }
+        if (!is_bad_range_map_entry_compatible(descriptor, *candidate)) return std::nullopt;
+        return *candidate;
     }
 
     // Marks map-known bad ranges as KnownBad in the entry's rescue ranges so
@@ -2544,8 +3880,9 @@ private:
     std::int64_t apply_known_bad_ranges_from_map(const SourceFileDescriptor& descriptor,
                                                  JournalFileEntry& entry) {
         if (!bad_range_map_read_hints_enabled_) return 0;
-        const storage::BadRangeMapFileEntry* map_entry = try_get_bad_range_map_entry(descriptor);
-        if (map_entry == nullptr) return 0;
+        std::optional<storage::BadRangeMapFileEntry> map_entry =
+            try_get_bad_range_map_entry(descriptor);
+        if (!map_entry.has_value()) return 0;
 
         std::int64_t total_mapped = 0;
         for (const auto& bad_range : map_entry->BadRanges) {
@@ -2567,10 +3904,7 @@ private:
     void try_persist_bad_range_map_entry(const SourceFileDescriptor& descriptor,
                                          const JournalFileEntry& entry, bool force_save) {
         if (!bad_range_map_loaded_ || bad_range_map_path_.empty()) return;
-        if (!options_.UpdateBadRangeMapFromRun &&
-            options_.OperationMode != models::JobOperationMode::ScanOnly) {
-            return;
-        }
+        if (!options_.UpdateBadRangeMapFromRun) return;
 
         std::lock_guard<std::mutex> guard(map_lock_);
         if (!bad_range_map_.has_value()) return;
@@ -2578,19 +3912,53 @@ private:
         std::string relative = detail::normalize_relative_path(descriptor.relative_path);
         if (relative.empty()) return;
 
+        // Synthetic salvage output is deliberately not promoted to a future
+        // skip hint. A later pass may be able to read those bytes after the
+        // device cools or is reconnected.
         std::vector<ByteRange> unreadable = merge_byte_ranges(snapshot_by_state(
-            entry.RescueRanges,
-            {RescueRangeState::Bad, RescueRangeState::KnownBad, RescueRangeState::Recovered}));
+            entry.RescueRanges, {RescueRangeState::Bad, RescueRangeState::KnownBad}));
 
         if (unreadable.empty()) {
             bad_range_map_->Files.remove(relative);
         } else {
+            const storage::BadRangeMapFileEntry* previous =
+                bad_range_map_->Files.find(relative);
             storage::BadRangeMapFileEntry map_entry;
             map_entry.RelativePath = relative;
             map_entry.SourceLength = descriptor.length;
             map_entry.LastWriteUtcTicks = descriptor.last_write_utc_ticks;
-            map_entry.FileFingerprint = build_file_fingerprint(descriptor);
+            FileStabilitySnapshot source_stability;
+            if (try_get_file_stability(descriptor.full_path, source_stability) &&
+                source_stability.length == descriptor.length &&
+                source_stability.last_write_utc_ticks == descriptor.last_write_utc_ticks) {
+                map_entry.SourceFileIndex =
+                    static_cast<std::int64_t>(source_stability.identity.file_index);
+                map_entry.SourceVolumeSerial =
+                    static_cast<std::int64_t>(source_stability.identity.volume_serial);
+                map_entry.FileFingerprint = build_file_fingerprint(
+                    descriptor, source_stability.change_utc_ticks);
+            }
             map_entry.BadRanges = std::move(unreadable);
+            auto ranges_equal = [](const std::vector<ByteRange>& left,
+                                   const std::vector<ByteRange>& right) {
+                if (left.size() != right.size()) return false;
+                for (std::size_t index = 0; index < left.size(); ++index) {
+                    if (left[index].Offset != right[index].Offset ||
+                        left[index].Length != right[index].Length) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            const bool repeated_observation =
+                previous != nullptr && previous->SourceFileIndex == map_entry.SourceFileIndex &&
+                previous->SourceVolumeSerial == map_entry.SourceVolumeSerial &&
+                models::detail::equals_ignore_case(previous->FileFingerprint,
+                                                   map_entry.FileFingerprint) &&
+                ranges_equal(previous->BadRanges, map_entry.BadRanges);
+            map_entry.ConfirmationCount = repeated_observation
+                                              ? std::min(1000, std::max(1, previous->ConfirmationCount) + 1)
+                                              : 1;
             map_entry.LastScanUtc = time::DateTimeOffset::now_utc();
             map_entry.LastError = entry.LastError;
             bad_range_map_->Files.set(relative, std::move(map_entry));
@@ -2598,7 +3966,7 @@ private:
 
         bad_range_map_->SourceRoot =
             wide_to_utf8(normalize_root_path(utf8_to_wide(options_.SourceRoot)));
-        bad_range_map_->SourceIdentity = expected_source_identity_;
+        bad_range_map_->SourceIdentity = expected_media_identity(true);
         bad_range_map_->UpdatedUtc = time::DateTimeOffset::now_utc();
         if (bad_range_map_->SchemaVersion <= 0) bad_range_map_->SchemaVersion = 1;
 
@@ -2611,7 +3979,9 @@ private:
         if (!should_save) return;
 
         try {
-            bad_range_map_store_.save(bad_range_map_path_, *bad_range_map_);
+            if (!bad_range_map_store_.save(bad_range_map_path_, *bad_range_map_)) {
+                emit_log("WARNING: Bad-range map was saved with reduced snapshot redundancy.");
+            }
             last_bad_range_map_flush_tick_ = GetTickCount64();
         } catch (const std::exception& ex) {
             emit_log("Bad-range map save failed: " + std::string(ex.what()));
@@ -2620,15 +3990,14 @@ private:
 
     void flush_bad_range_map() {
         if (!bad_range_map_loaded_ || bad_range_map_path_.empty()) return;
-        if (!options_.UpdateBadRangeMapFromRun &&
-            options_.OperationMode != models::JobOperationMode::ScanOnly) {
-            return;
-        }
+        if (!options_.UpdateBadRangeMapFromRun) return;
         std::lock_guard<std::mutex> guard(map_lock_);
         if (!bad_range_map_.has_value()) return;
         try {
             bad_range_map_->UpdatedUtc = time::DateTimeOffset::now_utc();
-            bad_range_map_store_.save(bad_range_map_path_, *bad_range_map_);
+            if (!bad_range_map_store_.save(bad_range_map_path_, *bad_range_map_)) {
+                emit_log("WARNING: Final bad-range map was saved with reduced snapshot redundancy.");
+            }
             last_bad_range_map_flush_tick_ = GetTickCount64();
         } catch (const std::exception& ex) {
             emit_log("Bad-range map final flush failed: " + std::string(ex.what()));
@@ -2650,12 +4019,37 @@ private:
         }
     }
 
+    static std::optional<bool> query_seek_penalty(const std::string& root_utf8) {
+        std::wstring full = storage::fsutil::get_full_path(utf8_to_wide(root_utf8));
+        if (full.size() < 2 || full[1] != L':') return std::nullopt;
+        std::wstring volume = L"\\\\.\\" + full.substr(0, 2);
+        HANDLE handle = CreateFileW(
+            volume.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, 0, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) return std::nullopt;
+
+        STORAGE_PROPERTY_QUERY query{};
+        query.PropertyId = StorageDeviceSeekPenaltyProperty;
+        query.QueryType = PropertyStandardQuery;
+        DEVICE_SEEK_PENALTY_DESCRIPTOR descriptor{};
+        DWORD returned = 0;
+        bool available = DeviceIoControl(
+            handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), &descriptor,
+            sizeof(descriptor), &returned, nullptr) != FALSE &&
+                         returned >= sizeof(descriptor) &&
+                         descriptor.Size >= sizeof(descriptor);
+        CloseHandle(handle);
+        if (!available) return std::nullopt;
+        return descriptor.IncursSeekPenalty != FALSE;
+    }
+
     std::int32_t resolve_parallel_scan_workers(std::int32_t file_count) const {
         if (options_.OperationMode != models::JobOperationMode::ScanOnly || file_count <= 1) return 1;
         if (options_.FragileMediaMode) return 1;
         if (options_.ParallelScanWorkers > 0) {
             return std::max(1, std::min(64, std::min(file_count, options_.ParallelScanWorkers)));
         }
+        if (query_seek_penalty(options_.SourceRoot).value_or(false)) return 1;
         SYSTEM_INFO info{};
         GetSystemInfo(&info);
         std::int32_t processors = std::max<std::int32_t>(
@@ -2667,6 +4061,10 @@ private:
         if (options_.OperationMode != models::JobOperationMode::Copy || file_count <= 1) return 1;
         if (options_.ParallelSmallFileWorkers > 0) {
             return std::max(1, std::min(64, std::min(file_count, options_.ParallelSmallFileWorkers)));
+        }
+        if (query_seek_penalty(options_.SourceRoot).value_or(false) ||
+            query_seek_penalty(options_.DestinationRoot).value_or(false)) {
+            return 1;
         }
         SYSTEM_INFO info{};
         GetSystemInfo(&info);
@@ -2681,7 +4079,9 @@ private:
             entry.State != FileCopyState::CompletedWithRecovery) {
             return false;
         }
-        return entry.SourceLength == descriptor.length &&
+        return entry.SourceChangeUtcTicks != 0 &&
+               entry.SourceFileIndex != 0 && entry.SourceVolumeSerial != 0 &&
+               entry.SourceLength == descriptor.length &&
                entry.SourceLastWriteUtcTicks == descriptor.last_write_utc_ticks &&
                entry.BytesCopied >= descriptor.length;
     }
@@ -2730,14 +4130,16 @@ private:
                                      shared.worker_count);
         FastScanOutcome outcome;
         outcome.buffer_size_bytes = controller.current_size();
-        if (descriptor.length <= 0) {
-            outcome.succeeded = true;
-            return outcome;
-        }
-
         std::vector<unsigned char> io_buffer(
             static_cast<std::size_t>(std::max(controller.maximum_size(), MinimumRescueBlockSize)));
         FileTransferSession session(descriptor.full_path, std::wstring());
+        FileStabilitySnapshot scan_source_stability;
+        if (!try_get_file_stability(session.source_handle(), scan_source_stability) ||
+            scan_source_stability.length != descriptor.length ||
+            scan_source_stability.last_write_utc_ticks != descriptor.last_write_utc_ticks) {
+            throw IoError("Source changed after scan enumeration: " +
+                          descriptor.relative_path + ".");
+        }
 
         try {
             std::int64_t offset = 0;
@@ -2778,6 +4180,18 @@ private:
                                   shared.worker_count, &active_snapshot);
                 }
             }
+            FileStabilitySnapshot completed_scan_stability;
+            if (!try_get_file_stability(session.source_handle(), completed_scan_stability) ||
+                !file_stability_matches(scan_source_stability,
+                                        completed_scan_stability)) {
+                throw IoError("Source content or metadata changed during scan: " +
+                              descriptor.relative_path + ".");
+            }
+            entry.SourceFileIndex = static_cast<std::int64_t>(
+                completed_scan_stability.identity.file_index);
+            entry.SourceVolumeSerial = static_cast<std::int64_t>(
+                completed_scan_stability.identity.volume_serial);
+            entry.SourceChangeUtcTicks = completed_scan_stability.change_utc_ticks;
             outcome.succeeded = true;
             outcome.bytes_read = offset;
             outcome.buffer_size_bytes = controller.current_size();
@@ -2883,6 +4297,7 @@ private:
                             progress.recovered_files += 1;
                         }
                         progress.total_bytes_copied += descriptor.length;
+                        progress.bytes_reused += descriptor.length;
                         emit_progress(progress, descriptor.relative_path, descriptor.length,
                                       descriptor.length, 0,
                                       resolve_buffer_size_for_file(descriptor.length),
@@ -2895,7 +4310,9 @@ private:
                         progress.skipped_files += 1;
                         std::int64_t already = entry->BytesCopied > 0 ? entry->BytesCopied : 0;
                         std::int64_t remaining = descriptor.length - already;
-                        progress.total_bytes_copied += remaining > 0 ? remaining : 0;
+                        const std::int64_t skipped = remaining > 0 ? remaining : 0;
+                        progress.total_bytes_copied += skipped;
+                        progress.bytes_skipped += skipped;
                         emit_progress(progress, descriptor.relative_path, descriptor.length,
                                       descriptor.length, 0,
                                       resolve_buffer_size_for_file(descriptor.length),
@@ -2904,7 +4321,7 @@ private:
                     }
 
                     if (options_.UseBadRangeMap && options_.SkipKnownBadRanges &&
-                        try_get_bad_range_map_entry(descriptor) != nullptr) {
+                        try_get_bad_range_map_entry(descriptor).has_value()) {
                         {
                             std::lock_guard<std::mutex> guard(journal_lock_);
                             seed_fast_scan_fallback_ranges(*entry, descriptor.length, 0);
@@ -2957,6 +4374,7 @@ private:
                     std::lock_guard<std::mutex> guard(progress_lock_);
                     progress.skipped_files += 1;
                     progress.total_bytes_copied += descriptor.length;
+                    progress.bytes_skipped += descriptor.length;
                     emit_progress(progress, descriptor.relative_path, descriptor.length,
                                   descriptor.length, 0,
                                   resolve_buffer_size_for_file(descriptor.length),
@@ -3109,6 +4527,13 @@ private:
         std::vector<unsigned char> io_buffer(
             static_cast<std::size_t>(std::max(controller.maximum_size(), MinimumRescueBlockSize)));
         FileTransferSession session(descriptor.full_path, std::wstring());
+        FileStabilitySnapshot scan_source_stability;
+        if (!try_get_file_stability(session.source_handle(), scan_source_stability) ||
+            scan_source_stability.length != descriptor.length ||
+            scan_source_stability.last_write_utc_ticks != descriptor.last_write_utc_ticks) {
+            throw IoError("Source changed after scan enumeration: " +
+                          descriptor.relative_path + ".");
+        }
 
         if (!preserve_existing_coverage || entry.RescueRanges.empty()) {
             entry.RescueRanges.clear();
@@ -3185,6 +4610,18 @@ private:
             entry.RescueRanges, {RescueRangeState::Bad, RescueRangeState::KnownBad}));
         sync_entry_bytes_copied(entry);
 
+        FileStabilitySnapshot completed_scan_stability;
+        if (!try_get_file_stability(session.source_handle(), completed_scan_stability) ||
+            !file_stability_matches(scan_source_stability, completed_scan_stability)) {
+            throw IoError("Source content or metadata changed during scan: " +
+                          descriptor.relative_path + ".");
+        }
+        entry.SourceFileIndex = static_cast<std::int64_t>(
+            completed_scan_stability.identity.file_index);
+        entry.SourceVolumeSerial = static_cast<std::int64_t>(
+            completed_scan_stability.identity.volume_serial);
+        entry.SourceChangeUtcTicks = completed_scan_stability.change_utc_ticks;
+
         emit_progress(progress, descriptor.relative_path,
                       display_progress_bytes(entry, descriptor.length, entry.BytesCopied),
                       descriptor.length, 0, active_buffer_size, "ScanComplete", final_regions,
@@ -3226,6 +4663,8 @@ private:
                                                        seed_progress_from_existing);
         } catch (const SourceMutationSkipped& ex) {
             progress.skipped_files += 1;
+            progress.total_bytes_copied += descriptor.length;
+            progress.bytes_skipped += descriptor.length;
             entry.State = FileCopyState::Pending;
             entry.LastError = ex.what();
             entry.DoNotRetry = false;
@@ -3343,51 +4782,102 @@ private:
                         return;
                     }
 
-                    std::wstring destination_path = destination_path_for(destination_root, descriptor);
-                    HANDLE reset = CreateFileW(destination_path.c_str(), GENERIC_WRITE,
-                                               FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
-                                               FILE_ATTRIBUTE_NORMAL, nullptr);
-                    if (reset == INVALID_HANDLE_VALUE) {
-                        failed_count += 1;
-                        continue;
-                    }
-                    CloseHandle(reset);
-
-                    DWORD flags = COPY_FILE_ALLOW_DECRYPTED_DESTINATION;
-                    if (descriptor.length >= 16LL * 1024 * 1024) flags |= COPY_FILE_NO_BUFFERING;
-                    QuietCallbackState state{&cancel, control_};
-                    BOOL cancel_flag = FALSE;
-                    BOOL ok = CopyFileExW(descriptor.full_path.c_str(), destination_path.c_str(),
-                                          quiet_routine, &state, &cancel_flag, flags);
-                    if (!ok) {
-                        failed_count += 1;
-                        continue;
-                    }
-
-                    if (options_.PreserveTimestamps) {
-                        set_last_write_time_utc(destination_path, descriptor.last_write_utc_ticks);
-                    }
-                    {
-                        std::lock_guard<std::mutex> guard(journal_lock_);
-                        JournalFileEntry* entry = journal.Files.find(descriptor.relative_path);
-                        if (entry != nullptr) {
-                            entry->State = FileCopyState::Completed;
-                            entry->BytesCopied = descriptor.length;
-                            entry->LastError.clear();
-                            entry->DoNotRetry = false;
-                            entry->LastRescuePass = "ParallelNativeFast";
-                            entry->RecoveredRanges.clear();
-                            entry->RescueRanges.clear();
-                            append_range(entry->RescueRanges, 0, descriptor.length,
-                                         RescueRangeState::Good);
+                    try {
+                        std::wstring destination_path = destination_path_for(destination_root, descriptor);
+                        FileStabilitySnapshot source_stability;
+                        const bool source_stability_valid =
+                            try_get_file_stability(descriptor.full_path, source_stability);
+                        if (source_stability_valid) note_hard_link_topology(source_stability);
+                        if (source_stability_valid &&
+                            (source_stability.length != descriptor.length ||
+                             source_stability.last_write_utc_ticks !=
+                                 descriptor.last_write_utc_ticks)) {
+                            failed_count += 1;
+                            continue;
                         }
+                        FileIdentity source_identity = source_stability.identity;
+                        const bool source_identity_valid = source_stability_valid ||
+                            try_get_file_identity(descriptor.full_path, source_identity);
+                        if (source_identity_valid) {
+                            std::lock_guard<std::mutex> guard(journal_lock_);
+                            JournalFileEntry* entry = journal.Files.find(descriptor.relative_path);
+                            if (entry != nullptr) {
+                                entry->SourceFileIndex = static_cast<std::int64_t>(source_identity.file_index);
+                                entry->SourceVolumeSerial = static_cast<std::int64_t>(source_identity.volume_serial);
+                                if (source_stability_valid) {
+                                    entry->SourceChangeUtcTicks =
+                                        source_stability.change_utc_ticks;
+                                }
+                            }
+                        }
+                        FileSecuritySnapshot source_security = capture_file_security(descriptor.full_path);
+                        NamedStreamEnumeration source_streams = enumerate_named_streams(descriptor.full_path);
+                        DestinationStage stage(destination_path, cancel);
+                        const std::wstring& working_path = stage.working_path();
+                        HANDLE reset = CreateFileW(working_path.c_str(), GENERIC_WRITE,
+                                                   FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+                        if (reset == INVALID_HANDLE_VALUE) {
+                            failed_count += 1;
+                            continue;
+                        }
+                        CloseHandle(reset);
+
+                        DWORD flags = options_.AllowDecryptedDestination
+                                          ? COPY_FILE_ALLOW_DECRYPTED_DESTINATION
+                                          : 0;
+                        if (descriptor.length >= 16LL * 1024 * 1024) flags |= COPY_FILE_NO_BUFFERING;
+                        QuietCallbackState state{&cancel, control_};
+                        BOOL cancel_flag = FALSE;
+                        BOOL ok = CopyFileExW(descriptor.full_path.c_str(), working_path.c_str(),
+                                              quiet_routine, &state, &cancel_flag, flags);
+                        if (!ok) {
+                            failed_count += 1;
+                            continue;
+                        }
+                        bytes_read_.fetch_add(descriptor.length);
+                        bytes_written_.fetch_add(descriptor.length);
+
+                        stage.make_writable();
+                        ensure_source_identity_unchanged(descriptor, source_identity, source_identity_valid);
+                        verify_file_with_retries(descriptor.full_path, working_path,
+                                                 descriptor.relative_path,
+                                                 models::VerificationMode::Full, cancel);
+                        preserve_file_metadata(descriptor, working_path, source_security,
+                                               source_streams, cancel,
+                                               models::VerificationMode::Full);
+                        ensure_source_stability_unchanged(descriptor, source_stability,
+                                                          source_stability_valid);
+                        ensure_media_identity_integrity(utf8_to_wide(options_.SourceRoot), destination_root,
+                                                        true, true);
+                        publish_stage(stage, descriptor, false);
+                        {
+                            std::lock_guard<std::mutex> guard(journal_lock_);
+                            JournalFileEntry* entry = journal.Files.find(descriptor.relative_path);
+                            if (entry != nullptr) {
+                                entry->State = FileCopyState::Completed;
+                                entry->BytesCopied = descriptor.length;
+                                entry->LastError.clear();
+                                entry->DoNotRetry = false;
+                                entry->LastRescuePass = "ParallelNativeFast";
+                                entry->RecoveredRanges.clear();
+                                entry->RescueRanges.clear();
+                                append_range(entry->RescueRanges, 0, descriptor.length,
+                                             RescueRangeState::Good);
+                            }
+                        }
+                        parallel_native_fast_path_files_ += 1;
+                        {
+                            std::lock_guard<std::mutex> guard(work_lock);
+                            completed_paths.push_back(descriptor.relative_path);
+                        }
+                        completed_count += 1;
+                    } catch (const OperationCanceled&) {
+                        cancelled.store(true);
+                        return;
+                    } catch (const std::exception&) {
+                        failed_count += 1;
                     }
-                    parallel_native_fast_path_files_ += 1;
-                    {
-                        std::lock_guard<std::mutex> guard(work_lock);
-                        completed_paths.push_back(descriptor.relative_path);
-                    }
-                    completed_count += 1;
                 }
             });
         }
@@ -3408,25 +4898,31 @@ private:
 
     void initialize_media_identity_expectations(const std::wstring& source_root,
                                                 const std::wstring& destination_root) {
-        expected_source_identity_ = trim_ascii(options_.ExpectedSourceIdentity);
-        expected_destination_identity_ = trim_ascii(options_.ExpectedDestinationIdentity);
+        std::string source_identity = trim_ascii(options_.ExpectedSourceIdentity);
+        std::string destination_identity = trim_ascii(options_.ExpectedDestinationIdentity);
+        bool captured_source = false;
+        bool captured_destination = false;
 
-        if (expected_source_identity_.empty()) {
-            std::string identity = resolve_media_identity(source_root);
-            if (!identity.empty()) {
-                expected_source_identity_ = identity;
-                options_.ExpectedSourceIdentity = identity;
-                emit_log("Source media identity baseline captured.");
-            }
+        if (source_identity.empty()) {
+            source_identity = resolve_media_identity(source_root);
+            captured_source = !source_identity.empty();
         }
-        if (expected_destination_identity_.empty()) {
-            std::string identity = resolve_media_identity(destination_root);
-            if (!identity.empty()) {
-                expected_destination_identity_ = identity;
-                options_.ExpectedDestinationIdentity = identity;
-                emit_log("Destination media identity baseline captured.");
-            }
+        if (destination_identity.empty()) {
+            destination_identity = resolve_media_identity(destination_root);
+            captured_destination = !destination_identity.empty();
         }
+
+        {
+            std::lock_guard<std::mutex> guard(media_identity_lock_);
+            expected_source_identity_ = source_identity;
+            expected_destination_identity_ = destination_identity;
+            if (captured_source) options_.ExpectedSourceIdentity = source_identity;
+            if (captured_destination) options_.ExpectedDestinationIdentity = destination_identity;
+        }
+        source_media_identity_accepted_.store(true, std::memory_order_release);
+        destination_media_identity_accepted_.store(true, std::memory_order_release);
+        if (captured_source) emit_log("Source media identity baseline captured.");
+        if (captured_destination) emit_log("Destination media identity baseline captured.");
     }
 
     static std::string trim_ascii(const std::string& text) {
@@ -3438,37 +4934,7 @@ private:
     }
 
     static std::string resolve_media_identity(const std::wstring& path_value) {
-        if (path_value.empty()) return std::string();
-        std::wstring full = storage::fsutil::get_full_path(path_value);
-        if (full.size() >= 2 && full[0] == L'\\' && full[1] == L'\\') {
-            // UNC \\server\share
-            std::vector<std::wstring> parts;
-            std::wstring current;
-            for (wchar_t c : full.substr(2)) {
-                if (c == L'\\' || c == L'/') {
-                    if (!current.empty()) parts.push_back(current);
-                    current.clear();
-                    if (parts.size() >= 2) break;
-                } else {
-                    current.push_back(c);
-                }
-            }
-            if (!current.empty() && parts.size() < 2) parts.push_back(current);
-            if (parts.size() < 2) return std::string();
-            std::wstring share = L"\\\\" + parts[0] + L"\\" + parts[1];
-            return "unc:" + wide_to_utf8(storage::fsutil::to_upper_invariant(share));
-        }
-
-        if (full.size() < 2 || full[1] != L':') return std::string();
-        std::wstring root = full.substr(0, 2) + L"\\";
-        DWORD serial = 0, max_component = 0, flags = 0;
-        if (!GetVolumeInformationW(root.c_str(), nullptr, 0, &serial, &max_component, &flags,
-                                   nullptr, 0)) {
-            return std::string();
-        }
-        char text[16];
-        std::snprintf(text, sizeof(text), "vol:%08X", static_cast<unsigned int>(serial));
-        return text;
+        return storage::fsutil::resolve_media_identity(path_value);
     }
 
     static bool identities_equivalent(const std::string& expected, const std::string& current) {
@@ -3476,15 +4942,35 @@ private:
         std::string c = trim_ascii(current);
         if (e.empty() || c.empty()) return e.size() == c.size();
         if (models::detail::equals_ignore_case(e, c)) return true;
-        // vol:XXXXXXXX serial equivalence.
+        auto legacy_unc_base = [](const std::string& identity) {
+            if (!detail::starts_with_ignore_case(identity, "unc:")) return std::string();
+            const std::size_t separator = identity.find('|');
+            return identity.substr(0, separator);
+        };
+        const std::string expected_unc = legacy_unc_base(e);
+        const std::string current_unc = legacy_unc_base(c);
+        if (!expected_unc.empty() && !current_unc.empty() &&
+            (e.find('|') == std::string::npos) !=
+                (c.find('|') == std::string::npos) &&
+            models::detail::equals_ignore_case(expected_unc, current_unc)) {
+            return true;
+        }
+        // A new identity is vol:<volume-guid>:<serial>. Permit a serial-only
+        // comparison only when exactly one side is a legacy vol:<serial>
+        // value; two new identities with different GUIDs are not equivalent.
         auto extract_serial = [](const std::string& identity, std::string& serial) {
             if (!detail::starts_with_ignore_case(identity, "vol:")) return false;
             std::size_t position = identity.find_last_of(':');
             serial = identity.substr(position + 1);
             return !serial.empty();
         };
+        auto is_legacy_volume_identity = [](const std::string& identity) {
+            if (!detail::starts_with_ignore_case(identity, "vol:")) return false;
+            return identity.find(':', 4) == std::string::npos;
+        };
         std::string es, cs;
-        if (extract_serial(e, es) && extract_serial(c, cs)) {
+        if (is_legacy_volume_identity(e) != is_legacy_volume_identity(c) &&
+            extract_serial(e, es) && extract_serial(c, cs)) {
             return models::detail::equals_ignore_case(es, cs);
         }
         return false;
@@ -3495,11 +4981,18 @@ private:
         std::atomic<ULONGLONG>& last = is_source ? last_source_identity_probe_tick_
                                                  : last_destination_identity_probe_tick_;
         ULONGLONG previous = last.load(std::memory_order_relaxed);
-        if (previous == 0 || now - previous >= 1000) {
-            last.store(now, std::memory_order_relaxed);
-            return true;
+        while (previous == 0 || now - previous >= 1000) {
+            if (last.compare_exchange_weak(previous, now, std::memory_order_acq_rel,
+                                           std::memory_order_relaxed)) {
+                return true;
+            }
         }
         return false;
+    }
+
+    std::string expected_media_identity(bool is_source) {
+        std::lock_guard<std::mutex> guard(media_identity_lock_);
+        return is_source ? expected_source_identity_ : expected_destination_identity_;
     }
 
     void throw_if_media_identity_mismatch(const std::wstring& path_value,
@@ -3514,35 +5007,41 @@ private:
     }
 
     void throw_if_media_identity_mismatch_throttled(const std::wstring& path_value,
-                                                    const std::string& expected_identity,
                                                     bool is_source, bool force = false) {
         if (!force && !should_probe_media_identity(is_source)) return;
-        throw_if_media_identity_mismatch(path_value, expected_identity, is_source);
+        throw_if_media_identity_mismatch(path_value, expected_media_identity(is_source), is_source);
     }
 
     void ensure_media_identity_integrity(const std::wstring& source_root,
                                          const std::wstring& destination_root,
                                          bool include_destination, bool force) {
-        throw_if_media_identity_mismatch_throttled(source_root, expected_source_identity_, true, force);
+        throw_if_media_identity_mismatch_throttled(source_root, true, force);
         if (!include_destination) return;
-        throw_if_media_identity_mismatch_throttled(destination_root, expected_destination_identity_,
-                                                   false, force);
+        throw_if_media_identity_mismatch_throttled(destination_root, false, force);
     }
 
-    bool is_media_identity_accepted(const std::wstring& path_value, std::string& expected_identity,
-                                    bool is_source) {
-        expected_identity = trim_ascii(expected_identity);
+    bool is_media_identity_accepted(const std::wstring& path_value, bool is_source) {
         std::string current = resolve_media_identity(path_value);
-        if (current.empty()) return expected_identity.empty();
-        if (expected_identity.empty()) {
-            expected_identity = current;
-            if (is_source) {
-                expected_source_identity_ = current;
-                options_.ExpectedSourceIdentity = current;
-            } else {
-                expected_destination_identity_ = current;
-                options_.ExpectedDestinationIdentity = current;
+        std::string expected_identity;
+        bool captured = false;
+        {
+            // Parallel scan workers all pass through this path. Keep the shared
+            // identity strings behind one lock: assigning even an unchanged
+            // std::string concurrently can double-free its heap allocation.
+            std::lock_guard<std::mutex> guard(media_identity_lock_);
+            std::string& stored = is_source ? expected_source_identity_
+                                            : expected_destination_identity_;
+            expected_identity = stored;
+            if (!current.empty() && expected_identity.empty()) {
+                stored = current;
+                expected_identity = current;
+                if (is_source) options_.ExpectedSourceIdentity = current;
+                else options_.ExpectedDestinationIdentity = current;
+                captured = true;
             }
+        }
+        if (current.empty()) return expected_identity.empty();
+        if (captured) {
             emit_log(std::string(is_source ? "Source" : "Destination") +
                      " media identity baseline captured.");
             return true;
@@ -3553,18 +5052,31 @@ private:
         std::atomic<ULONGLONG>& last_log = is_source ? last_source_mismatch_log_tick_
                                                      : last_destination_mismatch_log_tick_;
         ULONGLONG previous_log = last_log.load(std::memory_order_relaxed);
-        if (previous_log == 0 || now - previous_log >= 5000) {
-            last_log.store(now, std::memory_order_relaxed);
-            emit_log(std::string(is_source ? "Source" : "Destination") +
-                     " media identity mismatch on '" + wide_to_utf8(path_value) + "'. Expected " +
-                     expected_identity + ", found " + current + ".");
+        while (previous_log == 0 || now - previous_log >= 5000) {
+            if (last_log.compare_exchange_weak(previous_log, now, std::memory_order_acq_rel,
+                                               std::memory_order_relaxed)) {
+                emit_log(std::string(is_source ? "Source" : "Destination") +
+                         " media identity mismatch on '" + wide_to_utf8(path_value) +
+                         "'. Expected " + expected_identity + ", found " + current + ".");
+                break;
+            }
         }
         return false;
     }
 
+    bool cached_media_identity_accepted(const std::wstring& path_value, bool is_source) {
+        std::atomic<bool>& accepted = is_source ? source_media_identity_accepted_
+                                                : destination_media_identity_accepted_;
+        if (should_probe_media_identity(is_source)) {
+            accepted.store(is_media_identity_accepted(path_value, is_source),
+                           std::memory_order_release);
+        }
+        return accepted.load(std::memory_order_acquire);
+    }
+
     bool is_source_available(const std::wstring& source_root) {
         if (source_root.empty() || !directory_exists(source_root)) return false;
-        return is_media_identity_accepted(source_root, expected_source_identity_, true);
+        return cached_media_identity_accepted(source_root, true);
     }
 
     bool is_destination_available(const std::wstring& target_path) {
@@ -3573,16 +5085,20 @@ private:
         if (full.size() < 2) return false;
         std::wstring root = full.substr(0, 2) + L"\\";
         if (full[1] == L':' && !directory_exists(root)) return false;
-        if (!is_media_identity_accepted(full, expected_destination_identity_, false)) return false;
 
         std::wstring probe = full;
+        bool existing_path_found = false;
         while (!probe.empty()) {
-            if (storage::fsutil::file_exists(probe) || directory_exists(probe)) return true;
+            if (storage::fsutil::file_exists(probe) || directory_exists(probe)) {
+                existing_path_found = true;
+                break;
+            }
             std::wstring parent = storage::fsutil::get_directory_name(probe);
             if (parent == probe) break;
             probe = parent;
         }
-        return false;
+        if (!existing_path_found) return false;
+        return cached_media_identity_accepted(full, false);
     }
 
     void wait_for_media_availability(const std::wstring& source_root,
@@ -3618,7 +5134,7 @@ private:
             if (control_ != nullptr) control_->wait_if_paused(cancel);
 
             bool file_ok = storage::fsutil::file_exists(source_path);
-            bool identity_ok = is_media_identity_accepted(source_path, expected_source_identity_, true);
+            bool identity_ok = file_ok && cached_media_identity_accepted(source_path, true);
             if (file_ok && identity_ok) return;
 
             ULONGLONG now = GetTickCount64();
@@ -3794,10 +5310,18 @@ private:
         if (safe_all > 0) safe_copied = std::min(safe_copied, safe_all);
 
         CopyProgressSnapshot snapshot;
+        snapshot.SourceMediaIdentity = expected_media_identity(true);
+        snapshot.DestinationMediaIdentity = expected_media_identity(false);
         snapshot.CurrentFile = current_file;
         snapshot.CurrentFileBytesCopied = safe_bytes;
         snapshot.CurrentFileBytesTotal = safe_total;
         snapshot.TotalBytesCopied = safe_copied;
+        snapshot.WorkBytesCompleted = safe_copied;
+        snapshot.BytesRead = std::max<std::int64_t>(0, bytes_read_.load());
+        snapshot.BytesWritten = std::max<std::int64_t>(0, bytes_written_.load());
+        snapshot.BytesVerified = std::max<std::int64_t>(0, bytes_verified_.load());
+        snapshot.BytesSkipped = std::max<std::int64_t>(0, progress.bytes_skipped);
+        snapshot.BytesReused = std::max<std::int64_t>(0, progress.bytes_reused);
         snapshot.TotalBytes = safe_all;
         snapshot.LastChunkBytesTransferred = std::max(0, last_chunk);
         snapshot.BufferSizeBytes = std::max(0, buffer_size_bytes);
@@ -3820,6 +5344,17 @@ private:
         progress_callback_(snapshot);
     }
 
+    void emit_media_identity_snapshot() {
+        if (!progress_callback_) return;
+        CopyProgressSnapshot snapshot;
+        snapshot.SourceMediaIdentity = expected_media_identity(true);
+        snapshot.DestinationMediaIdentity = expected_media_identity(false);
+        // Keep the initialization event at zero progress instead of briefly
+        // rendering an empty job as 100 percent complete.
+        snapshot.TotalFiles = 1;
+        progress_callback_(snapshot);
+    }
+
     void emit_log(const std::string& message) {
         if (!log_callback_) return;
         SYSTEMTIME local;
@@ -3833,9 +5368,11 @@ private:
     void emit_run_summary(const CopyJobResult& result) {
         std::string speed = format_bytes(static_cast<std::int64_t>(
                                 std::max(0.0, result.AverageBytesPerSecond))) + "/s";
+        const bool scan = options_.OperationMode == models::JobOperationMode::ScanOnly;
+        const std::int64_t primary_bytes = scan ? result.BytesRead : result.BytesWritten;
         emit_log(std::string("Run summary: ") +
-                 (result.Succeeded ? "succeeded" : "completed with failures") + "; copied " +
-                 format_bytes(result.CopiedBytes) + " in " +
+                 (result.Succeeded ? "succeeded" : "completed with failures") + "; " +
+                 (scan ? "read " : "wrote ") + format_bytes(primary_bytes) + " in " +
                  std::to_string(result.ElapsedMilliseconds) + " ms (" + speed + ").");
         if (result.NativeFastPathFiles > 0 || result.ParallelNativeFastPathFiles > 0 ||
             result.ManagedCopyFiles > 0 || result.NativeFallbackFiles > 0) {
@@ -3851,12 +5388,25 @@ private:
         std::int64_t elapsed_ms = run_started_tick_ == 0
                                       ? 0
                                       : static_cast<std::int64_t>(GetTickCount64() - run_started_tick_);
-        double average = elapsed_ms > 0 ? static_cast<double>(progress.total_bytes_copied) /
+        const std::int64_t actual_bytes =
+            options_.OperationMode == models::JobOperationMode::ScanOnly
+                ? bytes_read_.load()
+                : bytes_written_.load();
+        double average = elapsed_ms > 0 ? static_cast<double>(actual_bytes) /
                                               (static_cast<double>(elapsed_ms) / 1000.0)
                                         : 0.0;
 
         CopyJobResult result;
-        result.Succeeded = succeeded;
+        // A copy is successful only when every source file was copied exactly.
+        // Recovered ranges are synthetic bytes and skipped files are missing
+        // data, so neither condition may be reported as a clean success. Scan
+        // mode is different: recovered files are the scan's findings, not
+        // substituted destination bytes.
+        const bool incomplete = source_enumeration_incomplete_ ||
+                                progress.failed_files > 0 || progress.skipped_files > 0 ||
+                                (options_.OperationMode == models::JobOperationMode::Copy &&
+                                 progress.recovered_files > 0);
+        result.Succeeded = succeeded && !cancelled && !incomplete;
         result.Cancelled = cancelled;
         result.TotalFiles = progress.total_files;
         result.CompletedFiles = progress.completed_files;
@@ -3864,7 +5414,15 @@ private:
         result.RecoveredFiles = progress.recovered_files;
         result.SkippedFiles = progress.skipped_files;
         result.TotalBytes = progress.total_bytes;
-        result.CopiedBytes = progress.total_bytes_copied;
+        result.CopiedBytes = options_.OperationMode == models::JobOperationMode::Copy
+                                 ? std::max<std::int64_t>(0, bytes_written_.load())
+                                 : 0;
+        result.WorkBytesCompleted = progress.total_bytes_copied;
+        result.BytesRead = std::max<std::int64_t>(0, bytes_read_.load());
+        result.BytesWritten = std::max<std::int64_t>(0, bytes_written_.load());
+        result.BytesVerified = std::max<std::int64_t>(0, bytes_verified_.load());
+        result.BytesSkipped = std::max<std::int64_t>(0, progress.bytes_skipped);
+        result.BytesReused = std::max<std::int64_t>(0, progress.bytes_reused);
         result.TransferEnginePolicyValue = options_.TransferEnginePolicyValue;
         result.ElapsedMilliseconds = elapsed_ms;
         result.AverageBytesPerSecond = average;
@@ -3873,7 +5431,12 @@ private:
         result.ManagedCopyFiles = managed_copy_files_;
         result.NativeFallbackFiles = native_fallback_files_;
         result.JournalPath = wide_to_utf8(journal_path);
-        result.ErrorMessage = error_message;
+        result.ErrorMessage = error_message.empty() ? source_enumeration_error_ : error_message;
+        {
+            std::lock_guard<std::mutex> guard(metadata_warning_lock_);
+            result.IntegrityNotice = integrity_warning_;
+            result.MetadataNotice = metadata_notice_;
+        }
         return result;
     }
 };

@@ -193,6 +193,7 @@ public:
         bool IsSupported = false;
         std::int64_t FileLength = 0;
         std::int64_t LastWriteUtcTicks = 0;
+        std::int64_t ChangeUtcTicks = 0;
         std::uint64_t FileIndex = 0;
         DWORD VolumeSerial = 0;
         std::vector<RawDiskExtent> Extents;
@@ -570,8 +571,14 @@ private:
         }
         layout.FileLength = static_cast<std::int64_t>(
             (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow);
-        layout.LastWriteUtcTicks = filetime_to_ticks(info.ftLastWriteTime.dwLowDateTime,
-                                                     info.ftLastWriteTime.dwHighDateTime);
+        FILE_BASIC_INFO basic{};
+        if (!GetFileInformationByHandleEx(file, FileBasicInfo, &basic, sizeof(basic))) {
+            reason = "GetFileInformationByHandleEx(FileBasicInfo) failed (" +
+                     std::to_string(GetLastError()) + ").";
+            return false;
+        }
+        layout.LastWriteUtcTicks = basic.LastWriteTime.QuadPart + time::FileTimeEpochTicks;
+        layout.ChangeUtcTicks = basic.ChangeTime.QuadPart + time::FileTimeEpochTicks;
         layout.FileIndex = (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32) |
                             info.nFileIndexLow;
         layout.VolumeSerial = info.dwVolumeSerialNumber;
@@ -791,14 +798,30 @@ private:
 
     bool is_cached_file_snapshot_current(const std::wstring& path, const FileLayout& layout) const {
         if (!layout.IsSupported) return false;
-        WIN32_FILE_ATTRIBUTE_DATA data{};
-        if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return false;
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return false;
+        BY_HANDLE_FILE_INFORMATION info{};
+        FILE_BASIC_INFO basic{};
+        BOOL ok = GetFileInformationByHandle(file, &info);
+        BOOL basic_ok = GetFileInformationByHandleEx(
+            file, FileBasicInfo, &basic, sizeof(basic));
+        CloseHandle(file);
+        if (!ok || !basic_ok) return false;
+
         const std::int64_t length = static_cast<std::int64_t>(
-            (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow);
+            (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow);
         const std::int64_t last_write =
-            filetime_to_ticks(data.ftLastWriteTime.dwLowDateTime, data.ftLastWriteTime.dwHighDateTime);
+            basic.LastWriteTime.QuadPart + time::FileTimeEpochTicks;
+        const std::int64_t change_time =
+            basic.ChangeTime.QuadPart + time::FileTimeEpochTicks;
+        const std::uint64_t file_index =
+            (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
         return length == layout.FileLength && last_write == layout.LastWriteUtcTicks &&
-               (data.dwFileAttributes & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_ENCRYPTED |
+               change_time == layout.ChangeUtcTicks &&
+               file_index == layout.FileIndex && info.dwVolumeSerialNumber == layout.VolumeSerial &&
+               (info.dwFileAttributes & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_ENCRYPTED |
                                          FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
     }
 

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -28,7 +29,11 @@ using time::TimeSpan;
 
 enum class JobOperationMode : std::int32_t { Copy = 0, ScanOnly = 1 };
 enum class OverwritePolicy : std::int32_t { Overwrite = 0, SkipExisting = 1, OverwriteIfSourceNewer = 2, Ask = 3 };
-enum class SymlinkHandlingMode : std::int32_t { Skip = 0, Follow = 1 };
+enum class SymlinkHandlingMode : std::int32_t {
+    Skip = 0,
+    Follow = 1,         // Legacy value: explicitly allow external targets.
+    FollowInternal = 2  // Follow only targets that remain beneath SourceRoot.
+};
 enum class TransferEnginePolicy : std::int32_t { Auto = 0, ManagedRescue = 1, NativeFast = 2 };
 enum class SourceMutationPolicy : std::int32_t { FailFile = 0, SkipFile = 1, WaitForReappearance = 2 };
 enum class VerificationMode : std::int32_t { None = 0, Sampled = 1, Full = 2 };
@@ -69,7 +74,13 @@ std::string_view enum_name(const EnumEntry<TEnum> (&table)[N], TEnum value) {
 template <typename TEnum, std::size_t N>
 TEnum enum_parse(const EnumEntry<TEnum> (&table)[N], const json::Value* value, TEnum fallback) {
     if (value == nullptr) return fallback;
-    if (value->is_number()) return static_cast<TEnum>(value->as_int32());
+    if (value->is_number()) {
+        const std::int32_t raw = value->as_int32(std::numeric_limits<std::int32_t>::min());
+        for (const auto& entry : table) {
+            if (static_cast<std::int32_t>(entry.value) == raw) return entry.value;
+        }
+        return fallback;
+    }
     if (!value->is_string()) return fallback;
     const std::string& text = value->as_string();
     for (const auto& entry : table) {
@@ -97,7 +108,8 @@ XACT_ENUM_TABLE(OverwritePolicy,
     {OverwritePolicy::Ask, "Ask"})
 XACT_ENUM_TABLE(SymlinkHandlingMode,
     {SymlinkHandlingMode::Skip, "Skip"},
-    {SymlinkHandlingMode::Follow, "Follow"})
+    {SymlinkHandlingMode::Follow, "Follow"},
+    {SymlinkHandlingMode::FollowInternal, "FollowInternal"})
 XACT_ENUM_TABLE(TransferEnginePolicy,
     {TransferEnginePolicy::Auto, "Auto"},
     {TransferEnginePolicy::ManagedRescue, "ManagedRescue"},
@@ -147,11 +159,15 @@ inline void read(const json::Object* obj, std::string_view name, bool& target) {
 }
 
 inline void read(const json::Object* obj, std::string_view name, std::int32_t& target) {
-    if (const auto* v = field(obj, name); v != nullptr && v->is_number()) target = v->as_int32();
+    if (const auto* v = field(obj, name); v != nullptr && v->is_number()) {
+        target = v->as_int32(target);
+    }
 }
 
 inline void read(const json::Object* obj, std::string_view name, std::int64_t& target) {
-    if (const auto* v = field(obj, name); v != nullptr && v->is_number()) target = v->as_int64();
+    if (const auto* v = field(obj, name); v != nullptr && v->is_number()) {
+        target = v->as_int64(target);
+    }
 }
 
 inline void read(const json::Object* obj, std::string_view name, double& target) {
@@ -194,6 +210,27 @@ inline void write_string_array(json::Writer& w, std::string_view name, const std
 // ---------------------------------------------------------------------------
 
 struct CopyJobOptions {
+    static constexpr std::int32_t MinimumBufferSizeBytes = 1024 * 1024;
+    static constexpr std::int32_t MaximumBufferSizeBytes = 256 * 1024 * 1024;
+    static constexpr std::int32_t MaximumRetries = 32;
+    static constexpr std::int32_t MaximumNormalRetries = 3;
+    static constexpr std::int32_t MinimumOperationTimeoutSeconds = 1;
+    static constexpr std::int32_t MaximumOperationTimeoutSeconds = 3600;
+    static constexpr std::int32_t MaximumPerFileTimeoutSeconds = 86400;
+    static constexpr std::int32_t MaximumRetryDelaySeconds = 86400;
+    static constexpr std::int32_t MaximumParallelWorkers = 64;
+    static constexpr std::int32_t MaximumSampleVerificationChunkBytes = 4 * 1024 * 1024;
+    static constexpr std::int32_t MaximumSampleVerificationChunkCount = 64;
+    static constexpr std::int32_t MaximumBadRangeMapAgeDays = 3650;
+    static constexpr std::int32_t MaximumSmallFileThresholdBytes = 1024 * 1024 * 1024;
+    static constexpr std::int32_t MinimumLockProbeIntervalMilliseconds = 100;
+    static constexpr std::int32_t MaximumLockProbeIntervalMilliseconds = 10000;
+    static constexpr std::int32_t MaximumFragileFailureWindowSeconds = 3600;
+    static constexpr std::int32_t MaximumFragileFailureThreshold = 1000;
+    static constexpr std::int32_t MaximumFragileCooldownSeconds = 600;
+    static constexpr std::int32_t MaximumRescueChunkBytes = 256 * 1024 * 1024;
+    static constexpr std::int32_t MaximumRescueSplitBytes = 64 * 1024 * 1024;
+
     JobOperationMode OperationMode = JobOperationMode::Copy;
     std::string SourceRoot;
     std::string DestinationRoot;
@@ -201,8 +238,8 @@ struct CopyJobOptions {
     std::string ExpectedDestinationIdentity;
 
     bool UseBadRangeMap = false;
-    bool SkipKnownBadRanges = true;
-    bool UpdateBadRangeMapFromRun = true;
+    bool SkipKnownBadRanges = false;
+    bool UpdateBadRangeMapFromRun = false;
     std::int32_t BadRangeMapMaxAgeDays = 30;
     bool UseExperimentalRawDiskScan = false;
     ScanPerformanceProfile ScanPerformanceProfileValue = ScanPerformanceProfile::Auto;
@@ -215,12 +252,19 @@ struct CopyJobOptions {
     OverwritePolicy OverwritePolicyValue = OverwritePolicy::Overwrite;
     SymlinkHandlingMode SymlinkHandling = SymlinkHandlingMode::Skip;
     bool CopyEmptyDirectories = true;
+    // Recovery output is useful, but synthetic bytes must not silently replace
+    // a better pre-existing copy. The worker publishes a sidecar unless this
+    // explicit expert override is present in the complete job payload.
+    bool AllowRecoveredOverwriteExisting = false;
+    // EFS reads yield plaintext to normal callers. Keep plaintext publication
+    // opt-in instead of treating loss of encryption as a metadata warning.
+    bool AllowDecryptedDestination = false;
 
     std::int32_t BufferSizeBytes = 4 * 1024 * 1024;
     bool UseAdaptiveBufferSizing = false;
     TransferEnginePolicy TransferEnginePolicyValue = TransferEnginePolicy::Auto;
     std::int64_t MaxThroughputBytesPerSecond = 0;
-    std::int32_t ParallelSmallFileWorkers = 1;
+    std::int32_t ParallelSmallFileWorkers = 0;
     std::int32_t SmallFileThresholdBytes = 256 * 1024;
     std::int32_t ParallelScanWorkers = 0;
 
@@ -236,21 +280,21 @@ struct CopyJobOptions {
     std::int32_t FragileFailureThreshold = 3;
     std::int32_t FragileCooldownSeconds = 6;
 
-    std::int32_t MaxRetries = 12;
+    std::int32_t MaxRetries = 2;
     TimeSpan OperationTimeout = TimeSpan::from_seconds(10);
     TimeSpan PerFileTimeout = TimeSpan::zero();
     TimeSpan InitialRetryDelay = TimeSpan::from_milliseconds(250);
     TimeSpan MaxRetryDelay = TimeSpan::from_seconds(8);
 
     bool ResumeFromJournal = true;
-    bool VerifyAfterCopy = false;
-    VerificationMode VerificationModeValue = VerificationMode::None;
+    bool VerifyAfterCopy = true;
+    VerificationMode VerificationModeValue = VerificationMode::Full;
     VerificationHashAlgorithm VerificationHashAlgorithmValue = VerificationHashAlgorithm::Sha256;
     std::int32_t SampleVerificationChunkBytes = 128 * 1024;
     std::int32_t SampleVerificationChunkCount = 3;
-    bool SalvageUnreadableBlocks = true;
+    bool SalvageUnreadableBlocks = false;
     SalvageFillPattern SalvageFillPatternValue = SalvageFillPattern::Zero;
-    bool ContinueOnFileError = true;
+    bool ContinueOnFileError = false;
     bool PreserveTimestamps = true;
 
     std::string WorkerProcessPriorityClass = "Normal";
@@ -286,6 +330,8 @@ struct CopyJobOptions {
         w.key("OverwritePolicy"); w.value(to_string(OverwritePolicyValue));
         w.key("SymlinkHandling"); w.value(to_string(SymlinkHandling));
         w.key("CopyEmptyDirectories"); w.value(CopyEmptyDirectories);
+        w.key("AllowRecoveredOverwriteExisting"); w.value(AllowRecoveredOverwriteExisting);
+        w.key("AllowDecryptedDestination"); w.value(AllowDecryptedDestination);
         w.key("BufferSizeBytes"); w.value(BufferSizeBytes);
         w.key("UseAdaptiveBufferSizing"); w.value(UseAdaptiveBufferSizing);
         w.key("TransferEnginePolicy"); w.value(to_string(TransferEnginePolicyValue));
@@ -355,6 +401,8 @@ struct CopyJobOptions {
         o.OverwritePolicyValue = parse_OverwritePolicy(obj->find("OverwritePolicy"), o.OverwritePolicyValue);
         o.SymlinkHandling = parse_SymlinkHandlingMode(obj->find("SymlinkHandling"), o.SymlinkHandling);
         detail::read(obj, "CopyEmptyDirectories", o.CopyEmptyDirectories);
+        detail::read(obj, "AllowRecoveredOverwriteExisting", o.AllowRecoveredOverwriteExisting);
+        detail::read(obj, "AllowDecryptedDestination", o.AllowDecryptedDestination);
         detail::read(obj, "BufferSizeBytes", o.BufferSizeBytes);
         detail::read(obj, "UseAdaptiveBufferSizing", o.UseAdaptiveBufferSizing);
         o.TransferEnginePolicyValue = parse_TransferEnginePolicy(obj->find("TransferEnginePolicy"), o.TransferEnginePolicyValue);
@@ -400,7 +448,43 @@ struct CopyJobOptions {
         detail::read(obj, "RescueFastScanRetries", o.RescueFastScanRetries);
         detail::read(obj, "RescueTrimRetries", o.RescueTrimRetries);
         detail::read(obj, "RescueScrapeRetries", o.RescueScrapeRetries);
+        if (!o.UseBadRangeMap) o.SkipKnownBadRanges = false;
         return o;
+    }
+
+    bool has_unattended_media_binding() const noexcept {
+        if (ExpectedSourceIdentity.empty()) return false;
+        return OperationMode == JobOperationMode::ScanOnly || !ExpectedDestinationIdentity.empty();
+    }
+
+    std::string unattended_policy_issue() const {
+        if (!has_unattended_media_binding()) return "source/destination media identity is not bound";
+        if (WaitForMediaAvailability || WaitForFileLockRelease) {
+            return "an indefinite media or file-lock wait is enabled";
+        }
+        if (MaxRetries > MaximumNormalRetries) return "the retry count can over-stress unstable media";
+        if (SymlinkHandling == SymlinkHandlingMode::Follow) {
+            return "symbolic-link following can expand the source outside its saved scope";
+        }
+        if (WorkerProcessPriorityClass == "High") return "high worker priority requires supervision";
+        if (OperationMode == JobOperationMode::ScanOnly) {
+            if (UseExperimentalRawDiskScan) return "direct NTFS extent reads require an attended run";
+            if (ParallelScanWorkers > 8) return "more than eight scan workers can over-stress media";
+            return std::string();
+        }
+        if (!VerifyAfterCopy || VerificationModeValue != VerificationMode::Full) {
+            return "full destination verification is not enabled";
+        }
+        if (ContinueOnFileError) return "continue-on-error permits an incomplete result";
+        if (SalvageUnreadableBlocks && AllowRecoveredOverwriteExisting) {
+            return "recovered data may replace an existing file";
+        }
+        if (AllowDecryptedDestination) return "encrypted source data may be published as plaintext";
+        return std::string();
+    }
+
+    bool has_safe_unattended_policy() const {
+        return unattended_policy_issue().empty();
     }
 };
 
@@ -418,6 +502,12 @@ struct CopyJobResult {
     std::int32_t SkippedFiles = 0;
     std::int64_t TotalBytes = 0;
     std::int64_t CopiedBytes = 0;
+    std::int64_t WorkBytesCompleted = 0;
+    std::int64_t BytesRead = 0;
+    std::int64_t BytesWritten = 0;
+    std::int64_t BytesVerified = 0;
+    std::int64_t BytesSkipped = 0;
+    std::int64_t BytesReused = 0;
     TransferEnginePolicy TransferEnginePolicyValue = TransferEnginePolicy::Auto;
     std::int64_t ElapsedMilliseconds = 0;
     double AverageBytesPerSecond = 0.0;
@@ -427,6 +517,21 @@ struct CopyJobResult {
     std::int32_t NativeFallbackFiles = 0;
     std::string JournalPath;
     std::string ErrorMessage;
+    // Successful runs can still have reduced assurance or metadata fidelity.
+    // Keep those notices separate from ErrorMessage so callers do not mistake
+    // an explicitly selected policy (for example, no verification) for an I/O
+    // failure.
+    std::string IntegrityNotice;
+    std::string MetadataNotice;
+
+    // Distinguishes a run that produced a partial/recovered result from a
+    // hard startup or validation failure. This is derived from the existing
+    // wire fields, so older journals and IPC payloads remain compatible.
+    bool is_incomplete() const noexcept {
+        if (Succeeded || Cancelled) return false;
+        return CompletedFiles > 0 || FailedFiles > 0 || RecoveredFiles > 0 || SkippedFiles > 0 ||
+               ErrorMessage.rfind("Source enumeration was incomplete", 0) == 0;
+    }
 
     void to_json(json::Writer& w) const {
         w.begin_object();
@@ -439,6 +544,12 @@ struct CopyJobResult {
         w.key("SkippedFiles"); w.value(SkippedFiles);
         w.key("TotalBytes"); w.value(TotalBytes);
         w.key("CopiedBytes"); w.value(CopiedBytes);
+        w.key("WorkBytesCompleted"); w.value(WorkBytesCompleted);
+        w.key("BytesRead"); w.value(BytesRead);
+        w.key("BytesWritten"); w.value(BytesWritten);
+        w.key("BytesVerified"); w.value(BytesVerified);
+        w.key("BytesSkipped"); w.value(BytesSkipped);
+        w.key("BytesReused"); w.value(BytesReused);
         w.key("TransferEnginePolicy"); w.value(to_string(TransferEnginePolicyValue));
         w.key("ElapsedMilliseconds"); w.value(ElapsedMilliseconds);
         w.key("AverageBytesPerSecond"); w.value(AverageBytesPerSecond);
@@ -448,6 +559,8 @@ struct CopyJobResult {
         w.key("NativeFallbackFiles"); w.value(NativeFallbackFiles);
         w.key("JournalPath"); w.value(JournalPath);
         w.key("ErrorMessage"); w.value(ErrorMessage);
+        w.key("IntegrityNotice"); w.value(IntegrityNotice);
+        w.key("MetadataNotice"); w.value(MetadataNotice);
         w.end_object();
     }
 
@@ -464,6 +577,17 @@ struct CopyJobResult {
         detail::read(obj, "SkippedFiles", r.SkippedFiles);
         detail::read(obj, "TotalBytes", r.TotalBytes);
         detail::read(obj, "CopiedBytes", r.CopiedBytes);
+        detail::read(obj, "WorkBytesCompleted", r.WorkBytesCompleted);
+        detail::read(obj, "BytesRead", r.BytesRead);
+        detail::read(obj, "BytesWritten", r.BytesWritten);
+        detail::read(obj, "BytesVerified", r.BytesVerified);
+        detail::read(obj, "BytesSkipped", r.BytesSkipped);
+        detail::read(obj, "BytesReused", r.BytesReused);
+        // Histories written by older workers only have CopiedBytes. Preserve a
+        // useful display while keeping the new counters truthful for new runs.
+        if (r.WorkBytesCompleted == 0 && r.CopiedBytes > 0) {
+            r.WorkBytesCompleted = r.CopiedBytes;
+        }
         r.TransferEnginePolicyValue = parse_TransferEnginePolicy(obj->find("TransferEnginePolicy"), r.TransferEnginePolicyValue);
         detail::read(obj, "ElapsedMilliseconds", r.ElapsedMilliseconds);
         detail::read(obj, "AverageBytesPerSecond", r.AverageBytesPerSecond);
@@ -473,6 +597,8 @@ struct CopyJobResult {
         detail::read(obj, "NativeFallbackFiles", r.NativeFallbackFiles);
         detail::read(obj, "JournalPath", r.JournalPath);
         detail::read(obj, "ErrorMessage", r.ErrorMessage);
+        detail::read(obj, "IntegrityNotice", r.IntegrityNotice);
+        detail::read(obj, "MetadataNotice", r.MetadataNotice);
         return r;
     }
 };
@@ -484,10 +610,18 @@ struct CopyJobResult {
 // ---------------------------------------------------------------------------
 
 struct CopyProgressSnapshot {
+    std::string SourceMediaIdentity;
+    std::string DestinationMediaIdentity;
     std::string CurrentFile;
     std::int64_t CurrentFileBytesCopied = 0;
     std::int64_t CurrentFileBytesTotal = 0;
     std::int64_t TotalBytesCopied = 0;
+    std::int64_t WorkBytesCompleted = 0;
+    std::int64_t BytesRead = 0;
+    std::int64_t BytesWritten = 0;
+    std::int64_t BytesVerified = 0;
+    std::int64_t BytesSkipped = 0;
+    std::int64_t BytesReused = 0;
     std::int64_t TotalBytes = 0;
     std::int32_t LastChunkBytesTransferred = 0;
     std::int32_t BufferSizeBytes = 0;
@@ -509,7 +643,10 @@ struct CopyProgressSnapshot {
             double done = static_cast<double>(CompletedFiles + FailedFiles + SkippedFiles);
             return done / static_cast<double>(std::max(1, TotalFiles));
         }
-        double ratio = static_cast<double>(TotalBytesCopied) / static_cast<double>(TotalBytes);
+        const std::int64_t completed = WorkBytesCompleted > 0
+                                           ? WorkBytesCompleted
+                                           : TotalBytesCopied;
+        double ratio = static_cast<double>(completed) / static_cast<double>(TotalBytes);
         return std::clamp(ratio, 0.0, 1.0);
     }
 
@@ -527,10 +664,18 @@ struct CopyProgressSnapshot {
 
     void to_json(json::Writer& w) const {
         w.begin_object();
+        w.key("SourceMediaIdentity"); w.value(SourceMediaIdentity);
+        w.key("DestinationMediaIdentity"); w.value(DestinationMediaIdentity);
         w.key("CurrentFile"); w.value(CurrentFile);
         w.key("CurrentFileBytesCopied"); w.value(CurrentFileBytesCopied);
         w.key("CurrentFileBytesTotal"); w.value(CurrentFileBytesTotal);
         w.key("TotalBytesCopied"); w.value(TotalBytesCopied);
+        w.key("WorkBytesCompleted"); w.value(WorkBytesCompleted);
+        w.key("BytesRead"); w.value(BytesRead);
+        w.key("BytesWritten"); w.value(BytesWritten);
+        w.key("BytesVerified"); w.value(BytesVerified);
+        w.key("BytesSkipped"); w.value(BytesSkipped);
+        w.key("BytesReused"); w.value(BytesReused);
         w.key("TotalBytes"); w.value(TotalBytes);
         w.key("LastChunkBytesTransferred"); w.value(LastChunkBytesTransferred);
         w.key("BufferSizeBytes"); w.value(BufferSizeBytes);
@@ -555,10 +700,21 @@ struct CopyProgressSnapshot {
         CopyProgressSnapshot s;
         const auto* obj = value.as_object();
         if (obj == nullptr) return s;
+        detail::read(obj, "SourceMediaIdentity", s.SourceMediaIdentity);
+        detail::read(obj, "DestinationMediaIdentity", s.DestinationMediaIdentity);
         detail::read(obj, "CurrentFile", s.CurrentFile);
         detail::read(obj, "CurrentFileBytesCopied", s.CurrentFileBytesCopied);
         detail::read(obj, "CurrentFileBytesTotal", s.CurrentFileBytesTotal);
         detail::read(obj, "TotalBytesCopied", s.TotalBytesCopied);
+        detail::read(obj, "WorkBytesCompleted", s.WorkBytesCompleted);
+        detail::read(obj, "BytesRead", s.BytesRead);
+        detail::read(obj, "BytesWritten", s.BytesWritten);
+        detail::read(obj, "BytesVerified", s.BytesVerified);
+        detail::read(obj, "BytesSkipped", s.BytesSkipped);
+        detail::read(obj, "BytesReused", s.BytesReused);
+        if (s.WorkBytesCompleted == 0 && s.TotalBytesCopied > 0) {
+            s.WorkBytesCompleted = s.TotalBytesCopied;
+        }
         detail::read(obj, "TotalBytes", s.TotalBytes);
         detail::read(obj, "LastChunkBytesTransferred", s.LastChunkBytesTransferred);
         detail::read(obj, "BufferSizeBytes", s.BufferSizeBytes);

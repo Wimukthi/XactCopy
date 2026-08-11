@@ -8,6 +8,9 @@
 #include <commctrl.h>
 #include <shellapi.h>
 
+#include <atomic>
+#include <thread>
+
 #include "dialogs.h"
 #include "job_manager.h"
 
@@ -44,6 +47,28 @@ private:
     TextPromptDialog(const ThemePalette& theme, std::wstring prompt, std::string initial)
         : theme_(theme), prompt_(std::move(prompt)), initial_(std::move(initial)) {}
 
+    void rebuild_font(UINT monitor_dpi) {
+        dpi_ = ui_layout_dpi(monitor_dpi, theme_.density_percent, theme_.scale_percent);
+        if (font_ != nullptr) DeleteObject(font_);
+        font_ = CreateFontW(-MulDiv(9, static_cast<int>(dpi_), 72), 0, 0, 0, FW_NORMAL,
+                            FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    }
+
+    void relayout(HWND hwnd) {
+        if (label_ == nullptr) return;
+        auto scale = [this](int value) { return MulDiv(value, static_cast<int>(dpi_), 96); };
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        MoveWindow(label_, scale(12), scale(10), client.right - scale(24), scale(18), TRUE);
+        MoveWindow(edit_, scale(12), scale(32), client.right - scale(24), scale(24), TRUE);
+        MoveWindow(ok_button_, client.right - scale(188), client.bottom - scale(36), scale(84),
+                   scale(26), TRUE);
+        MoveWindow(cancel_button_, client.right - scale(96), client.bottom - scale(36), scale(84),
+                   scale(26), TRUE);
+        tooltips_.update_layout();
+    }
+
     LRESULT proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam, bool& handled) {
         switch (message) {
             case WM_CREATE: {
@@ -51,41 +76,61 @@ private:
                 apply_window_icons(hwnd);
                 window_brush_ = CreateSolidBrush(theme_.window);
                 edit_brush_ = CreateSolidBrush(theme_.edit);
-                UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
-                                         theme_.scale_percent);
-                auto scale = [dpi](int value) { return MulDiv(value, static_cast<int>(dpi), 96); };
-                font_ = CreateFontW(-MulDiv(9, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL,
-                                    FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                                    CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
-                                    L"Segoe UI");
-                RECT client;
-                GetClientRect(hwnd, &client);
-                HWND label = CreateWindowExW(0, L"STATIC", prompt_.c_str(),
-                                             WS_CHILD | WS_VISIBLE | SS_NOPREFIX, scale(12),
-                                             scale(10), client.right - scale(24), scale(18), hwnd,
-                                             nullptr, GetModuleHandleW(nullptr), nullptr);
-                SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                rebuild_font(GetDpiForWindow(hwnd));
+                label_ = CreateWindowExW(0, L"STATIC", prompt_.c_str(),
+                                         WS_CHILD | WS_VISIBLE | SS_NOPREFIX, 0, 0, 0, 0, hwnd,
+                                         nullptr, GetModuleHandleW(nullptr), nullptr);
+                SendMessageW(label_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
                 edit_ = CreateWindowExW(0, L"EDIT",
                                         storage::fsutil::utf8_to_wide(initial_).c_str(),
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL |
                                             WS_BORDER,
-                                        scale(12), scale(32), client.right - scale(24), scale(24),
-                                        hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IdEdit)),
+                                        0, 0, 0, 0, hwnd,
+                                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IdEdit)),
                                         GetModuleHandleW(nullptr), nullptr);
                 SendMessageW(edit_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
                 apply_control_theme(edit_, theme_.dark);
                 SendMessageW(edit_, EM_SETSEL, 0, -1);
-                auto make_button = [&](int id, const wchar_t* text, int x) {
+                auto make_button = [&](int id, const wchar_t* text) {
                     HWND button = CreateWindowExW(
-                        0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, x,
-                        client.bottom - scale(36), scale(84), scale(26), hwnd,
+                        0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                        0, 0, 0, 0, hwnd,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                         GetModuleHandleW(nullptr), nullptr);
                     SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                    return button;
                 };
-                make_button(IdOk, L"OK", client.right - scale(188));
-                make_button(IdCancel, L"Cancel", client.right - scale(96));
+                ok_button_ = make_button(IdOk, L"OK");
+                cancel_button_ = make_button(IdCancel, L"Cancel");
+                tooltips_.create(hwnd, dpi_, theme_.dark);
+                tooltips_.add(label_, prompt_.c_str());
+                tooltips_.add(edit_, L"Enter the requested name or value. The current text is selected so typing replaces it.");
+                tooltips_.add(ok_button_, L"Accept the entered value and continue.");
+                tooltips_.add(cancel_button_, L"Close this prompt without applying the entered value.");
+                relayout(hwnd);
                 SetFocus(edit_);
+                handled = true;
+                return 0;
+            }
+            case WM_SIZE:
+                relayout(hwnd);
+                handled = true;
+                return 0;
+            case WM_DPICHANGED: {
+                rebuild_font(HIWORD(wparam) != 0 ? HIWORD(wparam) : LOWORD(wparam));
+                const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
+                SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+                for (HWND control : {label_, edit_, ok_button_, cancel_button_}) {
+                    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                }
+                tooltips_.update_dpi(dpi_);
+                apply_window_icons(hwnd);
+                relayout(hwnd);
+                RedrawWindow(hwnd, nullptr, nullptr,
+                             RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
                 handled = true;
                 return 0;
             }
@@ -120,19 +165,19 @@ private:
                     wchar_t buffer[512]{};
                     GetWindowTextW(edit_, buffer, 511);
                     result_ = storage::fsutil::wide_to_utf8(buffer);
-                    DestroyWindow(hwnd);
+                    host_.destroy();
                     handled = true;
                     return 0;
                 }
                 if (id == IdCancel || id == IDCANCEL) {
-                    DestroyWindow(hwnd);
+                    host_.destroy();
                     handled = true;
                     return 0;
                 }
                 return 0;
             }
             case WM_CLOSE:
-                DestroyWindow(hwnd);
+                host_.destroy();
                 handled = true;
                 return 0;
             case WM_DESTROY:
@@ -149,10 +194,15 @@ private:
     std::wstring prompt_;
     std::string initial_;
     std::optional<std::string> result_;
+    HWND label_ = nullptr;
     HWND edit_ = nullptr;
+    HWND ok_button_ = nullptr;
+    HWND cancel_button_ = nullptr;
+    UINT dpi_ = 96;
     HFONT font_ = nullptr;
     HBRUSH window_brush_ = nullptr;
     HBRUSH edit_brush_ = nullptr;
+    TooltipManager tooltips_;
 };
 
 // ---------------------------------------------------------------------------
@@ -172,8 +222,21 @@ public:
     static JobManagerRequest show(HWND owner, JobManagerService& manager, const ThemePalette& theme,
                                   AppSettings& settings) {
         JobManagerDialog dialog(manager, theme, settings);
-        int width = settings.get_int("JobManagerWidth", 700, 20000, 1080);
-        int height = settings.get_int("JobManagerHeight", 460, 20000, 640);
+        const int stored_width = settings.get_int("JobManagerWidth", 700, 20000, 0);
+        const int stored_height = settings.get_int("JobManagerHeight", 460, 20000, 0);
+        int width = stored_width > 0 ? stored_width : 1080;
+        int height = stored_height > 0 ? stored_height : 640;
+        // Older builds stored physical outer-window pixels. ModalHost now takes
+        // logical client dimensions, so migrate an existing placement once and
+        // avoid magnifying it on a high-DPI monitor.
+        if (stored_width > 0 && stored_height > 0 &&
+            !settings.get_bool("JobManagerPlacementLogicalClient", false)) {
+            const UINT layout_dpi = ui_layout_dpi(
+                owner != nullptr ? GetDpiForWindow(owner) : GetDpiForSystem(),
+                theme.density_percent, theme.scale_percent);
+            width = std::max(760, MulDiv(width, 96, static_cast<int>(layout_dpi)));
+            height = std::max(480, MulDiv(height, 96, static_cast<int>(layout_dpi)));
+        }
         dialog.host_.set_density_percent(theme.density_percent);
         dialog.host_.set_scale_percent(theme.scale_percent);
         dialog.host_.create(owner, L"XactCopyJobManager", L"Job Manager", width, height,
@@ -221,6 +284,14 @@ private:
     static constexpr int IdDetailsList = 2130;
     static constexpr UINT_PTR AutoRefreshTimerId = 1;
     static constexpr UINT_PTR SearchDebounceTimerId = 2;
+    static constexpr UINT JournalExportCompleteMessage = WM_APP + 0x521;
+
+    struct JournalExportResult {
+        bool exported = false;
+        std::wstring readable_path;
+        std::wstring view_root;
+        std::string error;
+    };
 
     JobManagerDialog(JobManagerService& manager, const ThemePalette& theme, AppSettings& settings)
         : manager_(manager), theme_(theme), settings_(settings) {
@@ -230,11 +301,22 @@ private:
     }
 
     void save_placement(HWND hwnd) {
-        RECT r;
-        if (!GetWindowRect(hwnd, &r)) return;
-        settings_.set_int("JobManagerWidth", r.right - r.left);
-        settings_.set_int("JobManagerHeight", r.bottom - r.top);
-        settings_.save();
+        RECT client{};
+        if (!GetClientRect(hwnd, &client)) return;
+        const UINT dpi = layout_dpi_ == 0 ? 96 : layout_dpi_;
+        // ModalHost persists logical client dimensions. Saving physical outer
+        // bounds made the dialog grow or shrink every time it was reopened on
+        // a monitor with a different scale factor.
+        const bool persisted = settings_.update_and_save([&](AppSettings& target) {
+            target.set_int("JobManagerWidth",
+                           MulDiv(client.right - client.left, 96, static_cast<int>(dpi)));
+            target.set_int("JobManagerHeight",
+                           MulDiv(client.bottom - client.top, 96, static_cast<int>(dpi)));
+            target.set_bool("JobManagerPlacementLogicalClient", true);
+        });
+        if (!persisted && manager_.on_persistence_warning) {
+            manager_.on_persistence_warning(settings_.last_save_error());
+        }
     }
 
     void destroy_resources() {
@@ -482,7 +564,7 @@ private:
         enable(buttons_[IdDuplicate], is_saved);
         enable(buttons_[IdDeleteJob], is_saved);
         enable(buttons_[IdDeleteRun], is_run);
-        enable(buttons_[IdOpenJournal], is_run);
+        enable(buttons_[IdOpenJournal], is_run && !journal_worker_.joinable());
         enable(buttons_[IdClearQueue], !queue_entries_.empty());
         enable(buttons_[IdClearHistory], !runs_.empty());
     }
@@ -516,6 +598,14 @@ private:
                     if (!run.ErrorMessage.empty()) {
                         line(L"Error: ", storage::fsutil::utf8_to_wide(run.ErrorMessage));
                     }
+                    if (run.Result.has_value() && !run.Result->IntegrityNotice.empty()) {
+                        line(L"Integrity notice: ",
+                             storage::fsutil::utf8_to_wide(run.Result->IntegrityNotice));
+                    }
+                    if (run.Result.has_value() && !run.Result->MetadataNotice.empty()) {
+                        line(L"Metadata notice: ",
+                             storage::fsutil::utf8_to_wide(run.Result->MetadataNotice));
+                    }
                     break;
                 }
             }
@@ -548,13 +638,13 @@ private:
                 request_.action = JobManagerRequestAction::RunSavedJob;
                 request_.job_id = row->job_id;
                 request_.queue_entry_id.clear();
-                DestroyWindow(hwnd);
+                host_.destroy();
                 return;
             case RowKind::QueueEntry:
                 request_.action = JobManagerRequestAction::RunQueuedEntry;
                 request_.queue_entry_id = row->primary_id;
                 request_.job_id = row->job_id;
-                DestroyWindow(hwnd);
+                host_.destroy();
                 return;
             default:
                 info_box(hwnd, L"Select a saved job or queue entry to run.");
@@ -589,6 +679,10 @@ private:
     }
 
     void open_journal_selected(HWND hwnd) {
+        if (journal_worker_.joinable()) {
+            info_box(hwnd, L"A journal is already being validated and opened.");
+            return;
+        }
         const Row* row = selected_row();
         if (row == nullptr || row->kind != RowKind::RunHistory) return;
         for (const auto& run : runs_) {
@@ -599,9 +693,31 @@ private:
             }
             std::wstring journal_path = storage::fsutil::utf8_to_wide(run.JournalPath);
             if (storage::fsutil::file_exists(journal_path)) {
-                std::wstring arguments = L"/select,\"" + journal_path + L"\"";
-                ShellExecuteW(hwnd, L"open", L"explorer.exe", arguments.c_str(), nullptr,
-                              SW_SHOWNORMAL);
+                std::wstring file_name = storage::fsutil::get_file_name(journal_path);
+                std::wstring base_name;
+                std::wstring extension;
+                storage::fsutil::split_extension(file_name, base_name, extension);
+                std::wstring view_root = storage::fsutil::local_app_data() +
+                                         L"\\XactCopy\\journal-views";
+                std::wstring readable_path = view_root + L"\\" + base_name +
+                                             L"-readable.json";
+                journal_dialog_closing_ = false;
+                EnableWindow(buttons_[IdOpenJournal], FALSE);
+                SetWindowTextW(buttons_[IdOpenJournal], L"Validating...");
+                journal_worker_ = std::thread(
+                    [this, hwnd, journal_path, readable_path, view_root]() {
+                        auto* result = new JournalExportResult;
+                        result->readable_path = readable_path;
+                        result->view_root = view_root;
+                        storage::JobJournalStore store;
+                        result->exported = store.export_readable_json(
+                            journal_path, readable_path, &result->error);
+                        if (journal_dialog_closing_.load() ||
+                            !PostMessageW(hwnd, JournalExportCompleteMessage, 0,
+                                          reinterpret_cast<LPARAM>(result))) {
+                            delete result;
+                        }
+                    });
             } else {
                 info_box(hwnd, L"The journal file no longer exists on disk.");
             }
@@ -611,7 +727,7 @@ private:
 
     void on_command(HWND hwnd, int id, int code) {
         if (id == IdClose || id == IDCANCEL) {
-            DestroyWindow(hwnd);
+            host_.destroy();
             return;
         }
         if (id == IdRefresh) {
@@ -707,20 +823,71 @@ private:
         }
     }
 
+    void finish_journal_export(HWND hwnd, JournalExportResult& result) {
+        if (journal_worker_.joinable()) journal_worker_.join();
+        SetWindowTextW(buttons_[IdOpenJournal], L"Open Journal");
+        update_action_states();
+        if (!result.exported) {
+            MessageDialog::show(
+                hwnd, theme_, L"Job Manager",
+                L"The journal could not be validated and exported:\n\n" +
+                    storage::fsutil::utf8_to_wide(result.error),
+                MessageIcon::Warning);
+            return;
+        }
+        HINSTANCE opened = ShellExecuteW(hwnd, L"open", result.readable_path.c_str(), nullptr,
+                                         result.view_root.c_str(), SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(opened) <= 32) {
+            std::wstring arguments = L"/select,\"" + result.readable_path + L"\"";
+            ShellExecuteW(hwnd, L"open", L"explorer.exe", arguments.c_str(), nullptr,
+                          SW_SHOWNORMAL);
+        }
+    }
+
+    void rebuild_fonts(UINT monitor_dpi) {
+        monitor_dpi_ = monitor_dpi == 0 ? 96 : monitor_dpi;
+        layout_dpi_ = ui_layout_dpi(monitor_dpi_, theme_.density_percent,
+                                    theme_.scale_percent);
+        if (font_ != nullptr) DeleteObject(font_);
+        if (title_font_ != nullptr) DeleteObject(title_font_);
+        font_ = CreateFontW(-MulDiv(9, static_cast<int>(layout_dpi_), 72), 0, 0, 0,
+                            FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                            DEFAULT_PITCH, L"Segoe UI");
+        title_font_ = CreateFontW(-MulDiv(12, static_cast<int>(layout_dpi_), 72), 0, 0, 0,
+                                  FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                  DEFAULT_PITCH, L"Segoe UI");
+    }
+
+    static const wchar_t* footer_help(int id) {
+        switch (id) {
+            case IdRunNow: return L"Run the selected saved job now, or run the selected queued entry without changing its saved options.";
+            case IdQueue: return L"Add the selected saved job to the end of the queue.";
+            case IdRemoveQueue: return L"Remove the selected queue entry without deleting its saved job.";
+            case IdMoveTop: return L"Move the selected queue entry to the first position.";
+            case IdMoveUp: return L"Move the selected queue entry one position earlier.";
+            case IdMoveDown: return L"Move the selected queue entry one position later.";
+            case IdMoveBottom: return L"Move the selected queue entry to the last position.";
+            case IdRename: return L"Rename the selected saved job. Existing queued entries continue referring to that job.";
+            case IdDuplicate: return L"Create a new saved job with the selected job's options and a new name.";
+            case IdDeleteJob: return L"Delete the selected saved job and remove every queue entry that refers to it.";
+            case IdDeleteRun: return L"Delete only the selected run-history record. It does not delete copied files or the saved job.";
+            case IdOpenJournal: return L"Validate the selected run's journal, export a readable JSON view, and open it. Large internal journals are stored in a compressed XCJZ container.";
+            case IdClearQueue: return L"Remove every pending queue entry after confirmation. Saved jobs are retained.";
+            case IdClearHistory: return L"Delete all run-history records after confirmation. Journals and copied files are not removed here.";
+            case IdClose: return L"Close Job Manager and return to the main window.";
+            default: return L"Perform this action on the selected Job Manager item.";
+        }
+    }
+
     void on_create(HWND hwnd) {
         set_dark_title_bar(hwnd, theme_.dark && theme_.themed_chrome);
         window_brush_ = CreateSolidBrush(theme_.window);
         edit_brush_ = CreateSolidBrush(theme_.edit);
-        UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
-                                 theme_.scale_percent);
+        rebuild_fonts(GetDpiForWindow(hwnd));
+        UINT dpi = layout_dpi_;
         auto scale = [dpi](int value) { return MulDiv(value, static_cast<int>(dpi), 96); };
-        font_ = CreateFontW(-MulDiv(9, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL, FALSE,
-                            FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                            CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        title_font_ = CreateFontW(-MulDiv(12, static_cast<int>(dpi), 72), 0, 0, 0, FW_SEMIBOLD,
-                                  FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                                  CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
-                                  L"Segoe UI");
 
         RECT client;
         GetClientRect(hwnd, &client);
@@ -745,10 +912,11 @@ private:
             HWND label = CreateWindowExW(0, L"STATIC", text,
                                          WS_CHILD | WS_VISIBLE | SS_NOPREFIX, x, filter_y + scale(5),
                                          width, scale(18), hwnd, nullptr,
-                                         GetModuleHandleW(nullptr), nullptr);
+                                          GetModuleHandleW(nullptr), nullptr);
             SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+            return label;
         };
-        make_label(L"View", margin, scale(34));
+        view_label_ = make_label(L"View", margin, scale(34));
         view_combo_ = CreateWindowExW(0, L"COMBOBOX", L"",
                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST |
                                           CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
@@ -760,7 +928,7 @@ private:
         }
         SendMessageW(view_combo_, CB_SETCURSEL, 0, 0);
 
-        make_label(L"Run Status", margin + scale(172), scale(64));
+        status_filter_label_ = make_label(L"Run Status", margin + scale(172), scale(64));
         status_combo_ = CreateWindowExW(0, L"COMBOBOX", L"",
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST |
                                             CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
@@ -775,7 +943,7 @@ private:
         }
         SendMessageW(status_combo_, CB_SETCURSEL, 0, 0);
 
-        make_label(L"Search", margin + scale(376), scale(44));
+        search_label_ = make_label(L"Search", margin + scale(376), scale(44));
         search_edit_ = CreateWindowExW(0, L"EDIT", L"",
                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL |
                                            WS_BORDER,
@@ -871,9 +1039,32 @@ private:
         for (HWND control : {view_combo_, status_combo_, search_edit_}) {
             SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
         }
+        const int combo_item_height = scale(22);
+        for (HWND combo : {view_combo_, status_combo_}) {
+            SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), combo_item_height);
+            SendMessageW(combo, CB_SETITEMHEIGHT, 0, combo_item_height);
+        }
         apply_combo_theme(view_combo_, theme_.dark);
         apply_combo_theme(status_combo_, theme_.dark);
         apply_control_theme(search_edit_, theme_.dark);
+
+        tooltips_.create(hwnd, layout_dpi_, theme_.dark);
+        tooltips_.add(title_label_, L"Manage reusable jobs, queued work, and previous run records from one console.");
+        tooltips_.add(summary_label_, L"Counts of saved jobs, pending queue entries, and retained run-history records.");
+        tooltips_.add(view_label_, L"Limit the grid to saved jobs, queue entries, run history, or show everything.");
+        tooltips_.add(view_combo_, L"Choose which kind of Job Manager records are displayed.");
+        tooltips_.add(status_filter_label_, L"Limit run-history rows to one completion state. Saved jobs and queue entries are unaffected.");
+        tooltips_.add(status_combo_, L"Filter run-history rows by queued, running, paused, completed, failed, cancelled, interrupted, or incomplete state.");
+        tooltips_.add(search_label_, L"Search visible records by name, state, source, destination, trigger, and summary text.");
+        tooltips_.add(search_edit_, L"Type to filter the grid. Filtering is delayed briefly so rapid typing does not repeatedly rebuild a large list.");
+        tooltips_.add(buttons_[IdRefresh], L"Reload saved jobs, queue entries, and run history from the catalog now.");
+        tooltips_.add(list_, L"Select a saved job, queue entry, or run record. Double-clicking an actionable row runs it; columns can be resized or reordered.");
+        tooltips_.add(ListView_GetHeader(list_), L"Column headings for the Job Manager grid. Drag a divider to resize a column or drag a heading to reorder it.");
+        tooltips_.add(details_label_, L"The pane below shows every available field for the selected grid record.");
+        tooltips_.add(details_list_, L"Scrollable details for the selected item, including identifiers, paths, timestamps, result counts, errors, and journal location.");
+        for (const auto& spec : footer_buttons()) {
+            tooltips_.add(buttons_[spec.id], footer_help(spec.id));
+        }
         relayout(hwnd);
 
         refresh_data(false);
@@ -902,8 +1093,7 @@ private:
     // window can be freely resized.
     void relayout(HWND hwnd) {
         if (list_ == nullptr) return;
-        UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
-                                 theme_.scale_percent);
+        const UINT dpi = layout_dpi_ == 0 ? 96 : layout_dpi_;
         auto scale = [dpi](int v) { return MulDiv(v, static_cast<int>(dpi), 96); };
         RECT client;
         GetClientRect(hwnd, &client);
@@ -917,8 +1107,24 @@ private:
         const int button_gap = scale(8);
         const int row_gap = scale(6);
 
+        MoveWindow(title_label_, margin, scale(8), scale(220), scale(22), TRUE);
         MoveWindow(summary_label_, client_right - scale(320) - margin, scale(12), scale(320),
                    scale(18), TRUE);
+
+        const int filter_y = scale(36);
+        MoveWindow(view_label_, margin, filter_y + scale(5), scale(34), scale(18), TRUE);
+        MoveWindow(view_combo_, margin + scale(38), filter_y, scale(120), scale(220), TRUE);
+        MoveWindow(status_filter_label_, margin + scale(172), filter_y + scale(5), scale(64),
+                   scale(18), TRUE);
+        MoveWindow(status_combo_, margin + scale(240), filter_y, scale(120), scale(240), TRUE);
+        MoveWindow(search_label_, margin + scale(376), filter_y + scale(5), scale(44), scale(18),
+                   TRUE);
+        const int refresh_width = scale(76);
+        const int refresh_x = client_right - margin - refresh_width;
+        const int search_x = margin + scale(424);
+        const int search_width = std::max(scale(100), refresh_x - scale(12) - search_x);
+        MoveWindow(search_edit_, search_x, filter_y, search_width, scale(24), TRUE);
+        MoveWindow(buttons_[IdRefresh], refresh_x, filter_y, refresh_width, scale(24), TRUE);
 
         // Flow the footer buttons to learn how many rows the current width needs
         // (so the footer grows/shrinks and the list gets the remaining space).
@@ -963,6 +1169,7 @@ private:
             fx += w + button_gap;
         }
         InvalidateRect(hwnd, nullptr, FALSE);
+        tooltips_.update_layout();
     }
 
     // Grow the Summary column to consume any spare width after a resize.
@@ -972,9 +1179,10 @@ private:
         GetClientRect(list_, &lr);
         int used = 0;
         for (int i = 0; i < 9; ++i) used += ListView_GetColumnWidth(list_, i);
-        int last = lr.right - used - GetSystemMetrics(SM_CXVSCROLL) - 4;
-        UINT dpi = ui_layout_dpi(GetDpiForWindow(list_), theme_.density_percent,
-                                 theme_.scale_percent);
+        const int scroll_width = GetSystemMetricsForDpi(
+            SM_CXVSCROLL, monitor_dpi_ == 0 ? USER_DEFAULT_SCREEN_DPI : monitor_dpi_);
+        int last = lr.right - used - scroll_width - 4;
+        const UINT dpi = layout_dpi_ == 0 ? 96 : layout_dpi_;
         if (last > MulDiv(120, static_cast<int>(dpi), 96)) {
             ListView_SetColumnWidth(list_, 9, last);
         }
@@ -1067,6 +1275,7 @@ private:
         COLORREF color;
         const std::string& state = row.state_utf8;
         if (state == "Failed") color = RGB(200, 40, 40);
+        else if (state == "Incomplete") color = RGB(210, 125, 30);
         else if (state == "Running") color = RGB(20, 140, 60);
         else if (state == "Completed") color = RGB(30, 100, 180);
         else if (state == "Cancelled" || state == "Interrupted") color = RGB(160, 120, 20);
@@ -1213,20 +1422,18 @@ private:
                 handled = true;
                 return 0;
             case WM_DPICHANGED: {
-                // Moved to a different-DPI monitor: rebuild fonts, re-font every
-                // child, adopt the suggested bounds, and relayout.
-                UINT dpi = ui_layout_dpi(HIWORD(wparam), theme_.density_percent,
-                                         theme_.scale_percent);
-                if (font_ != nullptr) DeleteObject(font_);
-                if (title_font_ != nullptr) DeleteObject(title_font_);
-                font_ = CreateFontW(-MulDiv(9, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL, FALSE,
-                                    FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                                    CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
-                                    L"Segoe UI");
-                title_font_ = CreateFontW(-MulDiv(12, static_cast<int>(dpi), 72), 0, 0, 0,
-                                          FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                                          DEFAULT_PITCH, L"Segoe UI");
+                const UINT old_layout_dpi = layout_dpi_ == 0 ? 96 : layout_dpi_;
+                const UINT next_monitor_dpi =
+                    HIWORD(wparam) != 0 ? HIWORD(wparam) : LOWORD(wparam);
+                // Cache the new metrics before SetWindowPos emits a nested
+                // WM_SIZE, otherwise that resize briefly lays out new bounds
+                // with the previous monitor's dimensions.
+                rebuild_fonts(next_monitor_dpi);
+                const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
+                SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
                 EnumChildWindows(
                     hwnd,
                     [](HWND child, LPARAM font) -> BOOL {
@@ -1238,17 +1445,39 @@ private:
                     SendMessageW(title_label_, WM_SETFONT, reinterpret_cast<WPARAM>(title_font_),
                                  TRUE);
                 }
-                SendMessageW(details_list_, LB_SETITEMHEIGHT, 0, MulDiv(18, static_cast<int>(dpi), 96));
-                const RECT* s = reinterpret_cast<const RECT*>(lparam);
-                SetWindowPos(hwnd, nullptr, s->left, s->top, s->right - s->left, s->bottom - s->top,
-                             SWP_NOZORDER | SWP_NOACTIVATE);
+                if (HWND header = ListView_GetHeader(list_)) {
+                    SendMessageW(header, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                }
+                for (int column = 0; column < 10; ++column) {
+                    const int old_width = ListView_GetColumnWidth(list_, column);
+                    ListView_SetColumnWidth(
+                        list_, column,
+                        MulDiv(old_width, static_cast<int>(layout_dpi_),
+                               static_cast<int>(old_layout_dpi)));
+                }
+                const int combo_item_height =
+                    MulDiv(22, static_cast<int>(layout_dpi_), 96);
+                for (HWND combo : {view_combo_, status_combo_}) {
+                    SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1),
+                                 combo_item_height);
+                    SendMessageW(combo, CB_SETITEMHEIGHT, 0, combo_item_height);
+                }
+                SendMessageW(details_list_, LB_SETITEMHEIGHT, 0,
+                             MulDiv(18, static_cast<int>(layout_dpi_), 96));
+                tooltips_.update_dpi(layout_dpi_);
+                apply_window_icons(hwnd);
                 relayout(hwnd);
+                RedrawWindow(hwnd, nullptr, nullptr,
+                             RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
                 handled = true;
                 return 0;
             }
             case WM_GETMINMAXINFO: {
-                UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
-                                         theme_.scale_percent);
+                const UINT dpi = layout_dpi_ == 0
+                                     ? ui_layout_dpi(GetDpiForWindow(hwnd),
+                                                     theme_.density_percent,
+                                                     theme_.scale_percent)
+                                     : layout_dpi_;
                 auto* mmi = reinterpret_cast<MINMAXINFO*>(lparam);
                 mmi->ptMinTrackSize.x = MulDiv(760, static_cast<int>(dpi), 96);
                 mmi->ptMinTrackSize.y = MulDiv(480, static_cast<int>(dpi), 96);
@@ -1300,10 +1529,8 @@ private:
                 if (measure.CtlType == ODT_LISTVIEW &&
                     static_cast<int>(measure.CtlID) == IdList) {
                     auto* mutable_measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lparam);
-                    UINT dpi = ui_layout_dpi(GetDpiForWindow(hwnd), theme_.density_percent,
-                                             theme_.scale_percent);
                     mutable_measure->itemHeight =
-                        MulDiv(grid_row_height_, static_cast<int>(dpi), 96);
+                        MulDiv(grid_row_height_, static_cast<int>(layout_dpi_), 96);
                     handled = true;
                     return TRUE;
                 }
@@ -1332,18 +1559,32 @@ private:
                 on_command(hwnd, LOWORD(wparam), HIWORD(wparam));
                 handled = true;
                 return 0;
-            case WM_CLOSE:
-                save_placement(hwnd);
-                DestroyWindow(hwnd);
+            case JournalExportCompleteMessage: {
+                std::unique_ptr<JournalExportResult> result(
+                    reinterpret_cast<JournalExportResult*>(lparam));
+                finish_journal_export(hwnd, *result);
                 handled = true;
                 return 0;
-            case WM_DESTROY:
+            }
+            case WM_CLOSE:
+                host_.destroy();
+                handled = true;
+                return 0;
+            case WM_DESTROY: {
+                journal_dialog_closing_ = true;
+                if (journal_worker_.joinable()) journal_worker_.join();
+                MSG pending{};
+                while (PeekMessageW(&pending, hwnd, JournalExportCompleteMessage,
+                                    JournalExportCompleteMessage, PM_REMOVE)) {
+                    delete reinterpret_cast<JournalExportResult*>(pending.lParam);
+                }
                 save_placement(hwnd);
                 if (list_ != nullptr) RemoveWindowSubclass(list_, &list_subclass_proc, 1);
                 KillTimer(hwnd, AutoRefreshTimerId);
                 KillTimer(hwnd, SearchDebounceTimerId);
                 handled = true;
                 return 0;
+            }
             default:
                 return 0;
         }
@@ -1376,11 +1617,19 @@ private:
     HWND details_label_ = nullptr;
     HWND title_label_ = nullptr;
     HWND summary_label_ = nullptr;
+    HWND view_label_ = nullptr;
+    HWND status_filter_label_ = nullptr;
+    HWND search_label_ = nullptr;
     std::map<int, HWND> buttons_;
+    UINT monitor_dpi_ = 0;
+    UINT layout_dpi_ = 0;
     HFONT font_ = nullptr;
     HFONT title_font_ = nullptr;
     HBRUSH window_brush_ = nullptr;
     HBRUSH edit_brush_ = nullptr;
+    TooltipManager tooltips_;
+    std::thread journal_worker_;
+    std::atomic<bool> journal_dialog_closing_{false};
 };
 
 } // namespace xact::ui

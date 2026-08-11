@@ -25,7 +25,7 @@ using namespace xact;
 
 class WorkerHost {
 public:
-    int run(const std::wstring& pipe_name) {
+    int run(const std::wstring& pipe_name, DWORD expected_parent_pid) {
         try {
             pipe_ = pipe::MessagePipe::create_server(pipe_name);
         } catch (const std::exception& ex) {
@@ -35,6 +35,13 @@ public:
 
         try {
             pipe_.wait_for_connection(lifetime_);
+            ULONG client_pid = 0;
+            if (expected_parent_pid == 0 ||
+                !GetNamedPipeClientProcessId(pipe_.native_handle(), &client_pid) ||
+                client_pid != expected_parent_pid) {
+                throw std::runtime_error(
+                    "Named-pipe client is not the supervisor process that launched this worker.");
+            }
             send_log("", "Worker connected to supervisor.");
 
             std::thread heartbeat([this] { heartbeat_loop(); });
@@ -356,7 +363,17 @@ private:
         result.RecoveredFiles = std::max(result.RecoveredFiles, snapshot.RecoveredFiles);
         result.SkippedFiles = std::max(result.SkippedFiles, snapshot.SkippedFiles);
         result.TotalBytes = std::max(result.TotalBytes, snapshot.TotalBytes);
-        result.CopiedBytes = std::max(result.CopiedBytes, snapshot.TotalBytesCopied);
+        result.WorkBytesCompleted =
+            std::max(result.WorkBytesCompleted, snapshot.WorkBytesCompleted);
+        result.BytesRead = std::max(result.BytesRead, snapshot.BytesRead);
+        result.BytesWritten = std::max(result.BytesWritten, snapshot.BytesWritten);
+        result.BytesVerified = std::max(result.BytesVerified, snapshot.BytesVerified);
+        result.BytesSkipped = std::max(result.BytesSkipped, snapshot.BytesSkipped);
+        result.BytesReused = std::max(result.BytesReused, snapshot.BytesReused);
+        // TotalBytesCopied is logical progress and includes skipped/reused work.
+        // CopiedBytes is retained for compatibility but must reflect actual
+        // destination writes in results emitted from a cancelled operation.
+        result.CopiedBytes = std::max(result.CopiedBytes, snapshot.BytesWritten);
     }
 
     void apply_process_priority(const std::string& requested) {
@@ -487,6 +504,19 @@ std::wstring read_pipe_name(int argc, wchar_t** argv) {
     return std::wstring();
 }
 
+DWORD read_parent_pid(int argc, wchar_t** argv) {
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (_wcsicmp(argv[i], L"--parent-pid") == 0) {
+            wchar_t* end = nullptr;
+            unsigned long value = std::wcstoul(argv[i + 1], &end, 10);
+            if (end != argv[i + 1] && end != nullptr && *end == L'\0' && value <= MAXDWORD) {
+                return static_cast<DWORD>(value);
+            }
+        }
+    }
+    return 0;
+}
+
 void notify_manual_launch() {
     static const wchar_t* message =
         L"XactCopyExecutive is a background worker and must be started by XactCopy.\r\n"
@@ -499,11 +529,12 @@ void notify_manual_launch() {
 
 int wmain(int argc, wchar_t** argv) {
     std::wstring pipe_name = read_pipe_name(argc, argv);
-    if (pipe_name.empty()) {
+    DWORD parent_pid = read_parent_pid(argc, argv);
+    if (pipe_name.empty() || parent_pid == 0) {
         notify_manual_launch();
         return 2;
     }
 
     WorkerHost host;
-    return host.run(pipe_name);
+    return host.run(pipe_name, parent_pid);
 }

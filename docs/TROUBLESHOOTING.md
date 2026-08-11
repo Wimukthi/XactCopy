@@ -18,17 +18,20 @@ each option means, see the [User Guide](USER_GUIDE.md).
 
 ### The copy stops on a file it can't read
 
-Turn on **Continue on error**. Without it, a file that can't be copied even after
-the rescue passes ends the job. With it, the file is recorded as failed and the
-job carries on.
+Turn on **Continue on error** only when recovering the remaining files is more
+important than producing one complete backup generation. The failed file stays
+visible and the run is **Incomplete**; earlier files may already have been
+published. Leave it off when a partial destination must never be mistaken for a
+complete backup.
 
 ### It's grinding for hours on a small region
 
 That is the rescue engine doing its job, but you can bound it:
 
-- **Scan Bad Blocks** first, then re-run the copy with **Use bad-range map** and
-  **Skip known-bad ranges**. The second pass will not re-read regions already
-  known to be dead.
+- If the device is stable enough for another full read, run **Assess Readable
+  Files**, then use **Use bad-range map** and **Skip known-bad ranges** on later
+  passes. Do not assess first on a rapidly deteriorating device: recover the
+  most valuable data before spending reads on diagnosis.
 - Lower **Retries** and **Timeout (s)** so each bad region gives up sooner.
 - Turn on **Fragile-media mode** if the drive is audibly struggling — it trades
   speed for a better chance of finishing before the drive dies.
@@ -77,17 +80,18 @@ rather than silently copied into the same journal.
 
 **Settings → Performance → Source mutation policy** decides what happens: fail
 the file, skip it, or wait for it to reappear. For a live source, *skip* keeps
-the job moving.
+the job moving but makes the result incomplete; it is not a consistent
+snapshot.
 
 ## Scan problems
 
 ### The scan is very slow
 
-Set **Settings → Performance → Scan profile** to *Fast health scan* and raise
+Set **Settings → Performance → Scan profile** to *Fast file assessment* and raise
 **Scan workers**. The fast profile still falls back to precise reads around any
 fault it finds, so the resulting map stays accurate.
 
-### The raw disk scan backend falls back to standard reads
+### The raw-volume assessment backend falls back to standard reads
 
 The raw backend is intentionally limited to allocated files on local NTFS
 volumes. It also requires XactCopy to be running as Administrator because it
@@ -125,11 +129,15 @@ of copying is cheaper than the I/O of flushing constantly. See
 
 ### The worker keeps restarting
 
-The supervisor restarts the worker when the heartbeat stops for 10 seconds, or
-when a running job makes no progress for longer than its activity budget. On very
-slow media, raise **Operation timeout** and **Max retries** under **Settings →
-Performance** — the stall budget is derived from them, so a job configured for
-slow media gets a longer leash.
+The supervisor restarts the worker when its heartbeat stops for 10 seconds, the
+pipe is lost, or the worker exits. Lack of file progress by itself produces a
+stall warning but does not kill a worker whose heartbeat is healthy; a Windows
+storage call may legitimately remain blocked in a driver. Automatic crash
+recovery is capped at three attempts, after which the run fails visibly instead
+of looping forever. Check the red supervisor messages and Windows storage events
+before raising **Operation timeout** or **Max retries**—those settings can make a
+failing device do substantially more work, but they do not repair a lost
+heartbeat.
 
 ## Application problems
 

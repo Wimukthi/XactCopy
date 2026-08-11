@@ -9,10 +9,12 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -143,6 +145,152 @@ inline std::wstring normalize_path(const std::wstring& path) {
     return to_upper_invariant(trim(get_full_path(trimmed)));
 }
 
+inline std::wstring strip_extended_path_prefix(std::wstring path) {
+    constexpr std::wstring_view unc_prefix = L"\\\\?\\UNC\\";
+    constexpr std::wstring_view local_prefix = L"\\\\?\\";
+    if (path.size() >= unc_prefix.size() &&
+        to_upper_invariant(path.substr(0, unc_prefix.size())) ==
+            to_upper_invariant(std::wstring(unc_prefix))) {
+        return L"\\\\" + path.substr(unc_prefix.size());
+    }
+    if (path.size() >= local_prefix.size() &&
+        path.compare(0, local_prefix.size(), local_prefix) == 0) {
+        return path.substr(local_prefix.size());
+    }
+    return path;
+}
+
+// Resolve junctions and mount points for both existing paths and a destination
+// that has not been created yet. The latter is resolved through its nearest
+// existing ancestor, then the missing suffix is appended. This is the path
+// form used for physical source/destination relationship checks.
+inline std::wstring resolve_final_path(const std::wstring& path) {
+    std::wstring full = trim(get_full_path(path));
+    while (full.size() > 3 && !full.empty() &&
+           (full.back() == L'\\' || full.back() == L'/')) {
+        full.pop_back();
+    }
+    if (full.empty()) return full;
+
+    std::vector<std::wstring> missing_components;
+    std::wstring existing = full;
+    DWORD attributes = GetFileAttributesW(existing.c_str());
+    while (attributes == INVALID_FILE_ATTRIBUTES) {
+        std::wstring parent = get_directory_name(existing);
+        if (parent.empty() || to_upper_invariant(parent) == to_upper_invariant(existing)) break;
+        std::wstring name = get_file_name(existing);
+        if (!name.empty()) missing_components.push_back(name);
+        existing = std::move(parent);
+        attributes = GetFileAttributesW(existing.c_str());
+    }
+    if (attributes == INVALID_FILE_ATTRIBUTES) return normalize_path(full);
+
+    DWORD flags = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? FILE_FLAG_BACKUP_SEMANTICS : 0;
+    HANDLE handle = CreateFileW(existing.c_str(), FILE_READ_ATTRIBUTES,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, flags, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return normalize_path(full);
+
+    DWORD needed = GetFinalPathNameByHandleW(handle, nullptr, 0, FILE_NAME_NORMALIZED);
+    std::wstring resolved;
+    if (needed > 0) {
+        resolved.resize(static_cast<std::size_t>(needed));
+        DWORD written = GetFinalPathNameByHandleW(handle, resolved.data(), needed,
+                                                  FILE_NAME_NORMALIZED);
+        if (written > 0 && written < needed) resolved.resize(written);
+        else resolved.clear();
+    }
+    CloseHandle(handle);
+    if (resolved.empty()) return normalize_path(full);
+
+    resolved = strip_extended_path_prefix(std::move(resolved));
+    for (auto it = missing_components.rbegin(); it != missing_components.rend(); ++it) {
+        if (!resolved.empty() && resolved.back() != L'\\') resolved.push_back(L'\\');
+        resolved += *it;
+    }
+    return normalize_path(resolved);
+}
+
+// Bind unattended work to a mounted volume GUID and serial. Old versions used
+// only the serial; the worker retains a one-way legacy comparison for existing
+// recovery state, while all newly persisted identities use this stronger form.
+inline std::string resolve_media_identity(const std::wstring& path_value) {
+    if (path_value.empty()) return std::string();
+    std::wstring full = get_full_path(path_value);
+    if (full.size() >= 2 && full[0] == L'\\' && full[1] == L'\\') {
+        std::vector<std::wstring> parts;
+        std::wstring current;
+        for (wchar_t c : full.substr(2)) {
+            if (c == L'\\' || c == L'/') {
+                if (!current.empty()) parts.push_back(current);
+                current.clear();
+                if (parts.size() >= 2) break;
+            } else {
+                current.push_back(c);
+            }
+        }
+        if (!current.empty() && parts.size() < 2) parts.push_back(current);
+        if (parts.size() < 2) return std::string();
+        std::wstring share = L"\\\\" + parts[0] + L"\\" + parts[1];
+        std::string identity = "unc:" + wide_to_utf8(to_upper_invariant(share));
+        HANDLE share_handle = CreateFileW(
+            share.c_str(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (share_handle != INVALID_HANDLE_VALUE) {
+            BY_HANDLE_FILE_INFORMATION info{};
+            if (GetFileInformationByHandle(share_handle, &info)) {
+                const std::uint64_t file_index =
+                    (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32) |
+                    info.nFileIndexLow;
+                char suffix[40]{};
+                std::snprintf(suffix, sizeof(suffix), "|%08X|%016llX",
+                              static_cast<unsigned int>(info.dwVolumeSerialNumber),
+                              static_cast<unsigned long long>(file_index));
+                identity += suffix;
+            }
+            CloseHandle(share_handle);
+        }
+        return identity;
+    }
+
+    if (full.size() < 2 || full[1] != L':') return std::string();
+    wchar_t volume_path[MAX_PATH]{};
+    std::wstring probe = full;
+    DWORD probe_attributes = GetFileAttributesW(probe.c_str());
+    while (probe_attributes == INVALID_FILE_ATTRIBUTES) {
+        std::wstring parent = get_directory_name(probe);
+        if (parent.empty() || to_upper_invariant(parent) == to_upper_invariant(probe)) break;
+        probe = std::move(parent);
+        probe_attributes = GetFileAttributesW(probe.c_str());
+    }
+    if (probe_attributes == INVALID_FILE_ATTRIBUTES) {
+        probe = full.substr(0, 2) + L"\\";
+    }
+    if (!GetVolumePathNameW(probe.c_str(), volume_path, MAX_PATH)) {
+        std::wstring root = full.substr(0, 2) + L"\\";
+        wcsncpy_s(volume_path, root.c_str(), _TRUNCATE);
+    }
+
+    DWORD serial = 0, max_component = 0, flags = 0;
+    if (!GetVolumeInformationW(volume_path, nullptr, 0, &serial, &max_component, &flags,
+                               nullptr, 0)) {
+        return std::string();
+    }
+
+    wchar_t volume_name[MAX_PATH]{};
+    std::wstring guid;
+    if (GetVolumeNameForVolumeMountPointW(volume_path, volume_name, MAX_PATH)) {
+        guid = volume_name;
+        if (guid.rfind(L"\\\\?\\Volume{", 0) == 0) guid.erase(0, 11);
+        while (!guid.empty() && (guid.back() == L'\\' || guid.back() == L'}')) guid.pop_back();
+    }
+    char serial_text[16]{};
+    std::snprintf(serial_text, sizeof(serial_text), "%08X", static_cast<unsigned int>(serial));
+    if (guid.empty()) return "vol:" + std::string(serial_text);
+    return "vol:" + wide_to_utf8(to_upper_invariant(guid)) + ":" + serial_text;
+}
+
 inline std::wstring local_app_data() {
     PWSTR folder = nullptr;
     std::wstring result;
@@ -153,14 +301,24 @@ inline std::wstring local_app_data() {
     return result;
 }
 
-inline std::optional<std::vector<unsigned char>> read_all_bytes(const std::wstring& path) {
+inline std::optional<std::vector<unsigned char>> read_all_bytes(
+    const std::wstring& path,
+    std::uint64_t maximum_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL) {
     HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return std::nullopt;
 
     LARGE_INTEGER size{};
-    if (!GetFileSizeEx(handle, &size) || size.QuadPart < 0 || size.QuadPart > (1LL << 31)) {
+    if (!GetFileSizeEx(handle, &size)) {
+        const DWORD error = GetLastError();
         CloseHandle(handle);
+        SetLastError(error);
+        return std::nullopt;
+    }
+    if (size.QuadPart < 0 ||
+        static_cast<std::uint64_t>(size.QuadPart) > maximum_bytes) {
+        CloseHandle(handle);
+        SetLastError(ERROR_FILE_TOO_LARGE);
         return std::nullopt;
     }
 
@@ -170,7 +328,9 @@ inline std::optional<std::vector<unsigned char>> read_all_bytes(const std::wstri
         DWORD chunk = 0;
         DWORD request = static_cast<DWORD>(std::min<std::size_t>(data.size() - offset, 1 << 20));
         if (!ReadFile(handle, data.data() + offset, request, &chunk, nullptr) || chunk == 0) {
+            const DWORD error = chunk == 0 ? ERROR_HANDLE_EOF : GetLastError();
             CloseHandle(handle);
+            SetLastError(error);
             return std::nullopt;
         }
         offset += chunk;
@@ -192,14 +352,27 @@ inline bool write_file_raw(const std::wstring& path, const unsigned char* data, 
         DWORD written = 0;
         DWORD request = static_cast<DWORD>(std::min<std::size_t>(size - offset, 1 << 20));
         if (!WriteFile(handle, data + offset, request, &written, nullptr) || written == 0) {
+            const DWORD error = written == 0 ? ERROR_WRITE_FAULT : GetLastError();
             CloseHandle(handle);
             DeleteFileW(path.c_str());
+            SetLastError(error);
             return false;
         }
         offset += written;
     }
-    if (write_through) FlushFileBuffers(handle);
-    CloseHandle(handle);
+    if (write_through && !FlushFileBuffers(handle)) {
+        const DWORD error = GetLastError();
+        CloseHandle(handle);
+        DeleteFileW(path.c_str());
+        SetLastError(error);
+        return false;
+    }
+    if (!CloseHandle(handle)) {
+        const DWORD error = GetLastError();
+        DeleteFileW(path.c_str());
+        SetLastError(error);
+        return false;
+    }
     return true;
 }
 
@@ -222,8 +395,11 @@ inline bool write_atomic_bytes(const std::wstring& path, const unsigned char* da
     if (!write_file_raw(temp_path, data, size, /*write_through*/ true, /*fail_if_exists*/ true)) {
         return false;
     }
-    if (!MoveFileExW(temp_path.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    if (!MoveFileExW(temp_path.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD error = GetLastError();
         DeleteFileW(temp_path.c_str());
+        SetLastError(error);
         return false;
     }
     return true;
@@ -530,12 +706,12 @@ inline void rotate_backups(const std::wstring& snapshot_path, int generation_cou
     }
 }
 
-inline void save_snapshot_set(const std::wstring& snapshot_path, const std::string& payload,
+inline bool save_snapshot_set(const std::wstring& snapshot_path, const std::string& payload,
                               int generation_count) {
     std::wstring directory = fsutil::get_directory_name(snapshot_path);
     if (!directory.empty()) fsutil::create_directories(directory);
     rotate_backups(snapshot_path, generation_count);
-    fsutil::write_atomic_bytes(snapshot_path, payload);
+    return fsutil::write_atomic_bytes(snapshot_path, payload);
 }
 
 // FNV-1a 32-bit, matching ComputeChecksum32.
@@ -555,9 +731,10 @@ inline std::string new_guid_n() {
     return crypto::to_hex_lower(raw);
 }
 
-// Shared HMAC key loader. The journal key is stored raw; the bad-range-map key
-// is DPAPI-protected with legacy raw-key migration. Both live under
-// %LOCALAPPDATA%\XactCopy\security and are cached per process.
+// Shared HMAC key loader. Map/catalog keys are DPAPI-protected for the current
+// user and legacy raw 32-byte values migrate atomically without changing key
+// material. The journal retains its original raw-key encoding for compatibility
+// with installed 2.x builds. All keys are cached per process.
 class HmacKeyCache {
 public:
     HmacKeyCache(const wchar_t* file_name, bool dpapi_protected)
@@ -571,13 +748,14 @@ public:
         fsutil::create_directories(security_root);
         std::wstring key_path = security_root + L"\\" + file_name_;
 
+        const bool key_exists = GetFileAttributesW(key_path.c_str()) != INVALID_FILE_ATTRIBUTES;
         std::vector<unsigned char> loaded;
-        if (auto file_bytes = fsutil::read_all_bytes(key_path)) {
+        if (auto file_bytes = fsutil::read_all_bytes(key_path, 1024 * 1024)) {
             if (dpapi_protected_) {
                 if (file_bytes->size() == KeySizeBytes) {
                     // Legacy raw key: accept and re-protect in place.
                     loaded = *file_bytes;
-                    try_save_dpapi(key_path, loaded);
+                    try_replace_with_dpapi(key_path, loaded);
                 } else {
                     try {
                         auto raw = crypto::dpapi_unprotect(*file_bytes);
@@ -591,13 +769,52 @@ public:
             }
         }
 
+        // Replacing an unreadable key would make every snapshot authenticated
+        // with the old key permanently unreadable.
+        if (key_exists && loaded.size() != KeySizeBytes) {
+            throw std::runtime_error(
+                "An existing XactCopy authentication key is unreadable or invalid.");
+        }
+
         if (loaded.size() != KeySizeBytes) {
             loaded.assign(KeySizeBytes, 0);
             crypto::fill_random(loaded);
-            if (dpapi_protected_) {
-                try_save_dpapi(key_path, loaded);
-            } else {
-                save_raw(key_path, loaded);
+            std::vector<unsigned char> persisted = loaded;
+            if (dpapi_protected_) persisted = crypto::dpapi_protect(loaded);
+
+            if (!create_key_file(key_path, persisted)) {
+                // Another process may have won the no-replace rename. Adopt
+                // its durable key instead of signing data with an ephemeral
+                // key that cannot be recovered after this process exits.
+                auto raced = fsutil::read_all_bytes(key_path, 1024 * 1024);
+                if (!raced.has_value()) {
+                    throw std::runtime_error(
+                        "XactCopy could not persist its authentication key.");
+                }
+                if (dpapi_protected_) {
+                    if (raced->size() == KeySizeBytes) {
+                        // A legacy process can win the creation race with a
+                        // raw key. Adopt that value, then migrate it in place.
+                        loaded = *raced;
+                        try_replace_with_dpapi(key_path, loaded);
+                    } else {
+                        try {
+                            auto raw = crypto::dpapi_unprotect(*raced);
+                            if (raw.size() == KeySizeBytes) loaded = std::move(raw);
+                            else loaded.clear();
+                        } catch (const std::exception&) {
+                            loaded.clear();
+                        }
+                    }
+                } else if (raced->size() == KeySizeBytes) {
+                    loaded = std::move(*raced);
+                } else {
+                    loaded.clear();
+                }
+                if (loaded.size() != KeySizeBytes) {
+                    throw std::runtime_error(
+                        "The persisted XactCopy authentication key is invalid.");
+                }
             }
         }
 
@@ -613,36 +830,33 @@ private:
     std::mutex lock_;
     std::vector<unsigned char> cached_;
 
-    static void save_raw(const std::wstring& key_path, std::vector<unsigned char>& key) {
+    static bool create_key_file(const std::wstring& key_path,
+                                const std::vector<unsigned char>& bytes) {
         std::wstring temp_path = key_path + L".tmp." + fsutil::random_temp_suffix();
-        if (!fsutil::write_file_raw(temp_path, key.data(), key.size(), false, true)) return;
-        DeleteFileW(key_path.c_str());
-        if (!MoveFileW(temp_path.c_str(), key_path.c_str())) {
+        if (!fsutil::write_file_raw(temp_path, bytes.data(), bytes.size(), true, true)) {
+            return false;
+        }
+        if (!MoveFileExW(temp_path.c_str(), key_path.c_str(), MOVEFILE_WRITE_THROUGH)) {
+            const DWORD error = GetLastError();
             DeleteFileW(temp_path.c_str());
-            // Lost the race with another process — adopt its key instead.
-            if (auto existing = fsutil::read_all_bytes(key_path);
-                existing.has_value() && existing->size() == KeySizeBytes) {
-                key = *existing;
-            }
+            SetLastError(error);
+            return false;
         }
         fsutil::set_hidden(key_path);
+        return true;
     }
 
-    static void try_save_dpapi(const std::wstring& key_path, const std::vector<unsigned char>& key) {
+    static void try_replace_with_dpapi(const std::wstring& key_path,
+                                       const std::vector<unsigned char>& key) {
         try {
             auto protected_bytes = crypto::dpapi_protect(key);
-            std::wstring temp_path = key_path + L".tmp." + fsutil::random_temp_suffix();
-            if (!fsutil::write_file_raw(temp_path, protected_bytes.data(), protected_bytes.size(),
-                                        false, true)) {
-                return;
-            }
-            DeleteFileW(key_path.c_str());
-            if (!MoveFileW(temp_path.c_str(), key_path.c_str())) {
-                DeleteFileW(temp_path.c_str());
-            }
+            // Atomic replacement leaves the durable legacy key intact when a
+            // migration write cannot be committed.
+            (void)fsutil::write_atomic_bytes(key_path, protected_bytes.data(),
+                                             protected_bytes.size());
             fsutil::set_hidden(key_path);
         } catch (const std::exception&) {
-            // DPAPI unavailable — key stays unprotected this session (matches .NET).
+            // Continue with the durable legacy key and retry migration later.
         }
     }
 };
@@ -654,6 +868,11 @@ inline HmacKeyCache& journal_key_cache() {
 
 inline HmacKeyCache& badmap_key_cache() {
     static HmacKeyCache cache(L"badmap-hmac.key", /*dpapi*/ true);
+    return cache;
+}
+
+inline HmacKeyCache& catalog_key_cache() {
+    static HmacKeyCache cache(L"catalog-hmac.key", /*dpapi*/ true);
     return cache;
 }
 
@@ -693,7 +912,7 @@ public:
 
     // save_utc lets tests pin the UpdatedUtc/SavedUtcTicks values; production
     // callers omit it (matches .NET DateTimeOffset.UtcNow behavior).
-    void save(const std::wstring& map_path, BadRangeMap map,
+    bool save(const std::wstring& map_path, BadRangeMap map,
               std::optional<DateTimeOffset> save_utc = std::nullopt) {
         if (map_path.empty()) {
             throw std::invalid_argument("Map path is required.");
@@ -721,8 +940,15 @@ public:
         std::string envelope = w.take();
 
         std::wstring mirror_path = detail::build_mirror_path(map_path, L"badmaps-mirror", L"badmap");
-        detail::save_snapshot_set(map_path, envelope, BackupGenerationCount);
-        detail::save_snapshot_set(mirror_path, envelope, BackupGenerationCount);
+        const bool primary_saved =
+            detail::save_snapshot_set(map_path, envelope, BackupGenerationCount);
+        const bool mirror_saved =
+            detail::save_snapshot_set(mirror_path, envelope, BackupGenerationCount);
+        if (!primary_saved && !mirror_saved) {
+            throw std::runtime_error(
+                "The bad-range map could not be committed to either durable snapshot.");
+        }
+        return primary_saved && mirror_saved;
     }
 
     // Serializes exactly like the .NET store's payload serializer (indented).
@@ -765,6 +991,24 @@ public:
             normalized.set(std::move(entry_key), std::move(item));
         }
         map.Files = std::move(normalized);
+    }
+
+    // Removes the authenticated primary, backups, and protected mirror for one
+    // source map. Returning reclaimed bytes lets the UI distinguish an absent
+    // map from a successful deletion without leaving a trusted fallback that
+    // would silently resurrect cleared hints.
+    static std::int64_t remove_map_set(const std::wstring& map_path) {
+        if (map_path.empty()) return 0;
+        std::int64_t reclaimed = 0;
+        const std::wstring mirror =
+            detail::build_mirror_path(map_path, L"badmaps-mirror", L"badmap");
+        for (const std::wstring& base : {map_path, mirror}) {
+            for (int generation = 1; generation <= BackupGenerationCount; ++generation) {
+                reclaimed += fsutil::delete_file(detail::backup_path(base, generation));
+            }
+            reclaimed += fsutil::delete_file(base);
+        }
+        return reclaimed;
     }
 
 private:
@@ -813,7 +1057,7 @@ private:
 
     std::optional<BadRangeMap> try_load_envelope(const std::wstring& snapshot_path,
                                                  const detail::SecurityContext& context) {
-        auto bytes = fsutil::read_all_bytes(snapshot_path);
+        auto bytes = fsutil::read_all_bytes(snapshot_path, 256ULL * 1024 * 1024);
         if (!bytes.has_value() || bytes->empty()) return std::nullopt;
 
         try {
@@ -853,13 +1097,19 @@ private:
     }
 
     std::optional<BadRangeMap> try_load_legacy(const std::wstring& snapshot_path) {
-        auto bytes = fsutil::read_all_bytes(snapshot_path);
+        auto bytes = fsutil::read_all_bytes(snapshot_path, 256ULL * 1024 * 1024);
         if (!bytes.has_value() || bytes->empty()) return std::nullopt;
 
         try {
             std::string_view text(reinterpret_cast<const char*>(bytes->data()), bytes->size());
             json::Value root = json::parse(text);
-            if (!root.is_object()) return std::nullopt;
+            const json::Object* object = root.as_object();
+            if (object == nullptr || object->find("Payload") != nullptr ||
+                object->find("PayloadSha256") != nullptr ||
+                object->find("Signature") != nullptr ||
+                (object->find("SourceRoot") == nullptr && object->find("Files") == nullptr)) {
+                return std::nullopt;
+            }
             BadRangeMap map = BadRangeMap::from_json(root);
             normalize_map(map);
             return map;
@@ -958,8 +1208,21 @@ public:
         };
 
         std::wstring mirror_path = detail::build_mirror_path(journal_path, L"journals-mirror", L"journal");
-        for (const auto& record : read_ledger_records(ledger_path(journal_path), context)) merge_trusted(record);
-        for (const auto& record : read_ledger_records(ledger_path(mirror_path), context)) merge_trusted(record);
+        const std::vector<LedgerRecord> primary_records =
+            read_ledger_records(ledger_path(journal_path), context);
+        const std::vector<LedgerRecord> mirror_records =
+            read_ledger_records(ledger_path(mirror_path), context);
+        for (const auto& record : primary_records) merge_trusted(record);
+        for (const auto& record : mirror_records) merge_trusted(record);
+        bool trust_chain_established = !trusted.empty();
+        if (auto anchor = read_anchor(anchor_path(journal_path), context);
+            anchor.has_value() && anchor->sequence > 0) {
+            trust_chain_established = true;
+        }
+        if (auto anchor = read_anchor(anchor_path(mirror_path), context);
+            anchor.has_value() && anchor->sequence > 0) {
+            trust_chain_established = true;
+        }
 
         if (!trusted.empty()) {
             // First readable snapshot per trusted hash, in candidate order.
@@ -996,6 +1259,12 @@ public:
             }
         }
 
+        // Once a valid ledger exists, accepting an untrusted parseable JSON
+        // snapshot would turn corruption into an authentication downgrade.
+        // Legacy journals are accepted only when no valid ledger has ever
+        // been established for this journal path.
+        if (trust_chain_established) return std::nullopt;
+
         // Legacy/plain snapshot fallback.
         for (const auto& candidate : candidates) {
             if (auto snapshot = try_read_snapshot(candidate)) {
@@ -1005,7 +1274,7 @@ public:
         return std::nullopt;
     }
 
-    void save(const std::wstring& journal_path, JobJournal journal,
+    bool save(const std::wstring& journal_path, JobJournal journal,
               std::optional<DateTimeOffset> save_utc = std::nullopt) {
         if (journal_path.empty()) {
             throw std::invalid_argument("Journal path is required.");
@@ -1031,8 +1300,14 @@ public:
         std::string snapshot_hash = crypto::sha256_hex(snapshot);
 
         std::wstring mirror_path = detail::build_mirror_path(journal_path, L"journals-mirror", L"journal");
-        detail::save_snapshot_set(journal_path, snapshot, BackupGenerationCount);
-        detail::save_snapshot_set(mirror_path, snapshot, BackupGenerationCount);
+        const bool primary_snapshot =
+            detail::save_snapshot_set(journal_path, snapshot, BackupGenerationCount);
+        const bool mirror_snapshot =
+            detail::save_snapshot_set(mirror_path, snapshot, BackupGenerationCount);
+        if (!primary_snapshot && !mirror_snapshot) {
+            throw std::runtime_error(
+                "The journal could not be committed to either durable snapshot.");
+        }
 
         detail::SecurityContext context = create_security_context(journal_path);
         std::wstring primary_anchor = anchor_path(journal_path);
@@ -1051,23 +1326,37 @@ public:
         record.Sequence = seed.sequence + 1;
         record.UpdatedUtcTicks = now.utc_ticks();
         record.SnapshotHash = snapshot_hash;
-        record.SnapshotLength = static_cast<std::int64_t>(payload.size());
+        record.SnapshotLength = static_cast<std::int64_t>(snapshot.size());
         record.PreviousRecordHash = seed.last_record_hash;
         record.RecordHash = compute_record_hash(record);
         record.Signature = compute_record_signature(record, context);
 
-        append_ledger_record(primary_ledger, record);
-        append_ledger_record(mirror_ledger, record);
+        bool primary_record = seed.primary_ledger_ready &&
+                              append_ledger_record(primary_ledger, record);
+        bool mirror_record = seed.mirror_ledger_ready &&
+                             append_ledger_record(mirror_ledger, record);
+        if (!primary_record && mirror_record) {
+            primary_record = copy_file_atomic(mirror_ledger, primary_ledger);
+        } else if (primary_record && !mirror_record) {
+            mirror_record = copy_file_atomic(primary_ledger, mirror_ledger);
+        }
+        if (!primary_record && !mirror_record) {
+            throw std::runtime_error(
+                "The journal snapshot was written, but its trust ledger could not be committed.");
+        }
 
         std::string anchor_json = build_anchor_json(record.Sequence, record.RecordHash,
                                                     record.UpdatedUtcTicks, context);
-        write_anchor(primary_anchor, anchor_json);
-        write_anchor(mirror_anchor, anchor_json);
+        const bool primary_anchor_saved = write_anchor(primary_anchor, anchor_json);
+        const bool mirror_anchor_saved = write_anchor(mirror_anchor, anchor_json);
 
         compact_ledger_if_needed(primary_ledger, context);
         compact_ledger_if_needed(mirror_ledger, context);
 
-        set_cached_seed(seed_cache_key, SeedState{record.Sequence, record.RecordHash});
+        set_cached_seed(seed_cache_key, SeedState{
+            record.Sequence, record.RecordHash, primary_record, mirror_record});
+        return primary_snapshot && mirror_snapshot && primary_record && mirror_record &&
+               primary_anchor_saved && mirror_anchor_saved;
     }
 
     static void normalize_journal(JobJournal& journal) {
@@ -1089,6 +1378,34 @@ public:
     std::vector<LedgerRecord> read_ledger(const std::wstring& journal_path) {
         detail::SecurityContext context = create_security_context(journal_path);
         return read_ledger_records(ledger_path(journal_path), context);
+    }
+
+    // Large snapshots use the XCJZ container internally, while the public
+    // journal extension remains .json for compatibility. Export through the
+    // trusted loader so an inspector sees readable JSON only after the ledger
+    // and snapshot have passed the same validation used by resume.
+    bool export_readable_json(const std::wstring& journal_path,
+                              const std::wstring& output_path,
+                              std::string* error = nullptr) {
+        try {
+            auto journal = load(journal_path);
+            if (!journal.has_value()) {
+                if (error != nullptr) *error = "No valid journal snapshot could be loaded.";
+                return false;
+            }
+            std::wstring directory = fsutil::get_directory_name(output_path);
+            if (!directory.empty()) fsutil::create_directories(directory);
+            json::Writer writer(/*indented*/ true);
+            journal->to_json(writer);
+            if (!fsutil::write_atomic_bytes(output_path, writer.take())) {
+                if (error != nullptr) *error = "The readable journal file could not be written.";
+                return false;
+            }
+            return true;
+        } catch (const std::exception& ex) {
+            if (error != nullptr) *error = ex.what();
+            return false;
+        }
     }
 
     static std::wstring ledger_path(const std::wstring& snapshot_path) { return snapshot_path + L".ledger"; }
@@ -1237,6 +1554,8 @@ private:
     struct SeedState {
         std::int64_t sequence = 0;
         std::string last_record_hash;
+        bool primary_ledger_ready = true;
+        bool mirror_ledger_ready = true;
     };
 
     std::mutex seed_lock_;
@@ -1272,7 +1591,8 @@ private:
 
     // Returns (snapshot hash, journal) or nullopt.
     std::optional<std::pair<std::string, JobJournal>> try_read_snapshot(const std::wstring& snapshot_path) {
-        auto bytes = fsutil::read_all_bytes(snapshot_path);
+        auto bytes = fsutil::read_all_bytes(
+            snapshot_path, detail::compression::MaximumDecompressedBytes);
         if (!bytes.has_value() || bytes->empty()) return std::nullopt;
 
         try {
@@ -1355,25 +1675,70 @@ private:
         return frame;
     }
 
-    static void append_ledger_record(const std::wstring& path, const LedgerRecord& record) {
+    static bool append_ledger_record(const std::wstring& path, const LedgerRecord& record) {
         std::wstring directory = fsutil::get_directory_name(path);
         if (!directory.empty()) fsutil::create_directories(directory);
 
         std::vector<unsigned char> frame = build_frame(record);
-        HANDLE handle = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
-                                    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
-                                    nullptr);
-        if (handle == INVALID_HANDLE_VALUE) return;
+        HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                    FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER original{};
+        if (!GetFileSizeEx(handle, &original) ||
+            !SetFilePointerEx(handle, original, nullptr, FILE_BEGIN)) {
+            CloseHandle(handle);
+            return false;
+        }
         DWORD written = 0;
-        WriteFile(handle, frame.data(), static_cast<DWORD>(frame.size()), &written, nullptr);
-        FlushFileBuffers(handle);
+        bool ok = WriteFile(handle, frame.data(), static_cast<DWORD>(frame.size()), &written,
+                            nullptr) && written == static_cast<DWORD>(frame.size()) &&
+                  FlushFileBuffers(handle);
+        if (!ok) {
+            // A short append must not poison the framing boundary for every
+            // later record. Best-effort rollback keeps the prior chain usable.
+            SetFilePointerEx(handle, original, nullptr, FILE_BEGIN);
+            SetEndOfFile(handle);
+            FlushFileBuffers(handle);
+        }
         CloseHandle(handle);
+        return ok;
+    }
+
+    static bool copy_file_atomic(const std::wstring& source,
+                                 const std::wstring& destination) {
+        auto bytes = fsutil::read_all_bytes(source, 64ULL * 1024 * 1024);
+        if (!bytes.has_value()) return false;
+        std::wstring directory = fsutil::get_directory_name(destination);
+        if (!directory.empty()) fsutil::create_directories(directory);
+        return fsutil::write_atomic_bytes(destination, bytes->data(), bytes->size());
+    }
+
+    static bool write_ledger_records(const std::wstring& path,
+                                     const std::vector<LedgerRecord>& records) {
+        std::vector<unsigned char> bytes;
+        for (const auto& record : records) {
+            std::vector<unsigned char> frame = build_frame(record);
+            bytes.insert(bytes.end(), frame.begin(), frame.end());
+        }
+        std::wstring directory = fsutil::get_directory_name(path);
+        if (!directory.empty()) fsutil::create_directories(directory);
+        return fsutil::write_atomic_bytes(path, bytes.data(), bytes.size());
+    }
+
+    static std::int64_t serialized_ledger_size(
+        const std::vector<LedgerRecord>& records) {
+        std::int64_t total = 0;
+        for (const auto& record : records) {
+            total += static_cast<std::int64_t>(build_frame(record).size());
+        }
+        return total;
     }
 
     static std::vector<LedgerRecord> read_ledger_records(const std::wstring& path,
                                                          const detail::SecurityContext& context) {
         std::vector<LedgerRecord> records;
-        auto bytes = fsutil::read_all_bytes(path);
+        auto bytes = fsutil::read_all_bytes(path, 64ULL * 1024 * 1024);
         if (!bytes.has_value()) return records;
 
         const unsigned char* data = bytes->data();
@@ -1465,15 +1830,15 @@ private:
         return w.take();
     }
 
-    static void write_anchor(const std::wstring& path, const std::string& payload) {
+    static bool write_anchor(const std::wstring& path, const std::string& payload) {
         std::wstring directory = fsutil::get_directory_name(path);
         if (!directory.empty()) fsutil::create_directories(directory);
-        fsutil::write_atomic_bytes(path, payload);
+        return fsutil::write_atomic_bytes(path, payload);
     }
 
     std::optional<SeedState> read_anchor(const std::wstring& path,
                                          const detail::SecurityContext& context) {
-        auto bytes = fsutil::read_all_bytes(path);
+        auto bytes = fsutil::read_all_bytes(path, 1024 * 1024);
         if (!bytes.has_value() || bytes->empty()) return std::nullopt;
 
         try {
@@ -1503,27 +1868,66 @@ private:
     SeedState resolve_seed_state(const std::wstring& primary_anchor, const std::wstring& mirror_anchor,
                                  const std::wstring& primary_ledger, const std::wstring& mirror_ledger,
                                  const detail::SecurityContext& context) {
-        std::vector<SeedState> states;
-        if (auto anchor = read_anchor(primary_anchor, context)) states.push_back(*anchor);
-        if (auto anchor = read_anchor(mirror_anchor, context)) states.push_back(*anchor);
+        std::vector<SeedState> anchors;
+        if (auto anchor = read_anchor(primary_anchor, context)) anchors.push_back(*anchor);
+        if (auto anchor = read_anchor(mirror_anchor, context)) anchors.push_back(*anchor);
 
-        auto primary_records = read_ledger_records(primary_ledger, context);
-        if (!primary_records.empty()) {
-            const auto& last = primary_records.back();
-            states.push_back(SeedState{last.Sequence, last.RecordHash});
-        }
-        auto mirror_records = read_ledger_records(mirror_ledger, context);
-        if (!mirror_records.empty()) {
-            const auto& last = mirror_records.back();
-            states.push_back(SeedState{last.Sequence, last.RecordHash});
+        std::vector<LedgerRecord> primary_records =
+            read_ledger_records(primary_ledger, context);
+        std::vector<LedgerRecord> mirror_records =
+            read_ledger_records(mirror_ledger, context);
+
+        const LedgerRecord* primary_last =
+            primary_records.empty() ? nullptr : &primary_records.back();
+        const LedgerRecord* mirror_last =
+            mirror_records.empty() ? nullptr : &mirror_records.back();
+        if (primary_last != nullptr && mirror_last != nullptr &&
+            primary_last->Sequence == mirror_last->Sequence &&
+            !crypto::secure_equals(primary_last->RecordHash,
+                                   mirror_last->RecordHash)) {
+            throw std::runtime_error(
+                "The journal trust ledgers have conflicting histories.");
         }
 
-        if (states.empty()) return SeedState{};
-        SeedState best = states.front();
-        for (std::size_t i = 1; i < states.size(); ++i) {
-            if (states[i].sequence > best.sequence) best = states[i];
+        const std::vector<LedgerRecord>* canonical = &primary_records;
+        const LedgerRecord* best = primary_last;
+        if (best == nullptr ||
+            (mirror_last != nullptr && mirror_last->Sequence > best->Sequence)) {
+            canonical = &mirror_records;
+            best = mirror_last;
         }
-        return best;
+
+        const std::int64_t sequence = best == nullptr ? 0 : best->Sequence;
+        const std::string record_hash = best == nullptr ? std::string() : best->RecordHash;
+        for (const SeedState& anchor : anchors) {
+            if (anchor.sequence > sequence ||
+                (anchor.sequence == sequence && anchor.sequence > 0 &&
+                 !crypto::secure_equals(anchor.last_record_hash, record_hash))) {
+                throw std::runtime_error(
+                    "A journal trust anchor refers to a missing ledger record.");
+            }
+        }
+
+        auto prepare = [&](const std::wstring& path,
+                           const std::vector<LedgerRecord>& current) {
+            const LedgerRecord* last = current.empty() ? nullptr : &current.back();
+            const bool same_tip = sequence == 0
+                                      ? last == nullptr
+                                      : last != nullptr && last->Sequence == sequence &&
+                                            crypto::secure_equals(last->RecordHash, record_hash);
+            const bool clean_length =
+                same_tip && fsutil::file_size(path) == serialized_ledger_size(current);
+            if (same_tip && clean_length) return true;
+            return write_ledger_records(path, *canonical);
+        };
+
+        bool primary_ready = prepare(primary_ledger, primary_records);
+        bool mirror_ready = prepare(mirror_ledger, mirror_records);
+        if (!primary_ready && !mirror_ready) {
+            throw std::runtime_error(
+                "Neither journal trust ledger could be repaired for a new checkpoint.");
+        }
+        return SeedState{sequence, record_hash, primary_ready, mirror_ready};
     }
 
     bool try_get_cached_seed(const std::wstring& key, SeedState& state) {
