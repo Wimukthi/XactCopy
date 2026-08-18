@@ -1007,33 +1007,128 @@ private:
                      L"Bad-range map");
             return;
         }
+        std::optional<storage::ManagedJobRun> latest_assessment_run;
+        ui::RunJournalInspection latest_assessment;
+        const std::wstring selected_source = storage::fsutil::normalize_path(
+            storage::fsutil::utf8_to_wide(window_text_utf8(source_edit_)));
+        for (const auto& run : job_manager_.get_recent_runs(1000)) {
+            const bool scan_mode = run.Options.has_value()
+                                       ? run.Options->OperationMode ==
+                                             models::JobOperationMode::ScanOnly
+                                       : models::detail::equals_ignore_case(run.Trigger, "scan") ||
+                                             storage::catalog_detail::is_blank(
+                                                 run.DestinationRoot);
+            if (!scan_mode || storage::catalog_detail::is_blank(run.SourceRoot) ||
+                storage::fsutil::normalize_path(
+                    storage::fsutil::utf8_to_wide(run.SourceRoot)) != selected_source) {
+                continue;
+            }
+            ui::RunJournalInspection inspection =
+                job_manager_.inspect_run_journal(run.RunId);
+            if (!inspection.Loaded) continue;
+            latest_assessment_run = run;
+            latest_assessment = std::move(inspection);
+            break;
+        }
+
         if (!map.has_value()) {
-            info_box(L"No authenticated bad-range map exists for the selected source.\n\n" +
-                         *path,
-                     L"Bad-range map");
-            return;
+            if (!latest_assessment_run.has_value()) {
+                info_box(L"No authenticated bad-range map or readable assessment journal "
+                         L"exists for the selected source.\n\n" + *path,
+                         L"Bad-range map");
+                return;
+            }
+            storage::BadRangeMap journal_only_map;
+            journal_only_map.SourceRoot = window_text_utf8(source_edit_);
+            journal_only_map.SourceIdentity = "(no map)";
+            map = std::move(journal_only_map);
         }
 
         std::int64_t bad_bytes = 0;
         std::size_t range_count = 0;
         std::size_t confirmed_files = 0;
+        std::size_t finding_files = 0;
         for (const auto& [key, entry] : map->Files.entries) {
-            (void)key;
+            if (entry.BadRanges.empty()) continue;
+            ++finding_files;
             if (entry.ConfirmationCount >= 2 && !entry.BadRanges.empty()) ++confirmed_files;
             range_count += entry.BadRanges.size();
+            std::int64_t file_bad_bytes = 0;
             for (const auto& range : entry.BadRanges) {
-                if (range.Length > 0) bad_bytes += range.Length;
+                if (range.Length > 0) {
+                    bad_bytes += range.Length;
+                    file_bad_bytes += range.Length;
+                }
+            }
+            append_log("Bad-range map finding: " +
+                       (entry.RelativePath.empty() ? key : entry.RelativePath) + " — " +
+                       std::to_string(entry.BadRanges.size()) + " range(s), " +
+                       format_bytes_short(file_bad_bytes) +
+                       (entry.ConfirmationCount >= 2 ? " (confirmed)." : " (observed once)."));
+        }
+
+        std::size_t journal_finding_files = 0;
+        std::size_t journal_localized_files = 0;
+        std::size_t journal_unlocalized_files = 0;
+        std::int64_t journal_unreadable_bytes = 0;
+        if (latest_assessment_run.has_value()) {
+            journal_finding_files = latest_assessment.Findings.size();
+            for (const auto& finding : latest_assessment.Findings) {
+                if (finding.UnreadableRangeCount > 0) {
+                    ++journal_localized_files;
+                    journal_unreadable_bytes += finding.UnreadableBytes;
+                } else {
+                    ++journal_unlocalized_files;
+                }
+                std::string detail = finding.UnreadableRangeCount > 0
+                                         ? std::to_string(finding.UnreadableRangeCount) +
+                                               " unreadable range(s), " +
+                                               format_bytes_short(finding.UnreadableBytes)
+                                         : "failure/skip without a localized byte range";
+                if (!finding.ErrorMessage.empty()) detail += "; " + finding.ErrorMessage;
+                append_log("Latest assessment finding: " + finding.RelativePath + " - " +
+                           detail + ".");
             }
         }
+
+        const std::wstring map_updated = map->UpdatedUtc == time::DateTimeOffset::min_value()
+                                             ? L"(no map)"
+                                             : storage::fsutil::utf8_to_wide(
+                                                   map->UpdatedUtc.to_string());
         std::wstring summary =
             L"Source: " + storage::fsutil::utf8_to_wide(map->SourceRoot) +
             L"\nMedia identity: " + storage::fsutil::utf8_to_wide(map->SourceIdentity) +
-            L"\nUpdated: " + storage::fsutil::utf8_to_wide(map->UpdatedUtc.to_string()) +
-            L"\nFiles recorded: " + std::to_wstring(map->Files.entries.size()) +
+            L"\nMap updated: " + map_updated +
+            L"\n\nBad-range map" +
+            L"\nFiles with findings: " + std::to_wstring(finding_files) +
             L"\nFiles with confirmed skip hints: " + std::to_wstring(confirmed_files) +
-            L"\nRecorded ranges: " + std::to_wstring(range_count) +
-            L"\nRecorded unreadable bytes: " +
-            storage::fsutil::utf8_to_wide(format_bytes_short(bad_bytes)) +
+            L"\nObserved ranges: " + std::to_wstring(range_count) +
+            L"\nBytes covered by findings: " +
+            storage::fsutil::utf8_to_wide(format_bytes_short(bad_bytes));
+
+        if (latest_assessment_run.has_value()) {
+            summary +=
+                std::wstring(L"\n\nLatest assessment journal") +
+                L"\nRun: " + storage::fsutil::utf8_to_wide(
+                                  latest_assessment_run->DisplayName) +
+                L"\nStatus: " + storage::fsutil::utf8_to_wide(
+                                     std::string(storage::to_string(
+                                         latest_assessment_run->Status))) +
+                L"\nFiles with findings/failures: " +
+                std::to_wstring(journal_finding_files) +
+                L"\nFiles with localized ranges: " +
+                std::to_wstring(journal_localized_files) +
+                L"\nFiles without localized ranges: " +
+                std::to_wstring(journal_unlocalized_files) +
+                L"\nLocalized unreadable bytes: " +
+                storage::fsutil::utf8_to_wide(
+                    format_bytes_short(journal_unreadable_bytes));
+        }
+
+        summary +=
+            L"\n\nAll filenames and details were listed in the main log. A range observed once "
+            L"is diagnostic only; it becomes a skip hint after a later matching observation. "
+            L"Journal failures without a localized range are not inserted into the range map."
             L"\n\nMap: " + *path;
         info_box(summary, L"Bad-range map");
     }
@@ -1824,9 +1919,65 @@ private:
                     run_queued_entry(request.queue_entry_id, /*manual*/ true);
                 }
                 break;
+            case ui::JobManagerRequestAction::ResumeRun:
+                if (!ui_is_blank(request.run_id)) resume_managed_run(request.run_id);
+                break;
             default:
                 break;
         }
+    }
+
+    void resume_managed_run(const std::string& run_id) {
+        if (starting_ || supervisor_.is_job_running()) {
+            info_box(L"A run is already in progress.");
+            return;
+        }
+        auto run = job_manager_.get_run_by_id(run_id);
+        if (!run.has_value()) {
+            warn_box(L"Selected run no longer exists.");
+            return;
+        }
+
+        bool exact = false;
+        std::string warning;
+        std::optional<models::CopyJobOptions> restored =
+            job_manager_.get_resume_options(run_id, &exact, &warning);
+        models::CopyJobOptions options;
+        if (restored.has_value()) {
+            options = *restored;
+        } else {
+            options = settings_.build_default_options();
+            options.SourceRoot = run->SourceRoot;
+            options.DestinationRoot = run->DestinationRoot;
+            const bool legacy_scan =
+                models::detail::equals_ignore_case(run->Trigger, "scan") ||
+                run->DisplayName.find("Assessment") != std::string::npos ||
+                ui_is_blank(run->DestinationRoot);
+            if (legacy_scan) {
+                options.OperationMode = models::JobOperationMode::ScanOnly;
+                options.DestinationRoot.clear();
+            }
+        }
+        if (!exact &&
+            !confirm_box(storage::fsutil::utf8_to_wide(
+                             warning +
+                             "\n\nThe source, destination, and operation type were recovered. Review the restored controls before continuing. Resume now?"),
+                         L"Legacy run settings", ui::MessageIcon::Warning)) {
+            apply_run_options_to_ui(options);
+            return;
+        }
+
+        const std::string journal_path =
+            job_manager_.get_resume_journal_path(run_id, /*validate_roots*/ true);
+        if (journal_path.empty()) {
+            warn_box(L"No authenticated resumable journal could be located for this run.");
+            return;
+        }
+        options.ResumeFromJournal = true;
+        options.ResumeJournalPathHint = journal_path;
+        apply_run_options_to_ui(options);
+        append_log("Resuming run '" + run->DisplayName + "' from " + journal_path + ".");
+        start_job_with(options, true, run->RunId, run->DisplayName);
     }
 
     void run_saved_job(const std::string& job_id) {
@@ -2276,6 +2427,50 @@ private:
         }
     }
 
+    void apply_run_options_to_ui(const models::CopyJobOptions& options) {
+        explorer_selection_root_ = options.SourceRoot;
+        explorer_selected_paths_ = options.SelectedRelativePaths;
+        explorer_selection_display_ = display_source(options);
+        SetWindowTextW(source_edit_,
+                       storage::fsutil::utf8_to_wide(explorer_selection_display_).c_str());
+        SetWindowTextW(destination_edit_,
+                       storage::fsutil::utf8_to_wide(options.DestinationRoot).c_str());
+
+        custom_transfer_engine_ = options.TransferEnginePolicyValue;
+        copy_profile_index_ = 2; // exact persisted options, not a mutable preset
+        copy_overwrite_index_ = std::clamp(static_cast<int>(options.OverwritePolicyValue), 0, 3);
+        copy_verify_index_ = ui::verification_combo_index(options);
+        scan_profile_index_ =
+            std::clamp(static_cast<int>(options.ScanPerformanceProfileValue), 0, 2);
+        scan_backend_index_ = options.UseExperimentalRawDiskScan ? 1 : 0;
+        scan_map_index_ = options.UpdateBadRangeMapFromRun ? 0 : 1;
+
+        active_mode_index_ = -1;
+        SendMessageW(mode_combo_, CB_SETCURSEL,
+                     options.OperationMode == models::JobOperationMode::ScanOnly ? 1 : 0, 0);
+        sync_mode_ui();
+
+        set_check(IdSalvageCheck, options.SalvageUnreadableBlocks);
+        set_check(IdResumeCheck, true);
+        set_check(IdMapCheck, options.UseBadRangeMap);
+        set_check(IdAdaptiveCheck, options.UseAdaptiveBufferSizing);
+        set_check(IdContinueCheck, options.ContinueOnFileError);
+        set_check(IdSkipKnownBadCheck,
+                  options.UseBadRangeMap && options.SkipKnownBadRanges);
+        set_check(IdWaitMediaCheck, options.WaitForMediaAvailability);
+        set_check(IdFragileCheck, options.FragileMediaMode);
+        sync_bad_range_controls();
+
+        const int buffer_mb = std::clamp(
+            std::max(1, options.BufferSizeBytes / (1024 * 1024)), 1, 256);
+        SetWindowTextW(buffer_edit_, std::to_wstring(buffer_mb).c_str());
+        SetWindowTextW(retries_edit_,
+                       std::to_wstring(std::clamp(options.MaxRetries, 0, 32)).c_str());
+        const std::int64_t timeout_seconds = std::clamp<std::int64_t>(
+            options.OperationTimeout.ticks / time::TicksPerSecond, 1, 3600);
+        SetWindowTextW(timeout_edit_, std::to_wstring(timeout_seconds).c_str());
+    }
+
     models::CopyJobOptions collect_options() {
         models::CopyJobOptions options = settings_.build_default_options();
         options.SourceRoot = window_text_utf8(source_edit_);
@@ -2441,7 +2636,12 @@ private:
             std::string display_name = managed_display_name;
             std::string trigger = "manual";
             if (display_name.empty()) {
-                if (from_recovery) { display_name = "Recovered Copy Session"; trigger = "resume-interrupted"; }
+                if (from_recovery) {
+                    display_name = options.OperationMode == models::JobOperationMode::ScanOnly
+                                       ? "Recovered Readability Assessment"
+                                       : "Recovered Copy Session";
+                    trigger = "resume-interrupted";
+                }
                 else if (options.OperationMode == models::JobOperationMode::ScanOnly) {
                     display_name = "Readability Assessment"; trigger = "scan";
                 } else { display_name = "Manual Copy"; }
@@ -2484,7 +2684,9 @@ private:
         if (ok) {
             active_run_id_ = supervisor_.current_job_id();
             recovery_.mark_job_started(active_run_id_, pending_start_job_name_,
-                                       pending_start_options_, "", settings_);
+                                       pending_start_options_,
+                                       compute_journal_path(pending_start_options_), settings_,
+                                       active_managed_run_id_);
             if (latest_progress_.has_value()) {
                 recovery_.update_media_identities(
                     active_run_id_, latest_progress_->SourceMediaIdentity,
@@ -2492,7 +2694,8 @@ private:
             }
             if (!active_managed_run_id_.empty()) {
                 job_manager_.mark_run_running(active_managed_run_id_,
-                                              compute_journal_path(pending_start_options_));
+                                              compute_journal_path(pending_start_options_),
+                                              &pending_start_options_);
             }
             EnableWindow(start_button_, FALSE);
             EnableWindow(pause_button_, TRUE);
@@ -2892,12 +3095,16 @@ private:
     }
 
     void resume_interrupted(const ui::RecoveryActiveRun& run) {
-        SetWindowTextW(source_edit_, storage::fsutil::utf8_to_wide(run.Options.SourceRoot).c_str());
-        SetWindowTextW(destination_edit_,
-                       storage::fsutil::utf8_to_wide(run.Options.DestinationRoot).c_str());
         models::CopyJobOptions options = run.Options;
         options.ResumeFromJournal = true;
-        start_job_with(options, true);
+        if (!run.JournalPath.empty()) options.ResumeJournalPathHint = run.JournalPath;
+        apply_run_options_to_ui(options);
+        append_log("Restored exact " +
+                   std::string(options.OperationMode == models::JobOperationMode::ScanOnly
+                                   ? "assessment"
+                                   : "copy") +
+                   " options from the interrupted run.");
+        start_job_with(options, true, run.ManagedRunId, run.JobName);
     }
 };
 

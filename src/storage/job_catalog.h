@@ -163,6 +163,9 @@ struct ManagedJobRun {
     std::string DisplayName;
     std::string SourceRoot;
     std::string DestinationRoot;
+    // Runs keep their own immutable launch definition. A saved job may later
+    // be edited, and ad-hoc runs have no ManagedJob to reconstruct from.
+    std::optional<models::CopyJobOptions> Options;
     std::string Trigger = "manual";
     std::string QueueEntryId;
     std::int32_t QueueAttempt = 0;
@@ -182,6 +185,9 @@ struct ManagedJobRun {
         w.key("DisplayName"); w.value(DisplayName);
         w.key("SourceRoot"); w.value(SourceRoot);
         w.key("DestinationRoot"); w.value(DestinationRoot);
+        if (Options.has_value()) {
+            w.key("Options"); Options->to_json(w);
+        }
         w.key("Trigger"); w.value(Trigger);
         w.key("QueueEntryId"); w.value(QueueEntryId);
         w.key("QueueAttempt"); w.value(QueueAttempt);
@@ -210,6 +216,10 @@ struct ManagedJobRun {
         models::detail::read(obj, "DisplayName", run.DisplayName);
         models::detail::read(obj, "SourceRoot", run.SourceRoot);
         models::detail::read(obj, "DestinationRoot", run.DestinationRoot);
+        if (const auto* options = obj->find("Options");
+            options != nullptr && options->is_object()) {
+            run.Options = models::CopyJobOptions::from_json(*options);
+        }
         models::detail::read(obj, "Trigger", run.Trigger);
         models::detail::read(obj, "QueueEntryId", run.QueueEntryId);
         models::detail::read(obj, "QueueAttempt", run.QueueAttempt);
@@ -228,7 +238,7 @@ struct ManagedJobRun {
 };
 
 struct JobCatalog {
-    std::int32_t SchemaVersion = 2;
+    std::int32_t SchemaVersion = 3;
     std::vector<ManagedJob> Jobs;
     std::vector<ManagedJobRun> Runs;
     std::vector<ManagedJobQueueEntry> QueueEntries;
@@ -280,7 +290,7 @@ struct JobCatalog {
 
 class JobCatalogStore {
 public:
-    static constexpr std::int32_t CurrentSchemaVersion = 2;
+    static constexpr std::int32_t CurrentSchemaVersion = 3;
     static constexpr std::int32_t CurrentEnvelopeSchemaVersion = 1;
     static constexpr int BackupGenerationCount = 2;
 

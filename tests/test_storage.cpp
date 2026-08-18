@@ -210,6 +210,11 @@ void verify_map(const std::optional<storage::BadRangeMap>& map, const std::strin
 void test_source_identity_fields() {
     storage::JobJournal journal;
     journal.JobId = "identity-journal";
+    models::CopyJobOptions journal_options;
+    journal_options.OperationMode = models::JobOperationMode::ScanOnly;
+    journal_options.SourceRoot = "H:\\TV Shows";
+    journal_options.UseExperimentalRawDiskScan = true;
+    journal.RunOptions = journal_options;
     storage::JournalFileEntry journal_entry;
     journal_entry.RelativePath = "same-metadata.bin";
     journal_entry.SourceChangeUtcTicks = 638123456789000000LL;
@@ -227,6 +232,8 @@ void test_source_identity_fields() {
     check(journal_payload.find("\"SourceChangeUtcTicks\": 638123456789000000") !=
               std::string::npos,
           "identity fields: journal change time serialized");
+    check(journal_payload.find("\"RunOptions\"") != std::string::npos,
+          "journal task options: self-describing resume definition serialized");
     storage::JobJournal journal_round_trip = storage::JobJournal::from_json(json::parse(journal_payload));
     const auto* loaded_journal_entry = journal_round_trip.Files.find("same-metadata.bin");
     check(loaded_journal_entry != nullptr &&
@@ -234,6 +241,11 @@ void test_source_identity_fields() {
               loaded_journal_entry->SourceFileIndex == 123456 &&
               loaded_journal_entry->SourceVolumeSerial == 987654,
           "identity fields: journal round-trip preserves identity and change time");
+    check(journal_round_trip.RunOptions.has_value() &&
+              journal_round_trip.RunOptions->OperationMode ==
+                  models::JobOperationMode::ScanOnly &&
+              journal_round_trip.RunOptions->UseExperimentalRawDiskScan,
+          "journal task options: scan mode and direct NTFS backend round-trip");
 
     storage::BadRangeMap map;
     storage::BadRangeMapFileEntry map_entry;
@@ -941,6 +953,7 @@ storage::JobCatalog build_canonical_catalog() {
     completed.DisplayName = job.Name;
     completed.SourceRoot = job.Options.SourceRoot;
     completed.DestinationRoot = job.Options.DestinationRoot;
+    completed.Options = job.Options;
     completed.Trigger = "queued-manual";
     completed.QueueEntryId = attempted.QueueEntryId;
     completed.QueueAttempt = 2;
@@ -978,7 +991,7 @@ storage::JobCatalog build_canonical_catalog() {
 }
 
 void verify_canonical_catalog(const storage::JobCatalog& catalog, const std::string& tag) {
-    check(catalog.SchemaVersion == 2, tag + ": catalog schema 2");
+    check(catalog.SchemaVersion == 3, tag + ": catalog schema 3");
     check(catalog.Jobs.size() == 1, tag + ": one job");
     if (catalog.Jobs.size() == 1) {
         const auto& job = catalog.Jobs[0];
@@ -1009,6 +1022,9 @@ void verify_canonical_catalog(const storage::JobCatalog& catalog, const std::str
         check(completed.Status == storage::ManagedJobRunStatus::Completed, tag + ": run 1 completed");
         check(completed.FinishedUtc.has_value(), tag + ": run 1 finished utc set");
         check(completed.JournalPath == "C:\\журнал\\j.json", tag + ": run 1 unicode journal path");
+        check(completed.Options.has_value() && completed.Options->MaxRetries == 9 &&
+                  completed.Options->VerificationModeValue == models::VerificationMode::Full,
+              tag + ": run 1 immutable options round-trip");
         check(completed.Result.has_value() && completed.Result->TotalFiles == 3 &&
                   completed.Result->TransferEnginePolicyValue == models::TransferEnginePolicy::NativeFast &&
                   completed.Result->AverageBytesPerSecond == 1048576.0,

@@ -5,6 +5,31 @@ All notable changes to XactCopy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions are four-part (`major.minor.build.revision`) and tagged `v<version>`.
 
+## [2.0.0.8] — 2026-08-18
+
+### Fixed
+
+- Interrupted copy and assessment runs now retain their immutable launch
+  options in both run history and the journal. Resume restores the operation
+  mode, scan backend/profile, conflict and verification policy, rescue/map
+  choices, worker tuning, timeouts, and selected-source scope before restarting.
+- Fast assessments checkpoint completed files while workers are active, and
+  precise assessments bind and checkpoint partial byte-range coverage so a
+  restart resumes useful work instead of beginning at the first file.
+- Parallel native-copy cancellation now commits completed publications before
+  unwinding, and cancellation results can no longer erase a valid journal path.
+- Job Manager run details now show authenticated journal progress plus every
+  recorded unreadable/recovered or failed filename. Interrupted, cancelled,
+  incomplete, and failed runs with journal state expose a **Resume** action.
+- Fragile-mode first-read stops now retain the failed primary-data offset and
+  attempted length in both the journal and bad-range map for assessments and
+  copies. A first observation remains diagnostic; repeated matching evidence is
+  still required before it can become a skip hint.
+- Missing, locked, access-denied, and unavailable sources are classified before
+  fragile-media handling, so those operational failures cannot be mislabeled as
+  physical bad ranges. The bad-range inspector also cross-references the latest
+  assessment journal and lists failures that could not be localized to bytes.
+
 ## [2.0.0.7] — 2026-08-06
 
 ### Added
@@ -186,6 +211,8 @@ supersedes the 1.x VB.NET releases.
   and the `vbnet-final` tag. Its on-disk journals, bad-range maps, and settings
   remain compatible with this release.
 
+[2.0.0.8]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.0.0.8
+[2.0.0.7]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.0.0.7
 [2.0.0.6]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.0.0.6
 [2.0.0.5]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.0.0.5
 [2.0.0.4]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.0.0.4

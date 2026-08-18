@@ -661,35 +661,15 @@ public:
                                            cancel);
         emit_log("Journal state prepared.");
 
-        // A fresh fast scan can contain tens of thousands of files. Saving the
-        // complete journal synchronously here serializes, compresses, hashes,
-        // mirrors, and appends the ledger before the first health read starts.
-        // That made the UI look hung and, more seriously, left Cancel unable to
-        // reach the scan workers while the large snapshot was being written.
-        // Keep the checkpoint, but take a copy and write it in the background
-        // while the read-only scan starts. Fast-scan workers do not flush the
-        // live journal, so the two journal instances cannot race; the final
-        // save below joins this thread before publishing the result.
-        std::thread deferred_initial_journal_save;
-        std::string deferred_initial_journal_error;
+        // A fresh fast scan can contain tens of thousands of files. Do not
+        // block worker startup on an all-pending snapshot. run_fast_scan_mode
+        // owns a synchronized live checkpoint writer, so its first durable
+        // snapshot already contains useful completed/partial coverage.
         const bool defer_initial_scan_checkpoint =
             scan_only && resolve_scan_performance_profile() == models::ScanPerformanceProfile::Fast &&
             scan.files.size() >= 2048;
         if (defer_initial_scan_checkpoint) {
-            emit_log("Large fast scan: writing the initial journal checkpoint in the background.");
-            JobJournal checkpoint = journal;
-            deferred_initial_journal_save = std::thread(
-                [this, journal_path, checkpoint = std::move(checkpoint),
-                 &deferred_initial_journal_error]() mutable {
-                    try {
-                        if (!journal_store_.save(journal_path, std::move(checkpoint))) {
-                            deferred_initial_journal_error =
-                                "checkpoint saved with reduced snapshot/ledger redundancy";
-                        }
-                    } catch (const std::exception& ex) {
-                        deferred_initial_journal_error = ex.what();
-                    }
-                });
+            emit_log("Large fast scan: initial checkpoint deferred to the live progress writer.");
         } else {
             emit_log("Saving initial journal checkpoint.");
             save_journal_now(journal_path, journal);
@@ -703,26 +683,8 @@ public:
         // Fast scan profile: parallel healthy-file reads with precise fallback.
         if (scan_only &&
             resolve_scan_performance_profile() == models::ScanPerformanceProfile::Fast) {
-            std::string fast_error;
-            try {
-                fast_error = run_fast_scan_mode(scan.files, source_root, progress, journal,
-                                                journal_path, cancel);
-            } catch (...) {
-                // A joinable thread must be joined before the exception leaves
-                // this scope. The background checkpoint is independent of the
-                // read-only work, so it is safe to wait for its final write.
-                if (deferred_initial_journal_save.joinable()) {
-                    deferred_initial_journal_save.join();
-                }
-                throw;
-            }
-            if (deferred_initial_journal_save.joinable()) {
-                deferred_initial_journal_save.join();
-            }
-            if (!deferred_initial_journal_error.empty()) {
-                emit_log("Initial journal checkpoint warning; the final checkpoint will retry full redundancy: " +
-                         deferred_initial_journal_error);
-            }
+            std::string fast_error = run_fast_scan_mode(
+                scan.files, source_root, progress, journal, journal_path, cancel);
             flush_bad_range_map();
             save_journal_now(journal_path, journal);
             CopyJobResult fast_result = create_result(
@@ -847,6 +809,26 @@ public:
             }
 
             if (scan_only) {
+                if (is_completed_scan_journal_entry(*entry, descriptor)) {
+                    progress.completed_files += 1;
+                    if (entry->State == FileCopyState::CompletedWithRecovery) {
+                        progress.recovered_files += 1;
+                    }
+                    progress.total_bytes_copied += descriptor.length;
+                    progress.bytes_reused += descriptor.length;
+                    emit_log("Reused assessment: " + descriptor.relative_path +
+                             " (bound journal completion).");
+                    emit_progress(
+                        progress, descriptor.relative_path, descriptor.length,
+                        descriptor.length, 0,
+                        resolve_buffer_size_for_file(descriptor.length),
+                        "ScanResume", unreadable_region_count(entry->RescueRanges),
+                        rescue_bytes(entry->RescueRanges,
+                                     {RescueRangeState::Pending, RescueRangeState::Bad,
+                                      RescueRangeState::KnownBad}));
+                    continue;
+                }
+
                 if (should_skip_failed_entry_for_fragile_resume(*entry)) {
                     progress.skipped_files += 1;
                     std::int64_t scan_already = entry->BytesCopied > 0 ? entry->BytesCopied : 0;
@@ -867,9 +849,13 @@ public:
                     entry->DoNotRetry = false;
                 }
 
+                const bool preserve_scan_coverage =
+                    options_.ResumeFromJournal && !entry->RescueRanges.empty() &&
+                    entry->SourceChangeUtcTicks != 0 && entry->SourceFileIndex != 0 &&
+                    entry->SourceVolumeSerial != 0;
                 std::string scan_error = process_precise_scan_file(
                     descriptor, *entry, progress, journal, journal_path,
-                    /*preserve_existing_coverage*/ false, /*seed_progress*/ true, cancel);
+                    preserve_scan_coverage, /*seed_progress*/ true, cancel);
                 if (!scan_error.empty() && !options_.ContinueOnFileError) {
                     save_journal_now(journal_path, journal);
                     return create_result(progress, journal_path, false, false, scan_error);
@@ -897,8 +883,6 @@ public:
 
             std::optional<std::string> copy_error;
             bool recovered = false;
-            bool fragile_skip = false;
-            std::string fragile_message;
 
             CancelContext file_cancel = cancel;
             if (options_.PerFileTimeout.ticks > 0) {
@@ -925,8 +909,9 @@ public:
                 flush_journal(journal_path, journal, true);
                 continue;
             } catch (const FragileReadSkip& ex) {
-                fragile_skip = true;
-                fragile_message = ex.what();
+                handle_fragile_read_skip(descriptor, *entry, progress, journal, journal_path,
+                                         ex, cancel);
+                continue;
             } catch (const OperationCanceled& oc) {
                 if (oc.user_requested) throw;
                 std::int64_t timeout_seconds =
@@ -935,12 +920,6 @@ public:
                              " sec) reached while copying " + descriptor.relative_path + ".";
             } catch (const std::exception& ex) {
                 copy_error = ex.what();
-            }
-
-            if (fragile_skip) {
-                handle_fragile_read_skip(descriptor, *entry, progress, journal, journal_path,
-                                         fragile_message, cancel);
-                continue;
             }
 
             if (!copy_error.has_value()) {
@@ -1331,6 +1310,12 @@ private:
         journal.JobId = job_id;
         journal.SourceRoot = source_root;
         journal.DestinationRoot = destination_root;
+        models::CopyJobOptions persisted_options = options_;
+        // A path hint is a transport detail for locating this journal, not part
+        // of the task's behavior. Everything else is required to reconstruct
+        // the exact copy/assessment after a restart.
+        persisted_options.ResumeJournalPathHint.clear();
+        journal.RunOptions = std::move(persisted_options);
 
         ULONGLONG last_prepare_log_tick = GetTickCount64();
         auto pump_prepare = [&](std::size_t index, std::string_view phase) {
@@ -1434,6 +1419,23 @@ private:
                     }
                     entry->DoNotRetry = false;
                 }
+            }
+
+            if (options_.OperationMode == models::JobOperationMode::ScanOnly &&
+                options_.ResumeFromJournal &&
+                (entry->BytesCopied > 0 || !entry->RescueRanges.empty()) &&
+                (entry->SourceChangeUtcTicks == 0 || entry->SourceFileIndex == 0 ||
+                 entry->SourceVolumeSerial == 0)) {
+                // Pre-binding journals can still be read for diagnostics, but
+                // partial coverage cannot safely survive a same-size,
+                // same-timestamp source replacement.
+                entry->BytesCopied = 0;
+                entry->State = FileCopyState::Pending;
+                entry->RecoveredRanges.clear();
+                entry->RescueRanges.clear();
+                entry->LastRescuePass.clear();
+                entry->LastError =
+                    "Legacy scan coverage lacked a stable source binding and was reset.";
             }
         }
 
@@ -1727,11 +1729,37 @@ private:
                utf8_to_wide(descriptor.relative_path);
     }
 
+    std::int64_t record_fragile_read_skip(const SourceFileDescriptor& descriptor,
+                                          JournalFileEntry& entry,
+                                          const FragileReadSkip& failure) {
+        entry.State = FileCopyState::Failed;
+        entry.LastError = failure.what();
+        entry.DoNotRetry = options_.PersistFragileSkipAcrossResume;
+
+        if (!failure.PrimaryDataRange || failure.Offset < 0 || failure.Length <= 0 ||
+            failure.Offset >= descriptor.length) {
+            return 0;
+        }
+        const std::int64_t observed_length = std::min<std::int64_t>(
+            failure.Length, descriptor.length - failure.Offset);
+        if (entry.RescueRanges.empty()) {
+            append_range(entry.RescueRanges, 0, descriptor.length,
+                         RescueRangeState::Pending);
+        }
+        set_range_state(entry.RescueRanges, failure.Offset, observed_length,
+                        RescueRangeState::Bad);
+        entry.LastRescuePass = "FragileFirstRead";
+        return observed_length;
+    }
+
     void handle_fragile_read_skip(const SourceFileDescriptor& descriptor, JournalFileEntry& entry,
                                   ProgressAccumulator& progress, JobJournal& journal,
-                                  const std::wstring& journal_path, const std::string& message,
-                                  const CancelContext& cancel,
-                                  const std::string& operation_label = "copy") {
+                                  const std::wstring& journal_path,
+                                  const FragileReadSkip& failure, const CancelContext& cancel,
+                                  const std::string& operation_label = "copy",
+                                  bool register_failure = true,
+                                  bool force_journal_flush = true) {
+        const std::string message = failure.what();
         std::int64_t already = entry.BytesCopied > 0 ? entry.BytesCopied : 0;
         std::int64_t remaining = descriptor.length - already;
         progress.skipped_files += 1;
@@ -1739,16 +1767,30 @@ private:
         progress.total_bytes_copied += skipped;
         progress.bytes_skipped += skipped;
 
-        entry.State = FileCopyState::Failed;
-        entry.LastError = message;
-        entry.DoNotRetry = options_.PersistFragileSkipAcrossResume;
+        const std::int64_t observed_length =
+            record_fragile_read_skip(descriptor, entry, failure);
+        if (observed_length > 0) {
+            sync_entry_bytes_copied(entry);
+            emit_log("[Fragile] Recorded first unreadable read range for " +
+                     descriptor.relative_path + " at " + format_bytes(failure.Offset) +
+                     " (" + format_bytes(observed_length) +
+                     "; diagnostic until a later matching observation confirms it).");
+        } else if (!failure.PrimaryDataRange) {
+            emit_log("[Fragile] The failed read was outside the primary file data; no primary-data "
+                     "bad-range hint was created.");
+        }
 
         emit_log("Skipped " + operation_label + ": " + descriptor.relative_path + " (" + message + ")");
         emit_progress(progress, descriptor.relative_path, descriptor.length, descriptor.length, 0,
-                      resolve_buffer_size_for_file(descriptor.length));
-        register_fragile_failure_and_maybe_cooldown(descriptor.relative_path, message, cancel);
+                      resolve_buffer_size_for_file(descriptor.length), entry.LastRescuePass,
+                      unreadable_region_count(entry.RescueRanges),
+                      rescue_bytes(entry.RescueRanges,
+                                   {RescueRangeState::Bad, RescueRangeState::KnownBad}));
+        if (register_failure) {
+            register_fragile_failure_and_maybe_cooldown(descriptor.relative_path, message, cancel);
+        }
         try_persist_bad_range_map_entry(descriptor, entry, false);
-        flush_journal(journal_path, journal, true);
+        flush_journal(journal_path, journal, force_journal_flush);
     }
 
     void register_fragile_failure_and_maybe_cooldown(const std::string& relative_path,
@@ -1906,7 +1948,8 @@ private:
                     stream_buffer_size, source_stream.length - offset));
                 std::int32_t read = read_chunk_with_retries(
                     source_stream_path, stream_label, offset, count, session, buffer.data(),
-                    cancel, std::max(0, options_.MaxRetries), false);
+                    cancel, std::max(0, options_.MaxRetries), false,
+                    /*primary_data_range*/ false);
                 if (read != count) {
                     throw IoError("Short read while copying alternate data stream " + stream_label + ".");
                 }
@@ -3282,7 +3325,8 @@ private:
                                          const std::string& relative_path, std::int64_t offset,
                                          std::int32_t length, FileTransferSession& session,
                                          unsigned char* buffer, const CancelContext& cancel,
-                                         std::int32_t max_retries, bool allow_salvage) {
+                                         std::int32_t max_retries, bool allow_salvage,
+                                         bool primary_data_range = true) {
         std::int32_t attempt = 0;
         std::optional<IoError> last_error;
         std::int32_t effective_max = max_retries >= 0 ? max_retries : options_.MaxRetries;
@@ -3332,13 +3376,6 @@ private:
                 }
             }
 
-            if (options_.FragileMediaMode && options_.SkipFileOnFirstReadError) {
-                session.invalidate_source();
-                std::string error_text = last_error.has_value() ? last_error->what() : "unknown read error";
-                throw FragileReadSkip("Fragile mode: first read failure at " + format_bytes(offset) +
-                                      " (" + error_text + ").");
-            }
-
             if (is_source_file_missing(*last_error)) {
                 switch (options_.SourceMutationPolicyValue) {
                     case models::SourceMutationPolicy::SkipFile:
@@ -3364,7 +3401,17 @@ private:
                 continue;
             }
 
-            if (is_fatal_read(*last_error)) break;
+            if (is_fatal_read(*last_error)) {
+                if (options_.FragileMediaMode && options_.SkipFileOnFirstReadError &&
+                    !is_access_denied(*last_error)) {
+                    session.invalidate_source();
+                    throw FragileReadSkip(
+                        "Fragile mode: first read failure at " + format_bytes(offset) +
+                            " (" + last_error->what() + ").",
+                        offset, length, primary_data_range);
+                }
+                break;
+            }
 
             if (options_.WaitForMediaAvailability && is_availability_related(*last_error, false)) {
                 session.invalidate_source();
@@ -3373,6 +3420,23 @@ private:
                 wait_for_source_file(source_path, cancel, false);
                 attempt = 0;
                 continue;
+            }
+
+            // A missing/locked file, access denial, or unavailable device is
+            // not evidence that this byte range is physically unreadable.
+            // Classify those conditions first so fragile mode records only an
+            // actual data-read failure (including a read timeout/short read).
+            const bool non_media_read_failure =
+                is_read_contention(*last_error) ||
+                is_availability_related(*last_error, true);
+            if (options_.FragileMediaMode && options_.SkipFileOnFirstReadError &&
+                !non_media_read_failure) {
+                session.invalidate_source();
+                const std::string error_text = last_error->what();
+                throw FragileReadSkip(
+                    "Fragile mode: first read failure at " + format_bytes(offset) +
+                        " (" + error_text + ").",
+                    offset, length, primary_data_range);
             }
 
             session.invalidate_source();
@@ -4105,12 +4169,21 @@ private:
         std::string error_message;
     };
 
+    struct FastFragileFailure {
+        SourceFileDescriptor descriptor;
+        std::string message;
+        std::int64_t offset = -1;
+        std::int32_t length = 0;
+        bool primary_data_range = false;
+    };
+
     // Shared coordination state for the fast-scan worker pool.
     struct FastScanShared {
         std::mutex queue_lock;
         std::vector<SourceFileDescriptor> queue;
         std::size_t next_index = 0;
         std::vector<SourceFileDescriptor> fallback;
+        std::vector<FastFragileFailure> fragile_failures;
         std::vector<std::string> started_keys;
         std::vector<std::string> active_files;
         std::mutex fatal_lock;
@@ -4141,8 +4214,25 @@ private:
                           descriptor.relative_path + ".");
         }
 
+        std::int64_t initial_offset = 0;
+        {
+            std::lock_guard<std::mutex> guard(journal_lock_);
+            entry.SourceFileIndex = static_cast<std::int64_t>(
+                scan_source_stability.identity.file_index);
+            entry.SourceVolumeSerial = static_cast<std::int64_t>(
+                scan_source_stability.identity.volume_serial);
+            entry.SourceChangeUtcTicks = scan_source_stability.change_utc_ticks;
+            initial_offset = std::clamp<std::int64_t>(entry.BytesCopied, 0,
+                                                       descriptor.length);
+        }
+        if (initial_offset > 0) {
+            std::lock_guard<std::mutex> guard(progress_lock_);
+            progress.total_bytes_copied += initial_offset;
+            progress.bytes_reused += initial_offset;
+        }
+
         try {
-            std::int64_t offset = 0;
+            std::int64_t offset = initial_offset;
             while (offset < descriptor.length) {
                 cancel.throw_if_cancelled();
                 if (control_ != nullptr) control_->wait_if_paused(cancel);
@@ -4165,7 +4255,10 @@ private:
                 controller.report_success(bytes_read,
                                           static_cast<double>(GetTickCount64() - chunk_started));
                 offset += bytes_read;
-                entry.BytesCopied = offset;
+                {
+                    std::lock_guard<std::mutex> guard(journal_lock_);
+                    entry.BytesCopied = offset;
+                }
                 {
                     std::lock_guard<std::mutex> guard(progress_lock_);
                     progress.total_bytes_copied += bytes_read;
@@ -4187,11 +4280,14 @@ private:
                 throw IoError("Source content or metadata changed during scan: " +
                               descriptor.relative_path + ".");
             }
-            entry.SourceFileIndex = static_cast<std::int64_t>(
-                completed_scan_stability.identity.file_index);
-            entry.SourceVolumeSerial = static_cast<std::int64_t>(
-                completed_scan_stability.identity.volume_serial);
-            entry.SourceChangeUtcTicks = completed_scan_stability.change_utc_ticks;
+            {
+                std::lock_guard<std::mutex> guard(journal_lock_);
+                entry.SourceFileIndex = static_cast<std::int64_t>(
+                    completed_scan_stability.identity.file_index);
+                entry.SourceVolumeSerial = static_cast<std::int64_t>(
+                    completed_scan_stability.identity.volume_serial);
+                entry.SourceChangeUtcTicks = completed_scan_stability.change_utc_ticks;
+            }
             outcome.succeeded = true;
             outcome.bytes_read = offset;
             outcome.buffer_size_bytes = controller.current_size();
@@ -4204,7 +4300,10 @@ private:
             throw;
         } catch (const std::exception& ex) {
             outcome.succeeded = false;
-            outcome.bytes_read = std::max<std::int64_t>(0, entry.BytesCopied);
+            {
+                std::lock_guard<std::mutex> guard(journal_lock_);
+                outcome.bytes_read = std::max<std::int64_t>(0, entry.BytesCopied);
+            }
             outcome.buffer_size_bytes = controller.current_size();
             outcome.error_message = ex.what();
             return outcome;
@@ -4370,6 +4469,28 @@ private:
                                  format_bytes(outcome.bytes_read) + " (" + outcome.error_message +
                                  ").");
                     }
+                } catch (const FragileReadSkip& ex) {
+                    {
+                        std::lock_guard<std::mutex> guard(journal_lock_);
+                        JournalFileEntry* failed_entry =
+                            journal.Files.find(descriptor.relative_path);
+                        if (failed_entry != nullptr) {
+                            // Capture the finding before any cooldown or process
+                            // interruption. The joined phase persists the map and
+                            // accounts progress without issuing another read.
+                            record_fragile_read_skip(descriptor, *failed_entry, ex);
+                        }
+                    }
+                    {
+                        std::lock_guard<std::mutex> guard(shared.queue_lock);
+                        shared.fragile_failures.push_back(FastFragileFailure{
+                            descriptor, ex.what(), ex.Offset, ex.Length,
+                            ex.PrimaryDataRange});
+                    }
+                    emit_log("Fast scan fragile stop captured: " +
+                             descriptor.relative_path + " (no precise reread queued).");
+                    register_fragile_failure_and_maybe_cooldown(
+                        descriptor.relative_path, ex.what(), cancel);
                 } catch (const SourceMutationSkipped&) {
                     std::lock_guard<std::mutex> guard(progress_lock_);
                     progress.skipped_files += 1;
@@ -4425,6 +4546,46 @@ private:
         emit_log("Fast scan engine: " + std::to_string(source_files.size()) + " file(s), " +
                  std::to_string(shared.worker_count) + " worker(s).");
 
+        HANDLE checkpoint_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        std::mutex checkpoint_error_lock;
+        std::string checkpoint_error;
+        auto save_checkpoint = [&]() {
+            JobJournal snapshot;
+            {
+                std::lock_guard<std::mutex> guard(journal_lock_);
+                snapshot = journal;
+            }
+            try {
+                if (!journal_store_.save(journal_path, std::move(snapshot))) {
+                    std::lock_guard<std::mutex> guard(checkpoint_error_lock);
+                    checkpoint_error =
+                        "live checkpoint has reduced snapshot/ledger redundancy";
+                }
+            } catch (const std::exception& ex) {
+                std::lock_guard<std::mutex> guard(checkpoint_error_lock);
+                checkpoint_error = ex.what();
+            }
+        };
+
+        // Fast workers update different entries concurrently and previously
+        // wrote nothing until every worker and fallback pass had finished.
+        // Snapshot under journal_lock_ at an adaptive cadence; cancellation
+        // performs one final synchronous snapshot below.
+        std::thread checkpoint_thread;
+        if (checkpoint_stop != nullptr) {
+            checkpoint_thread = std::thread([&]() {
+                DWORD interval_ms = 5000;
+                while (WaitForSingleObject(checkpoint_stop, interval_ms) == WAIT_TIMEOUT) {
+                    const ULONGLONG started = GetTickCount64();
+                    save_checkpoint();
+                    const ULONGLONG cost = std::max<ULONGLONG>(1, GetTickCount64() - started);
+                    interval_ms = static_cast<DWORD>(std::clamp<ULONGLONG>(
+                        cost * (JournalFlushDutyDivisor - 1), 5000,
+                        MaximumJournalFlushIntervalMs));
+                }
+            });
+        }
+
         std::vector<std::thread> workers;
         for (std::int32_t i = 0; i < shared.worker_count; ++i) {
             workers.emplace_back([this, &shared, &progress, &journal, &cancel]() {
@@ -4432,6 +4593,39 @@ private:
             });
         }
         for (auto& worker : workers) worker.join();
+
+        if (checkpoint_stop != nullptr) SetEvent(checkpoint_stop);
+        if (checkpoint_thread.joinable()) checkpoint_thread.join();
+
+        // Fragile mode is deliberately single-worker. Preserve each first-read
+        // failure now that the checkpoint writer is joined; sending it through
+        // precise fallback would contradict "skip on first read error" by
+        // reading the same failing range a second time.
+        for (const auto& captured : shared.fragile_failures) {
+            JournalFileEntry* entry =
+                journal.Files.find(captured.descriptor.relative_path);
+            if (entry == nullptr) continue;
+            FragileReadSkip failure(captured.message, captured.offset, captured.length,
+                                    captured.primary_data_range);
+            handle_fragile_read_skip(captured.descriptor, *entry, progress, journal,
+                                     journal_path, failure, cancel, "scan",
+                                     /*register_failure*/ false,
+                                     /*force_journal_flush*/ false);
+        }
+
+        if (shared.cancelled_user.load() || shared.cancelled_timeout.load()) {
+            // Preserve every completed file and the latest bound offset for the
+            // handful of files active at cancellation before unwinding.
+            save_checkpoint();
+        }
+        if (checkpoint_stop != nullptr) CloseHandle(checkpoint_stop);
+
+        {
+            std::lock_guard<std::mutex> guard(checkpoint_error_lock);
+            if (!checkpoint_error.empty()) {
+                emit_log("Fast scan checkpoint warning: " + checkpoint_error + ".");
+            }
+        }
 
         if (shared.cancelled_user.load()) throw OperationCanceled{true};
         if (shared.cancelled_timeout.load()) throw OperationCanceled{false};
@@ -4534,6 +4728,14 @@ private:
             throw IoError("Source changed after scan enumeration: " +
                           descriptor.relative_path + ".");
         }
+        // Persist the binding before the first read. If power or the process is
+        // lost mid-file, the checkpointed ranges can be reused only against
+        // this exact file generation.
+        entry.SourceFileIndex = static_cast<std::int64_t>(
+            scan_source_stability.identity.file_index);
+        entry.SourceVolumeSerial = static_cast<std::int64_t>(
+            scan_source_stability.identity.volume_serial);
+        entry.SourceChangeUtcTicks = scan_source_stability.change_utc_ticks;
 
         if (!preserve_existing_coverage || entry.RescueRanges.empty()) {
             entry.RescueRanges.clear();
@@ -4546,6 +4748,7 @@ private:
         sync_entry_bytes_copied(entry);
         if (seed_progress_from_existing) {
             progress.total_bytes_copied += entry.BytesCopied;
+            progress.bytes_reused += entry.BytesCopied;
         }
 
         emit_progress(progress, descriptor.relative_path,
@@ -4643,8 +4846,6 @@ private:
                                           const CancelContext& cancel) {
         std::optional<std::string> scan_error;
         bool detected = false;
-        bool fragile_skip = false;
-        std::string fragile_message;
 
         CancelContext file_cancel = cancel;
         if (options_.PerFileTimeout.ticks > 0) {
@@ -4672,8 +4873,9 @@ private:
             flush_journal(journal_path, journal, true);
             return std::string();
         } catch (const FragileReadSkip& ex) {
-            fragile_skip = true;
-            fragile_message = ex.what();
+            handle_fragile_read_skip(descriptor, entry, progress, journal, journal_path,
+                                     ex, cancel, "scan");
+            return std::string();
         } catch (const OperationCanceled& oc) {
             if (oc.user_requested) throw;
             std::int64_t timeout_seconds = options_.PerFileTimeout.ticks / time::TicksPerSecond;
@@ -4681,12 +4883,6 @@ private:
                          " sec) reached while scanning " + descriptor.relative_path + ".";
         } catch (const std::exception& ex) {
             scan_error = ex.what();
-        }
-
-        if (fragile_skip) {
-            handle_fragile_read_skip(descriptor, entry, progress, journal, journal_path,
-                                     fragile_message, cancel, "scan");
-            return std::string();
         }
 
         if (!scan_error.has_value()) {
@@ -4746,6 +4942,33 @@ private:
         std::atomic<std::int32_t> completed_count{0};
         std::atomic<std::int32_t> failed_count{0};
         std::atomic<bool> cancelled{false};
+
+        HANDLE checkpoint_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        std::thread checkpoint_thread;
+        if (checkpoint_stop != nullptr) {
+            checkpoint_thread = std::thread([this, &journal, &journal_path,
+                                              checkpoint_stop]() {
+                DWORD interval_ms = 5000;
+                while (WaitForSingleObject(checkpoint_stop, interval_ms) == WAIT_TIMEOUT) {
+                    JobJournal snapshot;
+                    {
+                        std::lock_guard<std::mutex> guard(journal_lock_);
+                        snapshot = journal;
+                    }
+                    const ULONGLONG started = GetTickCount64();
+                    try {
+                        (void)journal_store_.save(journal_path, std::move(snapshot));
+                    } catch (const std::exception&) {
+                        // The joined phase performs a final synchronous save;
+                        // keep copying if an intermediate redundancy write fails.
+                    }
+                    const ULONGLONG cost = std::max<ULONGLONG>(1, GetTickCount64() - started);
+                    interval_ms = static_cast<DWORD>(std::clamp<ULONGLONG>(
+                        cost * (JournalFlushDutyDivisor - 1), 5000,
+                        MaximumJournalFlushIntervalMs));
+                }
+            });
+        }
 
         struct QuietCallbackState {
             const CancelContext* cancel;
@@ -4883,14 +5106,22 @@ private:
         }
         for (auto& worker : workers) worker.join();
 
+        if (checkpoint_stop != nullptr) SetEvent(checkpoint_stop);
+        if (checkpoint_thread.joinable()) checkpoint_thread.join();
+        if (checkpoint_stop != nullptr) CloseHandle(checkpoint_stop);
+
+        // Save completed staged publications before cancellation unwinds. The
+        // previous order threw first and discarded every journal update from a
+        // partially completed parallel phase.
+        if (completed_count.load() > 0) {
+            save_journal_now(journal_path, journal);
+        }
+
         if (cancelled.load() || cancel.is_cancelled()) throw OperationCanceled{true};
 
         emit_log("Parallel small file phase complete: " + std::to_string(completed_count.load()) +
                  " succeeded, " + std::to_string(failed_count.load()) +
                  " deferred to sequential path.");
-        if (completed_count.load() > 0) {
-            flush_journal(journal_path, journal, true);
-        }
         return completed_paths;
     }
 

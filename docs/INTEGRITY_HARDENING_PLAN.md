@@ -1,5 +1,11 @@
 # XactCopy integrity hardening plan
 
+All thirteen delivery phases below are complete as of 2.0.0.8. The **objective**
+and **non-negotiable invariants** are the durable part: they are the contract
+new work must not weaken. The phase list is kept as the record of how the
+contract was reached, and **remaining architectural boundaries** states what
+XactCopy deliberately does not promise.
+
 ## Objective
 
 Make the result of a copy unambiguous and keep a failed, interrupted, stale,

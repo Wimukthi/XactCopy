@@ -41,8 +41,11 @@ That is the rescue engine doing its job, but you can bound it:
 Stop, and re-run with **Fragile-media mode** on. Under **Settings → Performance →
 Fragile Media Guard** you can also make XactCopy skip a file on its first read
 error, persist those skips across a resume, and cool down after a burst of
-failures. Because every run is journaled, restarting with different settings
-resumes rather than starting over.
+failures. A first-read stop records the failed read request as diagnostic range
+evidence, but it is not used as a future skip hint until a later matching
+observation confirms it. Resume restores the interrupted task's original
+settings and continues its authenticated journal rather than silently using the
+current main-window defaults.
 
 ### Some files copied but are corrupt
 
@@ -126,6 +129,12 @@ jobs that interval grows on purpose — the journal is rewritten in full on ever
 flush, so flushes are budgeted to stay near 5% of run time. Redoing a few seconds
 of copying is cheaper than the I/O of flushing constantly. See
 [ARCHITECTURE.md](ARCHITECTURE.md#durable-state-journals).
+
+Current journals retain both the task settings and source-bound progress. Job
+Manager's selected-run details show the checkpoint counts and bad/failed
+filenames before you resume. If it warns that a run is legacy, that journal was
+created before exact per-run settings were stored; review the restored mode and
+controls because the old file cannot prove which backend or tuning was used.
 
 ### The worker keeps restarting
 

@@ -307,7 +307,8 @@ void test_recovery_service() {
         models::CopyJobOptions options;
         options.SourceRoot = "D:\\Recover\\Src";
         options.DestinationRoot = "E:\\Recover\\Dst";
-        service.mark_job_started("run-123", "Recover job", options, "C:\\journal.json", settings);
+        service.mark_job_started("run-123", "Recover job", options, "C:\\journal.json", settings,
+                                 "managed-run-456");
         // Simulate a crash: no mark_job_ended / mark_clean_shutdown.
     }
 
@@ -320,6 +321,8 @@ void test_recovery_service() {
             check(info.interrupted_run->RunId == "run-123", "run id round-trips");
             check(info.interrupted_run->Options.SourceRoot == "D:\\Recover\\Src",
                   "options round-trip through recovery state");
+            check(info.interrupted_run->ManagedRunId == "managed-run-456",
+                  "managed history run id round-trips for restart resume");
         }
         service.mark_job_ended("run-123");
         service.mark_clean_shutdown();
@@ -676,7 +679,7 @@ void test_job_catalog_store() {
     check(store.save(catalog), "save catalog");
 
     storage::JobCatalog loaded = store.load();
-    check(loaded.SchemaVersion == 2, "schema version 2");
+    check(loaded.SchemaVersion == 3, "schema version 3");
     check(loaded.Jobs.size() == 1 && loaded.Jobs[0].Name == "Nightly Backup", "job round-trip");
     check(loaded.Jobs[0].Options.MaxRetries == 7, "job options round-trip");
     check(loaded.QueueEntries.size() == 1 && !loaded.QueueEntries[0].LastAttemptUtc.has_value(),
@@ -705,7 +708,7 @@ void test_job_catalog_store() {
     legacy.Jobs.push_back(job);
     legacy.QueuedJobIds.push_back(" " + job.JobId + " ");
     storage::JobCatalogStore::normalize(legacy);
-    check(legacy.SchemaVersion == 2, "legacy schema upgraded");
+    check(legacy.SchemaVersion == 3, "legacy schema upgraded");
     check(legacy.QueueEntries.size() == 1 && legacy.QueueEntries[0].JobId == job.JobId &&
               legacy.QueueEntries[0].Trigger == "legacy-migration" &&
               legacy.QueueEntries[0].EnqueuedBy == "migration",
@@ -794,6 +797,10 @@ void test_job_manager_service() {
     auto run = manager.create_run_for_job(saved->JobId, "queued-manual", work_item.QueueEntryId, work_item.Attempt);
     check(run.has_value() && run->Status == storage::ManagedJobRunStatus::Queued && run->Summary == "Queued",
           "create_run_for_job initial state");
+    check(run.has_value() && run->Options.has_value() &&
+              run->Options->ExpectedSourceIdentity == "identity-src" &&
+              run->Options->ExpectedDestinationIdentity == "identity-dst",
+          "run history keeps the immutable launch options needed for resume");
 
     manager.mark_run_running(run->RunId, "C:\\journals\\run.json");
     manager.mark_run_paused(run->RunId);
@@ -820,8 +827,45 @@ void test_job_manager_service() {
     assessment_result.CompletedFiles = 10;
     assessment_result.RecoveredFiles = 2;
     assessment_result.BytesRead = 1024;
-    auto assessment_run = manager.create_ad_hoc_run(options, "Readability Assessment", "scan");
-    manager.mark_run_running(assessment_run.RunId, "");
+    models::CopyJobOptions assessment_options = options;
+    assessment_options.OperationMode = models::JobOperationMode::ScanOnly;
+    assessment_options.DestinationRoot.clear();
+    assessment_options.UseExperimentalRawDiskScan = true;
+    const std::wstring assessment_journal_path = work + L"\\assessment-journal.json";
+    storage::JobJournal assessment_journal;
+    assessment_journal.JobId = "assessment-journal";
+    assessment_journal.SourceRoot = assessment_options.SourceRoot;
+    assessment_journal.DestinationRoot = assessment_options.SourceRoot;
+    assessment_journal.RunOptions = assessment_options;
+    storage::JournalFileEntry bad_entry;
+    bad_entry.RelativePath = "bad-show.mkv";
+    bad_entry.SourceLength = 1024;
+    bad_entry.BytesCopied = 1024;
+    bad_entry.State = storage::FileCopyState::CompletedWithRecovery;
+    bad_entry.RescueRanges.push_back(
+        {512, 128, storage::RescueRangeState::Bad});
+    assessment_journal.Files.set(bad_entry.RelativePath, bad_entry);
+    storage::JournalFileEntry pending_entry;
+    pending_entry.RelativePath = "pending-show.mkv";
+    pending_entry.SourceLength = 2048;
+    assessment_journal.Files.set(pending_entry.RelativePath, pending_entry);
+    storage::JournalFileEntry unlocalized_entry;
+    unlocalized_entry.RelativePath = "fragile-skip.mkv";
+    unlocalized_entry.SourceLength = 4096;
+    unlocalized_entry.State = storage::FileCopyState::Failed;
+    unlocalized_entry.LastError =
+        "Fragile mode stopped this older run before range localization.";
+    assessment_journal.Files.set(unlocalized_entry.RelativePath, unlocalized_entry);
+    storage::JobJournalStore assessment_store;
+    check(assessment_store.save(assessment_journal_path, assessment_journal),
+          "assessment journal fixture saved");
+
+    auto assessment_run = manager.create_ad_hoc_run(
+        assessment_options, "Readability Assessment", "scan");
+    manager.mark_run_running(
+        assessment_run.RunId,
+        storage::fsutil::wide_to_utf8(assessment_journal_path),
+        &assessment_options);
     manager.mark_run_completed(assessment_run.RunId, assessment_result);
     auto runs_after_assessment = manager.get_recent_runs();
     check(!runs_after_assessment.empty() &&
@@ -831,6 +875,58 @@ void test_job_manager_service() {
               runs_after_assessment[0].Summary.find("unreadable ranges in 2") !=
                   std::string::npos,
           "successful assessment history distinguishes unreadable findings from recovery output");
+    auto inspection = manager.inspect_run_journal(assessment_run.RunId);
+    check(inspection.Loaded && inspection.ScanMode && inspection.TotalFiles == 3 &&
+              inspection.CompletedFiles == 1 && inspection.PendingFiles == 1 &&
+              inspection.FailedFiles == 1 && inspection.Findings.size() == 2 &&
+              inspection.Findings[0].RelativePath == "bad-show.mkv" &&
+              inspection.Findings[0].UnreadableBytes == 128 &&
+              inspection.Findings[1].RelativePath == "fragile-skip.mkv" &&
+              inspection.Findings[1].UnreadableRangeCount == 0 &&
+              !inspection.Findings[1].ErrorMessage.empty(),
+          "assessment inspection exposes localized and unlocalized failed filenames");
+    bool resume_exact = false;
+    auto resume_options = manager.get_resume_options(
+        assessment_run.RunId, &resume_exact, nullptr);
+    check(resume_exact && resume_options.has_value() &&
+              resume_options->OperationMode == models::JobOperationMode::ScanOnly &&
+              resume_options->UseExperimentalRawDiskScan,
+          "run resume restores exact scan mode and direct NTFS backend");
+
+    models::CopyJobOptions legacy_scan_options = assessment_options;
+    legacy_scan_options.SourceRoot = storage::fsutil::wide_to_utf8(work + L"\\legacy-source");
+    legacy_scan_options.DestinationRoot.clear();
+    storage::fsutil::create_directories(
+        storage::fsutil::utf8_to_wide(legacy_scan_options.SourceRoot));
+    const std::wstring legacy_source = storage::fsutil::get_full_path(
+        storage::fsutil::utf8_to_wide(legacy_scan_options.SourceRoot));
+    const std::wstring legacy_journal_path =
+        storage::JobJournalStore::get_default_journal_path(
+            storage::JobJournalStore::build_job_id(legacy_source, legacy_source));
+    storage::JobJournal legacy_journal;
+    legacy_journal.JobId = "legacy-journal";
+    legacy_journal.SourceRoot = legacy_scan_options.SourceRoot;
+    legacy_journal.DestinationRoot = legacy_scan_options.SourceRoot;
+    check(assessment_store.save(legacy_journal_path, legacy_journal),
+          "legacy journal fixture saved at its deterministic path");
+    auto legacy_run = manager.create_ad_hoc_run(
+        legacy_scan_options, "Readability Assessment", "scan");
+    storage::JobCatalog legacy_catalog = storage::JobCatalogStore(path).load();
+    for (auto& catalog_run : legacy_catalog.Runs) {
+        if (catalog_run.RunId != legacy_run.RunId) continue;
+        catalog_run.Options.reset();
+        catalog_run.JournalPath.clear();
+    }
+    check(storage::JobCatalogStore(path).save(legacy_catalog),
+          "legacy run fixture removes its per-run path and options");
+    ui::JobManagerService legacy_manager(path);
+    check(legacy_manager.get_resume_journal_path(
+              legacy_run.RunId, /*validate_roots*/ true) ==
+              storage::fsutil::wide_to_utf8(legacy_journal_path),
+          "legacy run safely reconstructs a missing deterministic journal path");
+    auto legacy_inspection = legacy_manager.inspect_run_journal(legacy_run.RunId);
+    check(legacy_inspection.Loaded && legacy_inspection.ScanMode,
+          "legacy run with no destination is restored as assessment mode");
 
     models::CopyJobResult incomplete_result;
     incomplete_result.TotalFiles = 10;
@@ -848,16 +944,34 @@ void test_job_manager_service() {
           "partial run is persisted with a distinct incomplete status");
 
     auto interrupted = manager.create_ad_hoc_run(options, "Manual Copy", "manual");
-    manager.mark_run_running(interrupted.RunId, "");
+    manager.mark_run_running(interrupted.RunId, "C:\\journals\\interrupted.json");
     check(manager.mark_any_running_runs_interrupted("Application closed.") == 1,
           "running run marked interrupted");
+
+    models::CopyJobResult cancelled_result;
+    cancelled_result.Cancelled = true;
+    cancelled_result.ErrorMessage = "cancelled";
+    manager.mark_run_completed(interrupted.RunId, cancelled_result);
+    auto cancelled_run = manager.get_run_by_id(interrupted.RunId);
+    check(cancelled_run.has_value() &&
+              cancelled_run->JournalPath == "C:\\journals\\interrupted.json",
+          "empty cancellation result cannot erase the resumable journal path");
+    manager.mark_run_running(interrupted.RunId, "C:\\journals\\interrupted.json", &options);
+    auto restarted_run = manager.get_run_by_id(interrupted.RunId);
+    check(restarted_run.has_value() && !restarted_run->Result.has_value() &&
+              !restarted_run->FinishedUtc.has_value() &&
+              restarted_run->Status == storage::ManagedJobRunStatus::Running,
+          "resumed run clears its stale terminal result while running");
+
+    storage::JobJournalStore::remove_journal_set(assessment_journal_path);
+    storage::JobJournalStore::remove_journal_set(legacy_journal_path);
 
     check(manager.delete_job(duplicate->JobId), "delete job");
     check(manager.get_queue_entries().empty() ||
               manager.get_queue_entries()[0].JobId != duplicate->JobId,
           "delete job drops its queue entries");
 
-    check(manager.clear_run_history() == 4, "clear history removes runs");
+    check(manager.clear_run_history() == 5, "clear history removes runs");
     check(manager.get_recent_runs().empty(), "history empty after clear");
 
     // A fresh service instance sees the persisted state.

@@ -168,6 +168,25 @@ files, and directory alternate streams are not copied; both limitations are
 reported. Managed Rescue also reports filesystem features such as sparse or
 compressed layout that it cannot reproduce exactly.
 
+
+### Confirming integrity risks
+
+Some option combinations produce a result that cannot be claimed as an exact
+copy. When a copy starts with any of them, XactCopy lists them and asks you to
+confirm before the run begins:
+
+- Verification is **None**, so destination bytes are never checked.
+- Verification is **Sampled**, which can miss corruption outside the samples.
+- **Continue on error** is on, which can leave a mixed, incomplete destination.
+- Salvage is combined with the expert override that lets synthetic bytes replace
+  an existing destination file.
+- The expert override that allows EFS-encrypted source data to be published as
+  plaintext is on.
+
+The prompt is why these are described as *attended-only*: they are available,
+but not something a job should reach unattended without you having seen the
+consequence. The **Verified Copy** profile clears all of them.
+
 ## Bad-range maps
 
 A **bad-range map** records which byte ranges of a particular source file are
@@ -175,6 +194,20 @@ unreadable. Build one with **Assess Readable Files**, or let a copy populate it 
 goes. On later runs, enable **Use bad-range map** and **Skip known-bad ranges** so
 XactCopy spends its effort on recoverable data instead of grinding on sectors it
 already knows are dead.
+
+When **Fragile Media Guard → Skip file on first read error** is enabled, XactCopy
+intentionally stops before the rescue passes can localize the failure further.
+It records the exact read request that failed as a one-observation diagnostic
+range in the signed journal and map. That range is not trusted as a skip hint
+until a later run observes the same range against the same file and media
+identity. Missing files, locks, access denial, and an offline device are kept as
+ordinary run failures and are never promoted to physical range evidence.
+
+**Tools → Inspect Bad-Range Map** reports both the durable map and the latest
+matching assessment journal. Every filename is written to the main log. The
+journal section can therefore show files that failed or were skipped even when
+no byte range could safely be localized; those files are not silently presented
+as an empty successful scan.
 
 Maps are signed, age-limited, and bound to the source volume plus each file's
 identity, size, last-write time, NTFS change time, and fingerprint. A skip hint
@@ -200,10 +233,14 @@ run history in one grid.
   remain available for a reviewed manual run.
 - **History** — every run is recorded with its type, state (Running, Completed,
   Failed, Cancelled, Interrupted…), timings, source and destination, and a
-  summary. **Open Journal** validates the run's journal, exports a readable JSON
-  view, and opens that view. Large resumable journals use XactCopy's compressed
-  `XCJZ` container internally even though their compatibility filename ends in
-  `.json`; this is expected, not encryption or corruption.
+  summary. Selecting a run loads its authenticated checkpoint in the details
+  pane, including completed/pending counts and every recorded unreadable,
+  recovered, or failed filename. An interrupted, cancelled, incomplete, or
+  failed run with journal state changes **Run Now** to **Resume**. **Open
+  Journal** validates the same journal, exports a readable JSON view, and opens
+  that view. Large resumable journals use XactCopy's compressed `XCJZ` container
+  internally even though their compatibility filename ends in `.json`; this is
+  expected, not encryption or corruption.
 
 Filter with the **View** and **Run Status** combos or the **Search** box. The
 grid refreshes automatically; double-click a run to open its journal, and use
@@ -215,6 +252,14 @@ Because every run is journaled, XactCopy can recover from an unclean shutdown. I
 a run was active when XactCopy or Windows went down, the next launch detects the
 interrupted run and offers to **Resume** it — continuing from the journal —
 **Discard** it, or decide **Later**.
+
+Resume restores the task definition captured when the run started, not the
+current main-window defaults: copy versus assessment mode, selected files,
+direct-NTFS versus standard scanning, scan profile, conflict/verification
+policy, rescue and bad-map behavior, buffers, workers, retries, and timeouts.
+Older journals created before task definitions were embedded remain readable;
+when their exact settings cannot be reconstructed, Job Manager identifies the
+run as legacy and requires review rather than silently guessing.
 
 **Settings → Recovery & Startup** controls whether you are prompted, whether
 interrupted runs resume automatically, whether the prompt keeps reappearing until

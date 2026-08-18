@@ -104,7 +104,18 @@ public:
 
 class FragileReadSkip : public std::runtime_error {
 public:
-    explicit FragileReadSkip(std::string message) : std::runtime_error(std::move(message)) {}
+    FragileReadSkip(std::string message, std::int64_t offset, std::int32_t length,
+                    bool primary_data_range)
+        : std::runtime_error(std::move(message)),
+          Offset(offset),
+          Length(length),
+          PrimaryDataRange(primary_data_range) {}
+
+    // The handler needs the exact attempted read to preserve a diagnostic
+    // finding when fragile mode intentionally stops before rescue localization.
+    std::int64_t Offset = -1;
+    std::int32_t Length = 0;
+    bool PrimaryDataRange = false;
 };
 
 // ---------------------------------------------------------------------------

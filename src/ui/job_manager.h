@@ -48,6 +48,27 @@ struct QueuedJobWorkItem {
     storage::ManagedJob Job;
 };
 
+struct RunJournalFinding {
+    std::string RelativePath;
+    storage::FileCopyState State = storage::FileCopyState::Pending;
+    std::int32_t UnreadableRangeCount = 0;
+    std::int64_t UnreadableBytes = 0;
+    std::string ErrorMessage;
+};
+
+struct RunJournalInspection {
+    bool Loaded = false;
+    bool ScanMode = false;
+    std::string ErrorMessage;
+    std::int32_t TotalFiles = 0;
+    std::int32_t CompletedFiles = 0;
+    std::int32_t PendingFiles = 0;
+    std::int32_t FailedFiles = 0;
+    std::int64_t TotalBytes = 0;
+    std::int64_t ProcessedBytes = 0;
+    std::vector<RunJournalFinding> Findings;
+};
+
 class JobManagerService {
 public:
     std::function<void(const std::string&)> on_persistence_warning;
@@ -133,6 +154,168 @@ public:
         if (storage::catalog_detail::is_blank(job_id)) return std::nullopt;
         std::lock_guard<std::mutex> lock(mutex_);
         if (const auto* job = find_job_by_id_locked(job_id)) return *job;
+        return std::nullopt;
+    }
+
+    std::optional<storage::ManagedJobRun> get_run_by_id(const std::string& run_id) {
+        if (storage::catalog_detail::is_blank(run_id)) return std::nullopt;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto* run = find_run_by_id_locked(run_id)) return *run;
+        return std::nullopt;
+    }
+
+    std::string get_resume_journal_path(const std::string& run_id,
+                                        bool validate_roots = false) {
+        auto run = get_run_by_id(run_id);
+        if (!run.has_value()) return std::string();
+        const std::string path = resolve_run_journal_path(*run);
+        if (path.empty() || !validate_roots) return path;
+        try {
+            storage::JobJournalStore store;
+            auto journal = store.load(storage::fsutil::utf8_to_wide(path));
+            return journal.has_value() && journal_matches_run_roots(*journal, *run)
+                       ? path
+                       : std::string();
+        } catch (const std::exception&) {
+            return std::string();
+        }
+    }
+
+    RunJournalInspection inspect_run_journal(const std::string& run_id) {
+        RunJournalInspection inspection;
+        auto run = get_run_by_id(run_id);
+        if (!run.has_value()) {
+            inspection.ErrorMessage = "The selected run no longer exists.";
+            return inspection;
+        }
+        const std::string journal_path = resolve_run_journal_path(*run);
+        if (journal_path.empty()) {
+            inspection.ErrorMessage =
+                "No resumable journal could be located for this run.";
+            return inspection;
+        }
+
+        storage::JobJournalStore journal_store;
+        std::optional<storage::JobJournal> journal;
+        try {
+            journal = journal_store.load(storage::fsutil::utf8_to_wide(journal_path));
+        } catch (const std::exception& ex) {
+            inspection.ErrorMessage = ex.what();
+            return inspection;
+        }
+        if (!journal.has_value()) {
+            inspection.ErrorMessage = "The journal could not be authenticated or loaded.";
+            return inspection;
+        }
+        if (!journal_matches_run_roots(*journal, *run)) {
+            inspection.ErrorMessage =
+                "The located journal belongs to different source or destination roots.";
+            return inspection;
+        }
+
+        const std::optional<models::CopyJobOptions>& persisted_options =
+            run->Options.has_value() ? run->Options : journal->RunOptions;
+        inspection.ScanMode =
+            persisted_options.has_value()
+                ? persisted_options->OperationMode == models::JobOperationMode::ScanOnly
+                : models::detail::equals_ignore_case(run->Trigger, "scan") ||
+                      run->DisplayName.find("Assessment") != std::string::npos ||
+                      storage::catalog_detail::is_blank(run->DestinationRoot);
+        inspection.Loaded = true;
+        inspection.TotalFiles = static_cast<std::int32_t>(journal->Files.size());
+
+        for (const auto& [key, entry] : journal->Files.entries) {
+            inspection.TotalBytes += std::max<std::int64_t>(0, entry.SourceLength);
+            inspection.ProcessedBytes += std::clamp<std::int64_t>(
+                entry.BytesCopied, 0, std::max<std::int64_t>(0, entry.SourceLength));
+            switch (entry.State) {
+                case storage::FileCopyState::Completed:
+                case storage::FileCopyState::CompletedWithRecovery:
+                    ++inspection.CompletedFiles;
+                    break;
+                case storage::FileCopyState::Failed:
+                    ++inspection.FailedFiles;
+                    break;
+                default:
+                    ++inspection.PendingFiles;
+                    break;
+            }
+
+            RunJournalFinding finding;
+            finding.RelativePath = entry.RelativePath.empty() ? key : entry.RelativePath;
+            finding.State = entry.State;
+            finding.ErrorMessage = entry.LastError;
+            for (const auto& range : entry.RescueRanges) {
+                if (range.Length <= 0 ||
+                    (range.State != storage::RescueRangeState::Bad &&
+                     range.State != storage::RescueRangeState::KnownBad)) {
+                    continue;
+                }
+                ++finding.UnreadableRangeCount;
+                finding.UnreadableBytes += range.Length;
+            }
+            // Older journals may retain only the merged final unreadable list.
+            if (finding.UnreadableRangeCount == 0) {
+                for (const auto& range : entry.RecoveredRanges) {
+                    if (range.Length <= 0) continue;
+                    ++finding.UnreadableRangeCount;
+                    finding.UnreadableBytes += range.Length;
+                }
+            }
+            if (finding.UnreadableRangeCount > 0 ||
+                entry.State == storage::FileCopyState::CompletedWithRecovery ||
+                entry.State == storage::FileCopyState::Failed) {
+                inspection.Findings.push_back(std::move(finding));
+            }
+        }
+        return inspection;
+    }
+
+    std::optional<models::CopyJobOptions> get_resume_options(
+        const std::string& run_id, bool* exact = nullptr,
+        std::string* warning = nullptr) {
+        if (exact != nullptr) *exact = false;
+        if (warning != nullptr) warning->clear();
+        auto run = get_run_by_id(run_id);
+        if (!run.has_value()) return std::nullopt;
+        if (run->Options.has_value()) {
+            if (exact != nullptr) *exact = true;
+            return run->Options;
+        }
+
+        const std::string journal_path = resolve_run_journal_path(*run);
+        if (!journal_path.empty()) {
+            try {
+                storage::JobJournalStore store;
+                auto journal = store.load(
+                    storage::fsutil::utf8_to_wide(journal_path));
+                if (journal.has_value() && journal_matches_run_roots(*journal, *run) &&
+                    journal->RunOptions.has_value()) {
+                    if (exact != nullptr) *exact = true;
+                    return journal->RunOptions;
+                }
+            } catch (const std::exception& ex) {
+                if (warning != nullptr) {
+                    *warning = "The journal options could not be loaded: " +
+                               std::string(ex.what());
+                }
+            }
+        }
+
+        if (!run->JobId.empty()) {
+            auto job = get_job_by_id(run->JobId);
+            if (job.has_value()) {
+                if (warning != nullptr) {
+                    *warning =
+                        "This legacy run predates per-run settings. Its linked saved job settings will be used and may have changed since the run started.";
+                }
+                return job->Options;
+            }
+        }
+        if (warning != nullptr && warning->empty()) {
+            *warning =
+                "This legacy run predates per-run settings, so its exact tuning and backend cannot be reconstructed.";
+        }
         return std::nullopt;
     }
 
@@ -372,7 +555,8 @@ public:
         return run;
     }
 
-    void mark_run_running(const std::string& run_id, const std::string& journal_path) {
+    void mark_run_running(const std::string& run_id, const std::string& journal_path,
+                          const models::CopyJobOptions* options = nullptr) {
         if (storage::catalog_detail::is_blank(run_id)) return;
 
         std::lock_guard<std::mutex> lock(mutex_);
@@ -381,6 +565,15 @@ public:
 
         run->Status = storage::ManagedJobRunStatus::Running;
         run->JournalPath = journal_path;
+        run->FinishedUtc.reset();
+        run->Result.reset();
+        run->ErrorMessage.clear();
+        run->Summary = "Running";
+        if (options != nullptr) {
+            run->Options = *options;
+            run->SourceRoot = options->SourceRoot;
+            run->DestinationRoot = options->DestinationRoot;
+        }
         run->LastUpdatedUtc = DateTimeOffset::now_utc();
         save_catalog_locked();
     }
@@ -402,7 +595,11 @@ public:
 
         DateTimeOffset now_utc = DateTimeOffset::now_utc();
         run->Result = result;
-        if (result.has_value()) run->JournalPath = result->JournalPath;
+        // Cancellation/fatal paths in older workers emitted an empty result
+        // path. Never erase the valid path recorded when the run started.
+        if (result.has_value() && !result->JournalPath.empty()) {
+            run->JournalPath = result->JournalPath;
+        }
         run->ErrorMessage = result.has_value() ? result->ErrorMessage : std::string();
         run->LastUpdatedUtc = now_utc;
         run->FinishedUtc = now_utc;
@@ -529,6 +726,41 @@ public:
     }
 
 private:
+    static std::string resolve_run_journal_path(const storage::ManagedJobRun& run) {
+        if (!storage::catalog_detail::is_blank(run.JournalPath)) return run.JournalPath;
+        if (storage::catalog_detail::is_blank(run.SourceRoot)) return std::string();
+
+        const std::wstring source = storage::fsutil::get_full_path(
+            storage::fsutil::utf8_to_wide(run.SourceRoot));
+        const std::wstring destination = storage::catalog_detail::is_blank(run.DestinationRoot)
+                                             ? source
+                                             : storage::fsutil::get_full_path(
+                                                   storage::fsutil::utf8_to_wide(
+                                                       run.DestinationRoot));
+        if (source.empty() || destination.empty()) return std::string();
+        const std::wstring candidate = storage::JobJournalStore::get_default_journal_path(
+            storage::JobJournalStore::build_job_id(source, destination));
+        return storage::fsutil::file_exists(candidate)
+                   ? storage::fsutil::wide_to_utf8(candidate)
+                   : std::string();
+    }
+
+    static bool journal_matches_run_roots(const storage::JobJournal& journal,
+                                          const storage::ManagedJobRun& run) {
+        if (storage::catalog_detail::is_blank(run.SourceRoot)) return false;
+        const std::wstring run_source = storage::fsutil::normalize_path(
+            storage::fsutil::utf8_to_wide(run.SourceRoot));
+        const std::wstring run_destination = storage::fsutil::normalize_path(
+            storage::fsutil::utf8_to_wide(
+                storage::catalog_detail::is_blank(run.DestinationRoot)
+                    ? run.SourceRoot
+                    : run.DestinationRoot));
+        return storage::fsutil::normalize_path(
+                   storage::fsutil::utf8_to_wide(journal.SourceRoot)) == run_source &&
+               storage::fsutil::normalize_path(
+                   storage::fsutil::utf8_to_wide(journal.DestinationRoot)) == run_destination;
+    }
+
     static int compare_ordinal_ignore_case(const std::string& left, const std::string& right) {
         // StringComparer.OrdinalIgnoreCase: invariant upper-case ordinal compare
         // (ASCII folding is sufficient for the job names we compare here; .NET
@@ -617,6 +849,7 @@ private:
         run.DisplayName = display_name;
         run.SourceRoot = options.SourceRoot;
         run.DestinationRoot = options.DestinationRoot;
+        run.Options = options;
         run.Trigger = trigger;
         run.QueueEntryId = queue_entry_id;
         run.QueueAttempt = std::max(0, queue_attempt);

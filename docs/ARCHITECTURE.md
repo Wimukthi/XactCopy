@@ -75,7 +75,20 @@ JSON file cannot be used as a downgrade fallback.
 This is what powers **resume** and **crash recovery**: on restart the journal is
 merged with the current source. Partial destination coverage is reconstructed;
 a journal's completed marker permits reuse only after a fresh full source/
-destination hash comparison.
+destination hash comparison. Each current journal also embeds the normalized
+`CopyJobOptions` that created it (excluding only the transient path hint), so it
+can reconstruct copy/assessment mode, scan backend, policies, and tuning even if
+the UI recovery record is unavailable. Run history keeps a second immutable
+copy of those launch options; legacy records without either copy are resumed
+only through an explicit reviewed fallback.
+
+Precise assessments bind partial coverage to NTFS file identity and change time
+before the first read, then checkpoint range progress. Fast assessments snapshot
+the synchronized live file table while workers run and force a final snapshot on
+cooperative cancellation. The parallel native-copy phase likewise commits all
+completed atomic publications before cancellation unwinds. A crash can still
+repeat work since the last durable flush, but it cannot legitimately trust
+partial coverage that lacks a matching source-generation binding.
 
 Because a snapshot is rewritten in full on every flush, its cost scales with the
 journal — a whole-drive job can produce tens of megabytes of JSON. Flush
@@ -150,7 +163,9 @@ Saved jobs can launch unattended work, so `jobs\catalog.json` is not trusted as
 plain configuration. It is stored in an HMAC-SHA256 envelope bound to its path,
 with two rotating generations and an independently committed mirror. Reads walk
 the trusted candidate set and fall back after corruption/tampering. Legacy plain
-catalogs remain readable and are upgraded on the next save. A dequeue is not
+catalogs remain readable and are upgraded on the next save. Schema 3 run records
+store the immutable launch options and preserve a previously recorded journal
+path when a cancellation or fatal result omits one. A dequeue is not
 allowed to proceed in memory if its durable catalog update fails.
 
 ## Storage and security

@@ -43,8 +43,22 @@ Binaries are written in-tree to `build\`, which is git-ignored:
 - `xactcopy_{core,storage,supervisor,worker}_tests.exe` — the test suites.
 
 The test run covers the wire-format goldens, storage round-trips, a supervised
-copy job, and kill-mid-job auto-recovery with a byte-exact resume. Run it before
-opening a pull request; both toolchains must keep building.
+copy job with kill-mid-job auto-recovery, and the integrity contract: staged
+publication, conflict semantics, source-identity binding, resume coverage,
+salvage visibility, metadata and EFS fidelity, and raw-volume extent mapping.
+Run it before opening a pull request; both toolchains must keep building.
+
+One raw-volume test needs a real NTFS volume and Administrator rights, so it is
+opt-in and skipped by default:
+
+```powershell
+$env:XACTCOPY_RAW_DISK_TEST = "1"; .\build.ps1 -RunTests
+```
+
+Do not pipe `build.ps1` through `2>&1` in Windows PowerShell 5.1. Redirecting a
+native command's stderr wraps each line in a `NativeCommandError`, which the
+script's `$ErrorActionPreference = "Stop"` turns into a terminating error — an
+ordinary compiler warning then looks like a failed build.
 
 ## Repository layout
 
@@ -55,7 +69,7 @@ opening a pull request; both toolchains must keep building.
 | `tests/` | Unit-test suites and `tests/golden/` fixtures |
 | `installer/` | Inno Setup script and its build wrapper |
 | `tools/` | `New-AppIcon.ps1`, which regenerates `Icons\xactcopy.ico` from `Assets\xactcopy.png` |
-| `docs/` | User guide, troubleshooting, and architecture |
+| `docs/` | User guide, troubleshooting, architecture, and the integrity hardening contract |
 
 ## Releasing
 
@@ -71,9 +85,17 @@ This builds the binaries (unless `-SkipBuild`), reads the version from
 `src\version.h`, and runs Inno Setup to produce
 `installer\output\XactCopySetup-<version>-win-x64.exe`.
 
-To cut a release, add a `CHANGELOG.md` entry and attach the setup — and a
-`XactCopy-v<version>-win-x64.zip` portable build — to a GitHub release tagged
-`v<version>`, each with a `.sha256` file beside it.
+To cut a release, add a `CHANGELOG.md` entry and attach two assets to a GitHub
+release tagged `v<version>`:
+
+- `XactCopySetup-v<version>-win-x64.exe` — the Inno Setup installer.
+- `XactCopy-v<version>-win-x64.zip` — the portable build, flat at the archive
+  root: `XactCopy.exe`, `XactCopyExecutive.exe`, `LICENSE`, `README.md`,
+  `THIRD_PARTY_NOTICES.md`, and `licenses\`. The updater searches the extracted
+  tree for `XactCopy.exe`, so keep the executables at the root.
+
+Each asset needs a `.sha256` sidecar beside it containing **only** the bare
+lowercase hash followed by CRLF — 66 bytes, no filename, no `*` marker.
 
 The in-app updater reads `releases/latest` and **refuses to install a package it
 cannot checksum**. It takes the hash from GitHub's asset `digest` field if the
@@ -117,6 +139,12 @@ Two of them play a specific role worth knowing:
   foreground focus, so a capture harness has to drive it deliberately.
 - Anything that changes an on-disk or wire format needs a golden-file update and
   an explanation.
+- The invariants in
+  [docs/INTEGRITY_HARDENING_PLAN.md](docs/INTEGRITY_HARDENING_PLAN.md) are the
+  integrity contract. A change may not weaken one without saying so explicitly:
+  no in-place truncation of an existing destination, no partial or recovered
+  result presented as an exact copy, and no journal or bad-range hint applied
+  across a source whose identity has changed.
 
 ## Reporting bugs
 

@@ -209,12 +209,13 @@ private:
 // Job Manager dialog
 // ---------------------------------------------------------------------------
 
-enum class JobManagerRequestAction { None, RunSavedJob, RunQueuedEntry };
+enum class JobManagerRequestAction { None, RunSavedJob, RunQueuedEntry, ResumeRun };
 
 struct JobManagerRequest {
     JobManagerRequestAction action = JobManagerRequestAction::None;
     std::string job_id;
     std::string queue_entry_id;
+    std::string run_id;
 };
 
 class JobManagerDialog {
@@ -285,12 +286,19 @@ private:
     static constexpr UINT_PTR AutoRefreshTimerId = 1;
     static constexpr UINT_PTR SearchDebounceTimerId = 2;
     static constexpr UINT JournalExportCompleteMessage = WM_APP + 0x521;
+    static constexpr UINT FindingsLoadCompleteMessage = WM_APP + 0x522;
 
     struct JournalExportResult {
         bool exported = false;
         std::wstring readable_path;
         std::wstring view_root;
         std::string error;
+    };
+
+    struct FindingsLoadResult {
+        std::string row_id;
+        std::string journal_path;
+        RunJournalInspection inspection;
     };
 
     JobManagerDialog(JobManagerService& manager, const ThemePalette& theme, AppSettings& settings)
@@ -545,6 +553,15 @@ private:
         return &rows_[static_cast<std::size_t>(index)];
     }
 
+    const storage::ManagedJobRun* selected_run() const {
+        const Row* row = selected_row();
+        if (row == nullptr || row->kind != RowKind::RunHistory) return nullptr;
+        for (const auto& run : runs_) {
+            if (models::detail::equals_ignore_case(run.RunId, row->primary_id)) return &run;
+        }
+        return nullptr;
+    }
+
     void update_action_states() {
         const Row* row = selected_row();
         auto enable = [](HWND button, bool enabled) {
@@ -553,7 +570,19 @@ private:
         bool is_saved = row != nullptr && row->kind == RowKind::SavedJob;
         bool is_queue = row != nullptr && row->kind == RowKind::QueueEntry;
         bool is_run = row != nullptr && row->kind == RowKind::RunHistory;
-        enable(buttons_[IdRunNow], is_saved || is_queue);
+        const storage::ManagedJobRun* run = selected_run();
+        const std::string resume_journal_path =
+            run != nullptr ? manager_.get_resume_journal_path(run->RunId) : std::string();
+        const bool can_resume =
+            run != nullptr && !resume_journal_path.empty() &&
+            run->Status != storage::ManagedJobRunStatus::Completed &&
+            run->Status != storage::ManagedJobRunStatus::Running &&
+            run->Status != storage::ManagedJobRunStatus::Paused &&
+            run->Status != storage::ManagedJobRunStatus::Queued;
+        enable(buttons_[IdRunNow], is_saved || is_queue || can_resume);
+        if (buttons_[IdRunNow] != nullptr) {
+            SetWindowTextW(buttons_[IdRunNow], can_resume ? L"Resume" : L"Run Now");
+        }
         enable(buttons_[IdQueue], is_saved || (is_run && !row->job_id.empty()));
         enable(buttons_[IdRemoveQueue], is_queue);
         enable(buttons_[IdMoveTop], is_queue);
@@ -606,6 +635,7 @@ private:
                         line(L"Metadata notice: ",
                              storage::fsutil::utf8_to_wide(run.Result->MetadataNotice));
                     }
+                    append_journal_findings(run, lines);
                     break;
                 }
             }
@@ -630,6 +660,103 @@ private:
         InvalidateRect(details_list_, nullptr, TRUE);
     }
 
+    void append_journal_findings(const storage::ManagedJobRun& run,
+                                 std::vector<std::wstring>& lines) {
+        const std::string journal_path = manager_.get_resume_journal_path(run.RunId);
+        if (journal_path.empty()) {
+            lines.push_back(L"Findings: No resumable journal could be located for this run.");
+            return;
+        }
+        const bool cached =
+            findings_cache_.has_value() &&
+            models::detail::equals_ignore_case(findings_cache_row_id_, run.RunId) &&
+            models::detail::equals_ignore_case(findings_cache_path_, journal_path) &&
+            findings_cache_run_updated_ticks_ == run.LastUpdatedUtc.utc_ticks() &&
+            ((run.Status != storage::ManagedJobRunStatus::Running &&
+              run.Status != storage::ManagedJobRunStatus::Paused) ||
+             GetTickCount64() - findings_cache_loaded_tick_ < 10000);
+        if (!cached) {
+            if (!findings_worker_.joinable()) {
+                findings_loading_row_id_ = run.RunId;
+                findings_loading_path_ = journal_path;
+                HWND hwnd = host_.hwnd();
+                findings_worker_ = std::thread([this, hwnd, run_id = run.RunId,
+                                                path = journal_path]() {
+                    auto* result = new FindingsLoadResult;
+                    result->row_id = run_id;
+                    result->journal_path = path;
+                    result->inspection = manager_.inspect_run_journal(run_id);
+                    if (findings_dialog_closing_.load() ||
+                        !PostMessageW(hwnd, FindingsLoadCompleteMessage, 0,
+                                      reinterpret_cast<LPARAM>(result))) {
+                        delete result;
+                    }
+                });
+            }
+            lines.push_back(
+                models::detail::equals_ignore_case(findings_loading_row_id_, run.RunId)
+                    ? L"Findings: Loading authenticated journal details..."
+                    : L"Findings: Waiting for the selected journal inspection...");
+            return;
+        }
+
+        const RunJournalInspection& inspection = *findings_cache_;
+        if (!inspection.Loaded) {
+            lines.push_back(L"Findings unavailable: " +
+                            storage::fsutil::utf8_to_wide(inspection.ErrorMessage));
+            return;
+        }
+        lines.push_back(
+            L"Journal progress: " + std::to_wstring(inspection.CompletedFiles) + L"/" +
+            std::to_wstring(inspection.TotalFiles) + L" completed; " +
+            std::to_wstring(inspection.PendingFiles) + L" pending/in progress; " +
+            std::to_wstring(inspection.FailedFiles) + L" failed; " +
+            storage::fsutil::utf8_to_wide(
+                JobManagerService::format_bytes(inspection.ProcessedBytes)) +
+            L" of " + storage::fsutil::utf8_to_wide(
+                JobManagerService::format_bytes(inspection.TotalBytes)) + L" checkpointed.");
+        if (inspection.Findings.empty()) {
+            lines.push_back(L"Findings: No unreadable or failed files are recorded in this checkpoint.");
+            return;
+        }
+
+        lines.push_back((inspection.ScanMode ? L"Assessment findings (" : L"Copy/recovery findings (") +
+                        std::to_wstring(inspection.Findings.size()) + L"):");
+        for (const auto& finding : inspection.Findings) {
+            std::wstring prefix = finding.UnreadableRangeCount > 0
+                                      ? (inspection.ScanMode ? L"UNREADABLE: " : L"RECOVERED/UNREADABLE: ")
+                                      : L"FAILED: ";
+            std::wstring detail = prefix + storage::fsutil::utf8_to_wide(finding.RelativePath);
+            if (finding.UnreadableRangeCount > 0) {
+                detail += L" — " + std::to_wstring(finding.UnreadableRangeCount) +
+                          L" range(s), " + storage::fsutil::utf8_to_wide(
+                              JobManagerService::format_bytes(finding.UnreadableBytes));
+            }
+            if (!finding.ErrorMessage.empty()) {
+                detail += L" — " + storage::fsutil::utf8_to_wide(finding.ErrorMessage);
+            }
+            lines.push_back(std::move(detail));
+        }
+    }
+
+    void finish_findings_load(FindingsLoadResult& result) {
+        if (findings_worker_.joinable()) findings_worker_.join();
+        findings_loading_row_id_.clear();
+        findings_loading_path_.clear();
+        findings_cache_row_id_ = result.row_id;
+        findings_cache_path_ = result.journal_path;
+        if (const storage::ManagedJobRun* run = selected_run();
+            run != nullptr &&
+            models::detail::equals_ignore_case(run->RunId, result.row_id)) {
+            findings_cache_run_updated_ticks_ = run->LastUpdatedUtc.utc_ticks();
+        } else {
+            findings_cache_run_updated_ticks_ = 0;
+        }
+        findings_cache_loaded_tick_ = GetTickCount64();
+        findings_cache_ = std::move(result.inspection);
+        render_selected_details();
+    }
+
     void run_now_selected(HWND hwnd) {
         const Row* row = selected_row();
         if (row == nullptr) return;
@@ -646,9 +773,24 @@ private:
                 request_.job_id = row->job_id;
                 host_.destroy();
                 return;
-            default:
-                info_box(hwnd, L"Select a saved job or queue entry to run.");
+            case RowKind::RunHistory: {
+                const storage::ManagedJobRun* run = selected_run();
+                const std::string journal_path =
+                    run != nullptr ? manager_.get_resume_journal_path(run->RunId)
+                                   : std::string();
+                if (run == nullptr || journal_path.empty() ||
+                    run->Status == storage::ManagedJobRunStatus::Completed ||
+                    run->Status == storage::ManagedJobRunStatus::Running ||
+                    run->Status == storage::ManagedJobRunStatus::Paused ||
+                    run->Status == storage::ManagedJobRunStatus::Queued) {
+                    info_box(hwnd, L"This run does not have resumable journal state.");
+                    return;
+                }
+                request_.action = JobManagerRequestAction::ResumeRun;
+                request_.run_id = run->RunId;
+                host_.destroy();
                 return;
+            }
         }
     }
 
@@ -687,11 +829,14 @@ private:
         if (row == nullptr || row->kind != RowKind::RunHistory) return;
         for (const auto& run : runs_) {
             if (!models::detail::equals_ignore_case(run.RunId, row->primary_id)) continue;
-            if (run.JournalPath.empty()) {
-                info_box(hwnd, L"This run has no journal path recorded.");
+            const std::string resolved_journal_path =
+                manager_.get_resume_journal_path(run.RunId, /*validate_roots*/ true);
+            if (resolved_journal_path.empty()) {
+                info_box(hwnd, L"No resumable journal could be located for this run.");
                 return;
             }
-            std::wstring journal_path = storage::fsutil::utf8_to_wide(run.JournalPath);
+            std::wstring journal_path =
+                storage::fsutil::utf8_to_wide(resolved_journal_path);
             if (storage::fsutil::file_exists(journal_path)) {
                 std::wstring file_name = storage::fsutil::get_file_name(journal_path);
                 std::wstring base_name;
@@ -862,7 +1007,7 @@ private:
 
     static const wchar_t* footer_help(int id) {
         switch (id) {
-            case IdRunNow: return L"Run the selected saved job now, or run the selected queued entry without changing its saved options.";
+            case IdRunNow: return L"Run a saved/queued job, or resume an interrupted, cancelled, incomplete, or failed run from its journal and persisted settings.";
             case IdQueue: return L"Add the selected saved job to the end of the queue.";
             case IdRemoveQueue: return L"Remove the selected queue entry without deleting its saved job.";
             case IdMoveTop: return L"Move the selected queue entry to the first position.";
@@ -1566,17 +1711,30 @@ private:
                 handled = true;
                 return 0;
             }
+            case FindingsLoadCompleteMessage: {
+                std::unique_ptr<FindingsLoadResult> result(
+                    reinterpret_cast<FindingsLoadResult*>(lparam));
+                finish_findings_load(*result);
+                handled = true;
+                return 0;
+            }
             case WM_CLOSE:
                 host_.destroy();
                 handled = true;
                 return 0;
             case WM_DESTROY: {
                 journal_dialog_closing_ = true;
+                findings_dialog_closing_ = true;
                 if (journal_worker_.joinable()) journal_worker_.join();
+                if (findings_worker_.joinable()) findings_worker_.join();
                 MSG pending{};
                 while (PeekMessageW(&pending, hwnd, JournalExportCompleteMessage,
                                     JournalExportCompleteMessage, PM_REMOVE)) {
                     delete reinterpret_cast<JournalExportResult*>(pending.lParam);
+                }
+                while (PeekMessageW(&pending, hwnd, FindingsLoadCompleteMessage,
+                                    FindingsLoadCompleteMessage, PM_REMOVE)) {
+                    delete reinterpret_cast<FindingsLoadResult*>(pending.lParam);
                 }
                 save_placement(hwnd);
                 if (list_ != nullptr) RemoveWindowSubclass(list_, &list_subclass_proc, 1);
@@ -1630,6 +1788,15 @@ private:
     TooltipManager tooltips_;
     std::thread journal_worker_;
     std::atomic<bool> journal_dialog_closing_{false};
+    std::thread findings_worker_;
+    std::atomic<bool> findings_dialog_closing_{false};
+    std::string findings_loading_row_id_;
+    std::string findings_loading_path_;
+    std::string findings_cache_row_id_;
+    std::string findings_cache_path_;
+    std::int64_t findings_cache_run_updated_ticks_ = 0;
+    ULONGLONG findings_cache_loaded_tick_ = 0;
+    std::optional<RunJournalInspection> findings_cache_;
 };
 
 } // namespace xact::ui

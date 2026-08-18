@@ -313,6 +313,7 @@ private:
             result.Cancelled = true;
             result.ErrorMessage = "Job cancelled by supervisor.";
             result.TransferEnginePolicyValue = options.TransferEnginePolicyValue;
+            result.JournalPath = journal_path_for_options(options);
             apply_last_progress(result);
             ipc::WorkerJobResultEvent event;
             event.JobId = job_id;
@@ -351,6 +352,27 @@ private:
             }
         } catch (const std::exception&) {
         }
+    }
+
+    static std::string journal_path_for_options(const models::CopyJobOptions& options) {
+        if (!options.ResumeJournalPathHint.empty() &&
+            storage::fsutil::file_exists(
+                storage::fsutil::utf8_to_wide(options.ResumeJournalPathHint))) {
+            return options.ResumeJournalPathHint;
+        }
+        std::wstring source = storage::fsutil::get_full_path(
+            storage::fsutil::utf8_to_wide(options.SourceRoot));
+        std::wstring destination = storage::fsutil::get_full_path(
+            storage::fsutil::utf8_to_wide(options.DestinationRoot));
+        if (options.OperationMode == models::JobOperationMode::ScanOnly &&
+            options.DestinationRoot.empty()) {
+            destination = source;
+        }
+        if (source.empty() || destination.empty()) return std::string();
+        const std::string journal_id =
+            storage::JobJournalStore::build_job_id(source, destination);
+        return storage::fsutil::wide_to_utf8(
+            storage::JobJournalStore::get_default_journal_path(journal_id));
     }
 
     void apply_last_progress(models::CopyJobResult& result) {

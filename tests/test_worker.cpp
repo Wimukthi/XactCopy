@@ -10,7 +10,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -73,8 +75,8 @@ bool write_named_stream(const std::wstring& file_path, std::wstring_view stream_
 }
 
 void remove_tree(const std::wstring& root) {
-    std::wstring cmd = L"cmd /c rmdir /s /q \"" + root + L"\"";
-    _wsystem(cmd.c_str());
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(std::filesystem::path(root), cleanup_error);
 }
 
 void test_scan_source_fast_and_complete() {
@@ -951,6 +953,190 @@ void test_engine_fault_injection_timeout_and_offline_are_safe() {
     remove_tree(work);
 }
 
+void test_engine_fragile_first_read_findings_are_durable() {
+    std::printf("--- engine: fragile first-read findings survive into journal and map ---\n");
+    std::wstring work = make_tree(0, 0);
+    std::wstring scan_source = work + L"\\scan-source";
+    std::wstring scan_destination = work + L"\\scan-unused";
+    storage::fsutil::create_directories(scan_source);
+    write_pattern_file(scan_source + L"\\payload.bin", 64 * 1024, 1954);
+
+    const std::wstring scan_map_path = storage::BadRangeMapStore::get_default_map_path(
+        storage::fsutil::get_full_path(scan_source));
+    remove_bad_range_map_set(scan_map_path);
+
+    models::CopyJobOptions scan_options;
+    scan_options.SourceRoot = storage::fsutil::wide_to_utf8(scan_source);
+    scan_options.DestinationRoot = storage::fsutil::wide_to_utf8(scan_destination);
+    scan_options.OperationMode = models::JobOperationMode::ScanOnly;
+    scan_options.ScanPerformanceProfileValue = models::ScanPerformanceProfile::Precise;
+    scan_options.ResumeFromJournal = false;
+    scan_options.UseBadRangeMap = true;
+    scan_options.SkipKnownBadRanges = true;
+    scan_options.UpdateBadRangeMapFromRun = true;
+    scan_options.FragileMediaMode = true;
+    scan_options.SkipFileOnFirstReadError = true;
+    scan_options.PersistFragileSkipAcrossResume = true;
+    scan_options.WaitForMediaAvailability = false;
+    scan_options.ContinueOnFileError = true;
+    scan_options.MaxRetries = 4;
+    scan_options.UseAdaptiveBufferSizing = false;
+
+    std::atomic<bool> cancel{false};
+    ExecutionControl control;
+    SetEnvironmentVariableW(L"XACTCOPY_DEV_FAULT_RULES", L"read,0,0,always,io");
+    ResilientCopyEngine first_scan_engine(scan_options, &control, nullptr, nullptr);
+    const models::CopyJobResult first_scan = first_scan_engine.run(cancel);
+    SetEnvironmentVariableW(L"XACTCOPY_DEV_FAULT_RULES", nullptr);
+
+    storage::JobJournalStore journal_store;
+    auto first_journal = journal_store.load(
+        storage::fsutil::utf8_to_wide(first_scan.JournalPath));
+    const storage::JournalFileEntry* first_entry =
+        first_journal.has_value() ? first_journal->Files.find("payload.bin") : nullptr;
+    std::int64_t journal_bad_bytes = 0;
+    std::int32_t journal_bad_ranges = 0;
+    if (first_entry != nullptr) {
+        for (const auto& range : first_entry->RescueRanges) {
+            if (range.State == storage::RescueRangeState::Bad && range.Length > 0) {
+                ++journal_bad_ranges;
+                journal_bad_bytes += range.Length;
+            }
+        }
+    }
+
+    storage::BadRangeMapStore map_store;
+    auto first_map = map_store.load(scan_map_path);
+    const storage::BadRangeMapFileEntry* first_map_entry =
+        first_map.has_value() ? first_map->Files.find("payload.bin") : nullptr;
+    check(first_scan.SkippedFiles == 1 && first_scan.FailedFiles == 0,
+          "fragile assessment reports the intentionally skipped file");
+    check(first_entry != nullptr && first_entry->State == storage::FileCopyState::Failed &&
+              first_entry->DoNotRetry && journal_bad_ranges == 1 && journal_bad_bytes > 0,
+          "fragile assessment journal retains the failed filename and attempted byte range");
+    check(first_map_entry != nullptr && first_map_entry->BadRanges.size() == 1 &&
+              first_map_entry->BadRanges[0].Offset == 0 &&
+              first_map_entry->BadRanges[0].Length == journal_bad_bytes &&
+              first_map_entry->ConfirmationCount == 1,
+          "first fragile observation is visible in the bad-range map but remains unconfirmed");
+
+    SetEnvironmentVariableW(L"XACTCOPY_DEV_FAULT_RULES", L"read,0,0,always,io");
+    ResilientCopyEngine confirming_scan_engine(scan_options, &control, nullptr, nullptr);
+    const models::CopyJobResult confirming_scan = confirming_scan_engine.run(cancel);
+    SetEnvironmentVariableW(L"XACTCOPY_DEV_FAULT_RULES", nullptr);
+    auto confirmed_map = map_store.load(scan_map_path);
+    const storage::BadRangeMapFileEntry* confirmed_entry =
+        confirmed_map.has_value() ? confirmed_map->Files.find("payload.bin") : nullptr;
+    check(confirming_scan.SkippedFiles == 1 && confirmed_entry != nullptr &&
+              confirmed_entry->ConfirmationCount >= 2,
+          "a second matching fragile observation promotes the range to a trusted hint");
+
+    std::wstring fast_source = work + L"\\fast-source";
+    storage::fsutil::create_directories(fast_source);
+    write_pattern_file(fast_source + L"\\fast.bin", 64 * 1024, 1957);
+    const std::wstring fast_map_path = storage::BadRangeMapStore::get_default_map_path(
+        storage::fsutil::get_full_path(fast_source));
+    remove_bad_range_map_set(fast_map_path);
+    models::CopyJobOptions fast_options = scan_options;
+    fast_options.SourceRoot = storage::fsutil::wide_to_utf8(fast_source);
+    fast_options.DestinationRoot = fast_options.SourceRoot;
+    fast_options.ScanPerformanceProfileValue = models::ScanPerformanceProfile::Fast;
+
+    SetEnvironmentVariableW(L"XACTCOPY_DEV_FAULT_RULES", L"read,0,0,once,io");
+    std::vector<std::string> fast_logs;
+    ResilientCopyEngine fast_engine(
+        fast_options, &control, nullptr,
+        [&fast_logs](const std::string& message) { fast_logs.push_back(message); });
+    const models::CopyJobResult fast_result = fast_engine.run(cancel);
+    SetEnvironmentVariableW(L"XACTCOPY_DEV_FAULT_RULES", nullptr);
+    auto fast_map = map_store.load(fast_map_path);
+    const storage::BadRangeMapFileEntry* fast_entry =
+        fast_map.has_value() ? fast_map->Files.find("fast.bin") : nullptr;
+    bool precise_reread_queued = false;
+    for (const auto& line : fast_logs) {
+        if (line.find("Fast scan fallback queued: fast.bin") != std::string::npos) {
+            precise_reread_queued = true;
+            break;
+        }
+    }
+    check(fast_result.SkippedFiles == 1 && fast_entry != nullptr &&
+              fast_entry->ConfirmationCount == 1,
+          "fast fragile assessment preserves a one-shot first-read finding");
+    check(!precise_reread_queued,
+          "fast fragile assessment does not reread the failed range through precise fallback");
+
+    std::wstring copy_source = work + L"\\copy-source";
+    std::wstring copy_destination = work + L"\\copy-destination";
+    storage::fsutil::create_directories(copy_source);
+    storage::fsutil::create_directories(copy_destination);
+    write_pattern_file(copy_source + L"\\copy.bin", 64 * 1024, 1955);
+    const std::wstring copy_map_path = storage::BadRangeMapStore::get_default_map_path(
+        storage::fsutil::get_full_path(copy_source));
+    remove_bad_range_map_set(copy_map_path);
+
+    models::CopyJobOptions copy_options = scan_options;
+    copy_options.SourceRoot = storage::fsutil::wide_to_utf8(copy_source);
+    copy_options.DestinationRoot = storage::fsutil::wide_to_utf8(copy_destination);
+    copy_options.OperationMode = models::JobOperationMode::Copy;
+    copy_options.TransferEnginePolicyValue = models::TransferEnginePolicy::ManagedRescue;
+    copy_options.SmallFileThresholdBytes = 4096;
+    copy_options.UseBadRangeMap = false;
+    copy_options.SkipKnownBadRanges = false;
+
+    SetEnvironmentVariableW(L"XACTCOPY_DEV_FAULT_RULES", L"read,0,0,always,io");
+    ResilientCopyEngine copy_engine(copy_options, &control, nullptr, nullptr);
+    const models::CopyJobResult copy_result = copy_engine.run(cancel);
+    SetEnvironmentVariableW(L"XACTCOPY_DEV_FAULT_RULES", nullptr);
+    auto copy_map = map_store.load(copy_map_path);
+    const storage::BadRangeMapFileEntry* copy_map_entry =
+        copy_map.has_value() ? copy_map->Files.find("copy.bin") : nullptr;
+    auto copy_journal = journal_store.load(
+        storage::fsutil::utf8_to_wide(copy_result.JournalPath));
+    const storage::JournalFileEntry* copy_entry =
+        copy_journal.has_value() ? copy_journal->Files.find("copy.bin") : nullptr;
+    check(copy_result.SkippedFiles == 1 && copy_result.FailedFiles == 0 &&
+              copy_entry != nullptr && copy_entry->State == storage::FileCopyState::Failed,
+          "fragile copy retains the skipped source filename in its journal");
+    check(copy_map_entry != nullptr && copy_map_entry->BadRanges.size() == 1 &&
+              copy_map_entry->ConfirmationCount == 1,
+          "fragile copy persists its first unreadable primary-data range");
+    check(GetFileAttributesW((copy_destination + L"\\copy.bin").c_str()) ==
+              INVALID_FILE_ATTRIBUTES,
+          "fragile read failure does not publish a partial destination file");
+
+    std::wstring offline_source = work + L"\\offline-source";
+    storage::fsutil::create_directories(offline_source);
+    write_pattern_file(offline_source + L"\\offline.bin", 32 * 1024, 1956);
+    const std::wstring offline_map_path = storage::BadRangeMapStore::get_default_map_path(
+        storage::fsutil::get_full_path(offline_source));
+    remove_bad_range_map_set(offline_map_path);
+    models::CopyJobOptions offline_options = scan_options;
+    offline_options.SourceRoot = storage::fsutil::wide_to_utf8(offline_source);
+    offline_options.DestinationRoot = offline_options.SourceRoot;
+    offline_options.MaxRetries = 0;
+
+    SetEnvironmentVariableW(L"XACTCOPY_DEV_FAULT_RULES", L"read,0,0,always,offline");
+    ResilientCopyEngine offline_engine(offline_options, &control, nullptr, nullptr);
+    const models::CopyJobResult offline_result = offline_engine.run(cancel);
+    SetEnvironmentVariableW(L"XACTCOPY_DEV_FAULT_RULES", nullptr);
+    auto offline_map = map_store.load(offline_map_path);
+    check(offline_result.FailedFiles == 1 && offline_result.SkippedFiles == 0,
+          "an unavailable device is reported as an I/O failure, not a fragile bad-range skip");
+    check(offline_map.has_value() && offline_map->Files.empty(),
+          "device unavailability does not create a physical bad-range finding");
+
+    remove_result_journal(first_scan);
+    remove_result_journal(confirming_scan);
+    remove_result_journal(fast_result);
+    remove_result_journal(copy_result);
+    remove_result_journal(offline_result);
+    remove_bad_range_map_set(scan_map_path);
+    remove_bad_range_map_set(fast_map_path);
+    remove_bad_range_map_set(copy_map_path);
+    remove_bad_range_map_set(offline_map_path);
+    remove_tree(work);
+}
+
 void test_engine_salvage_is_not_success() {
     std::printf("--- engine: salvage is visibly non-exact ---\n");
     std::wstring work = make_tree(0, 0);
@@ -1317,6 +1503,160 @@ void test_engine_scan_resume_binds_change_time() {
     remove_tree(work);
 }
 
+void test_engine_precise_scan_resumes_partial_coverage() {
+    std::printf("--- engine: precise scan resumes bound partial coverage ---\n");
+    std::wstring work = make_tree(0, 0);
+    std::wstring source = work + L"\\source";
+    storage::fsutil::create_directories(source);
+    const std::wstring source_file = source + L"\\large.bin";
+    constexpr std::int64_t FileLength = 4LL * 1024 * 1024;
+    write_pattern_file(source_file, static_cast<std::size_t>(FileLength), 1920);
+
+    models::CopyJobOptions options;
+    options.OperationMode = models::JobOperationMode::ScanOnly;
+    options.SourceRoot = storage::fsutil::wide_to_utf8(source);
+    options.ScanPerformanceProfileValue = models::ScanPerformanceProfile::Precise;
+    options.BufferSizeBytes = models::CopyJobOptions::MinimumBufferSizeBytes;
+    options.UseAdaptiveBufferSizing = false;
+    options.RescueFastScanChunkBytes = 64 * 1024;
+    options.ParallelScanWorkers = 1;
+    options.ResumeFromJournal = false;
+    options.UseBadRangeMap = false;
+    options.UpdateBadRangeMapFromRun = false;
+    options.MaxRetries = 0;
+
+    std::atomic<bool> cancel{false};
+    bool cancellation_armed = false;
+    ExecutionControl control;
+    ResilientCopyEngine interrupted_engine(
+        options, &control,
+        [&cancel, &cancellation_armed](const models::CopyProgressSnapshot& snapshot) {
+            if (!cancellation_armed && snapshot.CurrentFileBytesCopied >= 128 * 1024) {
+                cancellation_armed = true;
+                // Let the adaptive journal interval expire before the callback
+                // returns; execute_rescue_pass checkpoints this chunk next.
+                Sleep(1100);
+                cancel.store(true);
+            }
+        },
+        nullptr);
+    bool cancelled = false;
+    try {
+        (void)interrupted_engine.run(cancel);
+    } catch (const OperationCanceled& oc) {
+        cancelled = oc.user_requested;
+    }
+
+    const std::wstring full_source = storage::fsutil::get_full_path(source);
+    const std::string job_id = storage::JobJournalStore::build_job_id(
+        full_source, full_source);
+    const std::wstring journal_path =
+        storage::JobJournalStore::get_default_journal_path(job_id);
+    storage::JobJournalStore store;
+    auto interrupted_journal = store.load(journal_path);
+    const auto* interrupted_entry = interrupted_journal.has_value()
+                                        ? interrupted_journal->Files.find("large.bin")
+                                        : nullptr;
+    const std::int64_t checkpointed = interrupted_entry != nullptr
+                                          ? interrupted_entry->BytesCopied
+                                          : 0;
+    check(cancelled && checkpointed > 0 && checkpointed < FileLength,
+          "precise scan interruption durably checkpoints partial file coverage");
+    check(interrupted_entry != nullptr && interrupted_entry->SourceChangeUtcTicks != 0 &&
+              interrupted_entry->SourceFileIndex != 0 &&
+              interrupted_entry->SourceVolumeSerial != 0,
+          "partial precise coverage is bound to the exact source generation");
+
+    cancel.store(false);
+    models::CopyJobOptions resumed = options;
+    resumed.ResumeFromJournal = true;
+    resumed.ResumeJournalPathHint = storage::fsutil::wide_to_utf8(journal_path);
+    ResilientCopyEngine resumed_engine(resumed, &control, nullptr, nullptr);
+    const models::CopyJobResult result = resumed_engine.run(cancel);
+    check(result.Succeeded && result.BytesReused >= checkpointed &&
+              result.BytesRead < FileLength,
+          "precise scan resumes from checkpointed ranges instead of rereading the file");
+
+    remove_result_journal(result);
+    remove_tree(work);
+}
+
+void test_engine_fast_scan_cancellation_preserves_completed_files() {
+    std::printf("--- engine: fast scan cancellation preserves completed files ---\n");
+    std::wstring work = make_tree(0, 0);
+    std::wstring source = work + L"\\source";
+    storage::fsutil::create_directories(source);
+    constexpr int FileCount = 8;
+    constexpr std::int64_t FileLength = 512 * 1024;
+    for (int index = 0; index < FileCount; ++index) {
+        write_pattern_file(source + L"\\file" + std::to_wstring(index) + L".bin",
+                           static_cast<std::size_t>(FileLength), 1930 + index);
+    }
+
+    models::CopyJobOptions options;
+    options.OperationMode = models::JobOperationMode::ScanOnly;
+    options.SourceRoot = storage::fsutil::wide_to_utf8(source);
+    options.ScanPerformanceProfileValue = models::ScanPerformanceProfile::Fast;
+    options.ParallelScanWorkers = 1;
+    options.ResumeFromJournal = false;
+    options.UseBadRangeMap = false;
+    options.UpdateBadRangeMapFromRun = false;
+    options.MaxRetries = 0;
+
+    std::atomic<bool> cancel{false};
+    ExecutionControl control;
+    ResilientCopyEngine interrupted_engine(
+        options, &control,
+        [&cancel](const models::CopyProgressSnapshot& snapshot) {
+            if (snapshot.CompletedFiles >= 2) cancel.store(true);
+        },
+        nullptr);
+    bool cancelled = false;
+    try {
+        (void)interrupted_engine.run(cancel);
+    } catch (const OperationCanceled& oc) {
+        cancelled = oc.user_requested;
+    }
+
+    const std::wstring full_source = storage::fsutil::get_full_path(source);
+    const std::string job_id = storage::JobJournalStore::build_job_id(
+        full_source, full_source);
+    const std::wstring journal_path =
+        storage::JobJournalStore::get_default_journal_path(job_id);
+    storage::JobJournalStore store;
+    auto interrupted_journal = store.load(journal_path);
+    std::int32_t completed = 0;
+    if (interrupted_journal.has_value()) {
+        for (const auto& item : interrupted_journal->Files.entries) {
+            if (item.second.State == storage::FileCopyState::Completed ||
+                item.second.State == storage::FileCopyState::CompletedWithRecovery) {
+                ++completed;
+            }
+        }
+    }
+    check(cancelled && completed >= 2 && completed < FileCount,
+          "fast scan cancellation writes completed entries before unwinding");
+    check(interrupted_journal.has_value() && interrupted_journal->RunOptions.has_value() &&
+              interrupted_journal->RunOptions->OperationMode ==
+                  models::JobOperationMode::ScanOnly &&
+              interrupted_journal->RunOptions->ScanPerformanceProfileValue ==
+                  models::ScanPerformanceProfile::Fast,
+          "fast scan journal retains the exact task definition");
+
+    cancel.store(false);
+    models::CopyJobOptions resumed = options;
+    resumed.ResumeFromJournal = true;
+    resumed.ResumeJournalPathHint = storage::fsutil::wide_to_utf8(journal_path);
+    ResilientCopyEngine resumed_engine(resumed, &control, nullptr, nullptr);
+    const models::CopyJobResult result = resumed_engine.run(cancel);
+    check(result.Succeeded && result.BytesReused >= completed * FileLength &&
+              result.BytesRead <= (FileCount - completed) * FileLength,
+          "fast scan resumes with completed files reused rather than restarted");
+
+    remove_result_journal(result);
+    remove_tree(work);
+}
+
 void test_engine_rejects_unsafe_options() {
     std::printf("--- engine: unsafe option combinations are rejected ---\n");
     std::wstring work = make_tree(0, 0);
@@ -1558,7 +1898,7 @@ void test_engine_large_fast_scan_checkpoint_is_cancelable() {
         options, &control, nullptr,
         [&logs, &cancel, &saw_background_checkpoint, &saw_fast_engine](const std::string& message) {
             logs.push_back(message);
-            if (message.find("Large fast scan: writing the initial journal checkpoint in the background") !=
+            if (message.find("Large fast scan: initial checkpoint deferred to the live progress writer") !=
                 std::string::npos) {
                 saw_background_checkpoint = true;
             }
@@ -1578,7 +1918,8 @@ void test_engine_large_fast_scan_checkpoint_is_cancelable() {
         cancelled = oc.user_requested;
     }
 
-    check(saw_background_checkpoint, "large fast scan defers its initial journal checkpoint");
+    check(saw_background_checkpoint,
+          "large fast scan defers its initial checkpoint to the live progress writer");
     check(saw_fast_engine, "large fast scan reaches the worker pool");
     check(cancelled, "large fast scan cancellation reaches the engine");
 
@@ -1898,10 +2239,13 @@ int main() {
     test_engine_refuses_ask_and_preserves_destination();
     test_engine_stages_destination_on_failure();
     test_engine_fault_injection_timeout_and_offline_are_safe();
+    test_engine_fragile_first_read_findings_are_durable();
     test_engine_salvage_is_not_success();
     test_engine_rejects_unverified_journal_completion();
     test_engine_tracks_source_identity_changes();
     test_engine_scan_resume_binds_change_time();
+    test_engine_precise_scan_resumes_partial_coverage();
+    test_engine_fast_scan_cancellation_preserves_completed_files();
     test_engine_rejects_unsafe_options();
     test_engine_fast_scan_profile();
     test_engine_parallel_scan_wait_for_media_is_thread_safe();

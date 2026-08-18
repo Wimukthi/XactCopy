@@ -31,6 +31,7 @@ struct LaunchOptions {
 
 struct RecoveryActiveRun {
     std::string RunId;
+    std::string ManagedRunId;
     std::string JobId;
     std::string JobName;
     std::string Trigger = "manual";
@@ -43,6 +44,7 @@ struct RecoveryActiveRun {
     void to_json(json::Writer& w) const {
         w.begin_object();
         w.key("RunId"); w.value(RunId);
+        w.key("ManagedRunId"); w.value(ManagedRunId);
         w.key("JobId"); w.value(JobId);
         w.key("JobName"); w.value(JobName);
         w.key("Trigger"); w.value(Trigger);
@@ -60,6 +62,7 @@ struct RecoveryActiveRun {
         const auto* obj = value.as_object();
         if (obj == nullptr) return run;
         models::detail::read(obj, "RunId", run.RunId);
+        models::detail::read(obj, "ManagedRunId", run.ManagedRunId);
         models::detail::read(obj, "JobId", run.JobId);
         models::detail::read(obj, "JobName", run.JobName);
         models::detail::read(obj, "Trigger", run.Trigger);
@@ -293,12 +296,14 @@ public:
 
     void mark_job_started(const std::string& run_id, const std::string& job_name,
                           const models::CopyJobOptions& options, const std::string& journal_path,
-                          const AppSettings& settings) {
+                          const AppSettings& settings,
+                          const std::string& managed_run_id = std::string()) {
         std::lock_guard<std::mutex> guard(lock_);
         time::DateTimeOffset now = time::DateTimeOffset::now_utc();
 
         RecoveryActiveRun run;
         run.RunId = run_id;
+        run.ManagedRunId = managed_run_id;
         run.JobId = run_id;
         run.JobName = job_name;
         run.Trigger = "manual";

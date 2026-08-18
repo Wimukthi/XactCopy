@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -299,6 +300,10 @@ struct JobJournal {
     std::string JobId;
     std::string SourceRoot;
     std::string DestinationRoot;
+    // The journal is the durable unit of resume. Keep the normalized options
+    // beside its file coverage so a journal remains self-describing even when
+    // the UI recovery record or run catalog is unavailable.
+    std::optional<models::CopyJobOptions> RunOptions;
     DateTimeOffset CreatedUtc = DateTimeOffset::now_utc();
     DateTimeOffset UpdatedUtc = DateTimeOffset::now_utc();
     OrderedFileMap<JournalFileEntry> Files;
@@ -308,6 +313,9 @@ struct JobJournal {
         w.key("JobId"); w.value(JobId);
         w.key("SourceRoot"); w.value(SourceRoot);
         w.key("DestinationRoot"); w.value(DestinationRoot);
+        if (RunOptions.has_value()) {
+            w.key("RunOptions"); RunOptions->to_json(w);
+        }
         w.key("CreatedUtc"); w.value_literal_string(CreatedUtc.to_string());
         w.key("UpdatedUtc"); w.value_literal_string(UpdatedUtc.to_string());
         w.key("Files");
@@ -327,6 +335,10 @@ struct JobJournal {
         models::detail::read(obj, "JobId", j.JobId);
         models::detail::read(obj, "SourceRoot", j.SourceRoot);
         models::detail::read(obj, "DestinationRoot", j.DestinationRoot);
+        if (const auto* options = obj->find("RunOptions");
+            options != nullptr && options->is_object()) {
+            j.RunOptions = models::CopyJobOptions::from_json(*options);
+        }
         models::detail::read(obj, "CreatedUtc", j.CreatedUtc);
         models::detail::read(obj, "UpdatedUtc", j.UpdatedUtc);
         if (const auto* files = obj->find("Files"); files != nullptr && files->is_object()) {

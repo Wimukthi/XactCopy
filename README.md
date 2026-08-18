@@ -119,6 +119,7 @@ Every option is explained in the [User Guide](docs/USER_GUIDE.md).
 | [User Guide](docs/USER_GUIDE.md) | Every mode, option, dialog, and workflow |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | What to do when a copy or scan misbehaves |
 | [Architecture](docs/ARCHITECTURE.md) | Supervised worker, IPC protocol, journals, on-disk formats |
+| [Integrity contract](docs/INTEGRITY_HARDENING_PLAN.md) | The invariants an exact copy must satisfy, and the known boundaries |
 | [Contributing](CONTRIBUTING.md) | Building from source, tests, packaging, conventions |
 | [Changelog](CHANGELOG.md) | Version history |
 | [Security policy](SECURITY.md) | Reporting a vulnerability |
