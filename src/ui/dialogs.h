@@ -657,7 +657,7 @@ private:
             section(0, "Status & Progress");
             check(0, "Show buffer status row", "ShowBufferStatusRow", true);
             check(0, "Show rescue status row", "ShowRescueStatusRow", true);
-            check(0, "Show percentage on progress bars", "ProgressBarShowPercentage", false);
+            check(0, "Show percentage on progress bars", "ProgressBarShowPercentage", true);
             combo(0, "Progress bar style", "ProgressBarStyle", {L"Thin", L"Standard", L"Thick"},
                   {"thin", "standard", "thick"}, "standard");
 
@@ -949,6 +949,7 @@ private:
     std::map<int, HWND> page_controls_;
     std::vector<HWND> page_labels_;
     std::map<int, HWND> page_field_labels_;
+    std::map<HWND, bool> page_label_enabled_;
     std::map<int, bool> page_checks_; // field index -> checked (owner-draw state)
 
     SettingsDialog(AppSettings& settings, const ThemePalette& theme)
@@ -1131,6 +1132,7 @@ private:
         page_controls_.clear();
         page_labels_.clear();
         page_field_labels_.clear();
+        page_label_enabled_.clear();
         page_checks_.clear();
     }
 
@@ -1171,7 +1173,12 @@ private:
         auto control = page_controls_.find(index);
         if (control != page_controls_.end()) EnableWindow(control->second, enabled ? TRUE : FALSE);
         auto label = page_field_labels_.find(index);
-        if (label != page_field_labels_.end()) EnableWindow(label->second, enabled ? TRUE : FALSE);
+        if (label != page_field_labels_.end()) {
+            // Disabled STATIC controls use an embossed system draw that clashes
+            // with both themed backgrounds. Paint a single muted label instead.
+            page_label_enabled_[label->second] = enabled;
+            InvalidateRect(label->second, nullptr, TRUE);
+        }
     }
 
     void sync_page_dependencies() {
@@ -1569,7 +1576,10 @@ private:
                 // Section headers use the accent color; regular labels the text color.
                 HFONT control_font = reinterpret_cast<HFONT>(
                     SendMessageW(reinterpret_cast<HWND>(lparam), WM_GETFONT, 0, 0));
-                SetTextColor(dc, control_font == section_font_ ? theme_.accent : theme_.text);
+                auto label = page_label_enabled_.find(reinterpret_cast<HWND>(lparam));
+                SetTextColor(dc, label != page_label_enabled_.end() && !label->second
+                                     ? theme_.muted_text
+                                     : control_font == section_font_ ? theme_.accent : theme_.text);
                 SetBkColor(dc, theme_.window);
                 handled = true;
                 return reinterpret_cast<LRESULT>(window_brush_);

@@ -8,9 +8,14 @@
 // -----------------------------------------------------------------------------
 
 #include <deque>
+#include <atomic>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -28,6 +33,7 @@
 #define WINVER 0x0A00 // MinGW gates the per-monitor DPI APIs on WINVER
 #endif
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <shellapi.h>
@@ -64,6 +70,7 @@ constexpr UINT WM_APP_PAUSE = WM_APP + 5;
 constexpr UINT WM_APP_START_DONE = WM_APP + 6; // wParam: 1 ok / 0 error; lParam: new std::string*
 constexpr UINT WM_APP_UPDATE_DONE = WM_APP + 7; // lParam: new ui::UpdateReleaseInfo*
 constexpr UINT WM_APP_APPLY_LAUNCH = WM_APP + 8; // deferred apply_explorer_launch_options()
+constexpr UINT WM_APP_LOG_TASK = WM_APP + 9;
 
 constexpr int IdSourceEdit = 1001;
 constexpr int IdSourceBrowse = 1002;
@@ -82,7 +89,6 @@ constexpr int IdPauseButton = 1014;
 constexpr int IdCancelButton = 1015;
 constexpr int IdLogList = 1016;
 constexpr int IdSettingsButton = 1017;
-constexpr int IdAboutButton = 1018;
 constexpr int IdContinueCheck = 1019;
 constexpr int IdSkipKnownBadCheck = 1020;
 constexpr int IdWaitMediaCheck = 1021;
@@ -92,7 +98,12 @@ constexpr int IdRetriesEdit = 1024;
 constexpr int IdTimeoutEdit = 1025;
 constexpr int IdCurrentBar = 1026;
 constexpr int IdOverallBar = 1027;
-constexpr int IdSaveDefaultsButton = 1028;
+constexpr int IdLogFilter = 1029;
+constexpr int IdLogFind = 1030;
+constexpr int IdLogFindNext = 1031;
+constexpr int IdLogCopySelected = 1032;
+constexpr int IdLogCopyAll = 1033;
+constexpr int IdLogSave = 1034;
 
 // Menu command ids (mirrors the .NET MainForm menu strip).
 constexpr int IdMenuStartCopy = 1101;
@@ -192,11 +203,8 @@ public:
             MulDiv(800, initial_dpi, 96), nullptr, nullptr, instance, this);
         if (hwnd_ == nullptr) return 1;
 
-        const HWND warning_target = hwnd_;
-        auto post_persistence_warning = [warning_target](const std::string& message) {
-            PostMessageW(warning_target, WM_APP_LOG, 0,
-                         reinterpret_cast<LPARAM>(
-                             new std::string("WARNING: " + message)));
+        auto post_persistence_warning = [this](const std::string& message) {
+            queue_log("WARNING: " + message);
         };
         job_manager_.on_persistence_warning = post_persistence_warning;
         recovery_.on_persistence_warning = post_persistence_warning;
@@ -245,6 +253,7 @@ public:
 
         MSG message;
         while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+            if (handle_log_shortcuts(message)) continue;
             if (IsDialogMessageW(hwnd_, &message)) continue;
             TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -280,14 +289,14 @@ private:
     HWND timeout_label_ = nullptr;
     HWND timeout_edit_ = nullptr;
     HWND start_button_ = nullptr;
-    HWND save_defaults_button_ = nullptr;
     HWND settings_button_ = nullptr;
-    HWND about_button_ = nullptr;
     HWND pause_button_ = nullptr;
     HWND cancel_button_ = nullptr;
     HWND current_label_ = nullptr;
     HWND current_bar_ = nullptr;
     HWND overall_bar_ = nullptr;
+    HWND file_progress_label_ = nullptr;
+    HWND overall_progress_label_ = nullptr;
     int current_permille_ = 0; // owner-drawn flat progress bars (0..1000)
     int overall_permille_ = 0;
     HWND stats_label_ = nullptr;
@@ -300,6 +309,32 @@ private:
     HWND diagnostics_label_ = nullptr;
     HWND status_label_ = nullptr;
     HWND log_list_ = nullptr;
+    HWND log_filter_ = nullptr;
+    HWND log_find_ = nullptr;
+    HWND log_find_button_ = nullptr;
+    ui::LogModel log_model_;
+    ui::LogFilter log_filter_mode_ = ui::LogFilter::All;
+    struct QueuedLog {
+        std::string text;
+        std::chrono::system_clock::time_point timestamp;
+    };
+    std::mutex log_queue_lock_;
+    std::deque<QueuedLog> log_queue_;
+    bool log_wake_pending_ = false;
+    std::size_t log_max_characters_ = 0;
+    std::thread log_save_thread_;
+    std::atomic<bool> log_save_running_{false};
+    enum class LogTaskKind { Find, Copy, Save };
+    struct LogTaskResult {
+        LogTaskKind kind = LogTaskKind::Find;
+        ui::LogFilter filter = ui::LogFilter::All;
+        bool found = false;
+        std::uint64_t sequence = 0;
+        std::wstring text;
+        HGLOBAL clipboard = nullptr;
+        std::string error;
+        ~LogTaskResult() { if (clipboard != nullptr) GlobalFree(clipboard); }
+    };
     int log_horizontal_extent_ = 0;
     HFONT font_ = nullptr;
     HFONT mono_font_ = nullptr;
@@ -371,7 +406,7 @@ private:
     // Appearance settings consumed by the UI.
     bool show_buffer_row_ = true;
     bool show_rescue_row_ = true;
-    bool bar_show_percentage_ = false;
+    bool bar_show_percentage_ = true;
     int progress_bar_height_logical_ = 14;
 
     static LRESULT CALLBACK static_window_proc(HWND hwnd, UINT message, WPARAM wparam,
@@ -455,10 +490,20 @@ private:
                 }
                 return 0;
             case WM_APP_LOG: {
-                std::unique_ptr<std::string> text(reinterpret_cast<std::string*>(lparam));
-                append_log(*text);
+                drain_log_queue();
                 return 0;
             }
+            case WM_APP_LOG_TASK: {
+                std::unique_ptr<LogTaskResult> result(reinterpret_cast<LogTaskResult*>(lparam));
+                finish_log_task(*result);
+                return 0;
+            }
+            case WM_CONTEXTMENU:
+                if (reinterpret_cast<HWND>(wparam) == log_list_) {
+                    show_log_context_menu(lparam);
+                    return 0;
+                }
+                return DefWindowProcW(hwnd_, message, wparam, lparam);
             case WM_APP_PROGRESS: {
                 std::unique_ptr<models::CopyProgressSnapshot> snapshot(
                     reinterpret_cast<models::CopyProgressSnapshot*>(lparam));
@@ -610,6 +655,12 @@ private:
                 if (start_thread_.joinable()) start_thread_.join();
                 if (update_thread_.joinable()) update_thread_.join();
                 supervisor_.stop();
+                if (log_save_thread_.joinable()) log_save_thread_.join();
+                {
+                    MSG pending{};
+                    while (PeekMessageW(&pending, hwnd_, WM_APP_LOG_TASK, WM_APP_LOG_TASK, PM_REMOVE))
+                        delete reinterpret_cast<LogTaskResult*>(pending.lParam);
+                }
                 if (!supervisor_.is_job_running()) recovery_.mark_clean_shutdown();
                 PostQuitMessage(0);
                 return 0;
@@ -677,9 +728,10 @@ private:
             map_check_,        adaptive_check_,      continue_check_,   skip_known_bad_check_,
             wait_media_check_, fragile_check_,       buffer_label_,     buffer_edit_,
             retries_label_,    retries_edit_,        timeout_label_,    timeout_edit_,
-            start_button_,     pause_button_,        cancel_button_,    save_defaults_button_,
-            settings_button_,
-            about_button_,     current_label_,       stats_label_,      status_label_,
+            start_button_,     pause_button_,        cancel_button_,    settings_button_,
+            log_filter_,       log_find_,            log_find_button_,
+            current_label_,    file_progress_label_, overall_progress_label_,
+            stats_label_,      status_label_,
             throughput_label_, eta_label_,           buffer_usage_label_, rescue_label_,
             job_summary_label_, journal_label_,      diagnostics_label_,
         };
@@ -694,7 +746,7 @@ private:
                          MulDiv(log_points + 6, effective_dpi(), 72));
         }
         const int combo_item_height = MulDiv(22, effective_dpi(), 96);
-        for (HWND combo : {mode_combo_, engine_combo_, overwrite_combo_, verify_combo_}) {
+        for (HWND combo : {mode_combo_, engine_combo_, overwrite_combo_, verify_combo_, log_filter_}) {
             if (combo == nullptr) continue;
             SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), combo_item_height);
             SendMessageW(combo, CB_SETITEMHEIGHT, 0, combo_item_height);
@@ -712,36 +764,17 @@ private:
         return size.cx + MulDiv(8, effective_dpi(), 96);
     }
 
-    void update_log_horizontal_extent(const std::wstring& text) {
-        if (log_list_ == nullptr || mono_font_ == nullptr) return;
-        HDC dc = GetDC(log_list_);
-        if (dc == nullptr) return;
-        HGDIOBJ old_font = SelectObject(dc, mono_font_);
-        int extent = measure_log_text_width(dc, text);
-        SelectObject(dc, old_font);
-        ReleaseDC(log_list_, dc);
-        if (extent <= log_horizontal_extent_) return;
-        log_horizontal_extent_ = extent;
-        SendMessageW(log_list_, LB_SETHORIZONTALEXTENT,
-                     static_cast<WPARAM>(log_horizontal_extent_), 0);
-    }
-
     void rebuild_log_horizontal_extent() {
         if (log_list_ == nullptr || mono_font_ == nullptr) return;
         HDC dc = GetDC(log_list_);
         if (dc == nullptr) return;
         HGDIOBJ old_font = SelectObject(dc, mono_font_);
-        int extent = 0;
-        int count = static_cast<int>(SendMessageW(log_list_, LB_GETCOUNT, 0, 0));
-        for (int index = 0; index < count; ++index) {
-            LRESULT length = SendMessageW(log_list_, LB_GETTEXTLEN, index, 0);
-            if (length < 0) continue;
-            std::wstring text(static_cast<std::size_t>(length) + 1, L'\0');
-            SendMessageW(log_list_, LB_GETTEXT, index,
-                         reinterpret_cast<LPARAM>(text.data()));
-            text.resize(static_cast<std::size_t>(length));
-            extent = std::max(extent, measure_log_text_width(dc, text));
-        }
+        TEXTMETRICW metrics{};
+        GetTextMetricsW(dc, &metrics);
+        const auto safe_width = std::min<std::size_t>(
+            log_max_characters_ * static_cast<std::size_t>(std::max<LONG>(1, metrics.tmMaxCharWidth)),
+            static_cast<std::size_t>(std::numeric_limits<int>::max() - 16));
+        int extent = static_cast<int>(safe_width) + MulDiv(8, effective_dpi(), 96);
         SelectObject(dc, old_font);
         ReleaseDC(log_list_, dc);
         log_horizontal_extent_ = extent;
@@ -751,6 +784,7 @@ private:
 
     void reset_log_horizontal_extent() {
         log_horizontal_extent_ = 0;
+        log_max_characters_ = 0;
         if (log_list_ != nullptr) {
             SendMessageW(log_list_, LB_SETHORIZONTALEXTENT, 0, 0);
         }
@@ -818,11 +852,8 @@ private:
         start_button_ = create(L"BUTTON", L"Start", WS_TABSTOP | BS_OWNERDRAW, IdStartButton);
         pause_button_ = create(L"BUTTON", L"Pause", WS_TABSTOP | BS_OWNERDRAW, IdPauseButton);
         cancel_button_ = create(L"BUTTON", L"Cancel", WS_TABSTOP | BS_OWNERDRAW, IdCancelButton);
-        save_defaults_button_ =
-            create(L"BUTTON", L"Save defaults", WS_TABSTOP | BS_OWNERDRAW, IdSaveDefaultsButton);
         settings_button_ =
             create(L"BUTTON", L"Settings...", WS_TABSTOP | BS_OWNERDRAW, IdSettingsButton);
-        about_button_ = create(L"BUTTON", L"About", WS_TABSTOP | BS_OWNERDRAW, IdAboutButton);
         EnableWindow(pause_button_, FALSE);
         EnableWindow(cancel_button_, FALSE);
 
@@ -833,6 +864,8 @@ private:
         // ourselves for a flat, borderless, consistent look.
         current_bar_ = create(L"STATIC", L"", SS_OWNERDRAW, IdCurrentBar);
         overall_bar_ = create(L"STATIC", L"", SS_OWNERDRAW, IdOverallBar);
+        file_progress_label_ = create(L"STATIC", L"File", SS_CENTERIMAGE | SS_NOPREFIX, 0);
+        overall_progress_label_ = create(L"STATIC", L"Overall", SS_CENTERIMAGE | SS_NOPREFIX, 0);
         stats_label_ = create(L"STATIC", L"", SS_NOPREFIX, 0);
         throughput_label_ =
             create(L"STATIC", L"Speed: 0 B/s (avg 0 B/s)", SS_ENDELLIPSIS | SS_NOPREFIX, 0);
@@ -847,10 +880,20 @@ private:
         status_label_ = create(L"STATIC", L"Status: Idle", SS_NOPREFIX, 0);
         // WS_BORDER (flat 1px, matches the edits) instead of WS_EX_CLIENTEDGE,
         // which draws a white sunken 3D edge the dark theme can't repaint.
+        log_filter_ = create(L"COMBOBOX", L"", combo_style, IdLogFilter);
+        for (const wchar_t* item : {L"All", L"Warnings and errors", L"Errors only"}) {
+            SendMessageW(log_filter_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+        }
+        SendMessageW(log_filter_, CB_SETCURSEL, 0, 0);
+        log_find_ = create(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, IdLogFind);
+        log_find_button_ = create(L"BUTTON", L"Find next", WS_TABSTOP | BS_OWNERDRAW, IdLogFindNext);
+        log_model_.set_capacity(static_cast<std::size_t>(
+            settings_.get_int("UiMaxLogLines", 1000, 1000000, 50000)));
         log_list_ = create(L"LISTBOX", L"",
                            WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | WS_BORDER | LBS_NOINTEGRALHEIGHT |
-                               LBS_DISABLENOSCROLL | LBS_NOSEL | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+                               LBS_DISABLENOSCROLL | LBS_NODATA | LBS_OWNERDRAWFIXED,
                            IdLogList, 0, mono_font_);
+        SetWindowSubclass(log_list_, &log_list_subclass, 1, reinterpret_cast<DWORD_PTR>(this));
         SendMessageW(log_list_, LB_SETITEMHEIGHT, 0,
                      MulDiv(log_points + 6, effective_dpi(), 72));
 
@@ -904,9 +947,7 @@ private:
         add(start_button_, L"Validate the current options and start the copy or read-only file-readability assessment.");
         add(pause_button_, L"Pause or resume scheduling and managed I/O at a safe cancellation point. An in-flight Windows API call may finish first.");
         add(cancel_button_, L"Request cancellation. If a storage driver does not respond within five seconds, XactCopy force-stops the isolated worker. Click again to force-stop immediately.");
-        add(save_defaults_button_, L"Save the visible run controls as defaults for future jobs without saving the current source, destination, or operation mode.");
         add(settings_button_, L"Open advanced appearance, copy, performance, diagnostics, verification, recovery, and Explorer-integration settings.");
-        add(about_button_, L"Show version, build, components, and update options.");
 
         add(current_label_, L"The file or scan item currently being processed.");
         add(current_bar_, L"Progress within the current file or scan item.");
@@ -920,6 +961,9 @@ private:
         add(journal_label_, L"Path of the resumable journal used by this run.");
         add(diagnostics_label_, L"UI and worker diagnostic counters. Enable or configure this strip in Settings.");
         add(log_list_, L"Detailed worker and supervisor log. Severity can be color-coded; use the horizontal scrollbar for long lines.");
+        add(log_filter_, L"Show all log lines, warnings and errors, or errors only.");
+        add(log_find_, L"Find text in the visible log. Ctrl+F focuses this box; F3 finds the next match.");
+        add(log_find_button_, L"Find the next match in the visible log, wrapping at the end.");
         add(status_label_, L"Supervisor state for worker startup, connection, running, pause, cancellation, recovery, and completion.");
     }
 
@@ -931,6 +975,8 @@ private:
         AppendMenuW(file_menu, MF_STRING, IdMenuResumeCopy, L"&Resume Operation");
         AppendMenuW(file_menu, MF_STRING, IdMenuCancelCopy, L"&Cancel Operation");
         AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(file_menu, MF_STRING, IdMenuSaveDefaults,
+                    L"Save current settings as &defaults");
         AppendMenuW(file_menu, MF_STRING, IdMenuOpenJournals, L"Open &Journal Folder");
         AppendMenuW(file_menu, MF_STRING, IdMenuOpenCrash, L"Open &Crash Folder");
         AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
@@ -942,8 +988,6 @@ private:
         AppendMenuW(tools_menu, MF_STRING, IdMenuClearBadMap, L"Clear Source Bad-Range &Map...");
         AppendMenuW(tools_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(tools_menu, MF_STRING, IdMenuSettings, L"&Settings...");
-        AppendMenuW(tools_menu, MF_STRING, IdMenuSaveDefaults,
-                    L"Save Current Settings as &Defaults");
         AppendMenuW(tools_menu, MF_STRING, IdMenuCheckUpdates, L"Check for &Updates...");
 
         HMENU jobs_menu = CreatePopupMenu();
@@ -1183,11 +1227,11 @@ private:
         edit_brush_ = CreateSolidBrush(theme_.edit);
 
         ui::attach_theme_window(hwnd_);
-        for (HWND control : {log_list_, source_edit_, destination_edit_, buffer_edit_,
+        for (HWND control : {log_list_, log_find_, source_edit_, destination_edit_, buffer_edit_,
                              retries_edit_, timeout_edit_}) {
             ui::apply_control_theme(control, theme_.dark);
         }
-        for (HWND combo : {mode_combo_, engine_combo_, overwrite_combo_, verify_combo_}) {
+        for (HWND combo : {mode_combo_, engine_combo_, overwrite_combo_, verify_combo_, log_filter_}) {
             ui::apply_combo_theme(combo, theme_.dark);
         }
         InvalidateRect(current_bar_, nullptr, FALSE);
@@ -1339,8 +1383,8 @@ private:
 
     void wire_supervisor_events() {
         HWND hwnd = hwnd_;
-        supervisor_.on_log = [hwnd](const std::string& message) {
-            PostMessageW(hwnd, WM_APP_LOG, 0, reinterpret_cast<LPARAM>(new std::string(message)));
+        supervisor_.on_log = [this](const std::string& message) {
+            queue_log(message);
         };
         supervisor_.on_progress = [hwnd](const models::CopyProgressSnapshot& snapshot) {
             PostMessageW(hwnd, WM_APP_PROGRESS, 0,
@@ -1389,8 +1433,7 @@ private:
     static bool is_button_id(int id) {
         return id == IdSourceBrowse || id == IdDestinationBrowse || id == IdStartButton ||
                id == IdPauseButton || id == IdCancelButton || id == IdSettingsButton ||
-               id == IdAboutButton || id == IdSourceAddFiles || id == IdClearSelection ||
-               id == IdSaveDefaultsButton;
+               id == IdSourceAddFiles || id == IdClearSelection || id == IdLogFindNext;
     }
 
     bool on_draw_item(const DRAWITEMSTRUCT& draw) {
@@ -1432,15 +1475,25 @@ private:
             ui::themedraw::fill_rect(draw.hDC, fill, theme_.accent);
         }
         ui::themedraw::frame_rect(draw.hDC, rect, theme_.border);
-        if (bar_show_percentage_ && (rect.bottom - rect.top) >= 14) {
+        if (bar_show_percentage_) {
             wchar_t text[8];
             swprintf(text, 8, L"%d%%", (clamped + 5) / 10);
             HGDIOBJ old_font = SelectObject(draw.hDC, font_);
             SetBkMode(draw.hDC, TRANSPARENT);
-            // Readable over both the filled and unfilled halves.
-            SetTextColor(draw.hDC, ui::readable_text_color(clamped >= 500 ? theme_.accent
-                                                                          : theme_.panel));
-            DrawTextW(draw.hDC, text, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            // A percentage may straddle the fill edge; paint each half with
+            // contrast against the color actually underneath it.
+            for (bool over_fill : {false, true}) {
+                const int saved_dc = SaveDC(draw.hDC);
+                if (saved_dc == 0) continue;
+                if (over_fill) IntersectClipRect(draw.hDC, rect.left, rect.top,
+                                                  rect.left + filled, rect.bottom);
+                else IntersectClipRect(draw.hDC, rect.left + filled, rect.top,
+                                       rect.right, rect.bottom);
+                SetTextColor(draw.hDC, ui::readable_text_color(over_fill ? theme_.accent
+                                                                         : theme_.panel));
+                DrawTextW(draw.hDC, text, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                RestoreDC(draw.hDC, saved_dc);
+            }
             SelectObject(draw.hDC, old_font);
         }
     }
@@ -1457,7 +1510,7 @@ private:
         show_diagnostics_ = settings_.get_bool("UiShowDiagnostics", false);
         show_buffer_row_ = settings_.get_bool("ShowBufferStatusRow", true);
         show_rescue_row_ = settings_.get_bool("ShowRescueStatusRow", true);
-        bar_show_percentage_ = settings_.get_bool("ProgressBarShowPercentage", false);
+        bar_show_percentage_ = settings_.get_bool("ProgressBarShowPercentage", true);
         const std::string bar_style = settings_.get_string("ProgressBarStyle", "standard");
         progress_bar_height_logical_ =
             models::detail::equals_ignore_case(bar_style, "thin")
@@ -1547,28 +1600,23 @@ private:
     }
 
     void draw_log_item(const DRAWITEMSTRUCT& draw) {
-        ui::themedraw::fill_rect(draw.hDC, draw.rcItem, theme_.edit);
+        const bool selected = (draw.itemState & ODS_SELECTED) != 0;
+        ui::themedraw::fill_rect(draw.hDC, draw.rcItem, selected ? theme_.selection : theme_.edit);
         if (draw.itemID == static_cast<UINT>(-1)) return;
-
-        const LRESULT length = SendMessageW(log_list_, LB_GETTEXTLEN, draw.itemID, 0);
-        if (length < 0) return;
-        std::wstring text(static_cast<std::size_t>(length) + 1, L'\0');
-        SendMessageW(log_list_, LB_GETTEXT, draw.itemID, reinterpret_cast<LPARAM>(text.data()));
-        text.resize(static_cast<std::size_t>(length));
-
-        COLORREF color = theme_.text;
-        if (colorize_log_) {
-            color = ui::severity_color(
-                theme_, ui::classify_log_line(storage::fsutil::wide_to_utf8(text)));
-        }
+        const auto entry = log_model_.at(log_filter_mode_, draw.itemID);
+        if (entry == nullptr) return;
+        COLORREF color = selected ? theme_.selection_text
+                                  : colorize_log_ ? ui::severity_color(theme_, entry->severity)
+                                                  : theme_.text;
 
         HGDIOBJ old_font = SelectObject(draw.hDC, mono_font_);
         SetBkMode(draw.hDC, TRANSPARENT);
         SetTextColor(draw.hDC, color);
         RECT text_rect = draw.rcItem;
         text_rect.left += 4;
-        DrawTextW(draw.hDC, text.c_str(), -1, &text_rect,
+        DrawTextW(draw.hDC, entry->text.c_str(), -1, &text_rect,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        if ((draw.itemState & ODS_FOCUS) != 0) DrawFocusRect(draw.hDC, &draw.rcItem);
         SelectObject(draw.hDC, old_font);
     }
 
@@ -1671,24 +1719,26 @@ private:
         place(start_button_, 0, button_width, scale(30));
         place(pause_button_, button_width + gap, button_width, scale(30));
         place(cancel_button_, (button_width + gap) * 2, button_width, scale(30));
-        int about_width = scale(80);
-        int settings_width = scale(100);
-        int save_defaults_width = scale(126);
-        place(about_button_, width - about_width, about_width, scale(30));
-        place(settings_button_, width - about_width - gap - settings_width, settings_width,
-              scale(30));
-        place(save_defaults_button_,
-              width - about_width - gap - settings_width - gap - save_defaults_width,
-              save_defaults_width, scale(30));
+        place(settings_button_, (button_width + gap) * 3, button_width, scale(30));
         y += scale(30) + gap;
 
         place(current_label_, 0, width);
         y += row_height;
-        const int bar_height = scale(progress_bar_height_logical_);
-        place(current_bar_, 0, width, bar_height);
-        y += bar_height + gap;
-        place(overall_bar_, 0, width, bar_height);
-        y += bar_height + scale(2);
+        const int bar_height = scale(bar_show_percentage_
+                                         ? std::max(progress_bar_height_logical_, 14)
+                                         : progress_bar_height_logical_);
+        const int progress_label_width = scale(60);
+        const int progress_row_height = std::max(row_height, bar_height);
+        place(file_progress_label_, 0, progress_label_width, progress_row_height);
+        y += (progress_row_height - bar_height) / 2;
+        place(current_bar_, progress_label_width, width - progress_label_width, bar_height);
+        y -= (progress_row_height - bar_height) / 2;
+        y += progress_row_height + gap;
+        place(overall_progress_label_, 0, progress_label_width, progress_row_height);
+        y += (progress_row_height - bar_height) / 2;
+        place(overall_bar_, progress_label_width, width - progress_label_width, bar_height);
+        y -= (progress_row_height - bar_height) / 2;
+        y += progress_row_height + scale(2);
         place(stats_label_, 0, width);
         y += row_height;
 
@@ -1721,6 +1771,14 @@ private:
         }
         y += gap;
 
+        const int filter_width = scale(190);
+        const int find_button_width = scale(95);
+        place(log_filter_, 0, filter_width, scale(160));
+        place(log_find_, filter_width + gap,
+              std::max(scale(80), width - filter_width - find_button_width - 2 * gap));
+        place(log_find_button_, width - find_button_width, find_button_width);
+        y += row_height + gap;
+
         int status_height = row_height;
         int log_height = client.bottom - y - status_height - margin - gap;
         if (log_height < scale(60)) log_height = scale(60);
@@ -1733,6 +1791,17 @@ private:
     // ---- Commands ----------------------------------------------------------
 
     void on_command(int id, int notification) {
+        if (id == IdLogFilter && notification == CBN_SELCHANGE) {
+            const int selection = static_cast<int>(SendMessageW(log_filter_, CB_GETCURSEL, 0, 0));
+            log_filter_mode_ = static_cast<ui::LogFilter>(std::clamp(selection, 0, 2));
+            SendMessageW(log_list_, LB_SETCOUNT, log_model_.size(log_filter_mode_), 0);
+            InvalidateRect(log_list_, nullptr, TRUE);
+            return;
+        }
+        if (id == IdLogFindNext) { find_log_next(); return; }
+        if (id == IdLogCopySelected) { copy_log(false); return; }
+        if (id == IdLogCopyAll) { copy_log(true); return; }
+        if (id == IdLogSave) { save_log(); return; }
         if (id == IdSourceEdit && notification == EN_CHANGE && !suppress_source_change_ &&
             !explorer_selected_paths_.empty()) {
             clear_selection(/*restore_root*/ false);
@@ -1796,6 +1865,9 @@ private:
                     ui_density_percent_ =
                         ui::ui_density_percent(settings_.get_string("UiDensity", "normal"));
                     apply_appearance_settings();
+                    log_model_.set_capacity(static_cast<std::size_t>(
+                        settings_.get_int("UiMaxLogLines", 1000, 1000000, 50000)));
+                    SendMessageW(log_list_, LB_SETCOUNT, log_model_.size(log_filter_mode_), 0);
                     configure_diagnostics_timer();
                     rebuild_fonts(GetDpiForWindow(hwnd_));
                     apply_fonts();
@@ -1804,11 +1876,9 @@ private:
                     sync_explorer_integration(true);
                 }
                 break;
-            case IdSaveDefaultsButton:
             case IdMenuSaveDefaults:
                 save_current_as_defaults();
                 break;
-            case IdAboutButton:
             case IdMenuAbout:
                 ui::AboutDialog::show(hwnd_, theme_, settings_, IdMenuCheckUpdates);
                 break;
@@ -2749,19 +2819,285 @@ private:
 
     // ---- Event application -------------------------------------------------
 
-    void append_log(const std::string& message) {
-        std::wstring wide = storage::fsutil::utf8_to_wide(message);
-        int max_lines = settings_.get_int("UiMaxLogLines", 1000, 1000000, 50000);
-        int cap = std::min(max_lines, 20000); // classic listbox practical cap
-        int count = static_cast<int>(SendMessageW(log_list_, LB_GETCOUNT, 0, 0));
-        while (count >= cap) {
-            SendMessageW(log_list_, LB_DELETESTRING, 0, 0);
-            --count;
+    static LRESULT CALLBACK log_list_subclass(HWND control, UINT message, WPARAM wparam,
+                                              LPARAM lparam, UINT_PTR, DWORD_PTR data) {
+        auto* self = reinterpret_cast<MainWindow*>(data);
+        if (message == LB_RESETCONTENT) self->log_model_.clear();
+        return DefSubclassProc(control, message, wparam, lparam);
+    }
+
+    void queue_log(const std::string& text) {
+        bool wake = false;
+        {
+            std::lock_guard<std::mutex> guard(log_queue_lock_);
+            log_queue_.push_back({text, std::chrono::system_clock::now()});
+            if (!log_wake_pending_) {
+                log_wake_pending_ = true;
+                wake = true;
+            }
         }
-        int index = static_cast<int>(
-            SendMessageW(log_list_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(wide.c_str())));
-        update_log_horizontal_extent(wide);
-        SendMessageW(log_list_, LB_SETTOPINDEX, index, 0);
+        if (wake && !PostMessageW(hwnd_, WM_APP_LOG, 0, 0)) {
+            std::lock_guard<std::mutex> guard(log_queue_lock_);
+            log_wake_pending_ = false;
+        }
+    }
+
+    void drain_log_queue() {
+        std::deque<QueuedLog> batch;
+        bool repost = false;
+        {
+            std::lock_guard<std::mutex> guard(log_queue_lock_);
+            // Bound one wake's work so a producer burst cannot starve input.
+            for (std::size_t count = 0; count < 512 && !log_queue_.empty(); ++count) {
+                batch.push_back(std::move(log_queue_.front()));
+                log_queue_.pop_front();
+            }
+            repost = !log_queue_.empty();
+            log_wake_pending_ = repost;
+        }
+        if (repost && !PostMessageW(hwnd_, WM_APP_LOG, 0, 0)) {
+            std::lock_guard<std::mutex> guard(log_queue_lock_);
+            log_wake_pending_ = false;
+        }
+        append_log_batch(batch);
+    }
+
+    void append_log(const std::string& message) {
+        std::deque<QueuedLog> batch;
+        batch.push_back({message, std::chrono::system_clock::now()});
+        append_log_batch(batch);
+    }
+
+    void append_log_batch(const std::deque<QueuedLog>& batch) {
+        if (batch.empty() || log_list_ == nullptr) return;
+        const int old_count = static_cast<int>(log_model_.size(log_filter_mode_));
+        int top = std::max(0, static_cast<int>(SendMessageW(log_list_, LB_GETTOPINDEX, 0, 0)));
+        int selected = static_cast<int>(SendMessageW(log_list_, LB_GETCURSEL, 0, 0));
+        RECT client{};
+        GetClientRect(log_list_, &client);
+        const int item_height = std::max(1, static_cast<int>(SendMessageW(log_list_, LB_GETITEMHEIGHT, 0, 0)));
+        const int visible_rows = (client.bottom - client.top + item_height - 1) / item_height;
+        const bool follow_tail = old_count == 0 || top + visible_rows >= old_count;
+        int added_visible = 0;
+        HDC dc = GetDC(log_list_);
+        HGDIOBJ old_font = dc != nullptr ? SelectObject(dc, mono_font_) : nullptr;
+        int extent = log_horizontal_extent_;
+        for (const auto& line : batch) {
+            const auto severity = ui::classify_log_line(line.text);
+            if (ui::LogModel::matches_filter(severity, log_filter_mode_)) {
+                ++added_visible;
+            }
+            std::wstring wide = storage::fsutil::utf8_to_wide(line.text);
+            log_max_characters_ = std::max(log_max_characters_, wide.size());
+            if (dc != nullptr) extent = std::max(extent, measure_log_text_width(dc, wide));
+            log_model_.append(std::move(wide), severity, line.timestamp);
+        }
+        if (dc != nullptr) {
+            if (old_font != nullptr) SelectObject(dc, old_font);
+            ReleaseDC(log_list_, dc);
+        }
+        const int count = static_cast<int>(log_model_.size(log_filter_mode_));
+        const int removed = std::max(0, old_count + added_visible - count);
+        SendMessageW(log_list_, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(log_list_, LB_SETCOUNT, count, 0);
+        if (selected >= 0) {
+            selected -= removed;
+            SendMessageW(log_list_, LB_SETCURSEL, selected >= 0 ? selected : -1, 0);
+        }
+        if (count > 0) {
+            const int target = follow_tail ? std::max(0, count - visible_rows)
+                                           : std::max(0, top - removed);
+            SendMessageW(log_list_, LB_SETTOPINDEX, target, 0);
+        }
+        if (extent > log_horizontal_extent_) {
+            log_horizontal_extent_ = extent;
+            SendMessageW(log_list_, LB_SETHORIZONTALEXTENT, extent, 0);
+        }
+        SendMessageW(log_list_, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(log_list_, nullptr, TRUE);
+    }
+
+    bool handle_log_shortcuts(const MSG& message) {
+        if (message.message != WM_KEYDOWN) return false;
+        if (message.wParam == 'F' && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+            SetFocus(log_find_);
+            SendMessageW(log_find_, EM_SETSEL, 0, -1);
+            return true;
+        }
+        if (message.wParam == VK_F3) { find_log_next(); return true; }
+        return false;
+    }
+
+    void find_log_next() {
+        const int length = GetWindowTextLengthW(log_find_);
+        if (length <= 0) { SetFocus(log_find_); return; }
+        std::wstring query(static_cast<std::size_t>(length) + 1, L'\0');
+        GetWindowTextW(log_find_, query.data(), length + 1);
+        query.resize(static_cast<std::size_t>(length));
+        const int selected = static_cast<int>(SendMessageW(log_list_, LB_GETCURSEL, 0, 0));
+        const auto entry = selected < 0 ? nullptr :
+            log_model_.at(log_filter_mode_, static_cast<std::size_t>(selected));
+        start_log_task(LogTaskKind::Find, {}, std::move(query), entry != nullptr,
+                       entry != nullptr ? entry->sequence : 0);
+    }
+
+    void copy_log(bool all) {
+        if (all) { start_log_task(LogTaskKind::Copy); return; }
+        const int selected = static_cast<int>(SendMessageW(log_list_, LB_GETCURSEL, 0, 0));
+        const auto entry = selected < 0 ? nullptr :
+            log_model_.at(log_filter_mode_, static_cast<std::size_t>(selected));
+        if (entry != nullptr) copy_log_text(entry->text + L"\r\n");
+    }
+
+    void copy_log_text(const std::wstring& text) {
+        if (text.empty() || !OpenClipboard(hwnd_)) return;
+        HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(wchar_t));
+        if (memory != nullptr) {
+            void* buffer = GlobalLock(memory);
+            if (buffer != nullptr) {
+                std::memcpy(buffer, text.c_str(), (text.size() + 1) * sizeof(wchar_t));
+                GlobalUnlock(memory);
+                EmptyClipboard();
+                if (SetClipboardData(CF_UNICODETEXT, memory) != nullptr) memory = nullptr;
+            }
+            if (memory != nullptr) GlobalFree(memory);
+        }
+        CloseClipboard();
+    }
+
+    void show_log_context_menu(LPARAM point) {
+        HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING, IdLogCopySelected, L"Copy selected");
+        AppendMenuW(menu, MF_STRING, IdLogCopyAll, L"Copy all visible");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IdLogSave, L"Save log as...");
+        POINT cursor{GET_X_LPARAM(point), GET_Y_LPARAM(point)};
+        if (cursor.x == -1 && cursor.y == -1) {
+            RECT rect{}; GetWindowRect(log_list_, &rect); cursor = {rect.left, rect.top};
+        }
+        TrackPopupMenu(menu, TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, hwnd_, nullptr);
+        DestroyMenu(menu);
+    }
+
+    void save_log() {
+        if (log_save_running_.load()) { MessageBeep(MB_OK); return; }
+        if (log_save_thread_.joinable()) log_save_thread_.join();
+        IFileSaveDialog* dialog = nullptr;
+        if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(&dialog)))) return;
+        const COMDLG_FILTERSPEC filters[] = {{L"Text files", L"*.txt"}, {L"All files", L"*.*"}};
+        dialog->SetFileTypes(2, filters);
+        dialog->SetDefaultExtension(L"txt");
+        dialog->SetFileName(L"XactCopy-log.txt");
+        std::wstring path;
+        if (SUCCEEDED(dialog->Show(hwnd_))) {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(dialog->GetResult(&item))) {
+                PWSTR name = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &name))) {
+                    path = name;
+                    CoTaskMemFree(name);
+                }
+                item->Release();
+            }
+        }
+        dialog->Release();
+        if (path.empty()) return;
+        start_log_task(LogTaskKind::Save, std::move(path));
+    }
+
+    void start_log_task(LogTaskKind kind, std::wstring path = {}, std::wstring query = {},
+                        bool has_selection = false, std::uint64_t selected_sequence = 0) {
+        if (log_save_running_.exchange(true)) { MessageBeep(MB_OK); return; }
+        if (log_save_thread_.joinable()) log_save_thread_.join();
+        auto snapshot = log_model_.begin_snapshot();
+        if (!snapshot) { log_save_running_ = false; MessageBeep(MB_OK); return; }
+        const auto filter = log_filter_mode_;
+        const HWND target = hwnd_;
+        log_save_thread_ = std::thread([this, target, snapshot, kind, filter,
+                                        path = std::move(path), query = std::move(query),
+                                        has_selection, selected_sequence]() mutable {
+            auto result = std::make_unique<LogTaskResult>();
+            result->kind = kind;
+            result->filter = filter;
+            try {
+                std::ofstream stream;
+                if (kind == LogTaskKind::Save) {
+                    stream.open(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
+                    if (!stream) throw std::runtime_error("Could not open the log file.");
+                }
+                for (auto& c : query) c = static_cast<wchar_t>(std::towlower(c));
+                bool first_found = false;
+                std::uint64_t first_sequence = 0;
+                while (auto entry = log_model_.next_snapshot(snapshot)) {
+                    if (!ui::LogModel::matches_filter(entry->severity, filter)) continue;
+                    if (kind == LogTaskKind::Find) {
+                        const auto match = std::search(entry->text.begin(), entry->text.end(),
+                            query.begin(), query.end(), [](wchar_t left, wchar_t right) {
+                                return std::towlower(left) == right;
+                            });
+                        if (match == entry->text.end()) continue;
+                        if (!first_found) { first_found = true; first_sequence = entry->sequence; }
+                        if (!has_selection || entry->sequence > selected_sequence) {
+                            result->found = true; result->sequence = entry->sequence; break;
+                        }
+                    } else if (kind == LogTaskKind::Copy) {
+                        result->text += entry->text;
+                        result->text += L"\r\n";
+                    } else {
+                        const std::string bytes = storage::fsutil::wide_to_utf8(entry->text);
+                        stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                        stream.write("\r\n", 2);
+                        if (!stream) throw std::runtime_error("Could not write the log file.");
+                    }
+                }
+                if (kind == LogTaskKind::Find && !result->found && first_found) {
+                    result->found = true; result->sequence = first_sequence;
+                }
+                if (kind == LogTaskKind::Save) {
+                    stream.close();
+                    if (!stream) throw std::runtime_error("Could not finish writing the log file.");
+                } else if (kind == LogTaskKind::Copy && !result->text.empty()) {
+                    const std::size_t bytes = (result->text.size() + 1) * sizeof(wchar_t);
+                    result->clipboard = GlobalAlloc(GMEM_MOVEABLE, bytes);
+                    if (result->clipboard == nullptr) throw std::runtime_error("Could not allocate clipboard data.");
+                    void* buffer = GlobalLock(result->clipboard);
+                    if (buffer == nullptr) throw std::runtime_error("Could not prepare clipboard data.");
+                    std::memcpy(buffer, result->text.c_str(), bytes);
+                    GlobalUnlock(result->clipboard);
+                    std::wstring().swap(result->text);
+                }
+            } catch (const std::exception& error) {
+                result->error = error.what();
+            }
+            log_model_.end_snapshot(snapshot);
+            if (PostMessageW(target, WM_APP_LOG_TASK, 0,
+                             reinterpret_cast<LPARAM>(result.get()))) result.release();
+            log_save_running_ = false;
+        });
+    }
+
+    void finish_log_task(LogTaskResult& result) {
+        if (!result.error.empty()) { append_log("ERROR: " + result.error); return; }
+        if (result.kind == LogTaskKind::Copy) {
+            if (result.clipboard != nullptr && OpenClipboard(hwnd_)) {
+                EmptyClipboard();
+                if (SetClipboardData(CF_UNICODETEXT, result.clipboard) != nullptr)
+                    result.clipboard = nullptr;
+                CloseClipboard();
+            }
+            return;
+        }
+        if (result.kind == LogTaskKind::Find) {
+            const auto index = result.found && result.filter == log_filter_mode_
+                                   ? log_model_.index_of_sequence(log_filter_mode_, result.sequence)
+                                   : log_model_.size(log_filter_mode_);
+            if (index < log_model_.size(log_filter_mode_)) {
+                SendMessageW(log_list_, LB_SETCURSEL, index, 0);
+                SendMessageW(log_list_, LB_SETTOPINDEX, index, 0);
+                SetFocus(log_list_);
+            } else MessageBeep(MB_OK);
+        }
     }
 
     void apply_progress(const models::CopyProgressSnapshot& snapshot) {
