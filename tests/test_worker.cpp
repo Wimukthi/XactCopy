@@ -873,6 +873,834 @@ void test_engine_parallel_native_requires_full_verification() {
     remove_tree(work);
 }
 
+void test_engine_parallel_resume_validation_is_reused() {
+    std::printf("--- engine: parallel resume validates each completed file once ---\n");
+    std::wstring work = make_tree(0, 0);
+    std::wstring source = work + L"\\source";
+    std::wstring destination = work + L"\\destination";
+    storage::fsutil::create_directories(source);
+    constexpr std::int64_t file_size = 12 * 1024;
+    for (int index = 0; index < 3; ++index) {
+        write_pattern_file(source + L"\\small" + std::to_wstring(index) + L".bin",
+                           static_cast<std::size_t>(file_size), 2000 + index);
+    }
+
+    models::CopyJobOptions options;
+    options.SourceRoot = storage::fsutil::wide_to_utf8(source);
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(destination);
+    options.TransferEnginePolicyValue = models::TransferEnginePolicy::NativeFast;
+    options.ResumeFromJournal = false;
+    options.UseBadRangeMap = false;
+    options.UpdateBadRangeMapFromRun = false;
+    options.CopyEmptyDirectories = false;
+    options.ParallelSmallFileWorkers = 2;
+    options.SmallFileThresholdBytes = 64 * 1024;
+    options.VerifyAfterCopy = true;
+    options.VerificationModeValue = models::VerificationMode::Full;
+
+    std::atomic<bool> cancel{false};
+    ExecutionControl control;
+    ResilientCopyEngine initial(options, &control, nullptr, nullptr);
+    const models::CopyJobResult initial_result = initial.run(cancel);
+    options.ResumeFromJournal = true;
+    options.ResumeJournalPathHint = initial_result.JournalPath;
+
+    int validation_progress = 0;
+    int hash_passes = 0;
+    ResilientCopyEngine resumed(
+        options, &control,
+        [&validation_progress](const models::CopyProgressSnapshot& snapshot) {
+            if (snapshot.RescuePass == "ResumeValidation") ++validation_progress;
+        },
+        [&hash_passes](const std::string& message) {
+            if (message.find("Verifying (full hash): small") != std::string::npos) ++hash_passes;
+        });
+    const models::CopyJobResult resumed_result = resumed.run(cancel);
+    check(initial_result.Succeeded && resumed_result.Succeeded &&
+              resumed_result.CompletedFiles == 3 && resumed_result.BytesReused == 3 * file_size,
+          "parallel resume reuses all fully verified completions");
+    check(hash_passes == 3 && resumed_result.BytesVerified == 6 * file_size,
+          "each completed source and destination is hashed exactly once");
+    check(validation_progress > 0, "resume pre-pass reports validation activity");
+
+    std::string changed_file;
+    ResilientCopyEngine changed(
+        options, &control,
+        [&changed_file, &destination](const models::CopyProgressSnapshot& snapshot) {
+            if (snapshot.RescuePass == "ResumeValidation" && changed_file.empty()) {
+                changed_file = snapshot.CurrentFile;
+                write_pattern_file(destination + L"\\" + storage::fsutil::utf8_to_wide(changed_file),
+                                   static_cast<std::size_t>(file_size), 2111);
+            }
+        }, nullptr);
+    const models::CopyJobResult changed_result = changed.run(cancel);
+    check(!changed_file.empty() && changed_result.Succeeded &&
+              changed_result.BytesReused == 2 * file_size &&
+              files_equal(source + L"\\" + storage::fsutil::utf8_to_wide(changed_file),
+                          destination + L"\\" + storage::fsutil::utf8_to_wide(changed_file)),
+          "a destination changed after validation is recopied, not reused");
+
+    std::string changed_source_file;
+    bool source_timestamp_restored = false;
+    ResilientCopyEngine changed_source(
+        options, &control,
+        [&](const models::CopyProgressSnapshot& snapshot) {
+            if (snapshot.RescuePass != "ResumeValidation" || !changed_source_file.empty()) return;
+            changed_source_file = snapshot.CurrentFile;
+            std::wstring path = source + L"\\" + storage::fsutil::utf8_to_wide(changed_source_file);
+            ExistingFileMetadata metadata;
+            if (try_get_existing_file_metadata(path, metadata)) {
+                Sleep(20);
+                write_pattern_file(path, static_cast<std::size_t>(file_size), 2112);
+                source_timestamp_restored = set_last_write_time_utc(path, metadata.last_write_utc_ticks);
+            }
+        }, nullptr);
+    const models::CopyJobResult changed_source_result = changed_source.run(cancel);
+    check(source_timestamp_restored && changed_source_result.Succeeded &&
+              changed_source_result.BytesReused == 2 * file_size &&
+              files_equal(source + L"\\" + storage::fsutil::utf8_to_wide(changed_source_file),
+                          destination + L"\\" + storage::fsutil::utf8_to_wide(changed_source_file)),
+          "a same-size source mutation with a restored timestamp is recopied");
+
+    remove_result_journal(changed_source_result);
+    remove_result_journal(changed_result);
+    remove_result_journal(resumed_result);
+    remove_result_journal(initial_result);
+    remove_tree(work);
+}
+
+void test_engine_parallel_nested_mixed_case_paths() {
+    std::printf("--- engine: parallel nested mixed-case paths ---\n");
+    std::wstring work = make_tree(0, 0);
+    std::wstring source = work + L"\\source";
+    std::wstring destination = work + L"\\destination";
+    const std::vector<std::wstring> names{L"Alpha.bin", L"BETA.bin", L"\u00dcber.bin"};
+    for (int directory = 0; directory < 8; ++directory) {
+        std::wstring subdirectory = L"\\Group" + std::to_wstring(directory);
+        storage::fsutil::create_directories(source + subdirectory);
+        for (std::size_t file = 0; file < names.size(); ++file) {
+            write_pattern_file(source + subdirectory + L"\\" + names[file], 4096,
+                               2200 + directory * 3 + static_cast<unsigned>(file));
+        }
+    }
+
+    models::CopyJobOptions options;
+    options.SourceRoot = storage::fsutil::wide_to_utf8(source);
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(destination);
+    options.TransferEnginePolicyValue = models::TransferEnginePolicy::NativeFast;
+    options.ResumeFromJournal = false;
+    options.UseBadRangeMap = false;
+    options.UpdateBadRangeMapFromRun = false;
+    options.CopyEmptyDirectories = false;
+    options.ParallelSmallFileWorkers = 4;
+    options.SmallFileThresholdBytes = 64 * 1024;
+    options.VerifyAfterCopy = true;
+    options.VerificationModeValue = models::VerificationMode::Full;
+    std::atomic<bool> cancel{false};
+    ExecutionControl control;
+    ResilientCopyEngine engine(options, &control, nullptr, nullptr);
+    const models::CopyJobResult result = engine.run(cancel);
+    bool all_equal = true;
+    for (int directory = 0; directory < 8; ++directory) {
+        std::wstring subdirectory = L"\\Group" + std::to_wstring(directory);
+        for (const auto& name : names) {
+            all_equal = all_equal && files_equal(source + subdirectory + L"\\" + name,
+                                                 destination + subdirectory + L"\\" + name);
+        }
+    }
+    check(result.Succeeded && result.CompletedFiles == 24 &&
+              result.ParallelNativeFastPathFiles == 24 && all_equal,
+          "parallel completions and repeated nested directories preserve all files");
+    remove_result_journal(result);
+    remove_tree(work);
+}
+
+void test_media_identity_publication_probe_cache() {
+    std::printf("--- engine: publication identity probe cache ---\n");
+    RecentMediaIdentityProbe recent;
+    std::atomic<int> probes{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> workers;
+    for (int index = 0; index < 8; ++index) {
+        workers.emplace_back([&] {
+            while (!start.load()) std::this_thread::yield();
+            recent.check([&] {
+                ++probes;
+                Sleep(20);
+                return true;
+            });
+        });
+    }
+    start.store(true);
+    for (auto& worker : workers) worker.join();
+    check(probes.load() == 1, "concurrent publishers share only a completed matching probe");
+    Sleep(300);
+    recent.check([&] { ++probes; return true; });
+    check(probes.load() == 2, "a publication probe older than 250 ms is repeated");
+
+    recent.check_fresh([&] { ++probes; return false; });
+    recent.check([&] { ++probes; return false; });
+    recent.check([&] { ++probes; return false; });
+    check(probes.load() == 5, "an unknown identity is never cached as a match");
+    int failures = 0;
+    for (int index = 0; index < 2; ++index) {
+        try {
+            recent.check([&]() -> bool {
+                ++probes;
+                if (probes.load() > 0) throw IoError("identity mismatch");
+                return false;
+            });
+        } catch (const IoError&) {
+            ++failures;
+        }
+    }
+    check(failures == 2 && probes.load() == 7,
+          "identity mismatches are propagated and never cached as successes");
+    recent.reset();
+    recent.check([&] { ++probes; Sleep(300); return true; });
+    recent.check([&] { ++probes; return true; });
+    check(probes.load() == 9,
+          "a slow probe is not reused after its 250 ms age has elapsed");
+
+    std::wstring work = make_tree(0, 0);
+    std::wstring source = work + L"\\source";
+    std::wstring destination = work + L"\\destination";
+    storage::fsutil::create_directories(source);
+    storage::fsutil::create_directories(destination);
+    write_pattern_file(source + L"\\payload.bin", 4096, 2300);
+    write_pattern_file(destination + L"\\payload.bin", 4096, 2301);
+    auto sentinel = storage::fsutil::read_all_bytes(destination + L"\\payload.bin");
+    models::CopyJobOptions options;
+    options.SourceRoot = storage::fsutil::wide_to_utf8(source);
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(destination);
+    options.ExpectedSourceIdentity = "deliberately-invalid-source-identity";
+    options.ResumeFromJournal = false;
+    options.UseBadRangeMap = false;
+    options.UpdateBadRangeMapFromRun = false;
+    std::atomic<bool> cancel{false};
+    ExecutionControl control;
+    bool mismatch_rejected = false;
+    try {
+        ResilientCopyEngine engine(options, &control, nullptr, nullptr);
+        (void)engine.run(cancel);
+    } catch (const IoError&) {
+        mismatch_rejected = true;
+    }
+    check(mismatch_rejected && sentinel.has_value() &&
+              storage::fsutil::read_all_bytes(destination + L"\\payload.bin") == sentinel,
+          "a real media identity mismatch leaves the destination intact");
+    remove_tree(work);
+}
+
+void test_engine_native_stage_and_managed_fallback() {
+    std::printf("--- engine: native stage and managed fallback ---\n");
+    std::wstring work = make_tree(0, 0);
+    std::wstring source = work + L"\\source";
+    std::wstring destination = work + L"\\destination";
+    storage::fsutil::create_directories(source);
+    storage::fsutil::create_directories(destination);
+    constexpr std::size_t file_size = 16 * 1024 * 1024 + 17;
+    write_pattern_file(source + L"\\payload.bin", file_size, 2400);
+    write_pattern_file(destination + L"\\payload.bin", 4096, 2401);
+    const auto sentinel = storage::fsutil::read_all_bytes(destination + L"\\payload.bin");
+
+    models::CopyJobOptions options;
+    options.SourceRoot = storage::fsutil::wide_to_utf8(source);
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(destination);
+    options.TransferEnginePolicyValue = models::TransferEnginePolicy::NativeFast;
+    options.ResumeFromJournal = false;
+    options.UseBadRangeMap = false;
+    options.UpdateBadRangeMapFromRun = false;
+    options.CopyEmptyDirectories = false;
+    options.ParallelSmallFileWorkers = 1;
+    options.VerifyAfterCopy = true;
+    options.VerificationModeValue = models::VerificationMode::Full;
+    std::atomic<bool> cancel{false};
+    ExecutionControl control;
+    bool saw_native_progress = false;
+    bool sentinel_preserved = false;
+    ResilientCopyEngine native(
+        options, &control,
+        [&](const models::CopyProgressSnapshot& snapshot) {
+            if (snapshot.RescuePass == "NativeFastPath" && !saw_native_progress) {
+                saw_native_progress = true;
+                sentinel_preserved = sentinel.has_value() &&
+                    storage::fsutil::read_all_bytes(destination + L"\\payload.bin") == sentinel;
+            }
+        }, nullptr);
+    const models::CopyJobResult native_result = native.run(cancel);
+    check(native_result.Succeeded && native_result.NativeFastPathFiles == 1 &&
+              saw_native_progress && sentinel_preserved &&
+              files_equal(source + L"\\payload.bin", destination + L"\\payload.bin"),
+          "native copy creates a stage and preserves the old destination until publication");
+
+    write_pattern_file(destination + L"\\payload.bin", 4096, 2401);
+    bool pause_requested = false;
+    bool fallback_logged = false;
+    std::atomic<bool> finished{false};
+    std::thread pause_guard([&] {
+        for (int attempt = 0; attempt < 300 && !finished.load(); ++attempt) Sleep(10);
+        control.resume();
+    });
+    ResilientCopyEngine fallback(
+        options, &control,
+        [&](const models::CopyProgressSnapshot& snapshot) {
+            if (snapshot.RescuePass == "NativeFastPath" && !pause_requested) {
+                pause_requested = true;
+                control.pause();
+            }
+        },
+        [&](const std::string& message) {
+            if (message.find("Native fast-path fallback on payload.bin") != std::string::npos) {
+                fallback_logged = true;
+                control.resume();
+            }
+        });
+    models::CopyJobResult fallback_result;
+    try {
+        fallback_result = fallback.run(cancel);
+    } catch (...) {
+        finished.store(true);
+        pause_guard.join();
+        throw;
+    }
+    finished.store(true);
+    pause_guard.join();
+    check(pause_requested && fallback_logged && fallback_result.Succeeded &&
+              fallback_result.NativeFallbackFiles == 1 && fallback_result.ManagedCopyFiles == 1 &&
+              files_equal(source + L"\\payload.bin", destination + L"\\payload.bin"),
+          "a paused native attempt prepares a fresh managed stage and copies exact bytes");
+    remove_result_journal(fallback_result);
+    remove_result_journal(native_result);
+    remove_tree(work);
+}
+
+void test_engine_parallel_progress_and_overwrite_accounting() {
+    std::printf("--- engine: parallel progress and overwrite accounting ---\n");
+    std::wstring work = make_tree(0, 0);
+    std::wstring source = work + L"\\source";
+    std::wstring destination = work + L"\\destination";
+    std::wstring collision_destination = work + L"\\collision-destination";
+    storage::fsutil::create_directories(source);
+    constexpr int file_count = 16;
+    constexpr std::int64_t file_size = 8192;
+    for (int index = 0; index < file_count; ++index) {
+        write_pattern_file(source + L"\\small" + std::to_wstring(index) + L".bin",
+                           static_cast<std::size_t>(file_size), 2500 + index);
+    }
+    models::CopyJobOptions options;
+    options.SourceRoot = storage::fsutil::wide_to_utf8(source);
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(destination);
+    options.TransferEnginePolicyValue = models::TransferEnginePolicy::NativeFast;
+    options.OverwritePolicyValue = models::OverwritePolicy::SkipExisting;
+    options.ResumeFromJournal = false;
+    options.UseBadRangeMap = false;
+    options.UpdateBadRangeMapFromRun = false;
+    options.CopyEmptyDirectories = false;
+    options.ParallelSmallFileWorkers = 3;
+    options.SmallFileThresholdBytes = 64 * 1024;
+    options.VerifyAfterCopy = true;
+    options.VerificationModeValue = models::VerificationMode::Full;
+    std::atomic<bool> cancel{false};
+    ExecutionControl control;
+    std::atomic<bool> in_phase{false};
+    std::vector<models::CopyProgressSnapshot> snapshots;
+    std::vector<models::CopyProgressSnapshot> phase_snapshots;
+    ResilientCopyEngine engine(
+        options, &control,
+        [&](const models::CopyProgressSnapshot& snapshot) {
+            snapshots.push_back(snapshot);
+            if (in_phase.load() && snapshot.RescuePass == "ParallelNativeFast") {
+                phase_snapshots.push_back(snapshot);
+            }
+        },
+        [&](const std::string& message) {
+            if (message.find("Parallel small file phase: ") != std::string::npos) {
+                in_phase.store(true);
+            } else if (message.find("Parallel small file phase complete:") != std::string::npos) {
+                in_phase.store(false);
+            }
+        });
+    const models::CopyJobResult result = engine.run(cancel);
+    bool monotonic = true;
+    for (std::size_t index = 1; index < snapshots.size(); ++index) {
+        monotonic = monotonic && snapshots[index].CompletedFiles >= snapshots[index - 1].CompletedFiles &&
+                    snapshots[index].WorkBytesCompleted >= snapshots[index - 1].WorkBytesCompleted;
+    }
+    check(!phase_snapshots.empty() && phase_snapshots.front().CompletedFiles > 0 &&
+              phase_snapshots.back().CompletedFiles == file_count && monotonic,
+          "parallel workers report monotonic completed files and bytes during the phase");
+    check(result.Succeeded && result.CompletedFiles == file_count && result.SkippedFiles == 0 &&
+              result.WorkBytesCompleted == file_count * file_size &&
+              result.BytesWritten == file_count * file_size && result.BytesReused == 0,
+          "published files are counted exactly once under SkipExisting");
+
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(collision_destination);
+    std::atomic<bool> collision_injected{false};
+    std::optional<std::vector<unsigned char>> sentinel;
+    ResilientCopyEngine collision(
+        options, &control, nullptr,
+        [&](const std::string& message) {
+            if (message.find("Parallel small file phase: ") != std::string::npos &&
+                !collision_injected.exchange(true)) {
+                write_pattern_file(collision_destination + L"\\small15.bin", 4096, 2600);
+                sentinel = storage::fsutil::read_all_bytes(collision_destination + L"\\small15.bin");
+            }
+        });
+    const models::CopyJobResult collision_result = collision.run(cancel);
+    check(collision_injected.load() && sentinel.has_value() &&
+              storage::fsutil::read_all_bytes(collision_destination + L"\\small15.bin") == sentinel &&
+              !collision_result.Succeeded && collision_result.SkippedFiles == 1 &&
+              collision_result.CompletedFiles == file_count - 1 &&
+              collision_result.WorkBytesCompleted == file_count * file_size,
+          "a destination appearing during the phase is skipped and its bytes remain intact");
+
+    std::wstring cancelled_destination = work + L"\\cancelled-destination";
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(cancelled_destination);
+    options.OverwritePolicyValue = models::OverwritePolicy::Overwrite;
+    ResilientCopyEngine interrupted(
+        options, &control,
+        [&cancel](const models::CopyProgressSnapshot& snapshot) {
+            if (snapshot.RescuePass == "ParallelNativeFast" && snapshot.CompletedFiles > 0) {
+                cancel.store(true);
+            }
+        }, nullptr);
+    bool cancelled_during_phase = false;
+    try {
+        (void)interrupted.run(cancel);
+    } catch (const OperationCanceled& error) {
+        cancelled_during_phase = error.user_requested;
+    }
+    cancel.store(false);
+    options.ResumeFromJournal = true;
+    ResilientCopyEngine resumed(options, &control, nullptr, nullptr);
+    const models::CopyJobResult resumed_result = resumed.run(cancel);
+    check(cancelled_during_phase && resumed_result.Succeeded &&
+              resumed_result.CompletedFiles == file_count && resumed_result.BytesReused >= file_size,
+          "cancellation checkpoints parallel publications for verified resume");
+
+    remove_result_journal(resumed_result);
+    remove_result_journal(collision_result);
+    remove_result_journal(result);
+    remove_tree(work);
+}
+
+void test_concurrent_verification_hashing() {
+    std::printf("--- engine: concurrent verification hashes ---\n");
+    HANDLE source_started = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE destination_started = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (source_started == nullptr || destination_started == nullptr) {
+        check(false, "verification concurrency events are available");
+        if (source_started != nullptr) CloseHandle(source_started);
+        if (destination_started != nullptr) CloseHandle(destination_started);
+        return;
+    }
+    bool source_saw_destination = false;
+    bool destination_saw_source = false;
+    auto hashes = xact::engine::detail::compute_hash_pair_concurrently(
+        [&] {
+            SetEvent(source_started);
+            source_saw_destination = WaitForSingleObject(destination_started, 5000) == WAIT_OBJECT_0;
+            return std::vector<unsigned char>{1, 2};
+        },
+        [&] {
+            SetEvent(destination_started);
+            destination_saw_source = WaitForSingleObject(source_started, 5000) == WAIT_OBJECT_0;
+            return std::vector<unsigned char>{3, 4};
+        });
+    CloseHandle(source_started);
+    CloseHandle(destination_started);
+    check(source_saw_destination && destination_saw_source &&
+              hashes.first == std::vector<unsigned char>({1, 2}) &&
+              hashes.second == std::vector<unsigned char>({3, 4}),
+          "source and destination hash operations overlap and return both digests");
+
+    std::atomic<bool> destination_finished{false};
+    std::atomic<bool> inject_error{true};
+    bool source_error_propagated = false;
+    try {
+        (void)xact::engine::detail::compute_hash_pair_concurrently(
+            [&]() -> std::vector<unsigned char> {
+                if (inject_error.load()) throw IoError("source hash failed");
+                return {};
+            },
+            [&] { destination_finished.store(true); return std::vector<unsigned char>{}; });
+    } catch (const IoError&) {
+        source_error_propagated = true;
+    }
+    check(source_error_propagated && destination_finished.load(),
+          "a source hash error is propagated after the destination thread joins");
+    bool cancellation_propagated = false;
+    try {
+        (void)xact::engine::detail::compute_hash_pair_concurrently(
+            [] { return std::vector<unsigned char>{}; },
+            [&]() -> std::vector<unsigned char> {
+                if (inject_error.load()) throw OperationCanceled{true};
+                return {};
+            });
+    } catch (const OperationCanceled& error) {
+        cancellation_propagated = error.user_requested;
+    }
+    check(cancellation_propagated, "destination hash cancellation crosses the thread boundary");
+
+    std::wstring work = make_tree(0, 0);
+    std::wstring source = work + L"\\source";
+    std::wstring destination = work + L"\\destination";
+    storage::fsutil::create_directories(source);
+    constexpr std::int64_t file_size = 1024 * 1024 + 93;
+    write_pattern_file(source + L"\\payload.bin", static_cast<std::size_t>(file_size), 2700);
+    models::CopyJobOptions options;
+    options.SourceRoot = storage::fsutil::wide_to_utf8(source);
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(destination);
+    options.TransferEnginePolicyValue = models::TransferEnginePolicy::NativeFast;
+    options.ResumeFromJournal = false;
+    options.UseBadRangeMap = false;
+    options.UpdateBadRangeMapFromRun = false;
+    options.CopyEmptyDirectories = false;
+    options.ParallelSmallFileWorkers = 1;
+    options.VerifyAfterCopy = true;
+    options.VerificationModeValue = models::VerificationMode::Full;
+    options.VerificationHashAlgorithmValue = models::VerificationHashAlgorithm::Sha512;
+    std::atomic<bool> cancel{false};
+    ExecutionControl control;
+    ResilientCopyEngine initial(options, &control, nullptr, nullptr);
+    const models::CopyJobResult initial_result = initial.run(cancel);
+    options.ResumeFromJournal = true;
+    options.ResumeJournalPathHint = initial_result.JournalPath;
+    bool removal_attempted = false;
+    bool removed = false;
+    ResilientCopyEngine resumed(
+        options, &control, nullptr,
+        [&](const std::string& message) {
+            if (!removal_attempted && message.find("Verifying (full hash): payload.bin") != std::string::npos) {
+                removal_attempted = true;
+                removed = DeleteFileW(storage::fsutil::long_path(destination + L"\\payload.bin").c_str()) != FALSE;
+            }
+        });
+    const models::CopyJobResult resumed_result = resumed.run(cancel);
+    check(initial_result.Succeeded && removed && resumed_result.Succeeded &&
+              resumed_result.BytesReused == 0 && resumed_result.BytesVerified == 3 * file_size &&
+              files_equal(source + L"\\payload.bin", destination + L"\\payload.bin"),
+          "a missing destination during concurrent SHA-512 validation is safely recopied");
+    remove_result_journal(resumed_result);
+    remove_result_journal(initial_result);
+    remove_tree(work);
+}
+
+void test_timed_io_reuses_events() {
+    std::printf("--- engine: reusable timed I/O events ---\n");
+    std::wstring work = make_tree(0, 0);
+    std::wstring source = work + L"\\source.bin";
+    std::wstring destination = work + L"\\destination.bin";
+    constexpr std::int32_t file_size = 32 * 1024 + 23;
+    write_pattern_file(source, file_size, 2800);
+    std::atomic<bool> cancel_flag{false};
+    CancelContext cancel{&cancel_flag, 0};
+    bool session_ok = true;
+    {
+        FileTransferSession session(source, destination);
+        HANDLE source_event = session.source_event();
+        HANDLE destination_event = session.destination_event();
+        std::vector<unsigned char> buffer(4096);
+        for (std::int32_t offset = 0; offset < file_size;) {
+            const std::int32_t count = std::min<std::int32_t>(4096, file_size - offset);
+            const std::int32_t read = timed_io::read_at(
+                session.source_handle(), offset, buffer.data(), count, 5000, cancel, false,
+                session.source_event());
+            session_ok = session_ok && read == count && session.source_event() == source_event &&
+                         session.destination_event() == destination_event;
+            timed_io::write_at(session.destination_handle(), offset, buffer.data(), read, 5000,
+                               cancel, session.destination_event());
+            offset += count;
+        }
+        session.invalidate_source();
+        unsigned char first_byte = 0;
+        session_ok = session_ok && session.source_event() == source_event &&
+                     timed_io::read_at(session.source_handle(), 0, &first_byte, 1, 5000, cancel,
+                                       false, session.source_event()) == 1;
+        session.invalidate_destination();
+    }
+    check(session_ok && files_equal(source, destination),
+          "one event per session handle serves repeated reads, writes, and reopen");
+
+    const std::wstring pipe_name = L"\\\\.\\pipe\\xactcopy-event-" +
+                                   storage::fsutil::random_temp_suffix();
+    HANDLE server = CreateNamedPipeW(storage::fsutil::long_path(pipe_name).c_str(),
+                                     PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+                                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                                     1, 4096, 4096, 0, nullptr);
+    HANDLE client = INVALID_HANDLE_VALUE;
+    if (server != INVALID_HANDLE_VALUE) {
+        client = CreateFileW(storage::fsutil::long_path(pipe_name).c_str(), GENERIC_WRITE,
+                             0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+    bool connected = false;
+    if (server != INVALID_HANDLE_VALUE && client != INVALID_HANDLE_VALUE) {
+        timed_io::Event connect_event;
+        OVERLAPPED connect{};
+        connect.hEvent = connect_event.get();
+        if (ConnectNamedPipe(server, &connect)) {
+            connected = true;
+        } else {
+            DWORD error = GetLastError();
+            if (error == ERROR_PIPE_CONNECTED) {
+                connected = true;
+            } else if (error == ERROR_IO_PENDING) {
+                if (WaitForSingleObject(connect.hEvent, 5000) == WAIT_OBJECT_0) {
+                    DWORD transferred = 0;
+                    connected = GetOverlappedResult(server, &connect, &transferred, FALSE) != FALSE;
+                } else {
+                    CancelIoEx(server, &connect);
+                    DWORD transferred = 0;
+                    GetOverlappedResult(server, &connect, &transferred, TRUE);
+                }
+            }
+        }
+    }
+    check(connected, "overlapped pipe is available for timeout and cancellation coverage");
+    if (connected) {
+        timed_io::Event event;
+        unsigned char byte = 0;
+        bool timed_out = false;
+        try {
+            (void)timed_io::read_at(server, 0, &byte, 1, 50, cancel, false, event.get());
+        } catch (const IoError& error) {
+            timed_out = error.kind == IoErrorKind::Timeout;
+        }
+
+        std::thread canceller([&] { Sleep(40); cancel_flag.store(true); });
+        bool cancelled = false;
+        std::exception_ptr unexpected_error;
+        try {
+            (void)timed_io::read_at(server, 0, &byte, 1, 5000, cancel, false, event.get());
+        } catch (const OperationCanceled& error) {
+            cancelled = error.user_requested;
+        } catch (...) {
+            unexpected_error = std::current_exception();
+        }
+        canceller.join();
+        cancel_flag.store(false);
+        if (unexpected_error) std::rethrow_exception(unexpected_error);
+
+        const unsigned char expected = 0xA5;
+        DWORD written = 0;
+        const bool sent = WriteFile(client, &expected, 1, &written, nullptr) != FALSE && written == 1;
+        const std::int32_t read = sent ? timed_io::read_at(server, 0, &byte, 1, 5000, cancel,
+                                                          false, event.get()) : 0;
+        check(timed_out && cancelled && sent && read == 1 && byte == expected,
+              "a timed-out and cancelled operation drains before the same event is reused");
+    }
+    if (client != INVALID_HANDLE_VALUE) CloseHandle(client);
+    if (server != INVALID_HANDLE_VALUE) CloseHandle(server);
+    remove_tree(work);
+}
+
+void test_engine_parallel_managed_default_policy() {
+    std::printf("--- engine: parallel managed default policy ---\n");
+    std::wstring work = make_tree(0, 0);
+    std::wstring source = work + L"\\source";
+    std::wstring destination = work + L"\\destination";
+    storage::fsutil::create_directories(source);
+    constexpr int file_count = 12;
+    constexpr std::int64_t file_size = 12 * 1024;
+    for (int index = 0; index < file_count; ++index) {
+        write_pattern_file(source + L"\\small" + std::to_wstring(index) + L".bin",
+                           static_cast<std::size_t>(file_size), 2900 + index);
+    }
+
+    const std::wstring normalized_source = storage::fsutil::get_full_path(source);
+    const std::wstring map_path = storage::BadRangeMapStore::get_default_map_path(normalized_source);
+    remove_bad_range_map_set(map_path);
+    storage::BadRangeMap map;
+    map.SchemaVersion = 1;
+    map.SourceRoot = storage::fsutil::wide_to_utf8(normalized_source);
+    map.SourceIdentity = storage::fsutil::resolve_media_identity(normalized_source);
+    map.UpdatedUtc = time::DateTimeOffset::now_utc();
+    for (int index = 0; index < file_count; ++index) {
+        storage::BadRangeMapFileEntry entry;
+        entry.RelativePath = "small" + std::to_string(index) + ".bin";
+        entry.SourceLength = file_size;
+        entry.BadRanges.push_back(storage::ByteRange{0, 4096});
+        entry.ConfirmationCount = 2;
+        map.Files.set(entry.RelativePath, entry);
+    }
+    storage::BadRangeMapStore map_store;
+    map_store.save(map_path, map);
+
+    models::CopyJobOptions options;
+    options.SourceRoot = storage::fsutil::wide_to_utf8(source);
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(destination);
+    options.ResumeFromJournal = false;
+    options.CopyEmptyDirectories = false;
+    options.ParallelSmallFileWorkers = 3;
+    options.UseBadRangeMap = true;
+    options.SkipKnownBadRanges = false;
+    options.UpdateBadRangeMapFromRun = true;
+    std::atomic<bool> cancel{false};
+    ExecutionControl control;
+    std::atomic<int> phase_progress{0};
+    std::atomic<bool> managed_phase{false};
+    ResilientCopyEngine engine(
+        options, &control,
+        [&](const models::CopyProgressSnapshot& snapshot) {
+            if (snapshot.RescuePass == "ParallelManagedRescue" && snapshot.CompletedFiles > 0) {
+                ++phase_progress;
+            }
+        },
+        [&](const std::string& message) {
+            if (message.find("Parallel small file phase:") != std::string::npos &&
+                message.find("(managed)") != std::string::npos) managed_phase.store(true);
+        });
+    const models::CopyJobResult result = engine.run(cancel);
+    bool all_equal = true;
+    for (int index = 0; index < file_count; ++index) {
+        std::wstring name = L"\\small" + std::to_wstring(index) + L".bin";
+        all_equal = all_equal && files_equal(source + name, destination + name);
+    }
+    auto updated_map = map_store.load(map_path);
+    check(options.TransferEnginePolicyValue == models::TransferEnginePolicy::Auto &&
+              options.MaxRetries == 2 && managed_phase.load() && phase_progress.load() > 0 &&
+              result.Succeeded && result.CompletedFiles == file_count &&
+              result.ManagedCopyFiles == file_count && result.ParallelNativeFastPathFiles == 0 &&
+              result.WorkBytesCompleted == file_count * file_size &&
+              result.BytesWritten == file_count * file_size && all_equal,
+          "Auto with two retries publishes fully verified managed files in parallel");
+    check(updated_map.has_value() && updated_map->Files.size() == 0,
+          "parallel exact reads safely clear stale bad-range map entries");
+
+    std::wstring deferred_destination = work + L"\\deferred-destination";
+    storage::fsutil::create_directories(deferred_destination);
+    write_pattern_file(deferred_destination + L"\\small0.bin", 4096, 2999);
+    const auto sentinel = storage::fsutil::read_all_bytes(deferred_destination + L"\\small0.bin");
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(deferred_destination);
+    options.UseBadRangeMap = false;
+    options.UpdateBadRangeMapFromRun = false;
+    HANDLE blocked_source = INVALID_HANDLE_VALUE;
+    bool sentinel_preserved = false;
+    bool saw_deferred = false;
+    ResilientCopyEngine deferred(
+        options, &control, nullptr,
+        [&](const std::string& message) {
+            if (message.find("Parallel small file phase:") != std::string::npos) {
+                blocked_source = CreateFileW(
+                    storage::fsutil::long_path(source + L"\\small0.bin").c_str(), GENERIC_WRITE,
+                    0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            } else if (message.find("Parallel small file phase complete:") != std::string::npos) {
+                saw_deferred = message.find("1 deferred to sequential path") != std::string::npos;
+                sentinel_preserved = sentinel.has_value() &&
+                    storage::fsutil::read_all_bytes(deferred_destination + L"\\small0.bin") == sentinel;
+                if (blocked_source != INVALID_HANDLE_VALUE) {
+                    CloseHandle(blocked_source);
+                    blocked_source = INVALID_HANDLE_VALUE;
+                }
+            }
+        });
+    const models::CopyJobResult deferred_result = deferred.run(cancel);
+    if (blocked_source != INVALID_HANDLE_VALUE) CloseHandle(blocked_source);
+    check(saw_deferred && sentinel_preserved && deferred_result.Succeeded &&
+              deferred_result.CompletedFiles == file_count &&
+              deferred_result.ManagedCopyFiles == file_count &&
+              files_equal(source + L"\\small0.bin", deferred_destination + L"\\small0.bin"),
+          "a failed managed worker preserves the old destination and retries sequentially");
+
+    std::wstring recovery_destination = work + L"\\recovery-destination";
+    storage::fsutil::create_directories(recovery_destination);
+    write_pattern_file(recovery_destination + L"\\small0.bin", 4096, 3000);
+    const auto recovery_sentinel = storage::fsutil::read_all_bytes(recovery_destination + L"\\small0.bin");
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(recovery_destination);
+    options.SalvageUnreadableBlocks = true;
+    options.MaxRetries = 0;
+    HANDLE read_block = INVALID_HANDLE_VALUE;
+    bool attempted_recovery = false;
+    bool recovery_withheld = false;
+    ResilientCopyEngine recovery(
+        options, &control, nullptr,
+        [&](const std::string& message) {
+            if (message.find("Parallel small file phase:") != std::string::npos) {
+                read_block = CreateFileW(
+                    storage::fsutil::long_path(source + L"\\small0.bin").c_str(), GENERIC_READ,
+                    FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, nullptr);
+            } else if (message.find("Recovered unreadable block on small0.bin") != std::string::npos) {
+                attempted_recovery = true;
+            } else if (message.find("Parallel small file phase complete:") != std::string::npos) {
+                bool no_sidecar = true;
+                std::error_code error;
+                for (std::filesystem::directory_iterator it(recovery_destination, error), end;
+                     !error && it != end; it.increment(error)) {
+                    if (it->path().filename().wstring().find(L".xactcopy-recovered.") !=
+                        std::wstring::npos) no_sidecar = false;
+                }
+                recovery_withheld = !error && no_sidecar && recovery_sentinel.has_value() &&
+                    storage::fsutil::read_all_bytes(recovery_destination + L"\\small0.bin") == recovery_sentinel;
+                if (read_block != INVALID_HANDLE_VALUE) {
+                    CloseHandle(read_block);
+                    read_block = INVALID_HANDLE_VALUE;
+                }
+            }
+        });
+    const models::CopyJobResult recovery_result = recovery.run(cancel);
+    if (read_block != INVALID_HANDLE_VALUE) CloseHandle(read_block);
+    check(attempted_recovery && recovery_withheld && recovery_result.Succeeded &&
+              recovery_result.RecoveredFiles == 0 &&
+              files_equal(source + L"\\small0.bin", recovery_destination + L"\\small0.bin"),
+          "synthetic parallel recovery stays unpublished and is retried sequentially");
+
+    std::wstring collision_destination = work + L"\\collision-destination";
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(collision_destination);
+    options.SalvageUnreadableBlocks = false;
+    options.MaxRetries = 2;
+    options.OverwritePolicyValue = models::OverwritePolicy::SkipExisting;
+    std::optional<std::vector<unsigned char>> collision_sentinel;
+    ResilientCopyEngine collision(
+        options, &control, nullptr,
+        [&](const std::string& message) {
+            if (message.find("Parallel small file phase:") != std::string::npos) {
+                write_pattern_file(collision_destination + L"\\small0.bin", 4096, 3001);
+                collision_sentinel = storage::fsutil::read_all_bytes(collision_destination + L"\\small0.bin");
+            }
+        });
+    const models::CopyJobResult collision_result = collision.run(cancel);
+    check(collision_sentinel.has_value() &&
+              storage::fsutil::read_all_bytes(collision_destination + L"\\small0.bin") == collision_sentinel &&
+              !collision_result.Succeeded && collision_result.SkippedFiles == 1 &&
+              collision_result.CompletedFiles == file_count - 1 &&
+              collision_result.WorkBytesCompleted == file_count * file_size,
+          "managed workers defer a new SkipExisting conflict without replacing it");
+
+    std::wstring cancelled_destination = work + L"\\cancelled-destination";
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(cancelled_destination);
+    options.OverwritePolicyValue = models::OverwritePolicy::Overwrite;
+    ResilientCopyEngine interrupted(
+        options, &control,
+        [&cancel](const models::CopyProgressSnapshot& snapshot) {
+            if (snapshot.RescuePass == "ParallelManagedRescue" && snapshot.CompletedFiles > 0) {
+                cancel.store(true);
+            }
+        }, nullptr);
+    bool cancelled_during_phase = false;
+    try {
+        (void)interrupted.run(cancel);
+    } catch (const OperationCanceled& error) {
+        cancelled_during_phase = error.user_requested;
+    }
+    cancel.store(false);
+    options.ResumeFromJournal = true;
+    ResilientCopyEngine resumed(options, &control, nullptr, nullptr);
+    const models::CopyJobResult resumed_result = resumed.run(cancel);
+    check(cancelled_during_phase && resumed_result.Succeeded &&
+              resumed_result.CompletedFiles == file_count && resumed_result.BytesReused >= file_size,
+          "managed parallel cancellation checkpoints publications for verified resume");
+
+    remove_result_journal(resumed_result);
+    remove_result_journal(collision_result);
+    remove_result_journal(recovery_result);
+    remove_result_journal(deferred_result);
+    remove_result_journal(result);
+    remove_bad_range_map_set(map_path);
+    remove_tree(work);
+}
+
 void test_engine_refuses_ask_and_preserves_destination() {
     std::printf("--- engine: Ask conflict is explicit and non-destructive ---\n");
     std::wstring work = make_tree(0, 0);
@@ -2320,6 +3148,14 @@ int main() {
     test_engine_efs_policy_when_supported();
     test_engine_reports_hard_link_topology_limit();
     test_engine_parallel_native_requires_full_verification();
+    test_engine_parallel_resume_validation_is_reused();
+    test_engine_parallel_nested_mixed_case_paths();
+    test_media_identity_publication_probe_cache();
+    test_engine_native_stage_and_managed_fallback();
+    test_engine_parallel_progress_and_overwrite_accounting();
+    test_concurrent_verification_hashing();
+    test_timed_io_reuses_events();
+    test_engine_parallel_managed_default_policy();
     test_engine_refuses_ask_and_preserves_destination();
     test_engine_stages_destination_on_failure();
     test_engine_fault_injection_timeout_and_offline_are_safe();
