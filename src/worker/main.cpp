@@ -594,6 +594,28 @@ void notify_manual_launch() {
 
 } // namespace
 
+// An elevated token holds these privileges but disabled. Without them,
+// capture_file_security cannot read SACLs and apply_file_security cannot set
+// a foreign owner, so an administrator run would still report those as not
+// preserved. SeRestore only changes owner assignment here: file opens do not
+// use FILE_FLAG_BACKUP_SEMANTICS, so access checks are unchanged. A normal
+// token lacks both and AdjustTokenPrivileges leaves it as it is.
+static void enable_security_privileges() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        return;
+    }
+    for (const wchar_t* name : {SE_SECURITY_NAME, SE_RESTORE_NAME}) {
+        TOKEN_PRIVILEGES privileges{};
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        if (LookupPrivilegeValueW(nullptr, name, &privileges.Privileges[0].Luid)) {
+            AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr);
+        }
+    }
+    CloseHandle(token);
+}
+
 int wmain(int argc, wchar_t** argv) {
     std::wstring pipe_name = read_pipe_name(argc, argv);
     DWORD parent_pid = read_parent_pid(argc, argv);
@@ -601,6 +623,7 @@ int wmain(int argc, wchar_t** argv) {
         notify_manual_launch();
         return 2;
     }
+    enable_security_privileges();
 
     WorkerHost host;
     return host.run(pipe_name, parent_pid);

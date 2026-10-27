@@ -35,6 +35,7 @@
 
 #include "app_icon.h"
 #include "dialogs.h"
+#include "elevation.h"
 #include "explorer_integration.h"
 #include "job_manager.h"
 #include "job_manager_dialog.h"
@@ -122,6 +123,8 @@ constexpr int IdClearSelection = 1041;
 // this quiet period elapses, giving one source root and one destination prompt.
 constexpr UINT IdSelectionTimer = 1;
 constexpr UINT IdDiagnosticsTimer = 2;
+// Polls an elevated relaunch until it accepts the handoff or exits.
+constexpr UINT IdElevationTimer = 3;
 constexpr UINT SelectionCoalesceMs = 700;
 
 constexpr const wchar_t* WindowClassName = L"XactCopyNativeMain";
@@ -149,6 +152,12 @@ std::string format_bytes_short(std::int64_t value) {
 
 class MainWindow {
 public:
+    // Set by wWinMain when this process is the elevated relaunch of a window
+    // that asked for a direct-NTFS assessment; run() starts it after startup.
+    void set_incoming_handoff(ui::elevation::HandoffRequest request) {
+        incoming_handoff_ = std::move(request);
+    }
+
     int run(HINSTANCE instance, const ui::LaunchOptions& launch) {
         instance_ = instance;
         launch_ = launch;
@@ -203,6 +212,13 @@ public:
 
         ui::apply_window_icons(hwnd_);
         ui::set_dark_title_bar(hwnd_, theme_.dark && theme_.themed_chrome);
+        if (process_elevated_) {
+            // Explorer verbs and drag-and-drop come from normal-integrity
+            // processes; let them reach this High-integrity window.
+            ui::elevation::allow_unelevated_messages(hwnd_);
+            SetWindowTextW(hwnd_, L"XactCopy (Administrator)");
+        }
+        ui::elevation::cleanup_stale_handoffs();
         DragAcceptFiles(hwnd_, TRUE); // dropped items join the selection
         restore_window_placement();
         ShowWindow(hwnd_, restore_maximized_ ? SW_SHOWMAXIMIZED : SW_SHOW);
@@ -236,8 +252,19 @@ public:
             check_for_updates(/*show_dialog*/ false);
         }
 
+        // An elevated relaunch exists to run one specific request; start it
+        // before any startup queue drain could take the worker first.
+        if (incoming_handoff_.has_value()) {
+            ui::elevation::HandoffRequest request = std::move(*incoming_handoff_);
+            incoming_handoff_.reset();
+            append_log("Running with administrator rights for direct NTFS volume reads.");
+            apply_run_options_to_ui(request.Options);
+            start_job_with(request.Options, request.FromRecovery, request.ManagedRunId,
+                           request.DisplayName);
+        }
+
         // Startup queue drain (MainForm honors AutoRunQueuedJobsOnStartup).
-        if (!supervisor_.is_job_running() &&
+        if (!supervisor_.is_job_running() && !starting_ &&
             settings_.get_bool("AutoRunQueuedJobsOnStartup", false)) {
             append_log("Startup queue mode enabled. Looking for queued jobs.");
             run_next_queued_job(/*manual*/ false);
@@ -322,6 +349,20 @@ private:
     bool paused_ = false;
     std::string active_run_id_;
     std::string active_managed_run_id_; // JobCatalog run id for the current job
+
+    // Direct-NTFS elevation (see elevation.h). `outgoing_handoff_` is a start
+    // this window passed to an elevated relaunch and is waiting on;
+    // `incoming_handoff_` is a start this (elevated) window received.
+    struct OutgoingHandoff {
+        ui::elevation::HandoffRequest request;
+        std::string token;
+        HANDLE process = nullptr;
+        ULONGLONG started_tick = 0;
+    };
+    const bool process_elevated_ = ui::elevation::is_process_elevated();
+    std::optional<OutgoingHandoff> outgoing_handoff_;
+    std::optional<ui::elevation::HandoffRequest> incoming_handoff_;
+    std::string pending_recovery_run_id_; // crash-recovery run being resumed by start_job_with
     bool restore_maximized_ = false;    // deferred maximize from saved placement
     bool checking_updates_ = false;
     bool update_check_show_dialog_ = false;
@@ -567,6 +608,10 @@ private:
                     refresh_diagnostics_label();
                     return 0;
                 }
+                if (wparam == IdElevationTimer) {
+                    poll_elevated_handoff();
+                    return 0;
+                }
                 return DefWindowProcW(hwnd_, message, wparam, lparam);
             case WM_DROPFILES: {
                 // Files/folders dropped on the window join the same selection.
@@ -607,6 +652,11 @@ private:
             case WM_DESTROY:
                 KillTimer(hwnd_, IdSelectionTimer);
                 KillTimer(hwnd_, IdDiagnosticsTimer);
+                KillTimer(hwnd_, IdElevationTimer);
+                if (outgoing_handoff_.has_value() && outgoing_handoff_->process != nullptr) {
+                    CloseHandle(outgoing_handoff_->process);
+                    outgoing_handoff_.reset();
+                }
                 if (start_thread_.joinable()) start_thread_.join();
                 if (update_thread_.joinable()) update_thread_.join();
                 supervisor_.stop();
@@ -989,7 +1039,7 @@ private:
 
     static void open_folder_in_explorer(const std::wstring& folder) {
         storage::fsutil::create_directories(folder);
-        ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        ui::elevation::open_as_user(nullptr, folder);
     }
 
     std::optional<std::wstring> selected_source_map_path() {
@@ -2593,6 +2643,26 @@ private:
             info_box(L"Choose a destination folder first.");
             return;
         }
+        if (outgoing_handoff_.has_value()) return; // an elevated relaunch is taking over
+
+        // Direct NTFS reads need administrator rights. Every start path (manual,
+        // Job Manager, queue, crash recovery, Explorer verb) passes through
+        // here, so this is where an unelevated window hands the run to an
+        // elevated relaunch instead of silently falling back to file reads.
+        std::string raw_unsupported;
+        if (ui::elevation::raw_scan_requires_elevation(options, process_elevated_,
+                                                       raw_unsupported)) {
+            if (!begin_elevated_handoff(options, from_recovery, managed_run_id,
+                                        managed_display_name)) {
+                return;
+            }
+            // Declined or failed, and the user chose standard file reads.
+        } else if (!raw_unsupported.empty() &&
+                   options.OperationMode == models::JobOperationMode::ScanOnly &&
+                   options.UseExperimentalRawDiskScan) {
+            append_log("Direct NTFS reads are not available: " + raw_unsupported +
+                       ". Standard file reads will be used.");
+        }
 
         if (options.OperationMode == models::JobOperationMode::Copy) {
             std::wstring risks;
@@ -2685,6 +2755,137 @@ private:
                              reinterpret_cast<LPARAM>(new std::string(ex.what())));
             }
         });
+    }
+
+    // ---- Direct-NTFS elevation handoff ------------------------------------
+
+    // Returns true when the caller should continue starting the run here
+    // (with direct reads switched off because elevation was declined or
+    // failed); false when the run was handed off or abandoned.
+    bool begin_elevated_handoff(models::CopyJobOptions& options, bool from_recovery,
+                                const std::string& managed_run_id,
+                                const std::string& managed_display_name) {
+        ui::elevation::HandoffRequest request;
+        request.Options = options;
+        request.FromRecovery = from_recovery;
+        request.ManagedRunId = managed_run_id;
+        request.DisplayName = managed_display_name;
+        request.RecoveryRunId = from_recovery ? pending_recovery_run_id_ : std::string();
+        request.UserSid = ui::elevation::current_user_sid();
+        request.CreatedUnixMs = ui::elevation::unix_now_ms();
+
+        append_log("Direct NTFS volume reads need administrator rights. Asking Windows for approval...");
+        const std::string token = ui::elevation::write_handoff(request);
+        if (token.empty()) {
+            return handle_elevation_unavailable(
+                request, options, "The elevation request could not be saved.");
+        }
+        HANDLE process = nullptr;
+        DWORD error = 0;
+        const auto outcome = ui::elevation::relaunch_elevated(hwnd_, token, process, error);
+        if (outcome != ui::elevation::LaunchOutcome::Started) {
+            ui::elevation::discard_handoff(token);
+            return handle_elevation_unavailable(
+                request, options,
+                outcome == ui::elevation::LaunchOutcome::Declined
+                    ? std::string("Administrator approval was declined.")
+                    : "XactCopy could not be restarted as administrator (Win32 " +
+                          std::to_string(error) + ").");
+        }
+
+        outgoing_handoff_ = OutgoingHandoff{std::move(request), token, process, GetTickCount64()};
+        EnableWindow(start_button_, FALSE);
+        set_inputs_enabled(false);
+        SetWindowTextW(status_label_, L"Status: Handing the run to the administrator window...");
+        SetTimer(hwnd_, IdElevationTimer, 250, nullptr);
+        return false;
+    }
+
+    // Elevation is not possible for this attempt. Offer the same run with
+    // standard file reads, or leave every record as it was before the click.
+    bool handle_elevation_unavailable(const ui::elevation::HandoffRequest& request,
+                                      models::CopyJobOptions& options,
+                                      const std::string& reason) {
+        append_log("WARNING: " + reason);
+        if (confirm_box(storage::fsutil::utf8_to_wide(
+                            reason + "\n\nRun this assessment with standard file reads instead? "
+                                     "Results are equivalent for readable data, but unreadable "
+                                     "regions are located through the filesystem rather than "
+                                     "the raw volume."),
+                        L"XactCopy - Direct NTFS reads unavailable", ui::MessageIcon::Question)) {
+            options.UseExperimentalRawDiskScan = false;
+            append_log("Continuing with standard file reads for this run.");
+            return true;
+        }
+        abandon_handoff_request(request, reason);
+        return false;
+    }
+
+    void abandon_handoff_request(const ui::elevation::HandoffRequest& request,
+                                 const std::string& reason) {
+        // A queued or Job Manager run was already recorded; close it out so it
+        // does not sit in the catalog as created-but-never-started.
+        if (!request.ManagedRunId.empty()) {
+            models::CopyJobResult failure;
+            failure.ErrorMessage = "Not started: " + reason;
+            job_manager_.mark_run_completed(request.ManagedRunId, failure);
+        }
+        // A declined crash-recovery resume stays pending for the next launch.
+        if (request.FromRecovery) recovery_.mark_resume_prompt_deferred(settings_, false);
+        append_log("Run not started: " + reason);
+    }
+
+    void poll_elevated_handoff() {
+        if (!outgoing_handoff_.has_value()) {
+            KillTimer(hwnd_, IdElevationTimer);
+            return;
+        }
+        OutgoingHandoff& handoff = *outgoing_handoff_;
+        const bool exited = WaitForSingleObject(handoff.process, 0) == WAIT_OBJECT_0;
+        // The elevated instance deletes the request file the moment it has
+        // read and validated it; that is its acceptance.
+        if (!exited && !ui::elevation::handoff_pending(handoff.token)) {
+            KillTimer(hwnd_, IdElevationTimer);
+            CloseHandle(handoff.process);
+            outgoing_handoff_.reset();
+            append_log("The administrator window accepted the run. Closing this window.");
+            ShowWindow(hwnd_, SW_HIDE);
+            // Clean shutdown releases the single-instance mutex the elevated
+            // window is waiting for. No job is running in this window.
+            PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+            return;
+        }
+        const bool timed_out = GetTickCount64() - handoff.started_tick > 60'000;
+        if (!exited && !timed_out) return;
+
+        KillTimer(hwnd_, IdElevationTimer);
+        DWORD exit_code = 0;
+        if (exited) GetExitCodeProcess(handoff.process, &exit_code);
+        CloseHandle(handoff.process);
+        ui::elevation::discard_handoff(handoff.token);
+        ui::elevation::HandoffRequest request = std::move(handoff.request);
+        outgoing_handoff_.reset();
+        EnableWindow(start_button_, TRUE);
+        set_inputs_enabled(true);
+        SetWindowTextW(status_label_, L"Status: Idle");
+
+        std::string reason;
+        if (!exited) {
+            reason = "The administrator window did not respond.";
+        } else if (exit_code == ui::elevation::ExitHandoffWrongUser) {
+            reason = "Administrator approval was given for a different Windows account. XactCopy "
+                     "keeps journals and keys per account, so the run cannot continue there.";
+        } else {
+            reason = "The administrator window could not take over the run (exit code " +
+                     std::to_string(exit_code) + ").";
+        }
+        models::CopyJobOptions options = request.Options;
+        if (handle_elevation_unavailable(request, options, reason)) {
+            if (request.FromRecovery) pending_recovery_run_id_ = request.RecoveryRunId;
+            start_job_with(options, request.FromRecovery, request.ManagedRunId,
+                           request.DisplayName);
+            pending_recovery_run_id_.clear();
+        }
     }
 
     void on_start_done(bool ok, const std::string& error) {
@@ -3083,6 +3284,11 @@ private:
     void maybe_prompt_recovery() {
         ui::RecoveryStartupInfo info = recovery_.initialize_session(settings_, launch_);
         if (!info.has_interrupted_run()) return;
+        // An elevated relaunch carries the run the user already chose in the
+        // unelevated window, which had this same recovery state and already
+        // asked about it. Asking again here would offer the run twice; any
+        // other pending run stays pending for the next normal launch.
+        if (incoming_handoff_.has_value()) return;
 
         const auto& run = *info.interrupted_run;
         if (info.should_auto_resume) {
@@ -3112,7 +3318,9 @@ private:
                                    ? "assessment"
                                    : "copy") +
                    " options from the interrupted run.");
+        pending_recovery_run_id_ = run.RunId;
         start_job_with(options, true, run.ManagedRunId, run.JobName);
+        pending_recovery_run_id_.clear();
     }
 };
 
@@ -3177,6 +3385,73 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     // GetCommandLineW (not lpCmdLine) so argv[0] is the executable, matching
     // parse_launch_options' expectations.
     const wchar_t* full_command_line = GetCommandLineW();
+
+    // Elevated relaunch for a direct-NTFS assessment (see elevation.h). The
+    // unelevated window that asked for it still holds the single-instance
+    // mutex and is waiting for this process to accept the request, so this
+    // path must not forward to it: validate, accept, then wait for the mutex.
+    std::string handoff_token;
+    std::string origin_sid;
+    {
+        int argc = 0;
+        wchar_t** argv = CommandLineToArgvW(full_command_line, &argc);
+        for (int i = 1; argv != nullptr && i + 1 < argc; ++i) {
+            if (_wcsicmp(argv[i], ui::elevation::HandoffSwitch) == 0) {
+                handoff_token = storage::fsutil::wide_to_utf8(argv[++i]);
+            } else if (_wcsicmp(argv[i], ui::elevation::OriginSidSwitch) == 0) {
+                origin_sid = storage::fsutil::wide_to_utf8(argv[++i]);
+            }
+        }
+        if (argv != nullptr) LocalFree(argv);
+    }
+    std::optional<ui::elevation::HandoffRequest> handoff;
+    if (!handoff_token.empty()) {
+        if (origin_sid.empty() || origin_sid != ui::elevation::current_user_sid()) {
+            // Over-the-shoulder UAC: an administrator approved with their own
+            // account. This process's journals, keys, and settings belong to
+            // that account, and it cannot read the requester's handoff file.
+            MessageBoxW(nullptr,
+                        L"Administrator approval was given for a different Windows account.\n\n"
+                        L"XactCopy keeps its journals and keys per account, so direct NTFS reads "
+                        L"must be approved by an administrator account that is also the signed-in "
+                        L"user. The original window will offer standard file reads instead.",
+                        L"XactCopy", MB_OK | MB_ICONWARNING);
+            return static_cast<int>(ui::elevation::ExitHandoffWrongUser);
+        }
+        ui::elevation::HandoffRequest request;
+        const auto status = ui::elevation::consume_handoff(handoff_token, request);
+        if (status != ui::elevation::HandoffStatus::Ok) {
+            const std::wstring text =
+                L"XactCopy was started as administrator, but the run request was refused: " +
+                storage::fsutil::utf8_to_wide(ui::elevation::describe(status)) + L".";
+            MessageBoxW(nullptr, text.c_str(), L"XactCopy", MB_OK | MB_ICONWARNING);
+            return static_cast<int>(ui::elevation::ExitHandoffRejected);
+        }
+        handoff = std::move(request);
+    }
+
+    if (handoff.has_value()) {
+        HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\XactCopyNative.SingleInstance");
+        if (mutex != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
+            const DWORD wait = WaitForSingleObject(mutex, 60'000);
+            if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+                MessageBoxW(nullptr,
+                            L"The previous XactCopy window did not close, so the administrator "
+                            L"window cannot take over. Close XactCopy and start the assessment again.",
+                            L"XactCopy", MB_OK | MB_ICONWARNING);
+                CloseHandle(mutex);
+                return static_cast<int>(ui::elevation::ExitHandoffMutexTimeout);
+            }
+        }
+        MainWindow window;
+        window.set_incoming_handoff(std::move(*handoff));
+        int result = window.run(instance, ui::LaunchOptions{});
+        if (mutex != nullptr) {
+            ReleaseMutex(mutex);
+            CloseHandle(mutex);
+        }
+        return result;
+    }
 
     // Single instance: hand our launch arguments to the running copy (so an
     // Explorer verb still lands on a selection) and surface its window.

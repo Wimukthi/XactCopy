@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "dialogs.h"      // dialog_detail::ModalHost, themedraw
+#include "elevation.h"
 #include "settings.h"
 #include "theme.h"
 #include "update_service.h"
@@ -1074,8 +1075,8 @@ private:
 
     void view_release() {
         if (release_.html_url.empty()) return;
-        ShellExecuteW(hwnd_, L"open", storage::fsutil::utf8_to_wide(release_.html_url).c_str(),
-                      nullptr, nullptr, SW_SHOWNORMAL);
+        // As the signed-in user: an elevated XactCopy must not start the browser elevated.
+        elevation::open_as_user(hwnd_, storage::fsutil::utf8_to_wide(release_.html_url));
     }
 };
 

@@ -101,7 +101,7 @@ if ($Compiler -eq "gcc") {
     $uiRes = Join-Path $outDir "xactcopy_ui_res.o"
     & windres (Join-Path $cppRoot "src\ui\app.rc") $uiRes --include-dir (Join-Path $cppRoot "src\ui")
     if ($LASTEXITCODE -ne 0) { throw "ui resource compile failed" }
-    & g++ @commonFlags @themeFlags -municode -mwindows $uiSource @themeSources $uiRes -o $uiExe @storageLibs -lcomctl32 -lcomdlg32 -ldwmapi -luxtheme -lgdi32 -lgdiplus -lmsimg32 -lshlwapi -lwinhttp -lversion
+    & g++ @commonFlags @themeFlags -municode -mwindows $uiSource @themeSources $uiRes -o $uiExe @storageLibs -lcomctl32 -lcomdlg32 -ldwmapi -luxtheme -lgdi32 -lgdiplus -lmsimg32 -lshlwapi -lwinhttp -lversion -loleaut32
     if ($LASTEXITCODE -ne 0) { throw "ui build failed" }
 } else {
     # Locate vcvars64.bat rather than hardcoding an edition: vswhere first (it
@@ -152,7 +152,7 @@ cl /nologo /std:c++20 /permissive- /W4 /O2 /EHsc /utf-8 "$workerTestSource" /Fe:
 if errorlevel 1 exit /b 1
 rc /nologo /fo "$outDir\xactcopy_ui.res" "$cppRoot\src\ui\app.rc"
 if errorlevel 1 exit /b 1
-cl /nologo /std:c++20 /permissive- /W4 /O2 /EHsc /utf-8 /DUNICODE /D_UNICODE $themeDefinitionArgs $themeIncludeArgs "$uiSource" $themeSourceArgs /Fe:"$uiExe" /Fo:"$outDir\\" /link /SUBSYSTEM:WINDOWS "$outDir\xactcopy_ui.res" bcrypt.lib crypt32.lib ole32.lib shell32.lib uuid.lib advapi32.lib user32.lib comctl32.lib comdlg32.lib dwmapi.lib uxtheme.lib gdi32.lib gdiplus.lib msimg32.lib shlwapi.lib winhttp.lib version.lib
+cl /nologo /std:c++20 /permissive- /W4 /O2 /EHsc /utf-8 /DUNICODE /D_UNICODE $themeDefinitionArgs $themeIncludeArgs "$uiSource" $themeSourceArgs /Fe:"$uiExe" /Fo:"$outDir\\" /link /SUBSYSTEM:WINDOWS "$outDir\xactcopy_ui.res" bcrypt.lib crypt32.lib ole32.lib shell32.lib uuid.lib advapi32.lib user32.lib comctl32.lib comdlg32.lib dwmapi.lib uxtheme.lib gdi32.lib gdiplus.lib msimg32.lib shlwapi.lib winhttp.lib version.lib oleaut32.lib
 "@
     $batPath = Join-Path $outDir "msvc_build.bat"
     # Batch files must be CRLF-terminated ASCII or cmd mis-parses them.

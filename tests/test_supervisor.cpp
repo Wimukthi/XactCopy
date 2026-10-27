@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/ui/elevation.h"
 #include "../src/ui/job_manager.h"
 #include "../src/ui/recovery.h"
 #include "../src/ui/settings.h"
@@ -245,6 +246,90 @@ void test_kill_recovery() {
 
     supervisor.stop();
     check(true, "supervisor stopped cleanly after recovery");
+}
+
+void test_elevation_handoff() {
+    std::printf("--- elevation: direct-NTFS handoff validation ---\n");
+    namespace el = ui::elevation;
+    const std::string sid = el::current_user_sid();
+    check(!sid.empty(), "current user SID resolves");
+
+    el::HandoffRequest request;
+    request.Options.OperationMode = models::JobOperationMode::ScanOnly;
+    request.Options.UseExperimentalRawDiskScan = true;
+    request.Options.SourceRoot = "C:\\Data";
+    request.Options.SelectedRelativePaths = {"a.bin", "nested\\b.bin"};
+    request.FromRecovery = true;
+    request.ManagedRunId = "managed-1";
+    request.DisplayName = "Nightly assessment";
+    request.RecoveryRunId = "recovery-1";
+    request.UserSid = sid;
+    request.CreatedUnixMs = el::unix_now_ms();
+
+    std::string token = el::write_handoff(request);
+    check(el::is_handoff_token(token), "handoff token is a SHA-256 hex digest");
+    check(el::handoff_pending(token), "written handoff is visible to the waiting window");
+    el::HandoffRequest loaded;
+    check(el::consume_handoff(token, loaded) == el::HandoffStatus::Ok, "valid handoff is accepted");
+    check(!el::handoff_pending(token), "accepting a handoff removes it (the acceptance signal)");
+    check(loaded.Options.SourceRoot == "C:\\Data" && loaded.Options.UseExperimentalRawDiskScan &&
+              loaded.Options.SelectedRelativePaths.size() == 2 && loaded.FromRecovery &&
+              loaded.ManagedRunId == "managed-1" && loaded.DisplayName == "Nightly assessment" &&
+              loaded.RecoveryRunId == "recovery-1",
+          "handoff round-trips the exact run request");
+    check(el::consume_handoff(token, loaded) == el::HandoffStatus::Missing,
+          "a consumed handoff cannot be replayed");
+
+    // Content swapped after approval: the approved token no longer matches.
+    token = el::write_handoff(request);
+    el::HandoffRequest swapped = request;
+    swapped.Options.SourceRoot = "D:\\Other";
+    const std::string swapped_payload = swapped.to_json();
+    storage::fsutil::write_file_raw(el::handoff_path(token),
+                                    reinterpret_cast<const unsigned char*>(swapped_payload.data()),
+                                    swapped_payload.size(), false, false);
+    check(el::consume_handoff(token, loaded) == el::HandoffStatus::Tampered,
+          "a request rewritten after approval is refused");
+
+    token = el::write_handoff(request);
+    check(el::consume_handoff(token, loaded, el::unix_now_ms(), "S-1-5-21-0-0-0-1001") ==
+              el::HandoffStatus::WrongUser,
+          "a handoff for another account is refused");
+
+    el::HandoffRequest stale = request;
+    stale.CreatedUnixMs = el::unix_now_ms() - el::HandoffMaximumAgeMs - 1000;
+    token = el::write_handoff(stale);
+    check(el::consume_handoff(token, loaded) == el::HandoffStatus::Expired,
+          "an old handoff is refused");
+
+    el::HandoffRequest copy_request = request;
+    copy_request.Options.OperationMode = models::JobOperationMode::Copy;
+    token = el::write_handoff(copy_request);
+    check(el::consume_handoff(token, loaded) == el::HandoffStatus::NotRawScan,
+          "elevation never starts a copy job");
+
+    check(el::consume_handoff("../../evil", loaded) == el::HandoffStatus::Invalid,
+          "a malformed token cannot name another file");
+
+    // Needs elevation only for a local NTFS source, and only when not elevated.
+    models::CopyJobOptions raw;
+    raw.OperationMode = models::JobOperationMode::ScanOnly;
+    raw.UseExperimentalRawDiskScan = true;
+    wchar_t windows_dir[MAX_PATH]{};
+    GetWindowsDirectoryW(windows_dir, MAX_PATH);
+    raw.SourceRoot = storage::fsutil::wide_to_utf8(windows_dir);
+    std::string unsupported;
+    check(el::raw_scan_requires_elevation(raw, false, unsupported),
+          "a local NTFS raw assessment needs elevation when unelevated");
+    check(!el::raw_scan_requires_elevation(raw, true, unsupported),
+          "an elevated process needs no relaunch");
+    raw.SourceRoot = "\\\\server\\share\\data";
+    check(!el::raw_scan_requires_elevation(raw, false, unsupported) && !unsupported.empty(),
+          "a UNC source never prompts for elevation and explains why");
+    raw.SourceRoot = storage::fsutil::wide_to_utf8(windows_dir);
+    raw.OperationMode = models::JobOperationMode::Copy;
+    check(!el::raw_scan_requires_elevation(raw, false, unsupported),
+          "copy jobs never request elevation");
 }
 
 // Freezes every thread of a process, as a system sleep does, or thaws it.
@@ -1068,6 +1153,7 @@ int main() {
     test_clean_job();
     test_kill_recovery();
     test_sleep_resume_does_not_restart_worker();
+    test_elevation_handoff();
     test_stop_joins_in_flight_recovery();
 
     if (g_failures == 0) {
