@@ -24,42 +24,61 @@ Quick Start in the [README](../README.md) is enough.
 
 ![The XactCopy main window during a copy](images/main-window.png)
 
-Pick a **Source** and **Destination** with *Browse…*, or type or paste a path.
-*Add Files…* opens a multi-select picker, and files or folders dropped onto the
-window are added the same way. When a specific set of items is selected rather
-than a whole folder, a summary line appears under the source box — for example
-*"3 items selected (2 files, 1 folder) — only these will be copied"* — with a
-**Clear** button. Choosing a source folder with *Browse* clears the selection and
-copies the whole folder again.
+The window has two columns: on the left you build tasks, on the right the
+tasks run. The operations log spans the bottom.
 
-Below the paths are four mode-sensitive combos. Copy mode shows **Profile**,
-conflict policy, and verification; assessment mode shows scan profile, read
-backend, and whether findings are saved. The resilience toggles and numeric
-tuning fields follow.
+### What to copy
 
-The main-window values are per-run overrides. Click **Save defaults**, or use
-**Tools -> Save Current Settings as Defaults**, to persist the reusable engine,
-overwrite, verification, resilience, buffer, retry, and timeout choices for
-future runs. The selected mode, source, destination, and journal remain
-per-run; use **Jobs -> Save Current Options As Job...** when an exact job
-profile should be retained.
+Add files and folders with **+ Files**, **+ Folder**, **Paste** (files copied in
+Explorer, or paths copied as text, one per line), by dropping them on the
+window, or through the Explorer context menu. Each item is one row, with its
+folder and size (sizes are counted in the background). **Del** removes the
+selected rows and **Clear** empties the list.
 
-While a job runs the window shows:
+Every item is copied *as itself*: a folder `Photos` lands as
+`Destination\Photos`, exactly as Explorer would place it. To copy only what is
+inside a folder, right-click it and choose **Copy folder contents only**.
+Items do not need to share a folder. Items from different folders (or drives)
+become separate tasks, one per folder, and XactCopy warns before adding them if
+two of them would write the same name into the destination.
 
-- Two progress bars: the current file and the job overall.
-- A counter line: files done, bytes done, and the current rescue pass.
-- Throughput with a running average, an **ETA**, buffer utilisation, and
-  rescue-pass telemetry.
-- A **Journal** path for the run, and a diagnostics row.
-- A live, severity-coloured operations log.
+### Destination and options
 
-The operations log has vertical and horizontal scroll bars, so long paths,
-journal details, and diagnostic messages can be inspected without being
-truncated.
+Choose a **Destination** with *Browse…*, type it, or pick a recent one from the
+**▾** button. Below it are four mode-sensitive combos. Copy mode shows
+**Profile**, conflict policy, and verification; assessment mode shows scan
+profile, read backend, and whether findings are saved. The resilience toggles
+and numeric tuning fields sit in the **Options** section, which is collapsed by
+default and shows a one-line summary of what the next task will use.
 
-During a run, **Pause** and **Cancel** remain available while job inputs lock.
-The first Cancel requests cooperative shutdown; a second click force-stops a
-worker that is stuck inside a Windows or device I/O call.
+The values are per-task. Use **File → Save current settings as defaults** to
+persist the reusable engine, overwrite, verification, resilience, buffer,
+retry, and timeout choices for future runs, and **Jobs → Save Current Options As
+Job...** (or **Save as job** on a task) to keep an exact job.
+
+### Tasks
+
+**Start** (Ctrl+Enter) adds tasks for the current sources and runs the task
+list; **Add to tasks** only queues them. Tasks run one at a time, in order, and
+the builder stays usable while one runs, so more work can be queued at any
+time. Each task row shows its state and, while running, progress, speed, and
+time remaining. Right-click a task to start it now, move it, retry it from its
+journal, open its destination, load it back into the builder, or save it as a
+job. **Pause after current task** holds the list after the running task ends.
+
+Tasks that never started are kept: if XactCopy closes with tasks still queued,
+it offers to restore them the next time it starts. Jobs started from the Job
+Manager or a crash-recovery prompt appear in the list too.
+
+Below the list, the running task's detail shows the current file, the **File**
+and **Overall** progress bars, counters, throughput with a running average, an
+**ETA**, buffer and rescue telemetry, and the run's **Journal** path. **Pause**
+and **Cancel** act on the running task. The first Cancel requests cooperative
+shutdown; a second click force-stops a worker that is stuck inside a Windows or
+device I/O call.
+
+The operations log can be filtered by severity, searched (Ctrl+F, F3), copied,
+and saved; it scrolls horizontally for long paths.
 
 ## Copy mode
 
@@ -413,8 +432,8 @@ package file against the extracted SHA-256 before restarting.
 
 | Menu | Items |
 | --- | --- |
-| **File** | Start / Pause / Resume / Cancel Operation · Open Journal Folder · Open Crash Folder · Exit |
-| **Tools** | Assess Readable Files… · Inspect/Clear Source Bad-Range Map… · Settings… · Save Current Settings as Defaults · Check for Updates… |
+| **File** | Start · Add to tasks · Pause / Resume / Cancel Operation · Save current settings as defaults · Open Journal Folder · Open Crash Folder · Exit |
+| **Tools** | Assess Readable Files… · Inspect/Clear Source Bad-Range Map… · Settings… · Check for Updates… |
 | **Jobs** | Save Current Options As Job… · Job Manager… · Resume Interrupted Job · Run Next Queued Job |
 | **Help** | About XactCopy |
 

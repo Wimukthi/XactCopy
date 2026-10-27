@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "../src/ui/elevation.h"
+#include "../src/ui/task_model.h"
 #include "../src/ui/job_manager.h"
 #include "../src/ui/journal_report.h"
 #include "../src/ui/log_model.h"
@@ -250,6 +251,124 @@ void test_kill_recovery() {
 
     supervisor.stop();
     check(true, "supervisor stopped cleanly after recovery");
+}
+
+void test_task_model() {
+    std::printf("--- task model: source groups, tasks, persistence ---\n");
+    auto item = [](const wchar_t* path, bool directory = false, bool contents = false) {
+        ui::SourceItem source;
+        source.path = path;
+        source.is_directory = directory;
+        source.contents_only = contents;
+        return source;
+    };
+
+    // Items sharing a parent become one job rooted at that parent.
+    auto groups = ui::group_sources({item(L"C:\\Users\\me\\Photos", true),
+                                     item(L"C:\\Users\\me\\notes.txt"),
+                                     item(L"D:\\Media\\Photos", true),
+                                     item(L"C:\\Users\\me\\Archive", true, true)});
+    check(groups.size() == 3, "three source groups (shared parent, other drive, contents-only)");
+    check(groups[0].root == L"C:\\Users\\me" && groups[0].relative_paths.size() == 2 &&
+              groups[0].relative_paths[0] == "Photos" && groups[0].relative_paths[1] == "notes.txt",
+          "items in one folder keep their own names under one root");
+    check(groups[1].root == L"D:\\Media" && groups[1].relative_paths.size() == 1,
+          "an item from another drive is its own job");
+    check(groups[2].contents_only && groups[2].root == L"C:\\Users\\me\\Archive" &&
+              groups[2].relative_paths.empty(),
+          "a contents-only folder copies everything beneath it");
+    auto root_item = ui::group_sources({item(L"E:\\file.bin")});
+    check(root_item.size() == 1 && root_item[0].root == L"E:\\",
+          "a file at a drive root is rooted at the drive, not \"E:\"");
+    auto duplicates = ui::group_sources({item(L"C:\\a\\x.txt"), item(L"c:\\A\\X.TXT")});
+    check(duplicates.size() == 1 && duplicates[0].relative_paths.size() == 1,
+          "the same item twice is listed once");
+
+    const auto collisions = ui::find_destination_collisions(groups);
+    check(collisions.size() == 1 && _wcsicmp(collisions[0].c_str(), L"Photos") == 0,
+          "two different Photos folders are reported as a destination collision");
+    check(ui::find_destination_collisions(
+              ui::group_sources({item(L"C:\\a\\one"), item(L"C:\\b\\two")})).empty(),
+          "distinct names from different folders do not collide");
+
+    models::CopyJobOptions options;
+    options.SourceRoot = "C:\\Users\\me";
+    options.SelectedRelativePaths = {"Photos", "notes.txt"};
+    auto restored = ui::items_from_options(options);
+    check(restored.size() == 2 && restored[0].path == L"C:\\Users\\me\\Photos",
+          "job options map back to source items");
+    options.SelectedRelativePaths.clear();
+    restored = ui::items_from_options(options);
+    check(restored.size() == 1 && restored[0].contents_only,
+          "a whole-folder job maps back to a contents-only folder");
+
+    // Result mapping.
+    models::CopyJobResult result;
+    result.Succeeded = true;
+    check(ui::state_from_result(result) == ui::TaskState::Completed, "clean success is Completed");
+    result.RecoveredFiles = 1;
+    check(ui::state_from_result(result) == ui::TaskState::CompletedWithRecovery,
+          "recovered data is not reported as a plain completion");
+    result = {};
+    result.Cancelled = true;
+    check(ui::state_from_result(result) == ui::TaskState::Cancelled, "cancel maps to Cancelled");
+    result = {};
+    result.ErrorMessage = "boom";
+    check(ui::state_from_result(result) == ui::TaskState::Failed, "an error maps to Failed");
+
+    // Task list operations.
+    ui::TaskList list;
+    auto make = [](const char* root) {
+        ui::SessionTask task;
+        task.options.SourceRoot = root;
+        task.options.DestinationRoot = "E:\\Backup";
+        return task;
+    };
+    const auto a = list.add(make("C:\\a"));
+    const auto b = list.add(make("C:\\b"));
+    const auto c = list.add(make("C:\\c"));
+    check(list.next_queued()->id == a, "the first queued task runs first");
+    check(list.move(c, -1) && list.at(1).id == c, "move up swaps with the previous queued task");
+    check(list.move_to_front(c) && list.at(0).id == c, "Start now moves a task to the front");
+    list.find(c)->state = ui::TaskState::Running;
+    check(!list.remove(c), "a running task cannot be removed");
+    check(list.next_queued()->id == a, "the next queued task skips the running one");
+    list.find(a)->state = ui::TaskState::Completed;
+    const auto counts = list.counts();
+    check(counts.active == 1 && counts.queued == 1 && counts.finished == 1, "task counts by state");
+    list.clear_finished();
+    check(list.size() == 2 && !list.find(a), "Clear finished removes only finished tasks");
+    check(list.queued().size() == 1 && list.queued()[0]->id == b, "only queued tasks are pending");
+
+    check(ui::task_title(make("C:\\a").options) =="Copy contents of C:\\a \xE2\x86\x92 E:\\Backup",
+          "task title for a whole folder");
+    models::CopyJobOptions scan;
+    scan.OperationMode = models::JobOperationMode::ScanOnly;
+    scan.UseExperimentalRawDiskScan = true;
+    scan.SourceRoot = "D:\\";
+    scan.SelectedRelativePaths = {"Media"};
+    check(ui::task_title(scan) == "Assess Media (direct NTFS)", "task title for a direct-NTFS assessment");
+    check(ui::summarize_options(models::CopyJobOptions{}).find("verify full") != std::string::npos,
+          "option summary names the verification mode");
+
+    // Pending-task persistence round trip, including the running flag.
+    std::vector<const ui::SessionTask*> pending = list.queued();
+    const auto parsed = ui::pending_tasks_from_json(ui::pending_tasks_to_json(pending, true));
+    check(parsed.list_running && parsed.tasks.size() == 1 &&
+              parsed.tasks[0].options.SourceRoot == "C:\\b",
+          "pending tasks round-trip with the list-running flag");
+    check(ui::pending_tasks_from_json("{not json").tasks.empty(),
+          "a corrupt pending-task file restores nothing");
+
+    const std::wstring file = make_work_dir() + L"\\session-tasks.json";
+    {
+        ui::PendingTaskWriter writer(file);
+        writer.post(ui::pending_tasks_to_json(pending, false));
+        writer.flush(ui::pending_tasks_to_json(pending, true));
+    }
+    const auto loaded = ui::load_pending_tasks(file);
+    check(loaded.tasks.size() == 1 && loaded.list_running,
+          "the background writer leaves the latest flushed state on disk");
 }
 
 void test_elevation_handoff() {
@@ -1346,6 +1465,7 @@ int main() {
     test_kill_recovery();
     test_sleep_resume_does_not_restart_worker();
     test_elevation_handoff();
+    test_task_model();
     test_stop_joins_in_flight_recovery();
 
     if (g_failures == 0) {

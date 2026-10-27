@@ -42,6 +42,7 @@
 #include "app_icon.h"
 #include "dialogs.h"
 #include "elevation.h"
+#include "task_model.h"
 #include "explorer_integration.h"
 #include "job_manager.h"
 #include "job_manager_dialog.h"
@@ -72,8 +73,9 @@ constexpr UINT WM_APP_START_DONE = WM_APP + 6; // wParam: 1 ok / 0 error; lParam
 constexpr UINT WM_APP_UPDATE_DONE = WM_APP + 7; // lParam: new ui::UpdateReleaseInfo*
 constexpr UINT WM_APP_APPLY_LAUNCH = WM_APP + 8; // deferred apply_explorer_launch_options()
 constexpr UINT WM_APP_LOG_TASK = WM_APP + 9;
+constexpr UINT WM_APP_SOURCE_SIZE = WM_APP + 10;   // lParam: new SourceSizeResult*
+constexpr UINT WM_APP_RUN_NEXT_TASK = WM_APP + 11; // start the next queued session task
 
-constexpr int IdSourceEdit = 1001;
 constexpr int IdSourceBrowse = 1002;
 constexpr int IdDestinationEdit = 1003;
 constexpr int IdDestinationBrowse = 1004;
@@ -128,6 +130,29 @@ constexpr int IdMenuClearBadMap = 1118;
 
 constexpr int IdSourceAddFiles = 1040;
 constexpr int IdClearSelection = 1041;
+constexpr int IdSourcePaste = 1042;
+constexpr int IdSourcesList = 1043;
+constexpr int IdTasksList = 1044;
+constexpr int IdAddTaskButton = 1045;
+constexpr int IdOptionsToggle = 1046;
+constexpr int IdRecentDestinations = 1047;
+constexpr int IdPauseListCheck = 1048;
+constexpr int IdClearFinished = 1049;
+// Context-menu commands for the sources and tasks lists.
+constexpr int IdSourceRemove = 1060;
+constexpr int IdSourceContentsOnly = 1061;
+constexpr int IdSourceOpenLocation = 1062;
+constexpr int IdSourceCopyPath = 1063;
+constexpr int IdTaskStartNow = 1070;
+constexpr int IdTaskMoveUp = 1071;
+constexpr int IdTaskMoveDown = 1072;
+constexpr int IdTaskRemove = 1073;
+constexpr int IdTaskRetry = 1074;
+constexpr int IdTaskOpenDestination = 1075;
+constexpr int IdTaskSaveAsJob = 1076;
+constexpr int IdTaskEdit = 1077;
+constexpr int IdRecentDestinationBase = 1200; // 1200..1209
+constexpr int MaxRecentDestinations = 10;
 
 // Explorer invokes a context-menu verb once per selected item, so a multi-select
 // arrives as a burst of launches. Selections are accumulated and applied once
@@ -260,6 +285,10 @@ public:
             check_for_updates(/*show_dialog*/ false);
         }
 
+        sources_changed();
+        refresh_tasks_view();
+        restore_pending_tasks();
+
         // An elevated relaunch exists to run one specific request; start it
         // before any startup queue drain could take the worker first.
         if (incoming_handoff_.has_value()) {
@@ -293,10 +322,55 @@ private:
     HWND hwnd_ = nullptr;
     HWND source_label_ = nullptr;
     HWND destination_label_ = nullptr;
-    HWND source_edit_ = nullptr;
     HWND destination_edit_ = nullptr;
-    HWND source_browse_ = nullptr;
+    HWND source_browse_ = nullptr; // "+ Folder"
     HWND destination_browse_ = nullptr;
+    HWND recent_destinations_button_ = nullptr;
+
+    // "What to copy" panel: one row per source item (see task_model.h).
+    HWND sources_list_ = nullptr;
+    HWND sources_footer_ = nullptr;
+    HWND source_paste_ = nullptr;
+    std::vector<ui::SourceItem> sources_;
+    struct SourceRowInfo {
+        int icon = -1;               // system image list index
+        std::int64_t bytes = -1;     // -1 while counting
+        std::int64_t files = 0;
+        bool size_incomplete = false; // some entries could not be read
+    };
+    std::vector<SourceRowInfo> source_rows_;
+    HIMAGELIST system_small_icons_ = nullptr;
+    struct SourceSizeResult {
+        std::uint64_t generation = 0;
+        std::wstring path;
+        std::int64_t bytes = 0;
+        std::int64_t files = 0;
+        bool incomplete = false;
+    };
+    // Background folder sizing: one long-lived thread, newest request wins.
+    std::mutex sizer_lock_;
+    std::condition_variable sizer_ready_;
+    std::vector<std::wstring> sizer_request_;
+    std::atomic<std::uint64_t> sizer_generation_{0};
+    bool sizer_stopping_ = false;
+    std::thread sizer_thread_;
+
+    // Options section collapses to one summary line.
+    HWND options_toggle_ = nullptr;
+    bool options_expanded_ = false;
+    HWND add_task_button_ = nullptr;
+
+    // "Tasks" panel: the session task list (task_model.h).
+    HWND tasks_label_ = nullptr;
+    HWND tasks_list_ = nullptr;
+    HWND pause_list_check_ = nullptr;
+    HWND clear_finished_button_ = nullptr;
+    HWND detail_label_ = nullptr;
+    ui::TaskList tasks_;
+    std::uint64_t running_task_id_ = 0; // task bound to the job currently starting/running
+    bool tasks_running_ = false;        // user started the list; advance automatically
+    bool closing_for_handoff_ = false;
+    std::unique_ptr<ui::PendingTaskWriter> pending_task_writer_;
     HWND mode_combo_ = nullptr;
     HWND engine_combo_ = nullptr;
     HWND overwrite_combo_ = nullptr;
@@ -402,20 +476,15 @@ private:
     bool checking_updates_ = false;
     bool update_check_show_dialog_ = false;
     std::thread update_thread_;
-    std::string explorer_selection_root_;    // internal directory root sent to the worker
-    std::string explorer_selection_display_; // exact item/common root shown in the Source box
-    std::vector<std::string> explorer_selected_paths_; // relative paths for the exact selection
 
-    // Multi-item selection: accumulated across a burst of arrivals, then applied
-    // once by the coalescing timer (see queue_selection/commit_selection).
-    ui::SelectionModel selection_;
+    // Explorer verbs arrive as a burst of launches, one per item. Items join
+    // the sources list at once; the coalescing timer only decides, once the
+    // burst ends, whether to switch mode and ask for a destination.
     bool selection_timer_active_ = false;
     bool selection_wants_destination_ = false;
-    HWND selection_label_ = nullptr;
     HWND source_add_files_ = nullptr;
     HWND clear_selection_ = nullptr;
     std::map<int, bool> check_states_;
-    bool suppress_source_change_ = false;
     int active_mode_index_ = -1;
     int copy_profile_index_ = 2; // Custom preserves advanced saved defaults.
     int copy_overwrite_index_ = 0;
@@ -495,7 +564,7 @@ private:
                 auto* limits = reinterpret_cast<MINMAXINFO*>(lparam);
                 const int dpi = effective_dpi();
                 limits->ptMinTrackSize.x = MulDiv(760, dpi, 96);
-                limits->ptMinTrackSize.y = MulDiv(620, dpi, 96);
+                limits->ptMinTrackSize.y = MulDiv(740, dpi, 96); // two columns + log
                 return 0;
             }
             case WM_ERASEBKGND: {
@@ -592,7 +661,21 @@ private:
                 }
                 taskbar_.set_state(hwnd_, paused_ ? ui::TaskbarProgressState::Paused
                                                   : ui::TaskbarProgressState::Normal);
+                if (ui::SessionTask* task = tasks_.find(running_task_id_)) {
+                    if (ui::is_active(task->state)) {
+                        task->state = paused_ ? ui::TaskState::Paused : ui::TaskState::Running;
+                        invalidate_task_row(task->id);
+                    }
+                }
                 update_menu_state();
+                return 0;
+            case WM_APP_SOURCE_SIZE: {
+                std::unique_ptr<SourceSizeResult> result(reinterpret_cast<SourceSizeResult*>(lparam));
+                on_source_size(*result);
+                return 0;
+            }
+            case WM_APP_RUN_NEXT_TASK:
+                on_run_next_task();
                 return 0;
             case WM_COPYDATA: {
                 // A second instance handed us its command line: adopt any
@@ -676,6 +759,17 @@ private:
                 return 0;
             }
             case WM_CLOSE:
+                if (!closing_for_handoff_ && !supervisor_.is_job_running()) {
+                    const auto counts = tasks_.counts();
+                    if (counts.queued > 0 &&
+                        !confirm_box(std::to_wstring(counts.queued) +
+                                         (counts.queued == 1 ? L" task has" : L" tasks have") +
+                                         L" not started yet. Exit anyway?\n\nThey will be offered "
+                                         L"again the next time XactCopy starts.",
+                                     L"XactCopy", ui::MessageIcon::Question)) {
+                        return 0;
+                    }
+                }
                 if (supervisor_.is_job_running()) {
                     if (!confirm_box(L"A copy job is running. Cancel it and exit?\n\n"
                                      L"The journal keeps progress, so the run can resume next time.",
@@ -704,6 +798,14 @@ private:
                 }
                 if (start_thread_.joinable()) start_thread_.join();
                 if (update_thread_.joinable()) update_thread_.join();
+                stop_sizer();
+                if (pending_task_writer_ != nullptr) {
+                    // Final synchronous write; the window is going away. The
+                    // running task (if any) is not "pending": crash recovery
+                    // owns it.
+                    pending_task_writer_->flush(
+                        ui::pending_tasks_to_json(tasks_.queued(), tasks_running_));
+                }
                 supervisor_.stop();
                 if (log_save_thread_.joinable()) log_save_thread_.join();
                 {
@@ -771,8 +873,11 @@ private:
         // GDI fallback (looks bold/wrong). Owner-drawn buttons/checks/combos read
         // their font via WM_GETFONT, so they need it set too.
         HWND ui_controls[] = {
-            source_label_,     destination_label_,   source_edit_,      destination_edit_,
-            source_browse_,    destination_browse_,  source_add_files_, selection_label_,
+            source_label_,     destination_label_,   destination_edit_,  sources_list_,
+            source_browse_,    destination_browse_,  source_add_files_,  source_paste_,
+            sources_footer_,   recent_destinations_button_, options_toggle_, add_task_button_,
+            tasks_label_,      tasks_list_,          pause_list_check_,  clear_finished_button_,
+            detail_label_,
             clear_selection_,  mode_combo_,          engine_combo_,
             overwrite_combo_,  verify_combo_,        salvage_check_,    resume_check_,
             map_check_,        adaptive_check_,      continue_check_,   skip_known_bad_check_,
@@ -794,6 +899,14 @@ private:
             SendMessageW(log_list_, WM_SETFONT, reinterpret_cast<WPARAM>(mono_font_), TRUE);
             SendMessageW(log_list_, LB_SETITEMHEIGHT, 0,
                          MulDiv(log_points + 6, effective_dpi(), 72));
+        }
+        // Sources: one line (icon, name, folder, size). Tasks: two lines plus a
+        // thin inline progress bar.
+        if (sources_list_ != nullptr) {
+            SendMessageW(sources_list_, LB_SETITEMHEIGHT, 0, MulDiv(24, effective_dpi(), 96));
+        }
+        if (tasks_list_ != nullptr) {
+            SendMessageW(tasks_list_, LB_SETITEMHEIGHT, 0, MulDiv(46, effective_dpi(), 96));
         }
         const int combo_item_height = MulDiv(22, effective_dpi(), 96);
         for (HWND combo : {mode_combo_, engine_combo_, overwrite_combo_, verify_combo_, log_filter_}) {
@@ -848,21 +961,37 @@ private:
         rebuild_fonts(monitor_dpi_);
         int log_points = settings_.get_int("LogFontSizePoints", 7, 20, 9);
 
-        source_label_ = create(L"STATIC", L"Source:", 0, 0);
-        source_edit_ = create(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, IdSourceEdit);
-        source_browse_ = create(L"BUTTON", L"Browse...", WS_TABSTOP | BS_OWNERDRAW, IdSourceBrowse);
+        // ---- What to copy ----
+        source_label_ = create(L"STATIC", L"What to copy", SS_NOPREFIX, 0);
         source_add_files_ =
-            create(L"BUTTON", L"Add Files...", WS_TABSTOP | BS_OWNERDRAW, IdSourceAddFiles);
-        selection_label_ = create(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS | SS_NOPREFIX, 0);
+            create(L"BUTTON", L"+ Files", WS_TABSTOP | BS_OWNERDRAW, IdSourceAddFiles);
+        source_browse_ = create(L"BUTTON", L"+ Folder", WS_TABSTOP | BS_OWNERDRAW, IdSourceBrowse);
+        source_paste_ = create(L"BUTTON", L"Paste", WS_TABSTOP | BS_OWNERDRAW, IdSourcePaste);
         clear_selection_ =
             create(L"BUTTON", L"Clear", WS_TABSTOP | BS_OWNERDRAW, IdClearSelection);
-        ShowWindow(selection_label_, SW_HIDE);
-        ShowWindow(clear_selection_, SW_HIDE);
-        destination_label_ = create(L"STATIC", L"Destination:", 0, 0);
+        // Owner-data list (LBS_NODATA): rows are painted from sources_.
+        sources_list_ = create(L"LISTBOX", L"",
+                               WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOINTEGRALHEIGHT |
+                                   LBS_NODATA | LBS_OWNERDRAWFIXED | LBS_EXTENDEDSEL |
+                                   LBS_NOTIFY,
+                               IdSourcesList);
+        SetWindowSubclass(sources_list_, &panel_list_subclass, 2, reinterpret_cast<DWORD_PTR>(this));
+        sources_footer_ = create(L"STATIC", L"", SS_ENDELLIPSIS | SS_NOPREFIX, 0);
+        {
+            SHFILEINFOW info{};
+            system_small_icons_ = reinterpret_cast<HIMAGELIST>(SHGetFileInfoW(
+                L"C:\\", FILE_ATTRIBUTE_DIRECTORY, &info, sizeof(info),
+                SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES));
+        }
+        sizer_thread_ = std::thread([this] { sizer_loop(); });
+
+        destination_label_ = create(L"STATIC", L"Destination", 0, 0);
         destination_edit_ =
             create(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, IdDestinationEdit);
         destination_browse_ =
             create(L"BUTTON", L"Browse...", WS_TABSTOP | BS_OWNERDRAW, IdDestinationBrowse);
+        recent_destinations_button_ = create(L"BUTTON", L"\x25BE", WS_TABSTOP | BS_OWNERDRAW,
+                                             IdRecentDestinations);
 
         DWORD combo_style = WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS;
         mode_combo_ = create(L"COMBOBOX", L"", combo_style, IdModeCombo);
@@ -899,13 +1028,32 @@ private:
         timeout_edit_ = create(L"EDIT", L"", WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL | WS_BORDER,
                                IdTimeoutEdit);
 
-        start_button_ = create(L"BUTTON", L"Start", WS_TABSTOP | BS_OWNERDRAW, IdStartButton);
+        options_toggle_ = create(L"BUTTON", L"", WS_TABSTOP | BS_OWNERDRAW, IdOptionsToggle);
+        options_expanded_ = settings_.get_bool("UiOptionsExpanded", false);
+
+        start_button_ = create(L"BUTTON", L"Start \x2192", WS_TABSTOP | BS_OWNERDRAW, IdStartButton);
+        add_task_button_ =
+            create(L"BUTTON", L"Add to tasks", WS_TABSTOP | BS_OWNERDRAW, IdAddTaskButton);
         pause_button_ = create(L"BUTTON", L"Pause", WS_TABSTOP | BS_OWNERDRAW, IdPauseButton);
         cancel_button_ = create(L"BUTTON", L"Cancel", WS_TABSTOP | BS_OWNERDRAW, IdCancelButton);
         settings_button_ =
             create(L"BUTTON", L"Settings...", WS_TABSTOP | BS_OWNERDRAW, IdSettingsButton);
         EnableWindow(pause_button_, FALSE);
         EnableWindow(cancel_button_, FALSE);
+
+        // ---- Tasks ----
+        tasks_label_ = create(L"STATIC", L"Tasks", SS_NOPREFIX, 0);
+        pause_list_check_ = create(L"BUTTON", L"Pause after current task",
+                                   WS_TABSTOP | BS_OWNERDRAW, IdPauseListCheck);
+        clear_finished_button_ =
+            create(L"BUTTON", L"Clear finished", WS_TABSTOP | BS_OWNERDRAW, IdClearFinished);
+        tasks_list_ = create(L"LISTBOX", L"",
+                             WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOINTEGRALHEIGHT |
+                                 LBS_NODATA | LBS_OWNERDRAWFIXED | LBS_NOTIFY,
+                             IdTasksList);
+        SetWindowSubclass(tasks_list_, &panel_list_subclass, 3, reinterpret_cast<DWORD_PTR>(this));
+        detail_label_ = create(L"STATIC", L"Running task", SS_NOPREFIX, 0);
+        pending_task_writer_ = std::make_unique<ui::PendingTaskWriter>();
 
         current_label_ = create(L"STATIC", L"Current: —", SS_ENDELLIPSIS | SS_NOPREFIX, 0);
         // Owner-drawn flat progress bars: classic msctls_progress32 draws a
@@ -963,12 +1111,21 @@ private:
     void configure_tooltips() {
         auto add = [this](HWND control, const wchar_t* text) { tooltips_.add(control, text); };
 
-        add(source_label_, L"The folder or common root XactCopy will read. Drag-and-drop and Explorer selections are also accepted.");
-        add(source_edit_, L"Enter the source folder. When individual files are selected, this shows their common root while the selection row lists the subset.");
-        add(source_browse_, L"Choose one source folder and replace the current source selection.");
-        add(source_add_files_, L"Add one or more files or folders to an exact selection without replacing items already selected.");
-        add(selection_label_, L"Summary of the exact files and folders selected beneath the displayed source root.");
-        add(clear_selection_, L"Clear the exact-item selection and return to copying or scanning the entire source folder.");
+        add(source_label_, L"The files and folders to copy or assess. Each item lands in the destination under its own name; items from different folders become separate tasks.");
+        add(sources_list_, L"Files and folders to copy. Drag items here, paste paths (Ctrl+V), press Del to remove, or right-click a folder to copy only its contents.");
+        add(source_browse_, L"Add one or more folders. Each folder is copied as itself unless you choose \"Copy folder contents only\" from its right-click menu.");
+        add(source_add_files_, L"Add one or more files.");
+        add(source_paste_, L"Add files copied in Explorer, or paths copied as text (one per line).");
+        add(clear_selection_, L"Remove every item from the list.");
+        add(sources_footer_, L"Item count and total size. Sizes are counted in the background.");
+        add(recent_destinations_button_, L"Pick a recently used destination.");
+        add(options_toggle_, L"Show or hide the detailed options. The summary shows what the next task will use.");
+        add(add_task_button_, L"Add tasks for these sources to the task list without starting them.");
+        add(tasks_label_, L"Tasks run one at a time, in order. Right-click a task for more actions.");
+        add(tasks_list_, L"Queued, running, and finished tasks. Enter starts the selected queued task; Del removes it; right-click for retry, move, open destination, and save as job.");
+        add(pause_list_check_, L"When checked, the next queued task waits after the current one finishes.");
+        add(clear_finished_button_, L"Remove finished tasks from the list. Run history stays in the Job Manager.");
+        add(detail_label_, L"Live detail for the running task.");
         add(destination_label_, L"The folder that receives copied files. Assess Readable Files mode is read-only and does not require a destination.");
         add(destination_edit_, L"Enter the destination folder. XactCopy stages and verifies each file beside its final path before replacement.");
         add(destination_browse_, L"Choose the destination folder.");
@@ -994,7 +1151,7 @@ private:
         add(timeout_label_, L"Timeout for an individual I/O operation, in seconds.");
         add(timeout_edit_, L"Enter the per-operation timeout. This is not the total job duration; retries and media-wait policies can extend the run.");
 
-        add(start_button_, L"Validate the current options and start the copy or read-only file-readability assessment.");
+        add(start_button_, L"Add tasks for these sources and start running the task list (Ctrl+Enter). While a task runs, this queues them instead.");
         add(pause_button_, L"Pause or resume scheduling and managed I/O at a safe cancellation point. An in-flight Windows API call may finish first.");
         add(cancel_button_, L"Request cancellation. If a storage driver does not respond within five seconds, XactCopy force-stops the isolated worker. Click again to force-stop immediately.");
         add(settings_button_, L"Open advanced appearance, copy, performance, diagnostics, verification, recovery, and Explorer-integration settings.");
@@ -1020,7 +1177,8 @@ private:
     // Mirrors the .NET MainForm menu strip (File / Tools / Jobs / Help).
     void build_menu_bar() {
         HMENU file_menu = CreatePopupMenu();
-        AppendMenuW(file_menu, MF_STRING, IdMenuStartCopy, L"&Start Operation");
+        AppendMenuW(file_menu, MF_STRING, IdMenuStartCopy, L"&Start\tCtrl+Enter");
+        AppendMenuW(file_menu, MF_STRING, IdAddTaskButton, L"&Add to tasks");
         AppendMenuW(file_menu, MF_STRING, IdMenuPauseCopy, L"&Pause Operation");
         AppendMenuW(file_menu, MF_STRING, IdMenuResumeCopy, L"&Resume Operation");
         AppendMenuW(file_menu, MF_STRING, IdMenuCancelCopy, L"&Cancel Operation");
@@ -1065,7 +1223,7 @@ private:
             EnableMenuItem(menu_bar_, static_cast<UINT>(id),
                            MF_BYCOMMAND | (enabled ? MF_ENABLED : MF_GRAYED));
         };
-        set_enabled(IdMenuStartCopy, !running);
+        set_enabled(IdMenuStartCopy, !outgoing_handoff_.has_value()); // queues while a task runs
         set_enabled(IdMenuScanBadBlocks, !running);
         set_enabled(IdMenuInspectBadMap, !running);
         set_enabled(IdMenuClearBadMap, !running);
@@ -1086,10 +1244,18 @@ private:
         ui::elevation::open_as_user(nullptr, folder);
     }
 
+    // The bad-range map is keyed by the root a job reads from: the first
+    // source group's root (the folder holding the first item, or a
+    // contents-only folder itself).
+    std::string primary_source_root() const {
+        const auto groups = ui::group_sources(sources_);
+        return groups.empty() ? std::string() : storage::fsutil::wide_to_utf8(groups.front().root);
+    }
+
     std::optional<std::wstring> selected_source_map_path() {
-        std::string source = window_text_utf8(source_edit_);
+        std::string source = primary_source_root();
         if (ui_is_blank(source)) {
-            warn_box(L"Choose a source before inspecting its bad-range map.");
+            warn_box(L"Add a source before inspecting its bad-range map.");
             return std::nullopt;
         }
         return storage::BadRangeMapStore::get_default_map_path(
@@ -1112,7 +1278,7 @@ private:
         std::optional<storage::ManagedJobRun> latest_assessment_run;
         ui::RunJournalInspection latest_assessment;
         const std::wstring selected_source = storage::fsutil::normalize_path(
-            storage::fsutil::utf8_to_wide(window_text_utf8(source_edit_)));
+            storage::fsutil::utf8_to_wide(primary_source_root()));
         for (const auto& run : job_manager_.get_recent_runs(1000)) {
             const bool scan_mode = run.Options.has_value()
                                        ? run.Options->OperationMode ==
@@ -1141,7 +1307,7 @@ private:
                 return;
             }
             storage::BadRangeMap journal_only_map;
-            journal_only_map.SourceRoot = window_text_utf8(source_edit_);
+            journal_only_map.SourceRoot = primary_source_root();
             journal_only_map.SourceIdentity = "(no map)";
             map = std::move(journal_only_map);
         }
@@ -1277,8 +1443,8 @@ private:
         edit_brush_ = CreateSolidBrush(theme_.edit);
 
         ui::attach_theme_window(hwnd_);
-        for (HWND control : {log_list_, log_find_, source_edit_, destination_edit_, buffer_edit_,
-                             retries_edit_, timeout_edit_}) {
+        for (HWND control : {log_list_, log_find_, sources_list_, tasks_list_, destination_edit_,
+                             buffer_edit_, retries_edit_, timeout_edit_}) {
             ui::apply_control_theme(control, theme_.dark);
         }
         for (HWND combo : {mode_combo_, engine_combo_, overwrite_combo_, verify_combo_, log_filter_}) {
@@ -1363,7 +1529,6 @@ private:
             SendMessageW(overwrite_combo_, CB_SETCURSEL, scan_backend_index_, 0);
             SendMessageW(verify_combo_, CB_SETCURSEL, scan_map_index_, 0);
             SetWindowTextW(resume_check_, L"Reuse previous scan progress");
-            SetWindowTextW(start_button_, L"Start assessment");
         } else {
             replace_combo_items(engine_combo_,
                                 {L"Profile: Verified Copy", L"Profile: Recover Media",
@@ -1377,16 +1542,16 @@ private:
             SendMessageW(overwrite_combo_, CB_SETCURSEL, copy_overwrite_index_, 0);
             SendMessageW(verify_combo_, CB_SETCURSEL, copy_verify_index_, 0);
             SetWindowTextW(resume_check_, L"Reuse verified previous progress");
-            SetWindowTextW(start_button_, L"Start copy");
             if (user_changed) launch_.explorer_scan_mode = false;
         }
 
         const bool scan = requested == 1;
         for (HWND control : {destination_label_, destination_edit_, destination_browse_,
-                             salvage_check_}) {
+                             recent_destinations_button_}) {
             if (control != nullptr) ShowWindow(control, scan ? SW_HIDE : SW_SHOW);
         }
-        layout();
+        layout(); // the Options section shows/hides salvage per mode
+        if (options_toggle_ != nullptr) InvalidateRect(options_toggle_, nullptr, TRUE);
     }
 
     void apply_settings_defaults() {
@@ -1424,11 +1589,7 @@ private:
         SetWindowTextW(timeout_edit_, std::to_wstring(timeout_seconds).c_str());
 
         show_diagnostics_ = settings_.get_bool("UiShowDiagnostics", false);
-
-        if (!launch_.explorer_folder_path.empty()) {
-            SetWindowTextW(source_edit_,
-                           storage::fsutil::utf8_to_wide(launch_.explorer_folder_path).c_str());
-        }
+        // Explorer launch paths join the sources list in apply_explorer_launch_options.
     }
 
     void wire_supervisor_events() {
@@ -1477,13 +1638,15 @@ private:
     static bool is_checkbox_id(int id) {
         return id == IdSalvageCheck || id == IdResumeCheck || id == IdMapCheck ||
                id == IdAdaptiveCheck || id == IdContinueCheck || id == IdSkipKnownBadCheck ||
-               id == IdWaitMediaCheck || id == IdFragileCheck;
+               id == IdWaitMediaCheck || id == IdFragileCheck || id == IdPauseListCheck;
     }
 
     static bool is_button_id(int id) {
         return id == IdSourceBrowse || id == IdDestinationBrowse || id == IdStartButton ||
                id == IdPauseButton || id == IdCancelButton || id == IdSettingsButton ||
-               id == IdSourceAddFiles || id == IdClearSelection || id == IdLogFindNext;
+               id == IdSourceAddFiles || id == IdClearSelection || id == IdLogFindNext ||
+               id == IdSourcePaste || id == IdAddTaskButton || id == IdRecentDestinations ||
+               id == IdClearFinished;
     }
 
     bool on_draw_item(const DRAWITEMSTRUCT& draw) {
@@ -1502,6 +1665,18 @@ private:
         }
         if (draw.CtlType == ODT_LISTBOX && id == IdLogList) {
             draw_log_item(draw);
+            return true;
+        }
+        if (draw.CtlType == ODT_LISTBOX && id == IdSourcesList) {
+            draw_source_item(draw);
+            return true;
+        }
+        if (draw.CtlType == ODT_LISTBOX && id == IdTasksList) {
+            draw_task_item(draw);
+            return true;
+        }
+        if (draw.CtlType == ODT_BUTTON && id == IdOptionsToggle) {
+            draw_options_toggle(draw);
             return true;
         }
         if (draw.CtlType == ODT_STATIC && (id == IdCurrentBar || id == IdOverallBar)) {
@@ -1634,19 +1809,968 @@ private:
     // Job-parameter inputs can't change mid-run, so lock them while a scan/copy
     // is active (Pause/Cancel, Settings, About and the log stay usable). Called
     // with false when a job starts and true when it ends.
-    void set_inputs_enabled(bool enabled) {
-        HWND inputs[] = {
-            source_edit_,      destination_edit_,   source_browse_,   destination_browse_,
-            source_add_files_, clear_selection_,
-            mode_combo_,       engine_combo_,       overwrite_combo_, verify_combo_,
-            salvage_check_,    resume_check_,       map_check_,       adaptive_check_,
-            continue_check_,   skip_known_bad_check_, wait_media_check_, fragile_check_,
-            buffer_edit_,      retries_edit_,       timeout_edit_,
-        };
-        for (HWND control : inputs) {
-            if (control != nullptr) EnableWindow(control, enabled ? TRUE : FALSE);
-        }
+    // The task builder stays editable while a job runs, so more tasks can be
+    // queued. Only an elevation handoff in progress locks Start/Add, because
+    // this window is about to close.
+    void set_inputs_enabled(bool /*enabled*/) {
+        update_action_buttons();
         sync_bad_range_controls();
+    }
+
+    void update_action_buttons() {
+        const BOOL can_queue = outgoing_handoff_.has_value() ? FALSE : TRUE;
+        if (start_button_ != nullptr) EnableWindow(start_button_, can_queue);
+        if (add_task_button_ != nullptr) EnableWindow(add_task_button_, can_queue);
+        if (start_button_ != nullptr) {
+            const bool busy = supervisor_.is_job_running() || starting_;
+            SetWindowTextW(start_button_, busy ? L"Queue \x2192" : L"Start \x2192");
+            InvalidateRect(start_button_, nullptr, FALSE);
+        }
+    }
+
+    // ---- Sources panel -----------------------------------------------------
+
+    void draw_source_item(const DRAWITEMSTRUCT& draw) {
+        const bool selected = (draw.itemState & ODS_SELECTED) != 0;
+        ui::themedraw::fill_rect(draw.hDC, draw.rcItem, selected ? theme_.selection : theme_.edit);
+        if (draw.itemID == static_cast<UINT>(-1) || draw.itemID >= sources_.size()) return;
+        const ui::SourceItem& item = sources_[draw.itemID];
+        const SourceRowInfo& info = source_rows_[draw.itemID];
+        const int dpi = effective_dpi();
+        auto scale = [dpi](int value) { return MulDiv(value, dpi, 96); };
+        RECT rect = draw.rcItem;
+        rect.left += scale(6);
+        rect.right -= scale(6);
+
+        const int icon_size = GetSystemMetricsForDpi(SM_CXSMICON, static_cast<UINT>(dpi));
+        if (system_small_icons_ != nullptr && info.icon >= 0) {
+            ImageList_DrawEx(system_small_icons_, info.icon, draw.hDC, rect.left,
+                             rect.top + (rect.bottom - rect.top - icon_size) / 2, icon_size,
+                             icon_size, CLR_NONE, CLR_NONE, ILD_TRANSPARENT);
+        }
+        rect.left += icon_size + scale(8);
+
+        HGDIOBJ old_font = SelectObject(draw.hDC, font_);
+        SetBkMode(draw.hDC, TRANSPARENT);
+        const COLORREF text = selected ? theme_.selection_text : theme_.text;
+        const COLORREF muted = selected ? theme_.selection_text : theme_.muted_text;
+
+        // Right: size or item count.
+        std::wstring size_text;
+        if (info.bytes < 0) {
+            size_text = L"counting\x2026";
+        } else {
+            size_text = storage::fsutil::utf8_to_wide(format_bytes_short(info.bytes));
+            if (item.is_directory) {
+                size_text = std::to_wstring(info.files) + (info.files == 1 ? L" file, " : L" files, ") +
+                            size_text;
+            }
+            if (info.size_incomplete) size_text += L"+";
+        }
+        RECT size_rect = rect;
+        SetTextColor(draw.hDC, muted);
+        DrawTextW(draw.hDC, size_text.c_str(), -1, &size_rect,
+                  DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SIZE size_extent{};
+        GetTextExtentPoint32W(draw.hDC, size_text.c_str(), static_cast<int>(size_text.size()),
+                              &size_extent);
+        rect.right -= size_extent.cx + scale(12);
+
+        // Name, then the containing folder (muted, path-ellipsized).
+        std::wstring name = storage::fsutil::get_file_name(item.path);
+        if (name.empty()) name = item.path;
+        if (item.contents_only) name += L"\\*  (contents)";
+        SetTextColor(draw.hDC, text);
+        RECT name_rect = rect;
+        DrawTextW(draw.hDC, name.c_str(), -1, &name_rect,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SIZE name_extent{};
+        GetTextExtentPoint32W(draw.hDC, name.c_str(), static_cast<int>(name.size()), &name_extent);
+        RECT folder_rect = rect;
+        folder_rect.left = std::min<LONG>(rect.right, rect.left + name_extent.cx + scale(10));
+        std::wstring folder = item.contents_only ? item.path
+                                                 : storage::fsutil::get_directory_name(item.path);
+        SetTextColor(draw.hDC, muted);
+        DrawTextW(draw.hDC, folder.c_str(), -1, &folder_rect,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(draw.hDC, old_font);
+        if ((draw.itemState & ODS_FOCUS) != 0) DrawFocusRect(draw.hDC, &draw.rcItem);
+    }
+
+    static ui::SourceItem make_source_item(const std::wstring& raw) {
+        ui::SourceItem item;
+        std::wstring full = storage::fsutil::get_full_path(storage::fsutil::trim(raw));
+        while (full.size() > 3 && (full.back() == L'\\' || full.back() == L'/')) full.pop_back();
+        item.path = full;
+        DWORD attributes = GetFileAttributesW(storage::fsutil::long_path(full).c_str());
+        item.is_directory = attributes != INVALID_FILE_ATTRIBUTES &&
+                            (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        // A drive root has no parent to be copied "as itself" into.
+        if (item.is_directory && full.size() <= 3) item.contents_only = true;
+        return item;
+    }
+
+    // Adds existing paths that are not already listed. Returns how many were added.
+    int add_sources(const std::vector<std::wstring>& paths, bool contents_only = false) {
+        int added = 0;
+        for (const auto& raw : paths) {
+            if (storage::fsutil::trim(raw).empty()) continue;
+            ui::SourceItem item = make_source_item(raw);
+            if (item.path.empty() ||
+                GetFileAttributesW(storage::fsutil::long_path(item.path).c_str()) ==
+                    INVALID_FILE_ATTRIBUTES) {
+                append_log("Not added (not found): " + storage::fsutil::wide_to_utf8(raw));
+                continue;
+            }
+            if (contents_only && item.is_directory) item.contents_only = true;
+            const bool duplicate = std::any_of(sources_.begin(), sources_.end(),
+                                               [&](const ui::SourceItem& existing) {
+                                                   return _wcsicmp(existing.path.c_str(),
+                                                                   item.path.c_str()) == 0;
+                                               });
+            if (duplicate) continue;
+            sources_.push_back(std::move(item));
+            ++added;
+        }
+        if (added > 0) sources_changed();
+        return added;
+    }
+
+    void set_sources(std::vector<ui::SourceItem> items) {
+        sources_ = std::move(items);
+        sources_changed();
+    }
+
+    // Rebuilds row metadata (icons from the extension only, so slow media is
+    // never touched on this thread) and asks the sizer for fresh totals.
+    void sources_changed() {
+        source_rows_.assign(sources_.size(), SourceRowInfo{});
+        std::vector<std::wstring> paths;
+        paths.reserve(sources_.size());
+        for (std::size_t i = 0; i < sources_.size(); ++i) {
+            SHFILEINFOW info{};
+            const DWORD attributes =
+                sources_[i].is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+            if (SHGetFileInfoW(sources_[i].path.c_str(), attributes, &info, sizeof(info),
+                               SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES) != 0) {
+                source_rows_[i].icon = info.iIcon;
+            }
+            paths.push_back(sources_[i].path);
+        }
+        {
+            std::lock_guard<std::mutex> guard(sizer_lock_);
+            sizer_request_ = std::move(paths);
+            sizer_generation_.fetch_add(1);
+        }
+        sizer_ready_.notify_one();
+        SendMessageW(sources_list_, LB_SETCOUNT, sources_.size(), 0);
+        InvalidateRect(sources_list_, nullptr, TRUE);
+        update_sources_footer();
+    }
+
+    void update_sources_footer() {
+        if (sources_footer_ == nullptr) return;
+        if (sources_.empty()) {
+            SetWindowTextW(sources_footer_,
+                           L"Add files or folders: + Files, + Folder, Paste, or drag them here.");
+            return;
+        }
+        int folders = 0;
+        std::int64_t bytes = 0;
+        bool counting = false;
+        for (std::size_t i = 0; i < sources_.size(); ++i) {
+            if (sources_[i].is_directory) ++folders;
+            if (source_rows_[i].bytes < 0) counting = true;
+            else bytes += source_rows_[i].bytes;
+        }
+        const int files = static_cast<int>(sources_.size()) - folders;
+        std::string text = std::to_string(sources_.size()) +
+                           (sources_.size() == 1 ? " item" : " items");
+        text += " \xC2\xB7 " + std::to_string(folders) + (folders == 1 ? " folder, " : " folders, ") +
+                std::to_string(files) + (files == 1 ? " file" : " files");
+        text += " \xC2\xB7 " + (counting ? std::string("counting\xE2\x80\xA6")
+                                         : format_bytes_short(bytes));
+        const auto groups = ui::group_sources(sources_);
+        if (groups.size() > 1) {
+            text += " \xC2\xB7 " + std::to_string(groups.size()) + " tasks (one per source folder)";
+        }
+        SetWindowTextW(sources_footer_, storage::fsutil::utf8_to_wide(text).c_str());
+    }
+
+    void on_source_size(const SourceSizeResult& result) {
+        if (result.generation != sizer_generation_.load()) return;
+        for (std::size_t i = 0; i < sources_.size(); ++i) {
+            if (_wcsicmp(sources_[i].path.c_str(), result.path.c_str()) != 0) continue;
+            source_rows_[i].bytes = result.bytes;
+            source_rows_[i].files = result.files;
+            source_rows_[i].size_incomplete = result.incomplete;
+            RECT row{};
+            if (SendMessageW(sources_list_, LB_GETITEMRECT, i, reinterpret_cast<LPARAM>(&row)) !=
+                LB_ERR) {
+                InvalidateRect(sources_list_, &row, FALSE);
+            }
+        }
+        update_sources_footer();
+    }
+
+    // Sizes each requested path on this background thread. A newer request
+    // (generation bump) abandons the current walk at the next entry.
+    void sizer_loop() {
+        for (;;) {
+            std::vector<std::wstring> request;
+            std::uint64_t generation = 0;
+            {
+                std::unique_lock<std::mutex> guard(sizer_lock_);
+                sizer_ready_.wait(guard, [this] { return sizer_stopping_ || !sizer_request_.empty(); });
+                if (sizer_stopping_) return;
+                request = std::move(sizer_request_);
+                sizer_request_.clear();
+                generation = sizer_generation_.load();
+            }
+            for (const auto& path : request) {
+                if (generation != sizer_generation_.load() || sizer_stopping_) break;
+                auto* result = new SourceSizeResult;
+                result->generation = generation;
+                result->path = path;
+                size_path(path, generation, *result);
+                if (generation != sizer_generation_.load() ||
+                    !PostMessageW(hwnd_, WM_APP_SOURCE_SIZE, 0, reinterpret_cast<LPARAM>(result))) {
+                    delete result;
+                }
+            }
+        }
+    }
+
+    void size_path(const std::wstring& path, std::uint64_t generation, SourceSizeResult& result) {
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        if (!GetFileAttributesExW(storage::fsutil::long_path(path).c_str(), GetFileExInfoStandard,
+                                  &data)) {
+            result.incomplete = true;
+            return;
+        }
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            result.bytes = (static_cast<std::int64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+            result.files = 1;
+            return;
+        }
+        std::vector<std::wstring> pending{path};
+        while (!pending.empty()) {
+            if (generation != sizer_generation_.load() || sizer_stopping_) return;
+            std::wstring directory = std::move(pending.back());
+            pending.pop_back();
+            WIN32_FIND_DATAW find{};
+            HANDLE handle = FindFirstFileExW(
+                storage::fsutil::long_path(directory + L"\\*").c_str(), FindExInfoBasic, &find,
+                FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+            if (handle == INVALID_HANDLE_VALUE) {
+                result.incomplete = true;
+                continue;
+            }
+            do {
+                const std::wstring name = find.cFileName;
+                if (name == L"." || name == L"..") continue;
+                if ((find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                    // Do not follow junctions/symlinks; the copy does not either by default.
+                    if ((find.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
+                        pending.push_back(directory + L"\\" + name);
+                    }
+                    continue;
+                }
+                result.bytes += (static_cast<std::int64_t>(find.nFileSizeHigh) << 32) | find.nFileSizeLow;
+                result.files += 1;
+            } while (FindNextFileW(handle, &find));
+            FindClose(handle);
+        }
+    }
+
+    void stop_sizer() {
+        {
+            std::lock_guard<std::mutex> guard(sizer_lock_);
+            sizer_stopping_ = true;
+        }
+        sizer_generation_.fetch_add(1);
+        sizer_ready_.notify_one();
+        if (sizer_thread_.joinable()) sizer_thread_.join();
+    }
+
+    std::vector<int> selected_list_indices(HWND list) const {
+        const int count = static_cast<int>(SendMessageW(list, LB_GETSELCOUNT, 0, 0));
+        std::vector<int> indices;
+        if (count > 0) {
+            indices.resize(static_cast<std::size_t>(count));
+            SendMessageW(list, LB_GETSELITEMS, count, reinterpret_cast<LPARAM>(indices.data()));
+        } else if (count == LB_ERR) { // single-selection list
+            const int current = static_cast<int>(SendMessageW(list, LB_GETCURSEL, 0, 0));
+            if (current >= 0) indices.push_back(current);
+        }
+        return indices;
+    }
+
+    void remove_selected_sources() {
+        auto indices = selected_list_indices(sources_list_);
+        if (indices.empty()) return;
+        std::sort(indices.rbegin(), indices.rend());
+        for (int index : indices) {
+            if (index >= 0 && static_cast<std::size_t>(index) < sources_.size()) {
+                sources_.erase(sources_.begin() + index);
+            }
+        }
+        SendMessageW(sources_list_, LB_SETSEL, FALSE, -1);
+        sources_changed();
+    }
+
+    void paste_sources() {
+        std::vector<std::wstring> paths;
+        if (!OpenClipboard(hwnd_)) return;
+        if (HANDLE drop = GetClipboardData(CF_HDROP)) {
+            HDROP files = static_cast<HDROP>(drop);
+            UINT count = DragQueryFileW(files, 0xFFFFFFFF, nullptr, 0);
+            for (UINT i = 0; i < count; ++i) {
+                UINT length = DragQueryFileW(files, i, nullptr, 0);
+                std::wstring path(length + 1, L'\0');
+                DragQueryFileW(files, i, path.data(), length + 1);
+                path.resize(length);
+                paths.push_back(std::move(path));
+            }
+        } else if (HANDLE text = GetClipboardData(CF_UNICODETEXT)) {
+            if (const auto* chars = static_cast<const wchar_t*>(GlobalLock(text))) {
+                std::wstring all(chars);
+                GlobalUnlock(text);
+                std::size_t start = 0;
+                while (start <= all.size()) {
+                    std::size_t end = all.find_first_of(L"\r\n", start);
+                    std::wstring line = storage::fsutil::trim(
+                        all.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start));
+                    if (line.size() >= 2 && line.front() == L'"' && line.back() == L'"') {
+                        line = line.substr(1, line.size() - 2);
+                    }
+                    if (!line.empty()) paths.push_back(std::move(line));
+                    if (end == std::wstring::npos) break;
+                    start = end + 1;
+                }
+            }
+        }
+        CloseClipboard();
+        if (paths.empty()) {
+            info_box(L"The clipboard has no file paths. Copy files in Explorer, or copy one path per line.");
+            return;
+        }
+        const int added = add_sources(paths);
+        append_log("Pasted " + std::to_string(added) + " source item(s).");
+    }
+
+    void show_sources_context_menu(LPARAM screen_point) {
+        POINT point{GET_X_LPARAM(screen_point), GET_Y_LPARAM(screen_point)};
+        if (point.x == -1 && point.y == -1) GetCursorPos(&point);
+        const auto indices = selected_list_indices(sources_list_);
+        const bool has_selection = !indices.empty();
+        const bool single_folder = indices.size() == 1 &&
+                                   static_cast<std::size_t>(indices[0]) < sources_.size() &&
+                                   sources_[static_cast<std::size_t>(indices[0])].is_directory;
+        HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING | (has_selection ? 0 : MF_GRAYED), IdSourceRemove,
+                    L"&Remove\tDel");
+        if (single_folder) {
+            const auto& item = sources_[static_cast<std::size_t>(indices[0])];
+            AppendMenuW(menu, MF_STRING | (item.contents_only ? MF_CHECKED : 0) |
+                                  (item.path.size() <= 3 ? MF_GRAYED : 0),
+                        IdSourceContentsOnly, L"Copy folder &contents only");
+        }
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING | (indices.size() == 1 ? 0 : MF_GRAYED), IdSourceOpenLocation,
+                    L"&Open location");
+        AppendMenuW(menu, MF_STRING | (has_selection ? 0 : MF_GRAYED), IdSourceCopyPath,
+                    L"Copy &path");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IdSourcePaste, L"P&aste paths\tCtrl+V");
+        AppendMenuW(menu, MF_STRING | (sources_.empty() ? MF_GRAYED : 0), IdClearSelection,
+                    L"C&lear all");
+        TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd_, nullptr);
+        DestroyMenu(menu);
+    }
+
+    void copy_text_to_clipboard(const std::wstring& text) {
+        if (!OpenClipboard(hwnd_)) return;
+        EmptyClipboard();
+        const std::size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+        if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+            if (void* target = GlobalLock(memory)) {
+                memcpy(target, text.c_str(), bytes);
+                GlobalUnlock(memory);
+                if (SetClipboardData(CF_UNICODETEXT, memory) == nullptr) GlobalFree(memory);
+            } else {
+                GlobalFree(memory);
+            }
+        }
+        CloseClipboard();
+    }
+
+    void on_source_command(int id) {
+        const auto indices = selected_list_indices(sources_list_);
+        switch (id) {
+            case IdSourceRemove:
+                remove_selected_sources();
+                break;
+            case IdSourceContentsOnly:
+                if (indices.size() == 1 && static_cast<std::size_t>(indices[0]) < sources_.size()) {
+                    auto& item = sources_[static_cast<std::size_t>(indices[0])];
+                    if (item.is_directory && item.path.size() > 3) {
+                        item.contents_only = !item.contents_only;
+                        sources_changed();
+                    }
+                }
+                break;
+            case IdSourceOpenLocation:
+                if (indices.size() == 1 && static_cast<std::size_t>(indices[0]) < sources_.size()) {
+                    const auto& item = sources_[static_cast<std::size_t>(indices[0])];
+                    ui::elevation::open_as_user(hwnd_, L"explorer.exe",
+                                                L"/select,\"" + item.path + L"\"");
+                }
+                break;
+            case IdSourceCopyPath: {
+                std::wstring text;
+                for (int index : indices) {
+                    if (static_cast<std::size_t>(index) >= sources_.size()) continue;
+                    if (!text.empty()) text += L"\r\n";
+                    text += sources_[static_cast<std::size_t>(index)].path;
+                }
+                if (!text.empty()) copy_text_to_clipboard(text);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    // ---- Options section ----------------------------------------------------
+
+    void draw_options_toggle(const DRAWITEMSTRUCT& draw) {
+        const bool focused = (draw.itemState & ODS_FOCUS) != 0;
+        ui::themedraw::fill_rect(draw.hDC, draw.rcItem, theme_.window);
+        RECT rect = draw.rcItem;
+        rect.left += MulDiv(2, effective_dpi(), 96);
+        HGDIOBJ old_font = SelectObject(draw.hDC, font_);
+        SetBkMode(draw.hDC, TRANSPARENT);
+        std::wstring heading = options_expanded_ ? L"\x25BE  Options" : L"\x25B8  Options";
+        SetTextColor(draw.hDC, theme_.accent);
+        DrawTextW(draw.hDC, heading.c_str(), -1, &rect,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        if (!options_expanded_) {
+            SIZE extent{};
+            GetTextExtentPoint32W(draw.hDC, heading.c_str(), static_cast<int>(heading.size()), &extent);
+            RECT summary_rect = rect;
+            summary_rect.left += extent.cx + MulDiv(12, effective_dpi(), 96);
+            std::wstring summary;
+            try {
+                summary = storage::fsutil::utf8_to_wide(ui::summarize_options(collect_options()));
+            } catch (const std::exception&) {
+                summary = L"(check the option values)";
+            }
+            SetTextColor(draw.hDC, theme_.muted_text);
+            DrawTextW(draw.hDC, summary.c_str(), -1, &summary_rect,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+        SelectObject(draw.hDC, old_font);
+        if (focused) DrawFocusRect(draw.hDC, &draw.rcItem);
+    }
+
+    void set_options_expanded(bool expanded) {
+        options_expanded_ = expanded;
+        settings_.set_bool("UiOptionsExpanded", expanded);
+        layout();
+        InvalidateRect(options_toggle_, nullptr, TRUE);
+    }
+
+    // ---- Recent destinations ------------------------------------------------
+
+    std::vector<std::wstring> recent_destinations() {
+        std::vector<std::wstring> result;
+        const std::wstring all =
+            storage::fsutil::utf8_to_wide(settings_.get_string("RecentDestinations", ""));
+        std::size_t start = 0;
+        while (start < all.size()) {
+            std::size_t end = all.find(L'|', start);
+            std::wstring entry = all.substr(start, end == std::wstring::npos ? std::wstring::npos
+                                                                              : end - start);
+            if (!entry.empty()) result.push_back(std::move(entry));
+            if (end == std::wstring::npos) break;
+            start = end + 1;
+        }
+        return result;
+    }
+
+    void remember_destination(const std::string& destination) {
+        if (ui_is_blank(destination)) return;
+        const std::wstring wide = storage::fsutil::utf8_to_wide(destination);
+        auto list = recent_destinations();
+        list.erase(std::remove_if(list.begin(), list.end(),
+                                  [&](const std::wstring& entry) {
+                                      return _wcsicmp(entry.c_str(), wide.c_str()) == 0;
+                                  }),
+                   list.end());
+        list.insert(list.begin(), wide);
+        if (list.size() > static_cast<std::size_t>(MaxRecentDestinations)) {
+            list.resize(MaxRecentDestinations);
+        }
+        std::wstring joined;
+        for (const auto& entry : list) {
+            if (!joined.empty()) joined += L"|";
+            joined += entry;
+        }
+        settings_.set_string("RecentDestinations", storage::fsutil::wide_to_utf8(joined));
+    }
+
+    void show_recent_destinations() {
+        const auto list = recent_destinations();
+        HMENU menu = CreatePopupMenu();
+        if (list.empty()) {
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"No recent destinations");
+        }
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            AppendMenuW(menu, MF_STRING, static_cast<UINT_PTR>(IdRecentDestinationBase + i),
+                        list[i].c_str());
+        }
+        RECT button{};
+        GetWindowRect(recent_destinations_button_, &button);
+        const int chosen = static_cast<int>(TrackPopupMenu(
+            menu, TPM_RIGHTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY, button.right,
+            button.bottom, 0, hwnd_, nullptr));
+        DestroyMenu(menu);
+        const int index = chosen - IdRecentDestinationBase;
+        if (chosen != 0 && index >= 0 && static_cast<std::size_t>(index) < list.size()) {
+            SetWindowTextW(destination_edit_, list[static_cast<std::size_t>(index)].c_str());
+        }
+    }
+
+    // ---- Tasks panel ---------------------------------------------------------
+
+    COLORREF task_state_color(ui::TaskState state) const {
+        COLORREF color;
+        switch (state) {
+            case ui::TaskState::Running: color = RGB(20, 140, 60); break;
+            case ui::TaskState::Starting:
+            case ui::TaskState::WaitingForElevation: color = RGB(40, 120, 190); break;
+            case ui::TaskState::Paused: color = RGB(140, 80, 180); break;
+            case ui::TaskState::Completed: color = RGB(30, 100, 180); break;
+            case ui::TaskState::CompletedWithRecovery:
+            case ui::TaskState::Incomplete: color = RGB(210, 125, 30); break;
+            case ui::TaskState::Failed: color = RGB(200, 40, 40); break;
+            case ui::TaskState::Cancelled: color = RGB(160, 120, 20); break;
+            default: return theme_.muted_text;
+        }
+        if (theme_.dark) color = ui::blend_color(color, RGB(255, 255, 255), 45);
+        return color;
+    }
+
+    void draw_task_item(const DRAWITEMSTRUCT& draw) {
+        const bool selected = (draw.itemState & ODS_SELECTED) != 0;
+        ui::themedraw::fill_rect(draw.hDC, draw.rcItem, selected ? theme_.selection : theme_.edit);
+        if (draw.itemID == static_cast<UINT>(-1) || draw.itemID >= tasks_.size()) return;
+        const ui::SessionTask& task = tasks_.at(draw.itemID);
+        const int dpi = effective_dpi();
+        auto scale = [dpi](int value) { return MulDiv(value, dpi, 96); };
+
+        RECT rect = draw.rcItem;
+        rect.left += scale(10);
+        rect.right -= scale(8);
+        const int line = (rect.bottom - rect.top - scale(8)) / 2;
+        RECT title_rect{rect.left + scale(14), rect.top + scale(3), rect.right,
+                        rect.top + scale(3) + line};
+        RECT status_rect{rect.left + scale(14), title_rect.bottom, rect.right,
+                         title_rect.bottom + line};
+
+        // State dot.
+        const COLORREF state_color = task_state_color(task.state);
+        const int dot = scale(8);
+        RECT dot_rect{rect.left, title_rect.top + (line - dot) / 2, rect.left + dot,
+                      title_rect.top + (line - dot) / 2 + dot};
+        ui::themedraw::fill_rect(draw.hDC, dot_rect, state_color);
+
+        HGDIOBJ old_font = SelectObject(draw.hDC, font_);
+        SetBkMode(draw.hDC, TRANSPARENT);
+        SetTextColor(draw.hDC, selected ? theme_.selection_text : theme_.text);
+        const std::wstring title = storage::fsutil::utf8_to_wide(ui::task_title(task.options));
+        DrawTextW(draw.hDC, title.c_str(), -1, &title_rect,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+        std::string status = ui::to_display(task.state);
+        if (task.state == ui::TaskState::Running || task.state == ui::TaskState::Paused) {
+            status += " \xC2\xB7 " + std::to_string(static_cast<int>(task.progress * 100.0 + 0.5)) + "%";
+            if (task.bytes_per_second > 0 && task.state == ui::TaskState::Running) {
+                status += " \xC2\xB7 " + format_bytes_short(
+                                              static_cast<std::int64_t>(task.bytes_per_second)) + "/s";
+            }
+            if (task.eta_seconds >= 0 && task.state == ui::TaskState::Running) {
+                status += " \xC2\xB7 " + format_eta(static_cast<double>(task.eta_seconds)) + " left";
+            }
+        } else if (!task.outcome.empty()) {
+            status += " \xC2\xB7 " + task.outcome;
+        }
+        SetTextColor(draw.hDC, selected ? theme_.selection_text : state_color);
+        const std::wstring status_wide = storage::fsutil::utf8_to_wide(status);
+        DrawTextW(draw.hDC, status_wide.c_str(), -1, &status_rect,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(draw.hDC, old_font);
+
+        // Thin inline progress bar along the bottom edge for an active task.
+        if (ui::is_active(task.state)) {
+            RECT track{rect.left, draw.rcItem.bottom - scale(5), rect.right, draw.rcItem.bottom - scale(2)};
+            ui::themedraw::fill_rect(draw.hDC, track, theme_.panel);
+            RECT fill = track;
+            fill.right = track.left + static_cast<LONG>((track.right - track.left) *
+                                                        std::clamp(task.progress, 0.0, 1.0));
+            if (fill.right > fill.left) ui::themedraw::fill_rect(draw.hDC, fill, theme_.accent);
+        }
+        RECT divider{draw.rcItem.left, draw.rcItem.bottom - 1, draw.rcItem.right, draw.rcItem.bottom};
+        ui::themedraw::fill_rect(draw.hDC, divider, ui::blend_color(theme_.edit, theme_.border, 60));
+        if ((draw.itemState & ODS_FOCUS) != 0) DrawFocusRect(draw.hDC, &draw.rcItem);
+    }
+
+    void refresh_tasks_view() {
+        const int selected = static_cast<int>(SendMessageW(tasks_list_, LB_GETCURSEL, 0, 0));
+        SendMessageW(tasks_list_, LB_SETCOUNT, tasks_.size(), 0);
+        if (selected >= 0 && static_cast<std::size_t>(selected) < tasks_.size()) {
+            SendMessageW(tasks_list_, LB_SETCURSEL, selected, 0);
+        }
+        InvalidateRect(tasks_list_, nullptr, TRUE);
+        const auto counts = tasks_.counts();
+        std::wstring label = L"Tasks";
+        if (tasks_.size() > 0) {
+            label += L"  \x00B7  " + std::to_wstring(counts.active) + L" running, " +
+                     std::to_wstring(counts.queued) + L" queued, " +
+                     std::to_wstring(counts.finished) + L" finished";
+        }
+        SetWindowTextW(tasks_label_, label.c_str());
+        EnableWindow(clear_finished_button_, counts.finished > 0 ? TRUE : FALSE);
+    }
+
+    void invalidate_task_row(std::uint64_t id) {
+        auto index = tasks_.index_of(id);
+        if (!index.has_value()) return;
+        RECT row{};
+        if (SendMessageW(tasks_list_, LB_GETITEMRECT, *index, reinterpret_cast<LPARAM>(&row)) != LB_ERR) {
+            InvalidateRect(tasks_list_, &row, FALSE);
+        }
+    }
+
+    void persist_pending_tasks() {
+        if (pending_task_writer_ == nullptr) return;
+        pending_task_writer_->post(ui::pending_tasks_to_json(tasks_.queued(), tasks_running_));
+    }
+
+    void tasks_changed() {
+        refresh_tasks_view();
+        persist_pending_tasks();
+    }
+
+    // Turns the builder (sources + destination + options) into tasks: one per
+    // source folder group. Returns how many tasks were added.
+    int add_tasks_from_builder() {
+        if (sources_.empty()) {
+            info_box(L"Add files or folders to copy first: + Files, + Folder, Paste, or drag them "
+                     L"onto the list.");
+            return 0;
+        }
+        models::CopyJobOptions base;
+        try {
+            base = collect_options();
+        } catch (const std::exception& ex) {
+            warn_box(storage::fsutil::utf8_to_wide(ex.what()), L"Invalid run setting");
+            return 0;
+        }
+        const bool scan = base.OperationMode == models::JobOperationMode::ScanOnly;
+        if (!scan && ui_is_blank(base.DestinationRoot)) {
+            info_box(L"Choose a destination folder first.");
+            SetFocus(destination_edit_);
+            return 0;
+        }
+        const auto groups = ui::group_sources(sources_);
+        if (groups.empty()) return 0;
+        if (!scan) {
+            const auto collisions = ui::find_destination_collisions(groups);
+            if (!collisions.empty()) {
+                std::wstring names;
+                for (const auto& name : collisions) names += L"\n  \x2022 " + name;
+                if (!confirm_box(L"These names come from more than one source folder and would be "
+                                 L"written to the same place in the destination:" + names +
+                                     L"\n\nThe later task would overwrite or merge into the earlier "
+                                     L"one, as the overwrite policy decides. Add the tasks anyway?",
+                                 L"XactCopy - Name collision", ui::MessageIcon::Warning)) {
+                    return 0;
+                }
+            }
+            remember_destination(base.DestinationRoot);
+        }
+        for (const auto& group : groups) {
+            ui::SessionTask task;
+            task.options = base;
+            task.options.SourceRoot = storage::fsutil::wide_to_utf8(group.root);
+            task.options.SelectedRelativePaths = group.relative_paths;
+            tasks_.add(std::move(task));
+        }
+        append_log("Added " + std::to_string(groups.size()) +
+                   (groups.size() == 1 ? " task." : " tasks (one per source folder)."));
+        tasks_changed();
+        return static_cast<int>(groups.size());
+    }
+
+    // Starts the next queued task when nothing else is running.
+    void run_next_task() {
+        if (supervisor_.is_job_running() || starting_ || outgoing_handoff_.has_value()) return;
+        if (running_task_id_ != 0) return;
+        ui::SessionTask* task = tasks_.next_queued();
+        if (task == nullptr) {
+            if (tasks_running_) append_log("All queued tasks have been started.");
+            tasks_running_ = false;
+            persist_pending_tasks();
+            return;
+        }
+        running_task_id_ = task->id;
+        task->state = ui::TaskState::Starting;
+        const std::uint64_t id = task->id;
+        models::CopyJobOptions options = task->options;
+        const bool from_recovery = task->from_recovery;
+        const std::string managed_run_id = task->managed_run_id;
+        const std::string display_name = task->display_name;
+        tasks_changed();
+        start_job_with(options, from_recovery, managed_run_id, display_name);
+        settle_unstarted_task(id, "Not started");
+    }
+
+    // start_job_with can decline (validation, a risk prompt answered No,
+    // elevation declined without fallback). Leave the task visibly not run and
+    // stop advancing instead of looping over the queue.
+    void settle_unstarted_task(std::uint64_t id, const std::string& outcome) {
+        if (running_task_id_ != id) return;
+        ui::SessionTask* task = tasks_.find(id);
+        if (task == nullptr) {
+            running_task_id_ = 0;
+            return;
+        }
+        if (outgoing_handoff_.has_value()) {
+            task->state = ui::TaskState::WaitingForElevation;
+        } else if (!starting_ && !supervisor_.is_job_running()) {
+            task->state = ui::TaskState::Cancelled;
+            task->outcome = outcome;
+            running_task_id_ = 0;
+            tasks_running_ = false;
+        }
+        tasks_changed();
+    }
+
+    // Every start path funnels through start_job_with; a job started outside
+    // the task list (Job Manager, crash recovery, an elevation handoff) gets a
+    // task row too, so the panel always shows what is running.
+    void bind_started_job_to_task() {
+        ui::SessionTask* task = running_task_id_ != 0 ? tasks_.find(running_task_id_) : nullptr;
+        if (task == nullptr) {
+            ui::SessionTask external;
+            external.options = pending_start_options_;
+            external.display_name = pending_start_job_name_;
+            external.managed_run_id = active_managed_run_id_;
+            running_task_id_ = tasks_.add(std::move(external));
+            task = tasks_.find(running_task_id_);
+        }
+        task->state = paused_ ? ui::TaskState::Paused : ui::TaskState::Running;
+        task->progress = 0.0;
+        tasks_changed();
+    }
+
+    void finish_running_task(const models::CopyJobResult& result) {
+        ui::SessionTask* task = running_task_id_ != 0 ? tasks_.find(running_task_id_) : nullptr;
+        running_task_id_ = 0;
+        if (task == nullptr) return;
+        task->state = ui::state_from_result(result);
+        task->progress = task->state == ui::TaskState::Completed ? 1.0 : task->progress;
+        task->bytes_per_second = 0;
+        task->eta_seconds = -1;
+        std::string outcome = std::to_string(result.CompletedFiles) + "/" +
+                              std::to_string(result.TotalFiles) + " files";
+        if (result.FailedFiles > 0) outcome += ", " + std::to_string(result.FailedFiles) + " failed";
+        if (result.RecoveredFiles > 0) outcome += ", " + std::to_string(result.RecoveredFiles) + " recovered";
+        if (result.SkippedFiles > 0) outcome += ", " + std::to_string(result.SkippedFiles) + " skipped";
+        if (!result.ErrorMessage.empty() && task->state == ui::TaskState::Failed) {
+            outcome += " \xE2\x80\x94 " + result.ErrorMessage;
+        }
+        task->outcome = std::move(outcome);
+        tasks_changed();
+    }
+
+    void show_tasks_context_menu(LPARAM screen_point) {
+        POINT point{GET_X_LPARAM(screen_point), GET_Y_LPARAM(screen_point)};
+        if (point.x == -1 && point.y == -1) GetCursorPos(&point);
+        const ui::SessionTask* task = selected_task();
+        const bool queued = task != nullptr && task->state == ui::TaskState::Queued;
+        const bool finished = task != nullptr && ui::is_finished(task->state);
+        const bool copy = task != nullptr &&
+                          task->options.OperationMode == models::JobOperationMode::Copy;
+        auto flag = [](bool enabled) { return MF_STRING | (enabled ? 0u : static_cast<UINT>(MF_GRAYED)); };
+        HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, flag(queued), IdTaskStartNow, L"&Start now");
+        AppendMenuW(menu, flag(queued), IdTaskMoveUp, L"Move &up");
+        AppendMenuW(menu, flag(queued), IdTaskMoveDown, L"Move &down");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, flag(finished && task->state != ui::TaskState::Completed), IdTaskRetry,
+                    L"&Retry (resume from journal)");
+        AppendMenuW(menu, flag(copy), IdTaskOpenDestination, L"&Open destination");
+        AppendMenuW(menu, flag(task != nullptr), IdTaskEdit, L"&Edit in builder");
+        AppendMenuW(menu, flag(task != nullptr), IdTaskSaveAsJob, L"Save as &job...");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, flag(task != nullptr && !ui::is_active(task->state)), IdTaskRemove,
+                    L"Re&move\tDel");
+        TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd_, nullptr);
+        DestroyMenu(menu);
+    }
+
+    ui::SessionTask* selected_task() {
+        const int index = static_cast<int>(SendMessageW(tasks_list_, LB_GETCURSEL, 0, 0));
+        if (index < 0 || static_cast<std::size_t>(index) >= tasks_.size()) return nullptr;
+        return &tasks_.at(static_cast<std::size_t>(index));
+    }
+
+    void select_task(std::uint64_t id) {
+        if (auto index = tasks_.index_of(id)) {
+            SendMessageW(tasks_list_, LB_SETCURSEL, *index, 0);
+        }
+    }
+
+    void on_task_command(int id) {
+        ui::SessionTask* task = selected_task();
+        if (task == nullptr) return;
+        const std::uint64_t task_id = task->id;
+        switch (id) {
+            case IdTaskStartNow:
+                tasks_.move_to_front(task_id);
+                tasks_running_ = true;
+                tasks_changed();
+                select_task(task_id);
+                run_next_task();
+                break;
+            case IdTaskMoveUp:
+            case IdTaskMoveDown:
+                if (tasks_.move(task_id, id == IdTaskMoveUp ? -1 : 1)) {
+                    tasks_changed();
+                    select_task(task_id);
+                }
+                break;
+            case IdTaskRemove:
+                if (tasks_.remove(task_id)) tasks_changed();
+                break;
+            case IdTaskRetry: {
+                ui::SessionTask retry;
+                retry.options = task->options;
+                retry.options.ResumeFromJournal = true;
+                retry.display_name = task->display_name;
+                const std::uint64_t retry_id = tasks_.add(std::move(retry));
+                tasks_changed();
+                select_task(retry_id);
+                if (!supervisor_.is_job_running() && !starting_) {
+                    tasks_.move_to_front(retry_id);
+                    tasks_running_ = true;
+                    run_next_task();
+                }
+                break;
+            }
+            case IdTaskOpenDestination:
+                if (!ui_is_blank(task->options.DestinationRoot)) {
+                    open_folder_in_explorer(storage::fsutil::utf8_to_wide(task->options.DestinationRoot));
+                }
+                break;
+            case IdTaskEdit:
+                apply_run_options_to_ui(task->options);
+                append_log("Loaded the task's settings into the builder.");
+                break;
+            case IdTaskSaveAsJob: {
+                models::CopyJobOptions options = task->options;
+                bind_media_identities(options);
+                auto name = ui::TextPromptDialog::show(hwnd_, theme_, L"Save Job",
+                                                       L"Name for this saved job:",
+                                                       suggest_job_name(options));
+                if (name.has_value() && !ui_is_blank(*name)) {
+                    if (auto saved = job_manager_.save_job(*name, options)) {
+                        append_log("Saved job '" + saved->Name + "'.");
+                    }
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    // Offers tasks that never started in the previous session. An elevated
+    // relaunch restores them silently: the unelevated window wrote them a
+    // moment ago as part of the same session.
+    void restore_pending_tasks() {
+        ui::PendingTasks pending = ui::load_pending_tasks();
+        if (pending.tasks.empty()) return;
+        const bool silent = incoming_handoff_.has_value();
+        if (!silent) {
+            const std::wstring text = std::to_wstring(pending.tasks.size()) +
+                                      (pending.tasks.size() == 1
+                                           ? L" task from your last session did not run. Restore it?"
+                                           : L" tasks from your last session did not run. Restore them?");
+            if (!confirm_box(text, L"XactCopy - Unstarted tasks")) {
+                persist_pending_tasks(); // forget them
+                return;
+            }
+        }
+        for (auto& task : pending.tasks) {
+            task.state = ui::TaskState::Queued;
+            tasks_.add(std::move(task));
+        }
+        tasks_running_ = silent && pending.list_running;
+        append_log("Restored " + std::to_string(pending.tasks.size()) + " unstarted task(s)." +
+                   (tasks_running_ ? "" : " Press Start to run them."));
+        tasks_changed();
+    }
+
+    // Keyboard handling for the two panel lists (Del removes; Enter starts a
+    // queued task), and right-click context menus.
+    static LRESULT CALLBACK panel_list_subclass(HWND control, UINT message, WPARAM wparam,
+                                                LPARAM lparam, UINT_PTR, DWORD_PTR data) {
+        auto* self = reinterpret_cast<MainWindow*>(data);
+        if (message == WM_KEYDOWN) {
+            if (control == self->sources_list_) {
+                if (wparam == VK_DELETE) { self->remove_selected_sources(); return 0; }
+                if (wparam == 'V' && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+                    self->paste_sources();
+                    return 0;
+                }
+                if (wparam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+                    SendMessageW(control, LB_SETSEL, TRUE, -1);
+                    return 0;
+                }
+            } else if (control == self->tasks_list_) {
+                if (wparam == VK_DELETE) { self->on_task_command(IdTaskRemove); return 0; }
+                if (wparam == VK_RETURN) { self->on_task_command(IdTaskStartNow); return 0; }
+            }
+        }
+        if (message == WM_GETDLGCODE && (wparam == VK_RETURN || wparam == VK_DELETE)) {
+            return DLGC_WANTALLKEYS;
+        }
+        if (message == WM_CONTEXTMENU) {
+            if (control == self->sources_list_) self->show_sources_context_menu(lparam);
+            else self->show_tasks_context_menu(lparam);
+            return 0;
+        }
+        if (message == WM_RBUTTONDOWN) {
+            // Select the row under the cursor before the context menu opens.
+            const LRESULT hit = SendMessageW(control, LB_ITEMFROMPOINT, 0, lparam);
+            if (HIWORD(hit) == 0) {
+                const int index = LOWORD(hit);
+                if (control == self->tasks_list_) {
+                    SendMessageW(control, LB_SETCURSEL, index, 0);
+                } else if (SendMessageW(control, LB_GETSEL, index, 0) <= 0) {
+                    SendMessageW(control, LB_SETSEL, FALSE, -1);
+                    SendMessageW(control, LB_SETSEL, TRUE, index);
+                }
+            }
+        }
+        if (message == WM_NCDESTROY) {
+            RemoveWindowSubclass(control, &panel_list_subclass, control == self->sources_list_ ? 2 : 3);
+        }
+        return DefSubclassProc(control, message, wparam, lparam);
     }
 
     void draw_log_item(const DRAWITEMSTRUCT& draw) {
@@ -1672,6 +2796,10 @@ private:
 
     // ---- Layout ------------------------------------------------------------
 
+    // Two columns: the task builder ("What to copy", destination, options) on
+    // the left and the task list with the running task's detail on the right,
+    // the log full-width below. The two lists absorb any shortage of height
+    // first, then the log, so controls never overlap at the minimum size.
     void layout() {
         RECT client;
         GetClientRect(hwnd_, &client);
@@ -1681,160 +2809,241 @@ private:
         const int margin = scale(12);
         const int row_height = scale(24);
         const int gap = scale(8);
-        int width = client.right - client.left - margin * 2;
+        const int button_height = scale(30);
+        const int label_height = scale(18);
+        const int client_width = client.right - client.left - margin * 2;
+        const int client_height = client.bottom - client.top - margin * 2;
+        const bool scan = is_scan_mode();
+
+        int origin_x = margin;
         int y = margin;
-
         auto place = [&](HWND handle, int x, int w, int h = 0) {
-            if (handle != nullptr) {
-                MoveWindow(handle, margin + x, y, w, h == 0 ? row_height : h, TRUE);
-                // MoveWindow only invalidates a resized control's newly exposed
-                // strip, so widened statics/bars keep stale pixels. Force a full
-                // repaint (WS_CLIPCHILDREN keeps the parent from smearing them).
-                InvalidateRect(handle, nullptr, TRUE);
-            }
+            if (handle == nullptr) return;
+            MoveWindow(handle, origin_x + x, y, std::max(0, w), h == 0 ? row_height : h, TRUE);
+            // MoveWindow only invalidates a resized control's newly exposed
+            // strip, so widened statics/bars keep stale pixels.
+            InvalidateRect(handle, nullptr, TRUE);
+        };
+        auto show = [](HWND handle, bool visible) {
+            if (handle != nullptr) ShowWindow(handle, visible ? SW_SHOW : SW_HIDE);
         };
 
-        int label_width = scale(84);
-        int browse_width = scale(84);
-        int add_width = scale(96);
-        // The source row carries an extra "Add Files..." button.
-        int source_edit_width = width - label_width - browse_width - add_width - gap * 3;
-        int edit_width = width - label_width - browse_width - gap * 2;
+        // ---- Fixed bottom: log toolbar, log, status ----
+        const int status_height = row_height;
+        const int log_toolbar_height = row_height;
 
-        place(source_label_, 0, label_width);
-        place(source_edit_, label_width + gap, source_edit_width);
-        place(source_add_files_, label_width + gap + source_edit_width + gap, add_width);
-        place(source_browse_, label_width + gap + source_edit_width + gap + add_width + gap,
-              browse_width);
-        y += row_height + gap;
+        // ---- Builder column metrics ----
+        const int left_width = std::max(scale(340), (client_width - gap * 2) * 9 / 20);
+        const int right_width = client_width - left_width - gap * 2;
 
-        // Selection summary row, shown only while a subset of the source is queued.
-        if (IsWindowVisible(selection_label_)) {
-            const int clear_width = scale(64);
-            place(selection_label_, label_width + gap,
-                  width - label_width - clear_width - gap * 2, scale(20));
-            place(clear_selection_, width - clear_width, clear_width, scale(20));
-            y += scale(20) + gap;
-        }
+        // Height the builder needs apart from the flexible sources list.
+        const int check_rows = 4;
+        int builder_fixed = row_height + gap            // header + buttons
+                            + label_height + gap       // footer
+                            + (scan ? 0 : row_height + gap)  // destination
+                            + (row_height + gap) * 2   // two combo rows
+                            + row_height + gap         // options toggle
+                            + button_height;           // actions
+        if (options_expanded_) builder_fixed += (row_height + gap) * (check_rows + 1);
+        const int min_sources = scale(96);
 
-        if (!is_scan_mode()) {
-            place(destination_label_, 0, label_width);
-            place(destination_edit_, label_width + gap, edit_width);
-            place(destination_browse_, label_width + gap + edit_width + gap, browse_width);
+        // Detail block under the task list: heading, current file, the two
+        // progress rows, stats, speed/ETA, optional buffer/rescue row, job,
+        // journal, optional diagnostics, then the Pause/Cancel buttons.
+        int detail_height = label_height + gap + row_height + (row_height + gap) * 2 + row_height +
+                            label_height * 3 + gap + button_height;
+        if (show_buffer_row_ || show_rescue_row_) detail_height += label_height;
+        if (show_diagnostics_) detail_height += label_height;
+        const int tasks_header = row_height + gap;
+        const int min_tasks = scale(110);
+
+        // Preferred split gives the top 62%; it never goes below what the
+        // columns need, and never past what leaves the log its minimum. When
+        // the window is too short for both, the lists shrink (to a floor).
+        const int min_log = scale(90);
+        const int needed = std::max(builder_fixed + min_sources,
+                                    tasks_header + min_tasks + gap + detail_height);
+        const int available_top = client_height - status_height - log_toolbar_height - min_log - gap * 2;
+        int top_height = std::max(needed, (client_height - status_height - log_toolbar_height) * 62 / 100);
+        top_height = std::min(top_height, available_top);
+        const int list_floor = scale(48);
+        top_height = std::max(top_height, std::max(builder_fixed, tasks_header + gap + detail_height) +
+                                              list_floor);
+
+        // ---- Left: builder ----
+        {
+            origin_x = margin;
+            y = margin;
+            const int width = left_width;
+            const int compact_width = scale(64);
+            const int files_width = scale(72);
+            const int folder_width = scale(84);
+            int x = width;
+            x -= compact_width;        place(clear_selection_, x, compact_width);
+            x -= gap + compact_width;  place(source_paste_, x, compact_width);
+            x -= gap + folder_width; place(source_browse_, x, folder_width);
+            x -= gap + files_width;  place(source_add_files_, x, files_width);
+            place(source_label_, 0, std::max(0, x - gap));
             y += row_height + gap;
+
+            const int builder_height = top_height;
+            const int sources_height = std::max(list_floor, builder_height - builder_fixed);
+            place(sources_list_, 0, width, sources_height);
+            y += sources_height + scale(2);
+            place(sources_footer_, 0, width, label_height);
+            y += label_height + gap;
+
+            if (!scan) {
+                const int label_width = scale(84);
+                const int browse_width = scale(84);
+                const int recent_width = scale(28);
+                const int edit_width = width - label_width - browse_width - recent_width - gap * 3;
+                place(destination_label_, 0, label_width);
+                place(destination_edit_, label_width + gap, edit_width);
+                place(recent_destinations_button_, label_width + gap + edit_width + gap, recent_width);
+                place(destination_browse_, width - browse_width, browse_width);
+                y += row_height + gap;
+            }
+
+            const int half = (width - gap) / 2;
+            place(mode_combo_, 0, half, row_height * 8);
+            place(engine_combo_, half + gap, half, row_height * 8);
+            y += row_height + gap;
+            place(overwrite_combo_, 0, half, row_height * 8);
+            place(verify_combo_, half + gap, half, row_height * 8);
+            y += row_height + gap;
+
+            place(options_toggle_, 0, width);
+            y += row_height + gap;
+
+            HWND option_checks[] = {salvage_check_, resume_check_, map_check_, adaptive_check_,
+                                    continue_check_, skip_known_bad_check_, wait_media_check_,
+                                    fragile_check_};
+            HWND option_fields[] = {buffer_label_, buffer_edit_, retries_label_, retries_edit_,
+                                    timeout_label_, timeout_edit_};
+            for (HWND control : option_checks) show(control, options_expanded_);
+            for (HWND control : option_fields) show(control, options_expanded_);
+            if (options_expanded_) {
+                show(salvage_check_, !scan);
+                std::vector<HWND> visible;
+                for (HWND control : option_checks) {
+                    if (control == salvage_check_ && scan) continue;
+                    visible.push_back(control);
+                }
+                for (std::size_t i = 0; i < visible.size(); i += 2) {
+                    place(visible[i], 0, half);
+                    if (i + 1 < visible.size()) place(visible[i + 1], half + gap, half);
+                    y += row_height + gap;
+                }
+                for (std::size_t i = visible.size(); i < 8; i += 2) y += row_height + gap;
+                const int slot = (width - gap * 2) / 3;
+                const int field_label = slot * 58 / 100;
+                int fx = 0;
+                auto place_field = [&](HWND label, HWND edit) {
+                    place(label, fx, field_label);
+                    place(edit, fx + field_label + scale(4), slot - field_label - scale(4));
+                    fx += slot + gap;
+                };
+                place_field(buffer_label_, buffer_edit_);
+                place_field(retries_label_, retries_edit_);
+                place_field(timeout_label_, timeout_edit_);
+                y += row_height + gap;
+            }
+
+            // Settings on the left, Add/Start on the right; narrow columns
+            // shrink the two action buttons rather than overlapping Settings.
+            const int settings_width = scale(100);
+            const int action_width =
+                std::min(scale(118), (width - settings_width - gap * 2) / 2);
+            place(settings_button_, 0, settings_width, button_height);
+            place(start_button_, width - action_width, action_width, button_height);
+            place(add_task_button_, width - action_width * 2 - gap, action_width, button_height);
+            y += button_height;
         }
 
-        int combo_width = (width - gap * 3) / 4;
-        place(mode_combo_, 0, combo_width, row_height * 8);
-        place(engine_combo_, combo_width + gap, combo_width, row_height * 8);
-        place(overwrite_combo_, (combo_width + gap) * 2, combo_width, row_height * 8);
-        place(verify_combo_, (combo_width + gap) * 3, combo_width, row_height * 8);
-        y += row_height + gap;
+        // ---- Right: tasks + running detail ----
+        {
+            origin_x = margin + left_width + gap * 2;
+            y = margin;
+            const int width = right_width;
+            const int column_top = y;
+            const int column_height = top_height;
 
-        int check_width = (width - gap * 3) / 4;
-        if (is_scan_mode()) {
-            place(resume_check_, 0, check_width);
-            place(map_check_, check_width + gap, check_width);
-            place(adaptive_check_, (check_width + gap) * 2, check_width);
-        } else {
-            place(salvage_check_, 0, check_width);
-            place(resume_check_, check_width + gap, check_width);
-            place(map_check_, (check_width + gap) * 2, check_width);
-            place(adaptive_check_, (check_width + gap) * 3, check_width);
-        }
-        y += row_height + gap;
+            const int clear_width = scale(108);
+            const int pause_width = scale(190);
+            place(clear_finished_button_, width - clear_width, clear_width);
+            place(pause_list_check_, width - clear_width - gap - pause_width, pause_width);
+            place(tasks_label_, 0, std::max(0, width - clear_width - pause_width - gap * 2));
+            y += row_height + gap;
 
-        place(continue_check_, 0, check_width);
-        place(skip_known_bad_check_, check_width + gap, check_width);
-        place(wait_media_check_, (check_width + gap) * 2, check_width);
-        place(fragile_check_, (check_width + gap) * 3, check_width);
-        y += row_height + gap;
+            const int tasks_height =
+                std::max(list_floor, column_top + column_height - y - detail_height - gap);
+            place(tasks_list_, 0, width, tasks_height);
+            y += tasks_height + gap;
 
-        // Numeric row: three label+edit pairs.
-        int field_label_width = scale(72);
-        int field_edit_width = scale(70);
-        int field_slot = field_label_width + gap + field_edit_width + scale(16);
-        int fx = 0;
-        auto place_field = [&](HWND label, HWND edit) {
-            place(label, fx, field_label_width);
-            place(edit, fx + field_label_width + gap, field_edit_width);
-            fx += field_slot;
-        };
-        place_field(buffer_label_, buffer_edit_);
-        place_field(retries_label_, retries_edit_);
-        place_field(timeout_label_, timeout_edit_);
-        y += row_height + gap;
+            place(detail_label_, 0, width, label_height);
+            y += label_height + gap;
+            place(current_label_, 0, width);
+            y += row_height;
+            const int bar_height = scale(bar_show_percentage_
+                                             ? std::max(progress_bar_height_logical_, 14)
+                                             : progress_bar_height_logical_);
+            const int progress_label_width = scale(60);
+            const int progress_row_height = std::max(row_height, bar_height);
+            for (auto [label, bar] : {std::pair<HWND, HWND>{file_progress_label_, current_bar_},
+                                      std::pair<HWND, HWND>{overall_progress_label_, overall_bar_}}) {
+                place(label, 0, progress_label_width, progress_row_height);
+                y += (progress_row_height - bar_height) / 2;
+                place(bar, progress_label_width, width - progress_label_width, bar_height);
+                y -= (progress_row_height - bar_height) / 2;
+                y += progress_row_height + gap;
+            }
+            place(stats_label_, 0, width);
+            y += row_height;
 
-        int button_width = scale(110);
-        place(start_button_, 0, button_width, scale(30));
-        place(pause_button_, button_width + gap, button_width, scale(30));
-        place(cancel_button_, (button_width + gap) * 2, button_width, scale(30));
-        place(settings_button_, (button_width + gap) * 3, button_width, scale(30));
-        y += scale(30) + gap;
-
-        place(current_label_, 0, width);
-        y += row_height;
-        const int bar_height = scale(bar_show_percentage_
-                                         ? std::max(progress_bar_height_logical_, 14)
-                                         : progress_bar_height_logical_);
-        const int progress_label_width = scale(60);
-        const int progress_row_height = std::max(row_height, bar_height);
-        place(file_progress_label_, 0, progress_label_width, progress_row_height);
-        y += (progress_row_height - bar_height) / 2;
-        place(current_bar_, progress_label_width, width - progress_label_width, bar_height);
-        y -= (progress_row_height - bar_height) / 2;
-        y += progress_row_height + gap;
-        place(overall_progress_label_, 0, progress_label_width, progress_row_height);
-        y += (progress_row_height - bar_height) / 2;
-        place(overall_bar_, progress_label_width, width - progress_label_width, bar_height);
-        y -= (progress_row_height - bar_height) / 2;
-        y += progress_row_height + scale(2);
-        place(stats_label_, 0, width);
-        y += row_height;
-
-        // Telemetry strip: two columns of stacked labels. Rows can be hidden via
-        // the ShowBufferStatusRow / ShowRescueStatusRow settings.
-        int col_width = (width - gap) / 2;
-        int label_height = scale(18);
-        auto place_two = [&](HWND left, HWND right) {
-            place(left, 0, col_width, label_height);
-            place(right, col_width + gap, col_width, label_height);
+            const int col_width = (width - gap) / 2;
+            auto place_two = [&](HWND left, HWND right) {
+                place(left, 0, col_width, label_height);
+                place(right, col_width + gap, col_width, label_height);
+                y += label_height;
+            };
+            place_two(throughput_label_, eta_label_);
+            show(buffer_usage_label_, show_buffer_row_);
+            show(rescue_label_, show_rescue_row_);
+            if (show_buffer_row_ || show_rescue_row_) {
+                place_two(show_buffer_row_ ? buffer_usage_label_ : nullptr,
+                          show_rescue_row_ ? rescue_label_ : nullptr);
+            }
+            place(job_summary_label_, 0, width, label_height);
             y += label_height;
-        };
-        auto show_hide = [](HWND h, bool visible) {
-            if (h != nullptr) ShowWindow(h, visible ? SW_SHOW : SW_HIDE);
-        };
-        place_two(throughput_label_, eta_label_);
-        show_hide(buffer_usage_label_, show_buffer_row_);
-        show_hide(rescue_label_, show_rescue_row_);
-        if (show_buffer_row_ || show_rescue_row_) {
-            place_two(show_buffer_row_ ? buffer_usage_label_ : nullptr,
-                      show_rescue_row_ ? rescue_label_ : nullptr);
-        }
-        place_two(job_summary_label_, journal_label_);
-        if (show_diagnostics_) {
-            if (diagnostics_label_ != nullptr) ShowWindow(diagnostics_label_, SW_SHOW);
-            place(diagnostics_label_, 0, width, label_height);
+            place(journal_label_, 0, width, label_height);
             y += label_height;
-        } else if (diagnostics_label_ != nullptr) {
-            ShowWindow(diagnostics_label_, SW_HIDE);
+            show(diagnostics_label_, show_diagnostics_);
+            if (show_diagnostics_) {
+                place(diagnostics_label_, 0, width, label_height);
+                y += label_height;
+            }
+            y += gap;
+            const int button_width = scale(100);
+            place(pause_button_, 0, button_width, button_height);
+            place(cancel_button_, button_width + gap, button_width, button_height);
         }
-        y += gap;
 
+        // ---- Bottom: log ----
+        origin_x = margin;
+        y = margin + top_height + gap;
         const int filter_width = scale(190);
         const int find_button_width = scale(95);
         place(log_filter_, 0, filter_width, scale(160));
         place(log_find_, filter_width + gap,
-              std::max(scale(80), width - filter_width - find_button_width - 2 * gap));
-        place(log_find_button_, width - find_button_width, find_button_width);
-        y += row_height + gap;
-
-        int status_height = row_height;
-        int log_height = client.bottom - y - status_height - margin - gap;
-        if (log_height < scale(60)) log_height = scale(60);
-        place(log_list_, 0, width, log_height);
+              std::max(scale(80), client_width - filter_width - find_button_width - 2 * gap));
+        place(log_find_button_, client_width - find_button_width, find_button_width);
+        y += log_toolbar_height + gap;
+        const int log_height =
+            std::max(scale(60), static_cast<int>(client.bottom) - margin - status_height - gap - y);
+        place(log_list_, 0, client_width, log_height);
         y += log_height + gap;
-        place(status_label_, 0, width);
+        place(status_label_, 0, client_width);
         tooltips_.update_layout();
     }
 
@@ -1852,10 +3061,28 @@ private:
         if (id == IdLogCopySelected) { copy_log(false); return; }
         if (id == IdLogCopyAll) { copy_log(true); return; }
         if (id == IdLogSave) { save_log(); return; }
-        if (id == IdSourceEdit && notification == EN_CHANGE && !suppress_source_change_ &&
-            !explorer_selected_paths_.empty()) {
-            clear_selection(/*restore_root*/ false);
-            append_log("Exact-item selection cleared because the Source field was edited.");
+        // The collapsed Options header summarises the current option values.
+        if (options_toggle_ != nullptr && !options_expanded_ && id != IdOptionsToggle) {
+            InvalidateRect(options_toggle_, nullptr, FALSE);
+        }
+        if (id == IdPauseListCheck && notification == BN_CLICKED) {
+            set_check(id, !get_check(id));
+            InvalidateRect(pause_list_check_, nullptr, FALSE);
+            return;
+        }
+        if (id == IdTasksList && notification == LBN_DBLCLK) {
+            if (const ui::SessionTask* task = selected_task()) {
+                if (task->state == ui::TaskState::Queued) on_task_command(IdTaskStartNow);
+                else if (ui::is_finished(task->state)) on_task_command(IdTaskEdit);
+            }
+            return;
+        }
+        if (id >= IdSourceRemove && id <= IdSourceCopyPath) {
+            on_source_command(id);
+            return;
+        }
+        if (id >= IdTaskStartNow && id <= IdTaskEdit) {
+            on_task_command(id);
             return;
         }
         if (id == IdModeCombo && notification == CBN_SELCHANGE) {
@@ -1884,18 +3111,32 @@ private:
         }
         switch (id) {
             case IdSourceBrowse:
-                // Choosing a source folder replaces any queued item selection.
-                if (!selection_.empty()) clear_selection(/*restore_root*/ false);
-                browse_folder(source_edit_);
+                add_folders_to_sources();
                 break;
             case IdSourceAddFiles:
                 add_files_to_selection();
                 break;
+            case IdSourcePaste:
+                paste_sources();
+                break;
             case IdClearSelection:
-                clear_selection();
+                set_sources({});
                 break;
             case IdDestinationBrowse:
                 browse_folder(destination_edit_);
+                break;
+            case IdRecentDestinations:
+                show_recent_destinations();
+                break;
+            case IdOptionsToggle:
+                set_options_expanded(!options_expanded_);
+                break;
+            case IdAddTaskButton:
+                add_tasks_from_builder();
+                break;
+            case IdClearFinished:
+                tasks_.clear_finished();
+                tasks_changed();
                 break;
             case IdStartButton:
                 start_job();
@@ -2022,7 +3263,14 @@ private:
             return;
         }
         if (ui_is_blank(options.SourceRoot)) {
-            info_box(L"Choose a source before saving a job.");
+            info_box(L"Add a source before saving a job.");
+            return;
+        }
+        const std::size_t groups = ui::group_sources(sources_).size();
+        if (groups > 1) {
+            info_box(L"A saved job reads from one folder, but these sources span " +
+                     std::to_wstring(groups) +
+                     L" folders. Add them as tasks, then use Save as job on each task.");
             return;
         }
         bind_media_identities(options);
@@ -2212,29 +3460,19 @@ private:
                                        ui::MessageButtons::YesNo) == IDYES;
     }
 
-    // ---- Multi-item selection ----------------------------------------------
+    // ---- Incoming items ------------------------------------------------------
 
-    // Single entry point for every source of items: launch arguments, a second
-    // instance's forwarded command line, the Add-Files dialog, and drag-and-drop.
-    // Nothing is applied immediately — a burst of arrivals (Explorer invoking the
-    // verb once per selected item) is coalesced into one selection, so the user
-    // gets a single source root and a single destination prompt.
+    // Single entry point for launch arguments, a second instance's forwarded
+    // command line, the pickers, and drag-and-drop. Items join the sources list
+    // immediately; a burst of Explorer launches (one per selected item) is
+    // coalesced only for the follow-up: switching to assessment mode and
+    // asking for a destination once.
     void queue_selection(const std::vector<std::wstring>& paths, bool scan_mode,
                          bool want_destination) {
         if (paths.empty()) return;
-        if (supervisor_.is_job_running()) {
-            append_log("Ignored a selection: a job is already running.");
-            return;
-        }
-        int added = 0;
-        for (const auto& path : paths) {
-            if (selection_.add(path)) ++added;
-        }
-        if (added == 0 && !selection_timer_active_) return;
+        add_sources(paths);
         if (scan_mode) launch_.explorer_scan_mode = true;
         if (want_destination) selection_wants_destination_ = true;
-
-        // Restart the quiet period so late arrivals join the same selection.
         SetTimer(hwnd_, IdSelectionTimer, SelectionCoalesceMs, nullptr);
         selection_timer_active_ = true;
     }
@@ -2244,97 +3482,36 @@ private:
         selection_timer_active_ = false;
         const bool want_destination = selection_wants_destination_;
         selection_wants_destination_ = false;
-
-        explorer_selection_root_.clear();
-        explorer_selection_display_.clear();
-        explorer_selected_paths_.clear();
-        if (selection_.empty()) {
-            update_selection_ui();
-            return;
-        }
-
-        std::wstring root = selection_.common_root();
-        if (root.empty() || !directory_exists(root)) {
-            append_log("Selected items do not share a common source folder.");
-            selection_.clear();
-            update_selection_ui();
-            return;
-        }
-        std::wstring display = selection_.display_path();
-        suppress_source_change_ = true;
-        SetWindowTextW(source_edit_, display.c_str());
-        suppress_source_change_ = false;
-
-        std::vector<std::string> relative = selection_.relative_paths(root);
-        if (!relative.empty()) {
-            explorer_selection_root_ = storage::fsutil::wide_to_utf8(root);
-            explorer_selection_display_ = storage::fsutil::wide_to_utf8(display);
-            explorer_selected_paths_ = std::move(relative);
-        }
-
         if (launch_.explorer_scan_mode) {
             SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0); // Assess Readable Files
             sync_mode_ui();
         }
         launch_.explorer_scan_mode = false;
-        append_log("Source set to " + storage::fsutil::wide_to_utf8(display) + " (" +
-                   std::to_string(selection_.size()) + " item(s) selected).");
-        update_selection_ui();
-
+        if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
+        SetForegroundWindow(hwnd_);
         if (want_destination) prompt_destination_from_explorer();
     }
 
-    void clear_selection(bool restore_root = true) {
-        if (restore_root && !explorer_selection_root_.empty()) {
-            suppress_source_change_ = true;
-            SetWindowTextW(source_edit_,
-                           storage::fsutil::utf8_to_wide(explorer_selection_root_).c_str());
-            suppress_source_change_ = false;
-        }
-        selection_.clear();
-        explorer_selection_root_.clear();
-        explorer_selection_display_.clear();
-        explorer_selected_paths_.clear();
-        update_selection_ui();
-        append_log(std::string("Selection cleared; the whole source folder will be ") +
-                   (is_scan_mode() ? "assessed." : "copied."));
+    // Folder picker with multi-select; each folder is added as an item.
+    void add_folders_to_sources() {
+        auto picked = pick_paths(/*folders*/ true, L"Add folders to copy");
+        add_sources(picked);
     }
 
-    // A multi-selection needs a summary because the Source box can only show its
-    // common root. Keep the same confirmation for a single exact item.
-    void update_selection_ui() {
-        const bool active = !explorer_selected_paths_.empty();
-        const bool was_visible = selection_label_ != nullptr &&
-                                 IsWindowVisible(selection_label_) != FALSE;
-        if (selection_label_ != nullptr) {
-            std::wstring text =
-                active ? selection_.summary() +
-                             (selection_.size() == 1 ? L" \x2014 only this will be copied"
-                                                     : L" \x2014 only these will be copied")
-                       : L"";
-            SetWindowTextW(selection_label_, text.c_str());
-            ShowWindow(selection_label_, active ? SW_SHOW : SW_HIDE);
-        }
-        if (clear_selection_ != nullptr) ShowWindow(clear_selection_, active ? SW_SHOW : SW_HIDE);
-        // The row only occupies space when shown, so re-run the layout when its
-        // visibility changes to open/close the gap beneath the source box.
-        if (was_visible != active) layout();
-    }
-
-    // Multi-select file picker; folders come in via Browse or drag-and-drop.
-    void add_files_to_selection() {
-        if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) {
-            return;
-        }
+    // Multi-select shell picker for files or folders.
+    std::vector<std::wstring> pick_paths(bool folders, const wchar_t* title) {
         std::vector<std::wstring> picked;
+        if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) {
+            return picked;
+        }
         IFileOpenDialog* dialog = nullptr;
         if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                                        IID_PPV_ARGS(&dialog)))) {
             DWORD options = 0;
             dialog->GetOptions(&options);
             dialog->SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM |
-                               FOS_FILEMUSTEXIST);
-            dialog->SetTitle(L"Add files to copy");
+                               (folders ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST));
+            dialog->SetTitle(title);
             if (SUCCEEDED(dialog->Show(hwnd_))) {
                 IShellItemArray* items = nullptr;
                 if (SUCCEEDED(dialog->GetResults(&items))) {
@@ -2357,8 +3534,11 @@ private:
             dialog->Release();
         }
         CoUninitialize();
-        // Already-chosen items stay; the picker adds to the set.
-        queue_selection(picked, /*scan_mode*/ false, /*want_destination*/ false);
+        return picked;
+    }
+
+    void add_files_to_selection() {
+        add_sources(pick_paths(/*folders*/ false, L"Add files to copy"));
     }
 
     // ---- Explorer launch application (--from-explorer[-folder]) ------------
@@ -2375,7 +3555,6 @@ private:
                (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     }
 
-    // Root/relative-path resolution now lives in ui::SelectionModel (selection.h).
 
     // Feeds launch arguments into the selection model. A folder-background
     // launch is a whole-folder copy and applies immediately; item selections go
@@ -2388,12 +3567,8 @@ private:
                 append_log("Explorer folder path was not found: " + launch_.explorer_folder_path);
                 return;
             }
-            selection_.clear();
-            explorer_selection_root_.clear();
-            explorer_selection_display_.clear();
-            explorer_selected_paths_.clear();
-            update_selection_ui();
-            SetWindowTextW(source_edit_, folder.c_str());
+            // The folder-background verb means "this folder's contents".
+            add_sources({folder}, /*contents_only*/ true);
             if (launch_.explorer_scan_mode) {
                 SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0);
                 sync_mode_ui();
@@ -2556,11 +3731,7 @@ private:
     }
 
     void apply_run_options_to_ui(const models::CopyJobOptions& options) {
-        explorer_selection_root_ = options.SourceRoot;
-        explorer_selected_paths_ = options.SelectedRelativePaths;
-        explorer_selection_display_ = display_source(options);
-        SetWindowTextW(source_edit_,
-                       storage::fsutil::utf8_to_wide(explorer_selection_display_).c_str());
+        set_sources(ui::items_from_options(options));
         SetWindowTextW(destination_edit_,
                        storage::fsutil::utf8_to_wide(options.DestinationRoot).c_str());
 
@@ -2601,7 +3772,7 @@ private:
 
     models::CopyJobOptions collect_options() {
         models::CopyJobOptions options = settings_.build_default_options();
-        options.SourceRoot = window_text_utf8(source_edit_);
+        options.SourceRoot.clear(); // set from the sources list below
         options.DestinationRoot = window_text_utf8(destination_edit_);
 
         int mode = static_cast<int>(SendMessageW(mode_combo_, CB_GETCURSEL, 0, 0));
@@ -2666,26 +3837,27 @@ private:
         int timeout_seconds = read_int_field(timeout_edit_, 1, 3600, "Operation timeout");
         options.OperationTimeout = time::TimeSpan::from_seconds(timeout_seconds);
 
-        // The Source box shows an exact single item, while the worker accepts a
-        // directory root plus relative paths. Translate back only while the box
-        // still contains the captured display path (manual edits opt out).
-        if (!explorer_selected_paths_.empty() &&
-            models::detail::equals_ignore_case(
-                storage::fsutil::wide_to_utf8(storage::fsutil::get_full_path(
-                    storage::fsutil::utf8_to_wide(options.SourceRoot))),
-                explorer_selection_display_)) {
-            options.SourceRoot = explorer_selection_root_;
-            options.SelectedRelativePaths = explorer_selected_paths_;
+        // Single-job callers (save as job, defaults) get the first source
+        // group; task creation splits every group into its own task.
+        const auto groups = ui::group_sources(sources_);
+        if (!groups.empty()) {
+            options.SourceRoot = storage::fsutil::wide_to_utf8(groups.front().root);
+            options.SelectedRelativePaths = groups.front().relative_paths;
         }
         return options;
     }
 
+    // Start: add tasks for the builder's sources and run the list. While a
+    // task is running the new tasks simply queue behind it.
     void start_job() {
-        try {
-            start_job_with(collect_options(), false);
-        } catch (const std::exception& ex) {
-            warn_box(storage::fsutil::utf8_to_wide(ex.what()), L"Invalid run setting");
+        if (add_tasks_from_builder() <= 0) return;
+        tasks_running_ = true;
+        persist_pending_tasks();
+        if (supervisor_.is_job_running() || starting_) {
+            append_log("Queued; the new task(s) start after the current one.");
+            return;
         }
+        run_next_task();
     }
 
     static void bind_media_identities(models::CopyJobOptions& options) {
@@ -2807,7 +3979,6 @@ private:
         // background thread so the UI stays responsive, then finish in
         // WM_APP_START_DONE. Without this the Start click blocks the message loop.
         starting_ = true;
-        EnableWindow(start_button_, FALSE);
         set_inputs_enabled(false);
         SetWindowTextW(status_label_, L"Status: Starting worker...");
         append_log("Starting worker...");
@@ -2919,6 +4090,9 @@ private:
             CloseHandle(handoff.process);
             outgoing_handoff_.reset();
             append_log("The administrator window accepted the run. Closing this window.");
+            // Queued tasks are already in the pending-task file; the elevated
+            // window restores them and continues the list.
+            closing_for_handoff_ = true;
             ShowWindow(hwnd_, SW_HIDE);
             // Clean shutdown releases the single-instance mutex the elevated
             // window is waiting for. No job is running in this window.
@@ -2956,6 +4130,7 @@ private:
                            request.DisplayName);
             pending_recovery_run_id_.clear();
         }
+        settle_unstarted_task(running_task_id_, "Not started: administrator approval unavailable");
     }
 
     void on_start_done(bool ok, const std::string& error) {
@@ -2976,10 +4151,11 @@ private:
                                               compute_journal_path(pending_start_options_),
                                               &pending_start_options_);
             }
-            EnableWindow(start_button_, FALSE);
             EnableWindow(pause_button_, TRUE);
             EnableWindow(cancel_button_, TRUE);
+            update_action_buttons();
             update_menu_state();
+            bind_started_job_to_task();
             append_log("Job started (" + active_run_id_ + ").");
         } else {
             if (!active_managed_run_id_.empty()) {
@@ -2988,7 +4164,13 @@ private:
                 job_manager_.mark_run_completed(active_managed_run_id_, failure);
                 active_managed_run_id_.clear();
             }
-            EnableWindow(start_button_, TRUE);
+            if (ui::SessionTask* task = tasks_.find(running_task_id_)) {
+                task->state = ui::TaskState::Failed;
+                task->outcome = "Could not start: " + error;
+            }
+            running_task_id_ = 0;
+            tasks_running_ = false; // a start failure would repeat for every queued task
+            tasks_changed();
             set_inputs_enabled(true);
             SetWindowTextW(status_label_, L"Status: Idle");
             update_menu_state();
@@ -3120,6 +4302,14 @@ private:
 
     bool handle_log_shortcuts(const MSG& message) {
         if (message.message != WM_KEYDOWN) return false;
+        const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (control && message.wParam == VK_RETURN) { start_job(); return true; }
+        if (control && message.wParam == 'O') {
+            if (shift) add_folders_to_sources();
+            else add_files_to_selection();
+            return true;
+        }
         if (message.wParam == 'F' && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
             SetFocus(log_find_);
             SendMessageW(log_find_, EM_SETSEL, 0, -1);
@@ -3458,6 +4648,18 @@ private:
             SetWindowTextW(eta_label_, L"ETA: Calculating...");
         }
 
+        // Mirror the headline numbers onto the running task's row.
+        if (ui::SessionTask* task = tasks_.find(running_task_id_)) {
+            task->progress = snapshot.overall_progress();
+            task->bytes_per_second = smoothed_bytes_per_second_;
+            task->eta_seconds = remaining_bytes <= 0 ? 0
+                                : reference_speed > 1.0
+                                    ? static_cast<std::int64_t>(static_cast<double>(remaining_bytes) /
+                                                                reference_speed)
+                                    : -1;
+            invalidate_task_row(task->id);
+        }
+
         if (snapshot.BufferSizeBytes > 0 && snapshot.LastChunkBytesTransferred > 0) {
             ++buffer_samples_count_;
             buffer_sample_bytes_total_ += snapshot.LastChunkBytesTransferred;
@@ -3494,12 +4696,12 @@ private:
             active_managed_run_id_.clear();
         }
 
-        EnableWindow(start_button_, TRUE);
         EnableWindow(pause_button_, FALSE);
         EnableWindow(cancel_button_, FALSE);
-        set_inputs_enabled(true);
         SetWindowTextW(pause_button_, L"Pause");
         paused_ = false;
+        set_inputs_enabled(true);
+        finish_running_task(result);
         update_menu_state();
         InvalidateRect(start_button_, nullptr, FALSE);
         InvalidateRect(pause_button_, nullptr, FALSE);
@@ -3562,7 +4764,28 @@ private:
             }
         }
 
-        // Drain the queue after each run finishes (MainForm.QueueAutoQueuedRun).
+        // Continue the session task list, or, when it is not running, drain
+        // the Job Manager queue as before (MainForm.QueueAutoQueuedRun). Posted
+        // so the supervisor finishes its completion bookkeeping first.
+        PostMessageW(hwnd_, WM_APP_RUN_NEXT_TASK, 0, 0);
+    }
+
+    void on_run_next_task() {
+        if (supervisor_.is_job_running() || starting_ || outgoing_handoff_.has_value()) return;
+        if (tasks_running_ && tasks_.next_queued() != nullptr) {
+            if (get_check(IdPauseListCheck)) {
+                tasks_running_ = false;
+                persist_pending_tasks();
+                append_log("Task list paused after the current task. Press Start or use Start now to continue.");
+                return;
+            }
+            run_next_task();
+            return;
+        }
+        if (tasks_running_) {
+            tasks_running_ = false;
+            persist_pending_tasks();
+        }
         run_next_queued_job(/*manual*/ false);
     }
 

@@ -77,16 +77,19 @@ file next to every asset so you can verify the download.
 
 ## Quick start
 
-1. Launch **XactCopy** and pick a **Source** and a **Destination**.
+1. Launch **XactCopy**, add files and folders to **What to copy** (buttons,
+   paste, drag-and-drop, or Explorer's context menu), and choose a
+   **Destination**.
 2. Choose a **Mode**:
    - **Verified Copy / Recovery** — copy data from source to destination.
    - **Assess Readable Files** — read allocated source files and map unreadable regions (no
      destination needed).
 3. Adjust options if you like — the defaults are sensible — then press **Start**.
-   Progress, throughput, ETA, and a live log update as it runs; **Pause** and
-   **Cancel** stay available throughout.
+   The work appears in the **Tasks** list with progress, throughput, and ETA;
+   more tasks can be queued while one runs, and **Pause** and **Cancel** stay
+   available throughout.
 
-The main-window choices are per-run overrides. Use **Save defaults** when you
+The main-window choices are per-task overrides. Use **Save defaults** when you
 want the reusable options to seed future runs; use a saved job when the mode,
 paths, and complete option set must be retained together.
 
