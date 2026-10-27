@@ -17,12 +17,16 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "../core/crypto.h"
@@ -512,6 +516,75 @@ private:
     }
 };
 
+namespace detail {
+
+template <typename SourceHash, typename DestinationHash>
+std::pair<std::vector<unsigned char>, std::vector<unsigned char>>
+compute_hash_pair_concurrently(SourceHash&& source_hash, DestinationHash&& destination_hash) {
+    std::vector<unsigned char> source_result;
+    std::vector<unsigned char> destination_result;
+    std::exception_ptr source_error;
+    std::exception_ptr destination_error;
+    std::thread destination_thread([&] {
+        try {
+            destination_result = destination_hash();
+        } catch (...) {
+            destination_error = std::current_exception();
+        }
+    });
+    try {
+        source_result = source_hash();
+    } catch (...) {
+        source_error = std::current_exception();
+    }
+    // Join even when either side fails, before propagating its exception.
+    destination_thread.join();
+    if (source_error) std::rethrow_exception(source_error);
+    if (destination_error) std::rethrow_exception(destination_error);
+    return {std::move(source_result), std::move(destination_result)};
+}
+
+} // namespace detail
+
+// A publication may reuse only a completed, successful identity probe. The
+// mutex also prevents concurrent publishers from trusting an in-flight probe.
+class RecentMediaIdentityProbe {
+public:
+    template <typename Probe>
+    void check(Probe&& probe) {
+        std::lock_guard<std::mutex> guard(lock_);
+        const ULONGLONG now = GetTickCount64();
+        if (valid_ && now - last_success_tick_ < 250) return;
+        perform(probe);
+    }
+
+    template <typename Probe>
+    void check_fresh(Probe&& probe) {
+        std::lock_guard<std::mutex> guard(lock_);
+        perform(probe);
+    }
+
+    void reset() {
+        std::lock_guard<std::mutex> guard(lock_);
+        valid_ = false;
+    }
+
+private:
+    template <typename Probe>
+    void perform(Probe& probe) {
+        valid_ = false;
+        const ULONGLONG started = GetTickCount64();
+        if (probe()) {
+            last_success_tick_ = started;
+            valid_ = true;
+        }
+    }
+
+    std::mutex lock_;
+    ULONGLONG last_success_tick_ = 0;
+    bool valid_ = false;
+};
+
 class ResilientCopyEngine {
 public:
     using ProgressCallback = std::function<void(const CopyProgressSnapshot&)>;
@@ -696,24 +769,81 @@ public:
 
         // Parallel small-file bulk phase (copy mode only; mirrors the .NET
         // eligibility gates — sequential loop later treats these as completed).
-        std::vector<std::string> parallel_completed;
-        if (!scan_only && options_.TransferEnginePolicyValue == models::TransferEnginePolicy::NativeFast &&
-            is_native_acceleration_allowed() && parallel_small_file_workers > 1 &&
+        struct ResumeValidation {
+            bool completed = false;
+            FileStabilitySnapshot source;
+            FileStabilitySnapshot destination;
+        };
+        std::unordered_map<std::string, ResumeValidation> resume_validations;
+        std::unordered_set<std::string> parallel_completed;
+        const bool parallel_native =
+            options_.TransferEnginePolicyValue == models::TransferEnginePolicy::NativeFast &&
+            is_native_acceleration_allowed();
+        const bool parallel_managed =
+            options_.TransferEnginePolicyValue != models::TransferEnginePolicy::NativeFast &&
+            !fault_injector_.has_value() && !options_.WaitForMediaAvailability &&
+            !options_.TreatAccessDeniedAsContention &&
+            options_.SourceMutationPolicyValue == models::SourceMutationPolicy::FailFile;
+        const std::string parallel_pass = parallel_managed ? "ParallelManagedRescue" : "ParallelNativeFast";
+        if (!scan_only && (parallel_native || parallel_managed) && parallel_small_file_workers > 1 &&
             !options_.FragileMediaMode && !options_.WaitForFileLockRelease &&
             options_.MaxThroughputBytesPerSecond <= 0 &&
-            // The parallel path has no managed rescue loop. Require a full
-            // content check before publication so NativeFast parallelism
-            // cannot turn an unchecked CopyFileExW result into a clean copy.
+            // Every parallel publication must pass full verification.
             resolve_verification_mode() == models::VerificationMode::Full &&
             !(options_.UseBadRangeMap && options_.SkipKnownBadRanges)) {
 
             std::vector<SourceFileDescriptor> eligible;
             std::int64_t threshold = std::max(MinimumRescueBlockSize, options_.SmallFileThresholdBytes);
+            ULONGLONG last_validation_progress_tick = 0;
             for (const auto& candidate : scan.files) {
+                cancel.throw_if_cancelled();
+                if (control_ != nullptr) control_->wait_if_paused(cancel);
                 if (candidate.length <= 0 || candidate.length > threshold) continue;
                 JournalFileEntry* candidate_entry = journal.Files.find(candidate.relative_path);
                 if (candidate_entry == nullptr) continue;
-                if (is_already_completed(*candidate_entry, candidate, destination_root, cancel)) continue;
+                ResumeValidation validation;
+                const bool was_completed = candidate_entry->State == FileCopyState::Completed;
+                const std::wstring destination_path = destination_path_for(destination_root, candidate);
+                const bool have_stability = was_completed &&
+                    try_get_file_stability(candidate.full_path, validation.source) &&
+                    try_get_file_stability(destination_path, validation.destination) &&
+                    validation.source.identity.file_index != 0 &&
+                    validation.source.identity.volume_serial != 0 &&
+                    validation.source.change_utc_ticks > time::FileTimeEpochTicks &&
+                    validation.destination.identity.file_index != 0 &&
+                    validation.destination.identity.volume_serial != 0 &&
+                    validation.destination.change_utc_ticks > time::FileTimeEpochTicks;
+                validation.completed = is_already_completed(*candidate_entry, candidate,
+                                                             destination_root, cancel);
+                if (validation.completed) {
+                    FileStabilitySnapshot source_after;
+                    FileStabilitySnapshot destination_after;
+                    // The cached verdict is reusable only while both files
+                    // still have the generations that were hashed.
+                    if (!have_stability ||
+                        !try_get_file_stability(candidate.full_path, source_after) ||
+                        !try_get_file_stability(destination_path, destination_after) ||
+                        !file_stability_matches(validation.source, source_after) ||
+                        !file_stability_matches(validation.destination, destination_after)) {
+                        validation.completed = false;
+                        reset_journal_coverage_for_retry(*candidate_entry);
+                    }
+                }
+                if (was_completed) {
+                    ULONGLONG now = GetTickCount64();
+                    if (last_validation_progress_tick == 0 ||
+                        now - last_validation_progress_tick >= 250) {
+                        emit_progress(progress, candidate.relative_path, candidate.length,
+                                      candidate.length, 0,
+                                      resolve_buffer_size_for_file(candidate.length),
+                                      "ResumeValidation");
+                        last_validation_progress_tick = now;
+                    }
+                }
+                if (validation.completed) {
+                    resume_validations.emplace(fold_relative_path(candidate.relative_path), validation);
+                    continue;
+                }
                 if (should_skip_failed_entry_for_fragile_resume(*candidate_entry)) continue;
                 std::string parallel_skip_reason;
                 if (decide_overwrite_policy(candidate, destination_root, parallel_skip_reason) !=
@@ -723,20 +853,15 @@ public:
                 eligible.push_back(candidate);
             }
             if (eligible.size() > 1) {
-                parallel_completed = copy_small_files_parallel(eligible, destination_root, journal,
-                                                               journal_path, cancel,
-                                                               parallel_small_file_workers);
+                for (const auto& path : copy_small_files_parallel(
+                         eligible, destination_root, progress, journal, journal_path, cancel,
+                         parallel_small_file_workers, parallel_managed)) {
+                    parallel_completed.insert(fold_relative_path(path));
+                }
             }
         }
         auto take_parallel_completed = [&parallel_completed](const std::string& relative) {
-            for (std::size_t i = 0; i < parallel_completed.size(); ++i) {
-                if (models::detail::equals_ignore_case(parallel_completed[i], relative)) {
-                    parallel_completed.erase(parallel_completed.begin() +
-                                             static_cast<std::ptrdiff_t>(i));
-                    return true;
-                }
-            }
-            return false;
+            return parallel_completed.erase(fold_relative_path(relative)) != 0;
         };
 
         for (const auto& descriptor : scan.files) {
@@ -751,6 +876,14 @@ public:
             // Overwrite/existing-destination semantics are copy-only; scan
             // mode always attempts source reads to discover bad ranges.
             if (!scan_only) {
+                if (take_parallel_completed(descriptor.relative_path)) {
+                    // The parallel phase already counted this publication.
+                    emit_progress(progress, descriptor.relative_path, descriptor.length,
+                                  descriptor.length, 0,
+                                  resolve_buffer_size_for_file(descriptor.length),
+                                  parallel_pass, 0, 0);
+                    continue;
+                }
                 std::string overwrite_reason;
                 ExistingDestinationDecision overwrite_decision =
                     decide_overwrite_policy(descriptor, destination_root, overwrite_reason);
@@ -778,17 +911,26 @@ public:
                     continue;
                 }
 
-                if (take_parallel_completed(descriptor.relative_path)) {
-                    progress.completed_files += 1;
-                    progress.total_bytes_copied += descriptor.length;
-                    emit_progress(progress, descriptor.relative_path, descriptor.length,
-                                  descriptor.length, 0,
-                                  resolve_buffer_size_for_file(descriptor.length),
-                                  "ParallelNativeFast", 0, 0);
-                    continue;
+                auto validation = resume_validations.find(fold_relative_path(descriptor.relative_path));
+                bool already_completed = false;
+                if (validation == resume_validations.end()) {
+                    already_completed = is_already_completed(*entry, descriptor, destination_root, cancel);
+                } else if (validation->second.completed) {
+                    FileStabilitySnapshot current_source;
+                    FileStabilitySnapshot current_destination;
+                    already_completed =
+                        try_get_file_stability(descriptor.full_path, current_source) &&
+                        try_get_file_stability(destination_path_for(destination_root, descriptor),
+                                               current_destination) &&
+                        file_stability_matches(validation->second.source, current_source) &&
+                        file_stability_matches(validation->second.destination, current_destination);
+                    if (!already_completed) {
+                        emit_log("Journal completion changed after validation for " +
+                                 descriptor.relative_path + "; copying again.");
+                        reset_journal_coverage_for_retry(*entry);
+                    }
                 }
-
-                if (is_already_completed(*entry, descriptor, destination_root, cancel)) {
+                if (already_completed) {
                     // A journal reuse is an exact, full-validated completion,
                     // not an omitted source file. Keep it in CompletedFiles
                     // so a clean resume remains a clean success; policy
@@ -1048,13 +1190,16 @@ private:
     std::string expected_source_identity_;
     std::string expected_destination_identity_;
     std::mutex media_identity_lock_;
+    RecentMediaIdentityProbe source_publication_probe_;
+    RecentMediaIdentityProbe destination_publication_probe_;
     std::atomic<ULONGLONG> last_source_identity_probe_tick_{0};
     std::atomic<ULONGLONG> last_destination_identity_probe_tick_{0};
     std::atomic<ULONGLONG> last_source_mismatch_log_tick_{0};
     std::atomic<ULONGLONG> last_destination_mismatch_log_tick_{0};
     std::atomic<bool> source_media_identity_accepted_{true};
     std::atomic<bool> destination_media_identity_accepted_{true};
-    std::vector<std::wstring> created_directories_;
+    std::unordered_set<std::wstring> created_directories_;
+    std::mutex created_directories_lock_;
     std::deque<ULONGLONG> fragile_failure_timestamps_;
     std::atomic<std::int32_t> native_fast_path_files_{0};
     std::atomic<std::int32_t> parallel_native_fast_path_files_{0};
@@ -1068,8 +1213,12 @@ private:
     bool source_enumeration_incomplete_ = false;
     std::string source_enumeration_error_;
     std::mutex metadata_warning_lock_;
+    std::mutex log_callback_lock_;
     std::string integrity_warning_;
     std::string metadata_notice_;
+    // Parallel managed workers keep ranges private until an exact stage is
+    // published; they must never write their one-file temporary journal.
+    bool defer_journal_checkpoints_ = false;
 
     // Bad-range map state (InitializeBadRangeMapAsync et al).
     std::optional<storage::BadRangeMap> bad_range_map_;
@@ -1575,6 +1724,7 @@ private:
     static constexpr ULONGLONG MaximumJournalFlushIntervalMs = 5 * 60 * 1000;
 
     void flush_journal(const std::wstring& journal_path, JobJournal& journal, bool force) {
+        if (defer_journal_checkpoints_) return;
         ULONGLONG now = GetTickCount64();
         ULONGLONG interval_ms = force ? 500 : 1000;
         ULONGLONG budget_ms = last_journal_save_cost_ms_ * (JournalFlushDutyDivisor - 1);
@@ -2149,7 +2299,7 @@ private:
     bool copy_single_file(const SourceFileDescriptor& descriptor, JournalFileEntry& entry,
                           const std::wstring& destination_root, ProgressAccumulator& progress,
                           JobJournal& journal, const std::wstring& journal_path,
-                          const CancelContext& cancel) {
+                          const CancelContext& cancel, bool parallel_exact = false) {
         std::wstring destination_path = destination_path_for(destination_root, descriptor);
         std::wstring destination_directory = storage::fsutil::get_directory_name(destination_path);
         if (!destination_directory.empty() && add_created_directory(destination_directory)) {
@@ -2194,8 +2344,16 @@ private:
         DestinationStage stage(destination_path, cancel);
         if (preserve_existing) stage.clone_existing_if_present();
         const std::wstring& working_path = stage.working_path();
-        prepare_destination_file(working_path, descriptor.length, destination_length, preserve_existing);
-        destination_length = get_existing_file_length(working_path);
+        if (!preserve_existing &&
+            should_use_native_copy_fast_path(descriptor.length, 0, has_persisted_coverage)) {
+            // CopyFileEx creates its own stage. Managed copies and native
+            // fallbacks still prepare the stage before opening a write handle.
+            destination_length = 0;
+        } else {
+            prepare_destination_file(working_path, descriptor.length, destination_length,
+                                     preserve_existing);
+            destination_length = get_existing_file_length(working_path);
+        }
 
         // Native CopyFileEx fast path.
         std::int64_t native_baseline = progress.total_bytes_copied;
@@ -2205,8 +2363,6 @@ private:
         if (native.attempted) {
             if (native.succeeded) {
                 ensure_source_identity_unchanged(descriptor, source_identity, source_identity_valid);
-                ensure_media_identity_integrity(utf8_to_wide(options_.SourceRoot), destination_root,
-                                                true, true);
                 stage.make_writable();
                 if (resolve_verification_mode() != models::VerificationMode::None) {
                     verify_file_with_retries(descriptor.full_path, working_path,
@@ -2216,6 +2372,8 @@ private:
                                        cancel, resolve_verification_mode());
                 ensure_source_stability_unchanged(descriptor, source_stability,
                                                   source_stability_valid);
+                ensure_media_identity_integrity(utf8_to_wide(options_.SourceRoot), destination_root,
+                                                true, true);
                 publish_stage(stage, descriptor, false);
                 return false;
             }
@@ -2328,6 +2486,10 @@ private:
             }
         }
 
+        if (parallel_exact && recovered_any) {
+            throw IoError("Non-exact recovery deferred to the sequential path: " +
+                          descriptor.relative_path + ".");
+        }
         ensure_source_identity_unchanged(descriptor, source_identity, source_identity_valid);
         session.invalidate_destination(); // release the staged write handle before metadata/commit
 
@@ -2355,6 +2517,14 @@ private:
 
         ensure_media_identity_integrity(utf8_to_wide(options_.SourceRoot), destination_root,
                                         true, true);
+        if (parallel_exact && options_.OverwritePolicyValue != models::OverwritePolicy::Overwrite) {
+            std::string overwrite_reason;
+            if (decide_overwrite_policy(descriptor, destination_root, overwrite_reason) !=
+                ExistingDestinationDecision::Copy) {
+                throw IoError("Destination conflict deferred to the sequential path: " +
+                              descriptor.relative_path + ".");
+            }
+        }
         publish_stage(stage, descriptor, recovered_any, &entry);
         managed_copy_files_ += 1;
         return recovered_any;
@@ -2385,12 +2555,8 @@ private:
     }
 
     bool add_created_directory(const std::wstring& directory) {
-        std::wstring upper = storage::fsutil::to_upper_invariant(directory);
-        for (const auto& existing : created_directories_) {
-            if (existing == upper) return false;
-        }
-        created_directories_.push_back(upper);
-        return true;
+        std::lock_guard<std::mutex> guard(created_directories_lock_);
+        return created_directories_.insert(storage::fsutil::to_upper_invariant(directory)).second;
     }
 
     static void prepare_destination_file(const std::wstring& destination_path,
@@ -3355,11 +3521,12 @@ private:
                         emit_raw_disk_fallback_once(source_path, raw.FallbackReason);
                         bytes_read = timed_io::read_at(
                             session.source_handle(), offset, buffer, length,
-                            operation_timeout_ms(), cancel);
+                            operation_timeout_ms(), cancel, false, session.source_event());
                     }
                 } else {
                     bytes_read = timed_io::read_at(
-                        session.source_handle(), offset, buffer, length, operation_timeout_ms(), cancel);
+                        session.source_handle(), offset, buffer, length, operation_timeout_ms(), cancel,
+                        false, session.source_event());
                 }
                 if (bytes_read != length) {
                     throw IoError("Short read at offset " + std::to_string(offset) + ". Expected " +
@@ -3485,7 +3652,7 @@ private:
                     }
                 }
                 timed_io::write_at(session.destination_handle(), offset, buffer, count,
-                                   operation_timeout_ms(), cancel);
+                                   operation_timeout_ms(), cancel, session.destination_event());
                 bytes_written_.fetch_add(count);
                 return;
             } catch (const IoError& ex) {
@@ -3588,16 +3755,21 @@ private:
         }
         if (mode == models::VerificationMode::Full) {
             emit_log("Verifying (full hash): " + relative_path);
-            auto source_hash = copied_source_hash.has_value()
-                                   ? *copied_source_hash
-                                   : compute_file_hash(source_path, cancel);
+            std::vector<unsigned char> source_hash;
+            std::vector<unsigned char> destination_hash;
+            // Destination reads retain the existing unbuffered path and its
+            // cached fallback. Independent handles permit parallel hashing.
             if (copied_source_hash.has_value()) {
+                source_hash = *copied_source_hash;
                 emit_log("Using source hash captured during copy: " + relative_path);
+                destination_hash = compute_file_hash(destination_path, cancel, /*uncached*/ true);
+            } else {
+                auto hashes = detail::compute_hash_pair_concurrently(
+                    [&] { return compute_file_hash(source_path, cancel); },
+                    [&] { return compute_file_hash(destination_path, cancel, /*uncached*/ true); });
+                source_hash = std::move(hashes.first);
+                destination_hash = std::move(hashes.second);
             }
-            // The destination was just written through the system cache. A
-            // cached read would hash those same pages and prove nothing about
-            // the media, so the destination side is always read unbuffered.
-            auto destination_hash = compute_file_hash(destination_path, cancel, /*uncached*/ true);
             if (source_hash != destination_hash) {
                 throw IoError("Verification hash mismatch: " + relative_path);
             }
@@ -3735,12 +3907,14 @@ private:
 
         crypto::detail::StreamingHash hasher(use_sha512());
         AlignedBuffer buffer(1 << 20);
+        timed_io::Event event;
         std::int64_t offset = 0;
         try {
             while (true) {
                 std::int32_t read = timed_io::read_at(handle, offset, buffer.data(),
                                                       static_cast<std::int32_t>(buffer.size()),
-                                                      operation_timeout_ms(), cancel, uncached);
+                                                      operation_timeout_ms(), cancel, uncached,
+                                                      event.get());
                 if (read <= 0) break;
                 hasher.update(buffer.data(), static_cast<std::size_t>(read));
                 bytes_verified_.fetch_add(read);
@@ -4981,17 +5155,32 @@ private:
         return *scan_error;
     }
 
-    // ---- Parallel small-file copy phase (CopyFileEx workers) ---------------
+    // ---- Parallel small-file copy phase -----------------------------------
 
     std::vector<std::string> copy_small_files_parallel(
         const std::vector<SourceFileDescriptor>& files, const std::wstring& destination_root,
-        JobJournal& journal, const std::wstring& journal_path, const CancelContext& cancel,
-        std::int32_t worker_count) {
+        ProgressAccumulator& progress, JobJournal& journal, const std::wstring& journal_path,
+        const CancelContext& cancel, std::int32_t worker_count, bool managed) {
         std::vector<std::string> completed_paths;
         if (files.empty()) return completed_paths;
 
+        std::int32_t concurrency = std::max(
+            1, std::min<std::int32_t>(worker_count,
+                                      static_cast<std::int32_t>(files.size())));
+        if (managed) {
+            std::int64_t largest_file = 0;
+            for (const auto& file : files) largest_file = std::max(largest_file, file.length);
+            const std::int32_t buffer_bytes = std::max(
+                MinimumRescueBlockSize,
+                create_buffer_controller(largest_file, BufferPurpose::Copy).maximum_size());
+            constexpr std::int32_t managed_buffer_budget = 128 * 1024 * 1024;
+            concurrency = std::min(concurrency, std::max(1, managed_buffer_budget / buffer_bytes));
+            if (concurrency < 2) return completed_paths;
+        }
+        const std::string phase_pass = managed ? "ParallelManagedRescue" : "ParallelNativeFast";
         emit_log("Parallel small file phase: " + std::to_string(files.size()) + " file(s) using " +
-                 std::to_string(worker_count) + " worker(s).");
+                 std::to_string(concurrency) + " worker(s) (" +
+                 (managed ? "managed" : "native") + ").");
 
         for (const auto& descriptor : files) {
             std::wstring destination_path = destination_path_for(destination_root, descriptor);
@@ -5001,40 +5190,85 @@ private:
             }
         }
 
-        std::int32_t concurrency = std::max(
-            1, std::min<std::int32_t>(worker_count,
-                                      static_cast<std::int32_t>(files.size())));
+        std::vector<std::unique_ptr<ResilientCopyEngine>> managed_engines;
+        if (managed) {
+            const std::string source_identity = expected_media_identity(true);
+            const std::string destination_identity = expected_media_identity(false);
+            for (std::int32_t index = 0; index < concurrency; ++index) {
+                CopyJobOptions worker_options = options_;
+                worker_options.TransferEnginePolicyValue = models::TransferEnginePolicy::ManagedRescue;
+                LogCallback worker_log;
+                if (log_callback_) {
+                    worker_log = [this](const std::string& message) { forward_log(message); };
+                }
+                auto worker = std::make_unique<ResilientCopyEngine>(
+                    std::move(worker_options), control_, nullptr, std::move(worker_log));
+                worker->fault_injector_.reset();
+                worker->defer_journal_checkpoints_ = true;
+                worker->expected_source_identity_ = source_identity;
+                worker->expected_destination_identity_ = destination_identity;
+                managed_engines.push_back(std::move(worker));
+            }
+        }
         std::mutex work_lock;
         std::size_t next_index = 0;
         std::atomic<std::int32_t> completed_count{0};
         std::atomic<std::int32_t> failed_count{0};
         std::atomic<bool> cancelled{false};
+        ULONGLONG last_progress_tick = 0;
+        std::string last_completed_path;
+        std::int64_t last_completed_length = 0;
+
+        auto record_completed = [&](const SourceFileDescriptor& descriptor) {
+            {
+                std::lock_guard<std::mutex> guard(work_lock);
+                completed_paths.push_back(descriptor.relative_path);
+            }
+            completed_count += 1;
+            std::lock_guard<std::mutex> guard(progress_lock_);
+            progress.completed_files += 1;
+            progress.total_bytes_copied += descriptor.length;
+            last_completed_path = descriptor.relative_path;
+            last_completed_length = descriptor.length;
+            const ULONGLONG now = GetTickCount64();
+            if (last_progress_tick == 0 || now - last_progress_tick >= 250) {
+                emit_progress(progress, descriptor.relative_path, descriptor.length,
+                              descriptor.length, 0,
+                              resolve_buffer_size_for_file(descriptor.length), phase_pass, 0, 0);
+                last_progress_tick = now;
+            }
+        };
 
         HANDLE checkpoint_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         std::thread checkpoint_thread;
         if (checkpoint_stop != nullptr) {
-            checkpoint_thread = std::thread([this, &journal, &journal_path,
-                                              checkpoint_stop]() {
-                DWORD interval_ms = 5000;
-                while (WaitForSingleObject(checkpoint_stop, interval_ms) == WAIT_TIMEOUT) {
-                    JobJournal snapshot;
-                    {
-                        std::lock_guard<std::mutex> guard(journal_lock_);
-                        snapshot = journal;
+            try {
+                checkpoint_thread = std::thread([this, &journal, &journal_path,
+                                                  checkpoint_stop]() {
+                    DWORD interval_ms = 5000;
+                    while (WaitForSingleObject(checkpoint_stop, interval_ms) == WAIT_TIMEOUT) {
+                        JobJournal snapshot;
+                        {
+                            std::lock_guard<std::mutex> guard(journal_lock_);
+                            snapshot = journal;
+                        }
+                        const ULONGLONG started = GetTickCount64();
+                        try {
+                            (void)journal_store_.save(journal_path, std::move(snapshot));
+                        } catch (const std::exception&) {
+                            // The joined phase performs a final synchronous save;
+                            // keep copying if an intermediate redundancy write fails.
+                        }
+                        const ULONGLONG cost = std::max<ULONGLONG>(1, GetTickCount64() - started);
+                        interval_ms = static_cast<DWORD>(std::clamp<ULONGLONG>(
+                            cost * (JournalFlushDutyDivisor - 1), 5000,
+                            MaximumJournalFlushIntervalMs));
                     }
-                    const ULONGLONG started = GetTickCount64();
-                    try {
-                        (void)journal_store_.save(journal_path, std::move(snapshot));
-                    } catch (const std::exception&) {
-                        // The joined phase performs a final synchronous save;
-                        // keep copying if an intermediate redundancy write fails.
-                    }
-                    const ULONGLONG cost = std::max<ULONGLONG>(1, GetTickCount64() - started);
-                    interval_ms = static_cast<DWORD>(std::clamp<ULONGLONG>(
-                        cost * (JournalFlushDutyDivisor - 1), 5000,
-                        MaximumJournalFlushIntervalMs));
-                }
-            });
+                });
+            } catch (...) {
+                CloseHandle(checkpoint_stop);
+                checkpoint_stop = nullptr;
+            }
         }
 
         struct QuietCallbackState {
@@ -5044,16 +5278,19 @@ private:
         auto quiet_routine = [](LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, DWORD,
                                 DWORD, HANDLE, HANDLE, LPVOID context) -> DWORD {
             auto* state = static_cast<QuietCallbackState*>(context);
-            if (state->cancel->is_cancelled() ||
+            if (state->cancel->is_cancelled() || state->cancel->deadline_passed() ||
                 (state->control != nullptr && state->control->is_paused())) {
                 return PROGRESS_CANCEL;
             }
-            return PROGRESS_QUIET;
+            return PROGRESS_CONTINUE;
         };
 
         std::vector<std::thread> workers;
+        bool worker_launch_reduced = false;
         for (std::int32_t worker_index = 0; worker_index < concurrency; ++worker_index) {
-            workers.emplace_back([&]() {
+            auto worker_task = [&, worker_index]() {
+                ResilientCopyEngine* managed_engine = managed
+                    ? managed_engines[static_cast<std::size_t>(worker_index)].get() : nullptr;
                 while (true) {
                     SourceFileDescriptor descriptor;
                     {
@@ -5073,6 +5310,66 @@ private:
                     }
 
                     try {
+                        if (managed_engine != nullptr) {
+                            JournalFileEntry local_entry;
+                            {
+                                std::lock_guard<std::mutex> guard(journal_lock_);
+                                JournalFileEntry* entry = journal.Files.find(descriptor.relative_path);
+                                if (entry == nullptr) {
+                                    failed_count += 1;
+                                    continue;
+                                }
+                                local_entry = *entry;
+                            }
+                            local_entry.State = FileCopyState::InProgress;
+                            local_entry.LastError.clear();
+                            local_entry.DoNotRetry = false;
+                            ProgressAccumulator local_progress;
+                            local_progress.total_files = 1;
+                            local_progress.total_bytes = descriptor.length;
+                            JobJournal local_journal;
+                            CancelContext file_cancel = cancel;
+                            if (options_.PerFileTimeout.ticks > 0) {
+                                file_cancel = cancel.with_deadline(
+                                    options_.PerFileTimeout.ticks / time::TicksPerMillisecond);
+                            }
+                            auto collect_worker_state = [&] {
+                                bytes_read_.fetch_add(managed_engine->bytes_read_.exchange(0));
+                                bytes_written_.fetch_add(managed_engine->bytes_written_.exchange(0));
+                                bytes_verified_.fetch_add(managed_engine->bytes_verified_.exchange(0));
+                                managed_copy_files_.fetch_add(managed_engine->managed_copy_files_.exchange(0));
+                                std::string warning;
+                                std::string notice;
+                                {
+                                    std::lock_guard<std::mutex> guard(managed_engine->metadata_warning_lock_);
+                                    warning.swap(managed_engine->integrity_warning_);
+                                    notice.swap(managed_engine->metadata_notice_);
+                                }
+                                add_integrity_warning(warning);
+                                add_metadata_notice(notice);
+                            };
+                            try {
+                                (void)managed_engine->copy_single_file(
+                                    descriptor, local_entry, destination_root, local_progress,
+                                    local_journal, journal_path, file_cancel, true);
+                            } catch (...) {
+                                collect_worker_state();
+                                throw;
+                            }
+                            collect_worker_state();
+                            local_entry.State = FileCopyState::Completed;
+                            local_entry.BytesCopied = descriptor.length;
+                            local_entry.LastError.clear();
+                            local_entry.DoNotRetry = false;
+                            try_persist_bad_range_map_entry(descriptor, local_entry, true);
+                            {
+                                std::lock_guard<std::mutex> guard(journal_lock_);
+                                JournalFileEntry* entry = journal.Files.find(descriptor.relative_path);
+                                if (entry != nullptr) *entry = std::move(local_entry);
+                            }
+                            record_completed(descriptor);
+                            continue;
+                        }
                         std::wstring destination_path = destination_path_for(destination_root, descriptor);
                         FileStabilitySnapshot source_stability;
                         const bool source_stability_valid =
@@ -5104,14 +5401,6 @@ private:
                         NamedStreamEnumeration source_streams = enumerate_named_streams(descriptor.full_path);
                         DestinationStage stage(destination_path, cancel);
                         const std::wstring& working_path = stage.working_path();
-                        HANDLE reset = CreateFileW(storage::fsutil::long_path(working_path).c_str(), GENERIC_WRITE,
-                                                   FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
-                                                   FILE_ATTRIBUTE_NORMAL, nullptr);
-                        if (reset == INVALID_HANDLE_VALUE) {
-                            failed_count += 1;
-                            continue;
-                        }
-                        CloseHandle(reset);
 
                         DWORD flags = options_.AllowDecryptedDestination
                                           ? COPY_FILE_ALLOW_DECRYPTED_DESTINATION
@@ -5140,6 +5429,15 @@ private:
                                                           source_stability_valid);
                         ensure_media_identity_integrity(utf8_to_wide(options_.SourceRoot), destination_root,
                                                         true, true);
+                        if (options_.OverwritePolicyValue != models::OverwritePolicy::Overwrite) {
+                            std::string overwrite_reason;
+                            if (decide_overwrite_policy(descriptor, destination_root,
+                                                        overwrite_reason) !=
+                                ExistingDestinationDecision::Copy) {
+                                failed_count += 1;
+                                continue;
+                            }
+                        }
                         publish_stage(stage, descriptor, false);
                         {
                             std::lock_guard<std::mutex> guard(journal_lock_);
@@ -5157,21 +5455,39 @@ private:
                             }
                         }
                         parallel_native_fast_path_files_ += 1;
-                        {
-                            std::lock_guard<std::mutex> guard(work_lock);
-                            completed_paths.push_back(descriptor.relative_path);
+                        record_completed(descriptor);
+                    } catch (const OperationCanceled& error) {
+                        if (error.user_requested) {
+                            cancelled.store(true);
+                            return;
                         }
-                        completed_count += 1;
-                    } catch (const OperationCanceled&) {
-                        cancelled.store(true);
-                        return;
+                        failed_count += 1;
                     } catch (const std::exception&) {
                         failed_count += 1;
                     }
                 }
-            });
+            };
+            try {
+                workers.emplace_back(std::move(worker_task));
+            } catch (...) {
+                // Workers already started can finish the shared queue. If no
+                // thread started, the ordinary sequential loop handles it.
+                worker_launch_reduced = true;
+                break;
+            }
         }
         for (auto& worker : workers) worker.join();
+        if (worker_launch_reduced) {
+            emit_log("Parallel worker startup was reduced; remaining files use the sequential path if needed.");
+        }
+
+        if (!last_completed_path.empty()) {
+            std::lock_guard<std::mutex> guard(progress_lock_);
+            emit_progress(progress, last_completed_path, last_completed_length,
+                          last_completed_length, 0,
+                          resolve_buffer_size_for_file(last_completed_length),
+                          phase_pass, 0, 0);
+        }
 
         if (checkpoint_stop != nullptr) SetEvent(checkpoint_stop);
         if (checkpoint_thread.joinable()) checkpoint_thread.join();
@@ -5196,6 +5512,8 @@ private:
 
     void initialize_media_identity_expectations(const std::wstring& source_root,
                                                 const std::wstring& destination_root) {
+        source_publication_probe_.reset();
+        destination_publication_probe_.reset();
         std::string source_identity = trim_ascii(options_.ExpectedSourceIdentity);
         std::string destination_identity = trim_ascii(options_.ExpectedDestinationIdentity);
         bool captured_source = false;
@@ -5293,21 +5611,31 @@ private:
         return is_source ? expected_source_identity_ : expected_destination_identity_;
     }
 
-    void throw_if_media_identity_mismatch(const std::wstring& path_value,
+    bool throw_if_media_identity_mismatch(const std::wstring& path_value,
                                           const std::string& expected_identity, bool is_source) {
         std::string expected = trim_ascii(expected_identity);
-        if (expected.empty()) return;
+        if (expected.empty()) return false;
         std::string current = resolve_media_identity(path_value);
-        if (current.empty()) return;
-        if (identities_equivalent(expected, current)) return;
+        if (current.empty()) return false;
+        if (identities_equivalent(expected, current)) return true;
         throw IoError(std::string(is_source ? "Source" : "Destination") +
                       " media identity mismatch. Expected '" + expected + "', found '" + current + "'.");
     }
 
     void throw_if_media_identity_mismatch_throttled(const std::wstring& path_value,
                                                     bool is_source, bool force = false) {
-        if (!force && !should_probe_media_identity(is_source)) return;
-        throw_if_media_identity_mismatch(path_value, expected_media_identity(is_source), is_source);
+        RecentMediaIdentityProbe& recent = is_source ? source_publication_probe_
+                                                     : destination_publication_probe_;
+        auto probe = [&] {
+            return throw_if_media_identity_mismatch(
+                path_value, expected_media_identity(is_source), is_source);
+        };
+        if (force) {
+            recent.check(probe);
+            return;
+        }
+        if (!should_probe_media_identity(is_source)) return;
+        recent.check_fresh(probe);
     }
 
     void ensure_media_identity_integrity(const std::wstring& source_root,
@@ -5366,8 +5694,15 @@ private:
         std::atomic<bool>& accepted = is_source ? source_media_identity_accepted_
                                                 : destination_media_identity_accepted_;
         if (should_probe_media_identity(is_source)) {
-            accepted.store(is_media_identity_accepted(path_value, is_source),
-                           std::memory_order_release);
+            RecentMediaIdentityProbe& recent = is_source ? source_publication_probe_
+                                                         : destination_publication_probe_;
+            recent.check_fresh([&] {
+                accepted.store(is_media_identity_accepted(path_value, is_source),
+                               std::memory_order_release);
+                // Availability accepts an unknown baseline; it is not proof
+                // of a matching identity for a later publication check.
+                return false;
+            });
         }
         return accepted.load(std::memory_order_acquire);
     }
@@ -5660,7 +5995,13 @@ private:
         char prefix[16];
         std::snprintf(prefix, sizeof(prefix), "[%02u:%02u:%02u] ", local.wHour, local.wMinute,
                       local.wSecond);
-        log_callback_(prefix + message);
+        forward_log(prefix + message);
+    }
+
+    void forward_log(const std::string& message) {
+        if (!log_callback_) return;
+        std::lock_guard<std::mutex> guard(log_callback_lock_);
+        log_callback_(message);
     }
 
     void emit_run_summary(const CopyJobResult& result) {

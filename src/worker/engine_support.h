@@ -1201,6 +1201,29 @@ namespace timed_io {
 
 enum class Outcome { Success, Timeout, EndOfFile };
 
+class Event {
+public:
+    Event() = default;
+    ~Event() {
+        if (handle_ != nullptr) CloseHandle(handle_);
+    }
+    Event(const Event&) = delete;
+    Event& operator=(const Event&) = delete;
+
+    HANDLE get() {
+        if (handle_ == nullptr) {
+            handle_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (handle_ == nullptr) {
+                throw IoError::from_win32("CreateEvent failed for positional I/O.", GetLastError());
+            }
+        }
+        return handle_;
+    }
+
+private:
+    HANDLE handle_ = nullptr;
+};
+
 inline Outcome wait_for_completion(HANDLE file, OVERLAPPED& overlapped, DWORD& transferred,
                                    std::int64_t timeout_ms, const CancelContext& cancel) {
     ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeout_ms > 0 ? timeout_ms : 0);
@@ -1233,9 +1256,14 @@ inline Outcome wait_for_completion(HANDLE file, OVERLAPPED& overlapped, DWORD& t
             return Outcome::Success;
         }
         if (wait_result == WAIT_FAILED) {
-            throw IoError::from_win32("Waiting for positional I/O failed.", GetLastError());
+            const DWORD error = GetLastError();
+            CancelIoEx(file, &overlapped);
+            GetOverlappedResult(file, &overlapped, &transferred, TRUE);
+            throw IoError::from_win32("Waiting for positional I/O failed.", error);
         }
         if (wait_result != WAIT_TIMEOUT) {
+            CancelIoEx(file, &overlapped);
+            GetOverlappedResult(file, &overlapped, &transferred, TRUE);
             throw IoError("Waiting for positional I/O returned an unexpected state.",
                           ERROR_INVALID_STATE, IoErrorKind::General);
         }
@@ -1250,41 +1278,37 @@ inline Outcome wait_for_completion(HANDLE file, OVERLAPPED& overlapped, DWORD& t
 // reporting EOF.
 inline std::int32_t read_at(HANDLE file, std::int64_t offset, unsigned char* buffer,
                             std::int32_t count, std::int64_t timeout_ms,
-                            const CancelContext& cancel, bool single_transfer = false) {
+                            const CancelContext& cancel, bool single_transfer = false,
+                            HANDLE reusable_event = nullptr) {
     std::int32_t total = 0;
+    Event owned_event;
     while (total < count) {
         OVERLAPPED overlapped{};
         std::int64_t position = offset + total;
         overlapped.Offset = static_cast<DWORD>(position & 0xFFFFFFFF);
         overlapped.OffsetHigh = static_cast<DWORD>(static_cast<std::uint64_t>(position) >> 32);
-        overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (overlapped.hEvent == nullptr) {
-            throw IoError::from_win32("CreateEvent failed for read.", GetLastError());
+        overlapped.hEvent = reusable_event != nullptr ? reusable_event : owned_event.get();
+        if (!ResetEvent(overlapped.hEvent)) {
+            throw IoError::from_win32("ResetEvent failed for read.", GetLastError());
         }
 
         DWORD transferred = 0;
         BOOL ok = ReadFile(file, buffer + total, static_cast<DWORD>(count - total), nullptr, &overlapped);
         DWORD error = ok ? ERROR_SUCCESS : GetLastError();
         Outcome outcome = Outcome::Success;
-        try {
-            if (!ok && error == ERROR_IO_PENDING) {
-                outcome = wait_for_completion(file, overlapped, transferred, timeout_ms, cancel);
-            } else if (!ok && error == ERROR_HANDLE_EOF) {
-                transferred = 0;
-                outcome = Outcome::EndOfFile;
-            } else if (!ok) {
-                throw IoError::from_win32("ReadFile failed.", error);
-            } else {
-                if (!GetOverlappedResult(file, &overlapped, &transferred, TRUE)) {
-                    throw IoError::from_win32("Completing positional read failed.",
-                                              GetLastError());
-                }
+        if (!ok && error == ERROR_IO_PENDING) {
+            outcome = wait_for_completion(file, overlapped, transferred, timeout_ms, cancel);
+        } else if (!ok && error == ERROR_HANDLE_EOF) {
+            transferred = 0;
+            outcome = Outcome::EndOfFile;
+        } else if (!ok) {
+            throw IoError::from_win32("ReadFile failed.", error);
+        } else {
+            if (!GetOverlappedResult(file, &overlapped, &transferred, TRUE)) {
+                throw IoError::from_win32("Completing positional read failed.",
+                                          GetLastError());
             }
-        } catch (...) {
-            CloseHandle(overlapped.hEvent);
-            throw;
         }
-        CloseHandle(overlapped.hEvent);
 
         if (outcome == Outcome::Timeout) {
             throw IoError("Read timed out.", 0, IoErrorKind::Timeout);
@@ -1298,38 +1322,33 @@ inline std::int32_t read_at(HANDLE file, std::int64_t offset, unsigned char* buf
 
 inline void write_at(HANDLE file, std::int64_t offset, const unsigned char* buffer,
                      std::int32_t count, std::int64_t timeout_ms,
-                     const CancelContext& cancel) {
+                     const CancelContext& cancel, HANDLE reusable_event = nullptr) {
     std::int32_t total = 0;
+    Event owned_event;
     while (total < count) {
         OVERLAPPED overlapped{};
         std::int64_t position = offset + total;
         overlapped.Offset = static_cast<DWORD>(position & 0xFFFFFFFF);
         overlapped.OffsetHigh = static_cast<DWORD>(static_cast<std::uint64_t>(position) >> 32);
-        overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (overlapped.hEvent == nullptr) {
-            throw IoError::from_win32("CreateEvent failed for write.", GetLastError());
+        overlapped.hEvent = reusable_event != nullptr ? reusable_event : owned_event.get();
+        if (!ResetEvent(overlapped.hEvent)) {
+            throw IoError::from_win32("ResetEvent failed for write.", GetLastError());
         }
 
         DWORD transferred = 0;
         BOOL ok = WriteFile(file, buffer + total, static_cast<DWORD>(count - total), nullptr, &overlapped);
         DWORD error = ok ? ERROR_SUCCESS : GetLastError();
         Outcome outcome = Outcome::Success;
-        try {
-            if (!ok && error == ERROR_IO_PENDING) {
-                outcome = wait_for_completion(file, overlapped, transferred, timeout_ms, cancel);
-            } else if (!ok) {
-                throw IoError::from_win32("WriteFile failed.", error);
-            } else {
-                if (!GetOverlappedResult(file, &overlapped, &transferred, TRUE)) {
-                    throw IoError::from_win32("Completing positional write failed.",
-                                              GetLastError());
-                }
+        if (!ok && error == ERROR_IO_PENDING) {
+            outcome = wait_for_completion(file, overlapped, transferred, timeout_ms, cancel);
+        } else if (!ok) {
+            throw IoError::from_win32("WriteFile failed.", error);
+        } else {
+            if (!GetOverlappedResult(file, &overlapped, &transferred, TRUE)) {
+                throw IoError::from_win32("Completing positional write failed.",
+                                          GetLastError());
             }
-        } catch (...) {
-            CloseHandle(overlapped.hEvent);
-            throw;
         }
-        CloseHandle(overlapped.hEvent);
 
         if (outcome == Outcome::Timeout) {
             throw IoError("Write timed out.", 0, IoErrorKind::Timeout);
@@ -1387,6 +1406,8 @@ public:
 
     HANDLE try_get_open_source() const noexcept { return source_; }
     HANDLE try_get_open_destination() const noexcept { return destination_; }
+    HANDLE source_event() { return source_event_.get(); }
+    HANDLE destination_event() { return destination_event_.get(); }
 
     void invalidate_source() noexcept {
         if (source_ != INVALID_HANDLE_VALUE) {
@@ -1409,6 +1430,10 @@ private:
     std::wstring destination_path_;
     HANDLE source_ = INVALID_HANDLE_VALUE;
     HANDLE destination_ = INVALID_HANDLE_VALUE;
+    // Each session issues at most one operation at a time per handle. Failed
+    // and cancelled operations are drained before these events are reused.
+    timed_io::Event source_event_;
+    timed_io::Event destination_event_;
 };
 
 } // namespace xact::engine
