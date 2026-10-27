@@ -20,6 +20,8 @@
 #include "../src/ui/settings.h"
 #include "../src/ui/supervisor.h"
 
+#include <tlhelp32.h>
+
 namespace {
 
 using namespace xact;
@@ -243,6 +245,79 @@ void test_kill_recovery() {
 
     supervisor.stop();
     check(true, "supervisor stopped cleanly after recovery");
+}
+
+// Freezes every thread of a process, as a system sleep does, or thaws it.
+void set_process_frozen(DWORD pid, bool frozen) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != pid) continue;
+        HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID);
+        if (thread == nullptr) continue;
+        if (frozen) SuspendThread(thread);
+        else ResumeThread(thread);
+        CloseHandle(thread);
+    }
+    CloseHandle(snapshot);
+}
+
+void test_sleep_resume_does_not_restart_worker() {
+    std::printf("--- supervisor: system sleep/resume keeps the worker ---\n");
+    std::wstring work = make_work_dir();
+    std::wstring source = work + L"\\src";
+    std::wstring destination = work + L"\\dst";
+    storage::fsutil::create_directories(source);
+    write_pattern_file(source + L"\\sleepy.bin", 12 * 1024 * 1024, 41);
+
+    ui::WorkerSupervisor supervisor;
+    EventSink sink;
+    sink.attach(supervisor);
+
+    models::CopyJobOptions options;
+    options.SourceRoot = storage::fsutil::wide_to_utf8(source);
+    options.DestinationRoot = storage::fsutil::wide_to_utf8(destination);
+    options.TransferEnginePolicyValue = models::TransferEnginePolicy::ManagedRescue;
+    options.MaxThroughputBytesPerSecond = 2 * 1024 * 1024;
+    options.ResumeFromJournal = true;
+    supervisor.start_job(options);
+
+    check(sink.wait_for_progress(30), "progress observed before simulated sleep");
+    std::string connected_state;
+    DWORD pid = 0;
+    if (sink.any_state_contains("Worker connected (PID", &connected_state)) {
+        if (std::size_t open = connected_state.find("PID "); open != std::string::npos) {
+            pid = static_cast<DWORD>(std::strtoul(connected_state.c_str() + open + 4, nullptr, 10));
+        }
+    }
+    check(pid != 0, "worker PID parsed for simulated sleep");
+    if (pid != 0) {
+        // The UI receives PBT_APMSUSPEND, then the whole system stops. Freeze
+        // the worker past the 10 s heartbeat timeout while the supervisor's
+        // own watchdog thread keeps running, which is harsher than a real
+        // sleep, where the supervisor stops too.
+        supervisor.notify_system_suspending();
+        set_process_frozen(pid, true);
+        Sleep(12'000);
+        set_process_frozen(pid, false);
+        supervisor.notify_system_resumed();
+    }
+
+    check(sink.wait_for_result(120), "job completes after simulated sleep");
+    {
+        std::lock_guard<std::mutex> guard(sink.lock);
+        if (!sink.results.empty()) {
+            const auto& result = sink.results.front();
+            check(result.Succeeded, "job succeeded across sleep (" + result.ErrorMessage + ")");
+        }
+    }
+    check(!sink.any_log_contains("Restarting worker"),
+          "no worker restart was triggered by the sleep gap");
+    check(files_equal(source + L"\\sleepy.bin", destination + L"\\sleepy.bin"),
+          "destination equals source after sleep/resume");
+    supervisor.stop();
 }
 
 void test_stop_joins_in_flight_recovery() {
@@ -992,6 +1067,7 @@ int main() {
     test_job_manager_service();
     test_clean_job();
     test_kill_recovery();
+    test_sleep_resume_does_not_restart_worker();
     test_stop_joins_in_flight_recovery();
 
     if (g_failures == 0) {

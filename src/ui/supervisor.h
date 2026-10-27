@@ -33,6 +33,16 @@ namespace supervisor_detail {
 inline constexpr int MaximumAutomaticRecoveries = 3;
 inline constexpr ULONGLONG CancelGracePeriodMs = 5'000;
 
+// Watchdog clock. GetTickCount64 keeps counting while the machine sleeps or
+// hibernates, so on resume every heartbeat looks hours stale and the worker
+// would be killed before it can send its next one. Unbiased interrupt time
+// excludes sleep and hibernation.
+inline ULONGLONG awake_tick_ms() noexcept {
+    ULONGLONG unbiased_100ns = 0;
+    if (QueryUnbiasedInterruptTime(&unbiased_100ns)) return unbiased_100ns / 10'000;
+    return GetTickCount64();
+}
+
 inline bool cancel_grace_expired(ULONGLONG requested_tick, ULONGLONG now,
                                  ULONGLONG grace_ms = CancelGracePeriodMs) noexcept {
     return requested_tick != 0 && now >= requested_tick && now - requested_tick >= grace_ms;
@@ -108,7 +118,7 @@ public:
             }
             return;
         }
-        cancel_requested_tick_.store(GetTickCount64());
+        cancel_requested_tick_.store(supervisor_detail::awake_tick_ms());
         cancel_escalation_queued_.store(false);
         set_paused_state(false);
 
@@ -170,10 +180,29 @@ public:
         stop_heartbeat_timer();
     }
 
+    // Power transitions from the UI's WM_POWERBROADCAST. While the system is
+    // suspending, the worker cannot answer, so the watchdog stands down; on
+    // resume it restarts every timeout window rather than judging the worker
+    // by the gap the suspension itself created. The awake clock already
+    // excludes S3/S4 sleep; this also covers states it still counts
+    // (connected standby throttling, a slow resume).
+    void notify_system_suspending() {
+        system_suspended_.store(true);
+    }
+
+    void notify_system_resumed() {
+        const ULONGLONG now = supervisor_detail::awake_tick_ms();
+        if (last_heartbeat_tick_.load() != 0) last_heartbeat_tick_.store(now);
+        if (last_job_activity_tick_.load() != 0) last_job_activity_tick_.store(now);
+        if (last_worker_progress_tick_.load() != 0) last_worker_progress_tick_.store(now);
+        system_suspended_.store(false);
+    }
+
     // Called by the UI once per second (or from the built-in timer thread).
     void check_heartbeat() {
         if (stopping_.load() || stopped_.load()) return;
-        const ULONGLONG now = GetTickCount64();
+        if (system_suspended_.load()) return;
+        const ULONGLONG now = supervisor_detail::awake_tick_ms();
         check_cancel_escalation(now);
         if (!pipe_connected_.load()) return;
 
@@ -225,6 +254,7 @@ private:
     std::atomic<int> consecutive_malformed_{0};
     std::atomic<bool> activity_stall_reported_{false};
 
+    std::atomic<bool> system_suspended_{false};
     std::atomic<ULONGLONG> last_heartbeat_tick_{0};
     std::atomic<ULONGLONG> last_job_activity_tick_{0};
     std::atomic<ULONGLONG> last_worker_progress_tick_{0};
@@ -305,7 +335,7 @@ private:
             throw std::runtime_error("Connected named-pipe server is not the worker process that XactCopy started.");
         }
         pipe_connected_.store(true);
-        last_heartbeat_tick_.store(GetTickCount64());
+        last_heartbeat_tick_.store(supervisor_detail::awake_tick_ms());
         consecutive_malformed_.store(0);
 
         if (receive_thread_.joinable()) receive_thread_.join();
@@ -393,14 +423,14 @@ private:
         if (message_type == ipc::message_types::WorkerHeartbeatEvent) {
             auto [header, payload] = ipc::parse_envelope(raw);
             auto heartbeat = ipc::WorkerHeartbeatEvent::from_json(payload);
-            last_heartbeat_tick_.store(GetTickCount64());
+            last_heartbeat_tick_.store(supervisor_detail::awake_tick_ms());
             set_paused_state(heartbeat.IsJobPaused);
             return;
         }
         if (message_type == ipc::message_types::WorkerProgressEvent) {
             auto [header, payload] = ipc::parse_envelope(raw);
             auto progress = ipc::WorkerProgressEvent::from_json(payload);
-            last_heartbeat_tick_.store(GetTickCount64());
+            last_heartbeat_tick_.store(supervisor_detail::awake_tick_ms());
             mark_job_activity(true);
             if (!job_running_.load()) return;
             std::string expected_job = current_job_id();
@@ -460,7 +490,7 @@ private:
     }
 
     void mark_job_activity(bool mark_progress) {
-        ULONGLONG now = GetTickCount64();
+        ULONGLONG now = supervisor_detail::awake_tick_ms();
         last_job_activity_tick_.store(now);
         if (mark_progress) last_worker_progress_tick_.store(now);
         activity_stall_reported_.store(false);

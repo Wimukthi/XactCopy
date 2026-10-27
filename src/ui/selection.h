@@ -31,7 +31,7 @@ public:
         std::wstring full = storage::fsutil::get_full_path(storage::fsutil::trim(raw));
         if (full.empty()) return false;
         while (full.size() > 3 && (full.back() == L'\\' || full.back() == L'/')) full.pop_back();
-        if (GetFileAttributesW(full.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+        if (GetFileAttributesW(storage::fsutil::long_path(full).c_str()) == INVALID_FILE_ATTRIBUTES) return false;
         for (const auto& existing : items_) {
             if (_wcsicmp(existing.c_str(), full.c_str()) == 0) return false;
         }
@@ -119,13 +119,13 @@ public:
     }
 
     static bool is_directory(const std::wstring& path) {
-        DWORD attributes = GetFileAttributesW(path.c_str());
+        DWORD attributes = GetFileAttributesW(storage::fsutil::long_path(path).c_str());
         return attributes != INVALID_FILE_ATTRIBUTES &&
                (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     }
 
     static bool exists(const std::wstring& path) {
-        return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+        return GetFileAttributesW(storage::fsutil::long_path(path).c_str()) != INVALID_FILE_ATTRIBUTES;
     }
 
 private:

@@ -7,6 +7,7 @@
 // -----------------------------------------------------------------------------
 
 #include <chrono>
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -205,6 +206,38 @@ void verify_map(const std::optional<storage::BadRangeMap>& map, const std::strin
         check(delta->BadRanges.size() == 1 && delta->BadRanges[0].Length == 4096,
               origin + ": map delta range");
     }
+}
+
+void test_long_path_prefixing() {
+    namespace fs = storage::fsutil;
+    const std::wstring short_local = L"C:\\data\\file.bin";
+    check(fs::long_path(short_local) == short_local, "short local path is passed through unchanged");
+    const std::wstring short_unc = L"\\\\server\\share\\file.bin";
+    check(fs::long_path(short_unc) == short_unc, "short UNC path is passed through unchanged");
+
+    const std::wstring segment(60, L'a');
+    std::wstring long_local = L"C:\\root";
+    for (int i = 0; i < 5; ++i) long_local += L"\\" + segment;
+    long_local += L"\\file.bin";
+    check(fs::long_path(long_local) == L"\\\\?\\" + long_local,
+          "long local path gains the extended-length prefix");
+
+    std::wstring long_unc = L"\\\\server\\share";
+    for (int i = 0; i < 5; ++i) long_unc += L"\\" + segment;
+    check(fs::long_path(long_unc) == L"\\\\?\\UNC\\server\\share" + long_unc.substr(14),
+          "long UNC path gains the extended-length UNC prefix");
+
+    const std::wstring already = L"\\\\?\\" + long_local;
+    check(fs::long_path(already) == already, "already-prefixed path is not prefixed twice");
+
+    std::wstring slashed = long_local;
+    std::replace(slashed.begin(), slashed.end(), L'\\', L'/');
+    std::wstring dotted = long_local;
+    dotted.insert(7, L"\\.\\skip\\..");
+    check(fs::long_path(slashed) == L"\\\\?\\" + long_local,
+          "forward slashes are normalized before prefixing");
+    check(fs::long_path(dotted) == L"\\\\?\\" + long_local,
+          "dot segments are folded before prefixing");
 }
 
 void test_source_identity_fields() {
@@ -1207,6 +1240,7 @@ int main(int argc, char** argv) {
     test_crypto_vectors();
     test_indented_writer_basics();
     test_ordered_file_map_scale();
+    test_long_path_prefixing();
     test_source_identity_fields();
 
     std::string golden_dir = argc > 1 ? argv[1] : "tests/golden";

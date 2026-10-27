@@ -448,6 +448,89 @@ void test_engine_copy_and_sampled_verification() {
     remove_tree(work);
 }
 
+// Paths past MAX_PATH on both sides, with sizes that put the unbuffered
+// destination hash's final read at, before, and just past a sector/buffer
+// boundary. Copies run through the default Auto (managed) path and through
+// NativeFast, under both full and sampled verification.
+void test_engine_long_paths_and_unbuffered_verification() {
+    std::printf("--- engine: long paths + unbuffered destination verification ---\n");
+    const std::wstring work = make_tree(0, 0);
+    const std::wstring segment(60, L'd');
+    std::wstring deep;
+    for (int i = 0; i < 4; ++i) deep += L"\\" + segment;
+    const std::wstring source = work + L"\\source" + deep;
+    storage::fsutil::create_directories(source);
+
+    const std::vector<std::pair<std::wstring, std::size_t>> files = {
+        {L"empty.bin", 0},
+        {L"odd.bin", 4097},
+        {L"aligned.bin", 1 << 20},
+        {L"over-buffer.bin", (1 << 20) + 1},
+        {L"multi.bin", 3 * (1 << 20) + 513},
+    };
+    for (std::size_t i = 0; i < files.size(); ++i) {
+        write_pattern_file(source + L"\\" + files[i].first, files[i].second,
+                           static_cast<unsigned>(700 + i));
+    }
+    check((source + L"\\" + files.back().first).size() > MAX_PATH,
+          "fixture source path exceeds MAX_PATH (" +
+              std::to_string((source + L"\\" + files.back().first).size()) + ")");
+
+    struct Variant {
+        const char* name;
+        models::TransferEnginePolicy policy;
+        models::VerificationMode verification;
+    };
+    const Variant variants[] = {
+        {"auto-full", models::TransferEnginePolicy::Auto, models::VerificationMode::Full},
+        {"native-full", models::TransferEnginePolicy::NativeFast, models::VerificationMode::Full},
+        {"auto-sampled", models::TransferEnginePolicy::Auto, models::VerificationMode::Sampled},
+    };
+    for (const Variant& variant : variants) {
+        const std::wstring destination =
+            work + L"\\" + storage::fsutil::utf8_to_wide(variant.name) + deep;
+        models::CopyJobOptions options;
+        options.SourceRoot = storage::fsutil::wide_to_utf8(work + L"\\source");
+        options.DestinationRoot = storage::fsutil::wide_to_utf8(
+            work + L"\\" + storage::fsutil::utf8_to_wide(variant.name));
+        options.TransferEnginePolicyValue = variant.policy;
+        options.VerificationModeValue = variant.verification;
+        options.SampleVerificationChunkBytes = 5000; // not sector-aligned on purpose
+        options.SampleVerificationChunkCount = 4;
+        options.ResumeFromJournal = false;
+        options.UseBadRangeMap = false;
+        options.UpdateBadRangeMapFromRun = false;
+
+        std::atomic<bool> cancel{false};
+        ExecutionControl control;
+        std::vector<std::string> logs;
+        ResilientCopyEngine engine(options, &control, nullptr,
+                                   [&logs](const std::string& message) { logs.push_back(message); });
+        models::CopyJobResult result;
+        std::string error;
+        try {
+            result = engine.run(cancel);
+        } catch (const std::exception& ex) {
+            error = ex.what();
+        }
+        const std::string label = std::string(variant.name) + ": ";
+        check(error.empty() && result.Succeeded,
+              label + "long-path copy succeeds (" + error + result.ErrorMessage + ")");
+        check(result.CompletedFiles == static_cast<std::int32_t>(files.size()),
+              label + "every long-path file completes");
+        bool all_equal = true;
+        for (const auto& file : files) {
+            all_equal = all_equal && files_equal(source + L"\\" + file.first,
+                                                 destination + L"\\" + file.first);
+        }
+        check(all_equal, label + "every long-path destination matches its source");
+        check(result.IntegrityNotice.find("did not support unbuffered reads") == std::string::npos,
+              label + "local NTFS destination is verified unbuffered");
+        remove_result_journal(result);
+    }
+    remove_tree(L"\\\\?\\" + work);
+}
+
 void test_engine_preserves_metadata_and_cleans_abandoned_stage() {
     std::printf("--- engine: metadata preservation + abandoned-stage cleanup ---\n");
     std::wstring work = make_tree(0, 0);
@@ -2231,6 +2314,7 @@ int main() {
     test_scan_symlink_scope_policy();
     test_file_stability_detects_same_size_timestamp_mutation();
     test_engine_copy_and_sampled_verification();
+    test_engine_long_paths_and_unbuffered_verification();
     test_engine_preserves_metadata_and_cleans_abandoned_stage();
     test_engine_reports_post_publish_metadata_failure_without_rolling_back_bytes();
     test_engine_efs_policy_when_supported();

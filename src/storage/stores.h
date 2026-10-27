@@ -58,8 +58,40 @@ inline std::string wide_to_utf8(std::wstring_view text) {
     return out;
 }
 
+// Path-based Win32 calls fail past MAX_PATH unless the process is long-path
+// aware AND the machine opted in through LongPathsEnabled. The extended-length
+// prefix works without either, but it also disables Win32 path normalization,
+// so it is applied only to absolute paths long enough to need it, after an
+// explicit GetFullPathNameW normalization. Shorter paths pass through
+// unchanged, keeping their exact existing behavior. Wrap the argument of every
+// path-taking API call with this; never store or compare its result.
+inline constexpr std::size_t ExtendedPathThreshold = MAX_PATH - 12; // CreateDirectoryW limit
+
+inline std::wstring long_path(const std::wstring& path) {
+    if (path.size() < ExtendedPathThreshold) return path;
+    if (path.rfind(L"\\\\?\\", 0) == 0 || path.rfind(L"\\\\.\\", 0) == 0) return path;
+    // The Unicode GetFullPathNameW is not bound by MAX_PATH. It folds '/',
+    // repeated separators, and "." / ".." segments that the prefix would
+    // otherwise pass to the filesystem verbatim.
+    std::wstring full = path;
+    DWORD needed = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (needed != 0) {
+        std::wstring out(static_cast<std::size_t>(needed), L'\0');
+        DWORD written = GetFullPathNameW(path.c_str(), needed, out.data(), nullptr);
+        if (written != 0 && written < needed) {
+            out.resize(written);
+            full = std::move(out);
+        }
+    }
+    if (full.size() >= 3 && full[1] == L':' && full[2] == L'\\') return L"\\\\?\\" + full;
+    if (full.size() > 2 && full[0] == L'\\' && full[1] == L'\\') {
+        return L"\\\\?\\UNC\\" + full.substr(2);
+    }
+    return path;
+}
+
 inline bool file_exists(const std::wstring& path) {
-    DWORD attributes = GetFileAttributesW(path.c_str());
+    DWORD attributes = GetFileAttributesW(long_path(path).c_str());
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
@@ -71,7 +103,7 @@ inline void create_directories(const std::wstring& path) {
     for (std::size_t i = 0; i <= path.size(); ++i) {
         if (i == path.size() || path[i] == L'\\' || path[i] == L'/') {
             if (!current.empty() && current.back() != L':') {
-                CreateDirectoryW(current.c_str(), nullptr);
+                CreateDirectoryW(long_path(current).c_str(), nullptr);
             }
             if (i < path.size()) current.push_back(L'\\');
             continue;
@@ -174,19 +206,19 @@ inline std::wstring resolve_final_path(const std::wstring& path) {
 
     std::vector<std::wstring> missing_components;
     std::wstring existing = full;
-    DWORD attributes = GetFileAttributesW(existing.c_str());
+    DWORD attributes = GetFileAttributesW(fsutil::long_path(existing).c_str());
     while (attributes == INVALID_FILE_ATTRIBUTES) {
         std::wstring parent = get_directory_name(existing);
         if (parent.empty() || to_upper_invariant(parent) == to_upper_invariant(existing)) break;
         std::wstring name = get_file_name(existing);
         if (!name.empty()) missing_components.push_back(name);
         existing = std::move(parent);
-        attributes = GetFileAttributesW(existing.c_str());
+        attributes = GetFileAttributesW(fsutil::long_path(existing).c_str());
     }
     if (attributes == INVALID_FILE_ATTRIBUTES) return normalize_path(full);
 
     DWORD flags = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? FILE_FLAG_BACKUP_SEMANTICS : 0;
-    HANDLE handle = CreateFileW(existing.c_str(), FILE_READ_ATTRIBUTES,
+    HANDLE handle = CreateFileW(fsutil::long_path(existing).c_str(), FILE_READ_ATTRIBUTES,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 nullptr, OPEN_EXISTING, flags, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return normalize_path(full);
@@ -234,7 +266,7 @@ inline std::string resolve_media_identity(const std::wstring& path_value) {
         std::wstring share = L"\\\\" + parts[0] + L"\\" + parts[1];
         std::string identity = "unc:" + wide_to_utf8(to_upper_invariant(share));
         HANDLE share_handle = CreateFileW(
-            share.c_str(), FILE_READ_ATTRIBUTES,
+            fsutil::long_path(share).c_str(), FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
             OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
         if (share_handle != INVALID_HANDLE_VALUE) {
@@ -257,12 +289,12 @@ inline std::string resolve_media_identity(const std::wstring& path_value) {
     if (full.size() < 2 || full[1] != L':') return std::string();
     wchar_t volume_path[MAX_PATH]{};
     std::wstring probe = full;
-    DWORD probe_attributes = GetFileAttributesW(probe.c_str());
+    DWORD probe_attributes = GetFileAttributesW(fsutil::long_path(probe).c_str());
     while (probe_attributes == INVALID_FILE_ATTRIBUTES) {
         std::wstring parent = get_directory_name(probe);
         if (parent.empty() || to_upper_invariant(parent) == to_upper_invariant(probe)) break;
         probe = std::move(parent);
-        probe_attributes = GetFileAttributesW(probe.c_str());
+        probe_attributes = GetFileAttributesW(fsutil::long_path(probe).c_str());
     }
     if (probe_attributes == INVALID_FILE_ATTRIBUTES) {
         probe = full.substr(0, 2) + L"\\";
@@ -304,7 +336,7 @@ inline std::wstring local_app_data() {
 inline std::optional<std::vector<unsigned char>> read_all_bytes(
     const std::wstring& path,
     std::uint64_t maximum_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL) {
-    HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    HANDLE handle = CreateFileW(fsutil::long_path(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return std::nullopt;
 
@@ -341,7 +373,7 @@ inline std::optional<std::vector<unsigned char>> read_all_bytes(
 
 inline bool write_file_raw(const std::wstring& path, const unsigned char* data, std::size_t size,
                            bool write_through, bool fail_if_exists) {
-    HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+    HANDLE handle = CreateFileW(fsutil::long_path(path).c_str(), GENERIC_WRITE, 0, nullptr,
                                 fail_if_exists ? CREATE_NEW : CREATE_ALWAYS,
                                 FILE_ATTRIBUTE_NORMAL | (write_through ? FILE_FLAG_WRITE_THROUGH : 0),
                                 nullptr);
@@ -354,7 +386,7 @@ inline bool write_file_raw(const std::wstring& path, const unsigned char* data, 
         if (!WriteFile(handle, data + offset, request, &written, nullptr) || written == 0) {
             const DWORD error = written == 0 ? ERROR_WRITE_FAULT : GetLastError();
             CloseHandle(handle);
-            DeleteFileW(path.c_str());
+            DeleteFileW(fsutil::long_path(path).c_str());
             SetLastError(error);
             return false;
         }
@@ -363,13 +395,13 @@ inline bool write_file_raw(const std::wstring& path, const unsigned char* data, 
     if (write_through && !FlushFileBuffers(handle)) {
         const DWORD error = GetLastError();
         CloseHandle(handle);
-        DeleteFileW(path.c_str());
+        DeleteFileW(fsutil::long_path(path).c_str());
         SetLastError(error);
         return false;
     }
     if (!CloseHandle(handle)) {
         const DWORD error = GetLastError();
-        DeleteFileW(path.c_str());
+        DeleteFileW(fsutil::long_path(path).c_str());
         SetLastError(error);
         return false;
     }
@@ -395,10 +427,10 @@ inline bool write_atomic_bytes(const std::wstring& path, const unsigned char* da
     if (!write_file_raw(temp_path, data, size, /*write_through*/ true, /*fail_if_exists*/ true)) {
         return false;
     }
-    if (!MoveFileExW(temp_path.c_str(), path.c_str(),
+    if (!MoveFileExW(fsutil::long_path(temp_path).c_str(), fsutil::long_path(path).c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         const DWORD error = GetLastError();
-        DeleteFileW(temp_path.c_str());
+        DeleteFileW(fsutil::long_path(temp_path).c_str());
         SetLastError(error);
         return false;
     }
@@ -410,22 +442,22 @@ inline bool write_atomic_bytes(const std::wstring& path, const std::string& data
 }
 
 inline void set_hidden(const std::wstring& path) {
-    DWORD attributes = GetFileAttributesW(path.c_str());
+    DWORD attributes = GetFileAttributesW(fsutil::long_path(path).c_str());
     if (attributes != INVALID_FILE_ATTRIBUTES) {
-        SetFileAttributesW(path.c_str(), attributes | FILE_ATTRIBUTE_HIDDEN);
+        SetFileAttributesW(fsutil::long_path(path).c_str(), attributes | FILE_ATTRIBUTE_HIDDEN);
     }
 }
 
 inline std::int64_t file_size(const std::wstring& path) {
     WIN32_FILE_ATTRIBUTE_DATA data{};
-    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return 0;
+    if (!GetFileAttributesExW(fsutil::long_path(path).c_str(), GetFileExInfoStandard, &data)) return 0;
     return (static_cast<std::int64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
 }
 
 // Last-write time as a FILETIME-derived 64-bit value (100 ns since 1601).
 inline std::uint64_t last_write_time(const std::wstring& path) {
     WIN32_FILE_ATTRIBUTE_DATA data{};
-    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return 0;
+    if (!GetFileAttributesExW(fsutil::long_path(path).c_str(), GetFileExInfoStandard, &data)) return 0;
     ULARGE_INTEGER value{};
     value.LowPart = data.ftLastWriteTime.dwLowDateTime;
     value.HighPart = data.ftLastWriteTime.dwHighDateTime;
@@ -444,13 +476,13 @@ inline std::uint64_t now_file_time() {
 // Deletes a file if present; clears read-only/hidden first. Returns the number
 // of bytes reclaimed (0 when the file was absent or could not be removed).
 inline std::int64_t delete_file(const std::wstring& path) {
-    DWORD attributes = GetFileAttributesW(path.c_str());
+    DWORD attributes = GetFileAttributesW(fsutil::long_path(path).c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES) return 0;
     std::int64_t size = file_size(path);
     if ((attributes & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN)) != 0) {
-        SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+        SetFileAttributesW(fsutil::long_path(path).c_str(), FILE_ATTRIBUTE_NORMAL);
     }
-    return DeleteFileW(path.c_str()) ? size : 0;
+    return DeleteFileW(fsutil::long_path(path).c_str()) ? size : 0;
 }
 
 // Non-recursive listing of files in `directory` matching `pattern` (e.g. L"*.json").
@@ -458,7 +490,7 @@ inline std::vector<std::wstring> enumerate_files(const std::wstring& directory,
                                                  const std::wstring& pattern) {
     std::vector<std::wstring> files;
     WIN32_FIND_DATAW find{};
-    HANDLE handle = FindFirstFileExW((directory + L"\\" + pattern).c_str(), FindExInfoBasic, &find,
+    HANDLE handle = FindFirstFileExW(fsutil::long_path(directory + L"\\" + pattern).c_str(), FindExInfoBasic, &find,
                                      FindExSearchNameMatch, nullptr, 0);
     if (handle == INVALID_HANDLE_VALUE) return files;
     do {
@@ -677,13 +709,13 @@ inline void rotate_backups(const std::wstring& snapshot_path, int generation_cou
 
         if (generation > 1) {
             if (fsutil::file_exists(source)) {
-                MoveFileExW(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING);
+                MoveFileExW(fsutil::long_path(source).c_str(), fsutil::long_path(destination).c_str(), MOVEFILE_REPLACE_EXISTING);
             } else if (fsutil::file_exists(destination)) {
-                DeleteFileW(destination.c_str());
+                DeleteFileW(fsutil::long_path(destination).c_str());
             }
         } else {
             if (fsutil::file_exists(destination)) {
-                DeleteFileW(destination.c_str());
+                DeleteFileW(fsutil::long_path(destination).c_str());
             }
             if (fsutil::file_exists(source)) {
                 // Rename rather than copy: the caller always writes a fresh
@@ -698,8 +730,8 @@ inline void rotate_backups(const std::wstring& snapshot_path, int generation_cou
                 // and .bak1 now holds exactly the content the snapshot had, so
                 // a crash here recovers the same state a crash one step later
                 // would have.
-                if (!MoveFileExW(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-                    CopyFileW(source.c_str(), destination.c_str(), FALSE);
+                if (!MoveFileExW(fsutil::long_path(source).c_str(), fsutil::long_path(destination).c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                    CopyFileW(fsutil::long_path(source).c_str(), fsutil::long_path(destination).c_str(), FALSE);
                 }
             }
         }
@@ -748,7 +780,7 @@ public:
         fsutil::create_directories(security_root);
         std::wstring key_path = security_root + L"\\" + file_name_;
 
-        const bool key_exists = GetFileAttributesW(key_path.c_str()) != INVALID_FILE_ATTRIBUTES;
+        const bool key_exists = GetFileAttributesW(fsutil::long_path(key_path).c_str()) != INVALID_FILE_ATTRIBUTES;
         std::vector<unsigned char> loaded;
         if (auto file_bytes = fsutil::read_all_bytes(key_path, 1024 * 1024)) {
             if (dpapi_protected_) {
@@ -836,9 +868,9 @@ private:
         if (!fsutil::write_file_raw(temp_path, bytes.data(), bytes.size(), true, true)) {
             return false;
         }
-        if (!MoveFileExW(temp_path.c_str(), key_path.c_str(), MOVEFILE_WRITE_THROUGH)) {
+        if (!MoveFileExW(fsutil::long_path(temp_path).c_str(), fsutil::long_path(key_path).c_str(), MOVEFILE_WRITE_THROUGH)) {
             const DWORD error = GetLastError();
-            DeleteFileW(temp_path.c_str());
+            DeleteFileW(fsutil::long_path(temp_path).c_str());
             SetLastError(error);
             return false;
         }
@@ -1680,7 +1712,7 @@ private:
         if (!directory.empty()) fsutil::create_directories(directory);
 
         std::vector<unsigned char> frame = build_frame(record);
-        HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+        HANDLE handle = CreateFileW(fsutil::long_path(path).c_str(), GENERIC_READ | GENERIC_WRITE,
                                     FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
                                     FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
         if (handle == INVALID_HANDLE_VALUE) return false;
@@ -1789,7 +1821,7 @@ private:
 
     static void compact_ledger_if_needed(const std::wstring& path,
                                          const detail::SecurityContext& context) {
-        HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ,
+        HANDLE handle = CreateFileW(fsutil::long_path(path).c_str(), GENERIC_READ,
                                     FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (handle == INVALID_HANDLE_VALUE) return;
@@ -1811,8 +1843,8 @@ private:
             all.insert(all.end(), frame.begin(), frame.end());
         }
         if (fsutil::write_file_raw(temp_path, all.data(), all.size(), true, true)) {
-            if (!MoveFileExW(temp_path.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-                DeleteFileW(temp_path.c_str());
+            if (!MoveFileExW(fsutil::long_path(temp_path).c_str(), fsutil::long_path(path).c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                DeleteFileW(fsutil::long_path(temp_path).c_str());
             }
         }
     }

@@ -223,7 +223,7 @@ inline FILETIME ticks_to_filetime(std::int64_t ticks) {
 
 inline bool try_get_existing_file_metadata(const std::wstring& path, ExistingFileMetadata& metadata) {
     WIN32_FILE_ATTRIBUTE_DATA data{};
-    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return false;
+    if (!GetFileAttributesExW(storage::fsutil::long_path(path).c_str(), GetFileExInfoStandard, &data)) return false;
     if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) return false;
     metadata.length = static_cast<std::int64_t>(
         (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow);
@@ -233,7 +233,7 @@ inline bool try_get_existing_file_metadata(const std::wstring& path, ExistingFil
 }
 
 inline bool try_get_file_identity(const std::wstring& path, FileIdentity& identity) {
-    HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ,
+    HANDLE handle = CreateFileW(storage::fsutil::long_path(path).c_str(), GENERIC_READ,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return false;
@@ -269,7 +269,7 @@ inline bool try_get_file_stability(HANDLE handle, FileStabilitySnapshot& snapsho
 
 inline bool try_get_file_stability(const std::wstring& path,
                                    FileStabilitySnapshot& snapshot) {
-    HANDLE handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+    HANDLE handle = CreateFileW(storage::fsutil::long_path(path).c_str(), FILE_READ_ATTRIBUTES,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return false;
@@ -291,7 +291,7 @@ inline bool file_stability_matches(const FileStabilitySnapshot& expected,
 // file over the previous destination. The journal is already write-through,
 // but that alone cannot make the destination bytes survive a power loss.
 inline void flush_file_path(const std::wstring& path) {
-    HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE,
+    HANDLE handle = CreateFileW(storage::fsutil::long_path(path).c_str(), GENERIC_WRITE,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 nullptr, OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
@@ -302,7 +302,7 @@ inline void flush_file_path(const std::wstring& path) {
         // onto the stage before the final flush. A read handle is sufficient
         // for FlushFileBuffers on Windows and avoids making a correct staged
         // file unflushable solely because it is read-only.
-        handle = CreateFileW(path.c_str(), GENERIC_READ,
+        handle = CreateFileW(storage::fsutil::long_path(path).c_str(), GENERIC_READ,
                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                              nullptr, OPEN_EXISTING,
                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
@@ -325,12 +325,12 @@ inline std::int64_t get_existing_file_length(const std::wstring& path) {
 }
 
 inline bool directory_exists(const std::wstring& path) {
-    DWORD attributes = GetFileAttributesW(path.c_str());
+    DWORD attributes = GetFileAttributesW(storage::fsutil::long_path(path).c_str());
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
 inline bool set_last_write_time_utc(const std::wstring& path, std::int64_t ticks) {
-    HANDLE handle = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES,
+    HANDLE handle = CreateFileW(storage::fsutil::long_path(path).c_str(), FILE_WRITE_ATTRIBUTES,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return false;
@@ -342,7 +342,7 @@ inline bool set_last_write_time_utc(const std::wstring& path, std::int64_t ticks
 
 inline bool set_file_times_utc(const std::wstring& path, const FILETIME& creation_time,
                                const FILETIME& access_time, const FILETIME& write_time) {
-    HANDLE handle = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES,
+    HANDLE handle = CreateFileW(storage::fsutil::long_path(path).c_str(), FILE_WRITE_ATTRIBUTES,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                 OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
@@ -364,7 +364,7 @@ inline constexpr DWORD CopyableFileAttributes =
 inline bool set_copyable_file_attributes(const std::wstring& path, DWORD source_attributes) {
     DWORD attributes = source_attributes & CopyableFileAttributes;
     if (attributes == 0) attributes = FILE_ATTRIBUTE_NORMAL;
-    return SetFileAttributesW(path.c_str(), attributes) != FALSE;
+    return SetFileAttributesW(storage::fsutil::long_path(path).c_str(), attributes) != FALSE;
 }
 
 struct FileSecuritySnapshot {
@@ -386,13 +386,13 @@ inline FileSecuritySnapshot capture_file_security(const std::wstring& path) {
     auto read_descriptor = [&path](SECURITY_INFORMATION information,
                                    std::vector<unsigned char>& output) -> DWORD {
         DWORD required = 0;
-        if (GetFileSecurityW(path.c_str(), information, nullptr, 0, &required)) {
+        if (GetFileSecurityW(storage::fsutil::long_path(path).c_str(), information, nullptr, 0, &required)) {
             return ERROR_INVALID_DATA;
         }
         DWORD error = GetLastError();
         if (error != ERROR_INSUFFICIENT_BUFFER || required == 0) return error;
         output.resize(required);
-        if (!GetFileSecurityW(path.c_str(), information,
+        if (!GetFileSecurityW(storage::fsutil::long_path(path).c_str(), information,
                               reinterpret_cast<PSECURITY_DESCRIPTOR>(output.data()),
                               required, &required)) {
             return GetLastError();
@@ -434,7 +434,7 @@ inline FileSecurityApplyResult apply_file_security(const std::wstring& path,
 
     auto* descriptor = reinterpret_cast<PSECURITY_DESCRIPTOR>(
         const_cast<unsigned char*>(snapshot.descriptor.data()));
-    if (SetFileSecurityW(path.c_str(), snapshot.information, descriptor)) {
+    if (SetFileSecurityW(storage::fsutil::long_path(path).c_str(), snapshot.information, descriptor)) {
         return FileSecurityApplyResult{
             (snapshot.information & (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION)) != 0,
             (snapshot.information & SACL_SECURITY_INFORMATION) != 0};
@@ -444,7 +444,7 @@ inline FileSecurityApplyResult apply_file_security(const std::wstring& path,
     // Setting an owner or group usually requires a privilege that a normal
     // user does not have. Preserve the DACL rather than silently retaining the
     // destination directory's permissions; the caller records the limitation.
-    if (!SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, descriptor)) {
+    if (!SetFileSecurityW(storage::fsutil::long_path(path).c_str(), DACL_SECURITY_INFORMATION, descriptor)) {
         throw IoError::from_win32("Unable to apply source file permissions to staged destination.",
                                   GetLastError());
     }
@@ -473,7 +473,7 @@ inline bool is_default_data_stream(std::wstring_view name) {
 inline NamedStreamEnumeration enumerate_named_streams(const std::wstring& path) {
     NamedStreamEnumeration result;
     WIN32_FIND_STREAM_DATA stream_data{};
-    HANDLE find = FindFirstStreamW(path.c_str(), FindStreamInfoStandard, &stream_data, 0);
+    HANDLE find = FindFirstStreamW(storage::fsutil::long_path(path).c_str(), FindStreamInfoStandard, &stream_data, 0);
     if (find == INVALID_HANDLE_VALUE) {
         DWORD error = GetLastError();
         if (error == ERROR_INVALID_FUNCTION || error == ERROR_NOT_SUPPORTED ||
@@ -595,12 +595,12 @@ inline bool starts_with_ignore_case(std::string_view text, std::string_view pref
 }
 
 inline bool is_reparse_point(const std::wstring& path) {
-    DWORD attributes = GetFileAttributesW(path.c_str());
+    DWORD attributes = GetFileAttributesW(storage::fsutil::long_path(path).c_str());
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 }
 
 inline std::wstring resolve_final_path(const std::wstring& path) {
-    HANDLE handle = CreateFileW(path.c_str(), 0,
+    HANDLE handle = CreateFileW(storage::fsutil::long_path(path).c_str(), 0,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                 OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return std::wstring();
@@ -827,7 +827,7 @@ inline SourceScanResult scan_source(
             }
         }
         WIN32_FIND_DATAW find_data{};
-        HANDLE find = FindFirstFileExW(search.c_str(), FindExInfoBasic, &find_data,
+        HANDLE find = FindFirstFileExW(storage::fsutil::long_path(search).c_str(), FindExInfoBasic, &find_data,
                                        FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
         if (find == INVALID_HANDLE_VALUE) {
             DWORD error = GetLastError();
@@ -1159,6 +1159,41 @@ private:
 // Timed positional I/O + transfer session
 // ---------------------------------------------------------------------------
 
+// Page-aligned I/O buffer for FILE_FLAG_NO_BUFFERING reads. VirtualAlloc
+// returns page-aligned memory, which satisfies every sector size Windows
+// supports for unbuffered I/O.
+class AlignedBuffer {
+public:
+    // Unbuffered offsets and request sizes must be multiples of the sector
+    // size; 4 KiB covers 512e and 4Kn media.
+    static constexpr std::int32_t Alignment = 4096;
+
+    explicit AlignedBuffer(std::size_t size) : size_(size) {
+        data_ = static_cast<unsigned char*>(
+            VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (data_ == nullptr) throw std::bad_alloc();
+    }
+    ~AlignedBuffer() {
+        if (data_ != nullptr) VirtualFree(data_, 0, MEM_RELEASE);
+    }
+    AlignedBuffer(const AlignedBuffer&) = delete;
+    AlignedBuffer& operator=(const AlignedBuffer&) = delete;
+
+    unsigned char* data() noexcept { return data_; }
+    std::size_t size() const noexcept { return size_; }
+
+    static std::int64_t align_up(std::int64_t value) {
+        return ((value + Alignment - 1) / Alignment) * Alignment;
+    }
+    static std::int64_t align_down(std::int64_t value) {
+        return (value / Alignment) * Alignment;
+    }
+
+private:
+    unsigned char* data_ = nullptr;
+    std::size_t size_ = 0;
+};
+
 // One overlapped positional operation with an operation timeout and
 // cancellation polling. Mirrors RandomAccess.Read/WriteAsync + CancelAfter +
 // CancelIoEx from the .NET worker.
@@ -1209,9 +1244,13 @@ inline Outcome wait_for_completion(HANDLE file, OVERLAPPED& overlapped, DWORD& t
 
 // Reads exactly `count` bytes at `offset` unless EOF; Timeout outcome throws
 // IoError{kind=Timeout}. Returns bytes actually read (may be < count at EOF).
+// `single_transfer` returns after the first completed transfer. Unbuffered
+// handles need it: after a short read at end of file the next offset is no
+// longer sector-aligned, so continuing the loop would fail instead of
+// reporting EOF.
 inline std::int32_t read_at(HANDLE file, std::int64_t offset, unsigned char* buffer,
                             std::int32_t count, std::int64_t timeout_ms,
-                            const CancelContext& cancel) {
+                            const CancelContext& cancel, bool single_transfer = false) {
     std::int32_t total = 0;
     while (total < count) {
         OVERLAPPED overlapped{};
@@ -1252,6 +1291,7 @@ inline std::int32_t read_at(HANDLE file, std::int64_t offset, unsigned char* buf
         }
         if (transferred == 0) break; // EOF
         total += static_cast<std::int32_t>(transferred);
+        if (single_transfer) break;
     }
     return total;
 }
@@ -1320,7 +1360,7 @@ public:
 
     HANDLE source_handle() {
         if (source_ == INVALID_HANDLE_VALUE) {
-            source_ = CreateFileW(source_path_.c_str(), GENERIC_READ,
+            source_ = CreateFileW(storage::fsutil::long_path(source_path_).c_str(), GENERIC_READ,
                                   FILE_SHARE_READ, nullptr,
                                   OPEN_EXISTING,
                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN,
@@ -1334,7 +1374,7 @@ public:
 
     HANDLE destination_handle() {
         if (destination_ == INVALID_HANDLE_VALUE) {
-            destination_ = CreateFileW(destination_path_.c_str(), GENERIC_WRITE,
+            destination_ = CreateFileW(storage::fsutil::long_path(destination_path_).c_str(), GENERIC_WRITE,
                                        FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
                                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN,
                                        nullptr);

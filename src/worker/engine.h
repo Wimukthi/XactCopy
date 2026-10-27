@@ -64,7 +64,7 @@ public:
         : final_path_(std::move(final_path)), cancel_(&cancel) {
         working_path_ = final_path_ + L".xactcopy-stage." + storage::fsutil::random_temp_suffix();
         lock_path_ = working_path_ + L".lock";
-        lock_handle_ = CreateFileW(lock_path_.c_str(), GENERIC_READ | GENERIC_WRITE,
+        lock_handle_ = CreateFileW(storage::fsutil::long_path(lock_path_).c_str(), GENERIC_READ | GENERIC_WRITE,
                                    FILE_SHARE_READ, nullptr, CREATE_NEW,
                                    FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
         if (lock_handle_ == INVALID_HANDLE_VALUE) {
@@ -74,8 +74,8 @@ public:
 
     ~DestinationStage() {
         if (!committed_) {
-            SetFileAttributesW(working_path_.c_str(), FILE_ATTRIBUTE_NORMAL);
-            DeleteFileW(working_path_.c_str());
+            SetFileAttributesW(storage::fsutil::long_path(working_path_).c_str(), FILE_ATTRIBUTE_NORMAL);
+            DeleteFileW(storage::fsutil::long_path(working_path_).c_str());
         }
         if (lock_handle_ != INVALID_HANDLE_VALUE) {
             CloseHandle(lock_handle_);
@@ -90,7 +90,7 @@ public:
     const std::wstring& final_path() const noexcept { return final_path_; }
 
     bool final_exists_now() const noexcept {
-        DWORD attributes = GetFileAttributesW(final_path_.c_str());
+        DWORD attributes = GetFileAttributesW(storage::fsutil::long_path(final_path_).c_str());
         return attributes != INVALID_FILE_ATTRIBUTES &&
                (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
     }
@@ -102,20 +102,20 @@ public:
     const std::wstring& published_path() const noexcept { return published_path_; }
 
     void make_writable() {
-        DWORD attributes = GetFileAttributesW(working_path_.c_str());
+        DWORD attributes = GetFileAttributesW(storage::fsutil::long_path(working_path_).c_str());
         if (attributes == INVALID_FILE_ATTRIBUTES) {
             throw IoError::from_win32("Unable to inspect staged destination attributes.", GetLastError());
         }
         if ((attributes & FILE_ATTRIBUTE_READONLY) == 0) return;
         attributes &= ~FILE_ATTRIBUTE_READONLY;
         if (attributes == 0) attributes = FILE_ATTRIBUTE_NORMAL;
-        if (!SetFileAttributesW(working_path_.c_str(), attributes)) {
+        if (!SetFileAttributesW(storage::fsutil::long_path(working_path_).c_str(), attributes)) {
             throw IoError::from_win32("Unable to make staged destination writable.", GetLastError());
         }
     }
 
     void clone_existing_if_present() {
-        DWORD attributes = GetFileAttributesW(final_path_.c_str());
+        DWORD attributes = GetFileAttributesW(storage::fsutil::long_path(final_path_).c_str());
         if (attributes == INVALID_FILE_ATTRIBUTES) {
             DWORD error = GetLastError();
             if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return;
@@ -127,7 +127,7 @@ public:
 
         StageCopyState state{cancel_};
         BOOL cancel_flag = FALSE;
-        BOOL ok = CopyFileExW(final_path_.c_str(), working_path_.c_str(),
+        BOOL ok = CopyFileExW(storage::fsutil::long_path(final_path_).c_str(), storage::fsutil::long_path(working_path_).c_str(),
                               stage_copy_progress, &state, &cancel_flag,
                               COPY_FILE_FAIL_IF_EXISTS);
         if (!ok) {
@@ -157,14 +157,14 @@ public:
 
 private:
     void commit_to(const std::wstring& publish_path, bool replace_existing) {
-        DWORD staged_attributes = GetFileAttributesW(working_path_.c_str());
+        DWORD staged_attributes = GetFileAttributesW(storage::fsutil::long_path(working_path_).c_str());
         if (staged_attributes == INVALID_FILE_ATTRIBUTES) {
             throw IoError::from_win32("Unable to inspect staged destination before publish.",
                                       GetLastError());
         }
         const bool staged_readonly = (staged_attributes & FILE_ATTRIBUTE_READONLY) != 0;
 
-        DWORD final_attributes = GetFileAttributesW(publish_path.c_str());
+        DWORD final_attributes = GetFileAttributesW(storage::fsutil::long_path(publish_path).c_str());
         bool final_exists = final_attributes != INVALID_FILE_ATTRIBUTES &&
                             (final_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
         if (!replace_existing && final_exists) {
@@ -190,7 +190,7 @@ private:
             if (staged_readonly) {
                 DWORD writable_attributes = staged_attributes & ~FILE_ATTRIBUTE_READONLY;
                 if (writable_attributes == 0) writable_attributes = FILE_ATTRIBUTE_NORMAL;
-                if (!SetFileAttributesW(working_path_.c_str(), writable_attributes)) {
+                if (!SetFileAttributesW(storage::fsutil::long_path(working_path_).c_str(), writable_attributes)) {
                     throw IoError::from_win32("Unable to prepare read-only stage for publish.",
                                               GetLastError());
                 }
@@ -200,14 +200,14 @@ private:
             if (final_readonly) {
                 DWORD writable_attributes = final_attributes & ~FILE_ATTRIBUTE_READONLY;
                 if (writable_attributes == 0) writable_attributes = FILE_ATTRIBUTE_NORMAL;
-                if (!SetFileAttributesW(publish_path.c_str(), writable_attributes)) {
+                if (!SetFileAttributesW(storage::fsutil::long_path(publish_path).c_str(), writable_attributes)) {
                     throw IoError::from_win32("Unable to prepare read-only destination for publish.",
                                               GetLastError());
                 }
             }
             DWORD move_flags = MOVEFILE_WRITE_THROUGH |
                                (replace_existing ? MOVEFILE_REPLACE_EXISTING : 0);
-            if (!MoveFileExW(working_path_.c_str(), publish_path.c_str(), move_flags)) {
+            if (!MoveFileExW(storage::fsutil::long_path(working_path_).c_str(), storage::fsutil::long_path(publish_path).c_str(), move_flags)) {
                 throw IoError::from_win32("Unable to publish staged destination.", GetLastError());
             }
             published = true;
@@ -220,7 +220,7 @@ private:
                                         static_cast<DWORD>(std::size(injected_attribute_failure))) > 0;
             if (staged_readonly &&
                 (fail_attribute_restore_for_test ||
-                 !SetFileAttributesW(publish_path.c_str(), staged_attributes))) {
+                 !SetFileAttributesW(storage::fsutil::long_path(publish_path).c_str(), staged_attributes))) {
                 // Publication is already durable and cannot be rolled back by
                 // pretending this was a pre-commit failure. Surface the
                 // metadata problem separately while keeping the byte result.
@@ -230,12 +230,12 @@ private:
             }
         } catch (...) {
             if (!published && final_readonly &&
-                GetFileAttributesW(publish_path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                SetFileAttributesW(publish_path.c_str(), final_attributes);
+                GetFileAttributesW(storage::fsutil::long_path(publish_path).c_str()) != INVALID_FILE_ATTRIBUTES) {
+                SetFileAttributesW(storage::fsutil::long_path(publish_path).c_str(), final_attributes);
             }
             if (!published && staged_readonly &&
-                GetFileAttributesW(working_path_.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                SetFileAttributesW(working_path_.c_str(), staged_attributes);
+                GetFileAttributesW(storage::fsutil::long_path(working_path_).c_str()) != INVALID_FILE_ATTRIBUTES) {
+                SetFileAttributesW(storage::fsutil::long_path(working_path_).c_str(), staged_attributes);
             }
             throw;
         }
@@ -304,7 +304,7 @@ inline void cleanup_abandoned_staging_files(
 
         std::wstring search = detail::trim_trailing_separators(current) + L"\\*";
         WIN32_FIND_DATAW data{};
-        HANDLE find = FindFirstFileExW(search.c_str(), FindExInfoBasic, &data,
+        HANDLE find = FindFirstFileExW(storage::fsutil::long_path(search).c_str(), FindExInfoBasic, &data,
                                        FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
         if (find == INVALID_HANDLE_VALUE) continue;
 
@@ -337,26 +337,26 @@ inline void cleanup_abandoned_staging_files(
                 data.ftLastWriteTime.dwLowDateTime;
             if (written == 0 || now <= written || now - written < stale_after_100ns) continue;
             std::wstring lock_path = full + L".lock";
-            if (GetFileAttributesW(lock_path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            if (GetFileAttributesW(storage::fsutil::long_path(lock_path).c_str()) != INVALID_FILE_ATTRIBUTES) {
                 // FILE_FLAG_DELETE_ON_CLOSE removes this marker on a normal
                 // process exit. If power loss left only the directory entry,
                 // an exclusive probe proves no live staging owner remains.
-                HANDLE lock_probe = CreateFileW(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                HANDLE lock_probe = CreateFileW(storage::fsutil::long_path(lock_path).c_str(), GENERIC_READ | GENERIC_WRITE,
                                                 0, nullptr, OPEN_EXISTING,
                                                 FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (lock_probe == INVALID_HANDLE_VALUE) continue;
                 CloseHandle(lock_probe);
-                SetFileAttributesW(lock_path.c_str(), FILE_ATTRIBUTE_NORMAL);
-                DeleteFileW(lock_path.c_str());
+                SetFileAttributesW(storage::fsutil::long_path(lock_path).c_str(), FILE_ATTRIBUTE_NORMAL);
+                DeleteFileW(storage::fsutil::long_path(lock_path).c_str());
             }
 
-            HANDLE probe = CreateFileW(full.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+            HANDLE probe = CreateFileW(storage::fsutil::long_path(full).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (probe == INVALID_HANDLE_VALUE) continue;
             CloseHandle(probe);
 
-            SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
-            if (DeleteFileW(full.c_str()) && log) {
+            SetFileAttributesW(storage::fsutil::long_path(full).c_str(), FILE_ATTRIBUTE_NORMAL);
+            if (DeleteFileW(storage::fsutil::long_path(full).c_str()) && log) {
                 log("Removed abandoned destination stage: " + wide_to_utf8(full));
             }
         } while (FindNextFileW(find, &data));
@@ -1538,7 +1538,7 @@ private:
                                              false, true)) {
             return false;
         }
-        DeleteFileW(probe.c_str());
+        DeleteFileW(storage::fsutil::long_path(probe).c_str());
         return true;
     }
 
@@ -1837,7 +1837,7 @@ private:
     }
 
     static bool path_is_encrypted(const std::wstring& path) {
-        DWORD attributes = GetFileAttributesW(path.c_str());
+        DWORD attributes = GetFileAttributesW(storage::fsutil::long_path(path).c_str());
         return attributes != INVALID_FILE_ATTRIBUTES &&
                (attributes & FILE_ATTRIBUTE_ENCRYPTED) != 0;
     }
@@ -1848,7 +1848,7 @@ private:
             options_.AllowDecryptedDestination || path_is_encrypted(working_path)) {
             return;
         }
-        if (!EncryptFileW(working_path.c_str()) || !path_is_encrypted(working_path)) {
+        if (!EncryptFileW(storage::fsutil::long_path(working_path).c_str()) || !path_is_encrypted(working_path)) {
             DWORD error = GetLastError();
             throw IoError::from_win32(
                 "Unable to preserve EFS encryption on the staged destination. Enable the explicit plaintext override only when decrypted output is intended.",
@@ -1911,7 +1911,7 @@ private:
         for (const auto& destination_stream : destination_streams.streams) {
             if (find_stream(source_streams.streams, destination_stream.name) != nullptr) continue;
             std::wstring stale_path = working_path + destination_stream.name;
-            if (!DeleteFileW(stale_path.c_str())) {
+            if (!DeleteFileW(storage::fsutil::long_path(stale_path).c_str())) {
                 throw IoError::from_win32("Unable to remove stale destination data stream.",
                                           GetLastError());
             }
@@ -1926,7 +1926,7 @@ private:
             cancel.throw_if_cancelled();
             std::wstring source_stream_path = descriptor.full_path + source_stream.name;
             std::wstring destination_stream_path = working_path + source_stream.name;
-            HANDLE create = CreateFileW(destination_stream_path.c_str(), GENERIC_WRITE,
+            HANDLE create = CreateFileW(storage::fsutil::long_path(destination_stream_path).c_str(), GENERIC_WRITE,
                                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                          nullptr, CREATE_ALWAYS,
                                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
@@ -2081,7 +2081,7 @@ private:
         } catch (const std::exception&) {
             return; // Never delete an unrecognized adjacent user file.
         }
-        if (owned && !DeleteFileW(manifest_path.c_str())) {
+        if (owned && !DeleteFileW(storage::fsutil::long_path(manifest_path).c_str())) {
             DWORD error = GetLastError();
             if (error != ERROR_FILE_NOT_FOUND) {
                 add_metadata_notice(
@@ -2398,7 +2398,7 @@ private:
                                          bool preserve_existing) {
         if (existing_length < 0) existing_length = 0;
         if (existing_length == 0 || !preserve_existing) {
-            HANDLE handle = CreateFileW(destination_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+            HANDLE handle = CreateFileW(storage::fsutil::long_path(destination_path).c_str(), GENERIC_WRITE, FILE_SHARE_READ,
                                         nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (handle == INVALID_HANDLE_VALUE) {
                 throw IoError::from_win32("Unable to create destination file.", GetLastError());
@@ -2407,7 +2407,7 @@ private:
             return;
         }
         if (existing_length > expected_length) {
-            HANDLE handle = CreateFileW(destination_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+            HANDLE handle = CreateFileW(storage::fsutil::long_path(destination_path).c_str(), GENERIC_WRITE, FILE_SHARE_READ,
                                         nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (handle == INVALID_HANDLE_VALUE) {
                 throw IoError::from_win32("Unable to open destination file for trim.", GetLastError());
@@ -2477,7 +2477,7 @@ private:
                     detail::trim_trailing_separators(destination_root) + L"\\" + utf8_to_wide(relative);
 
                 WIN32_FILE_ATTRIBUTE_DATA source_data{};
-                if (!GetFileAttributesExW(source_path.c_str(), GetFileExInfoStandard,
+                if (!GetFileAttributesExW(storage::fsutil::long_path(source_path).c_str(), GetFileExInfoStandard,
                                           &source_data) ||
                     (source_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
                     throw IoError::from_win32(
@@ -2608,7 +2608,7 @@ private:
         if (descriptor.length >= 16LL * 1024 * 1024) flags |= COPY_FILE_NO_BUFFERING;
 
         BOOL cancel_flag = FALSE;
-        BOOL ok = CopyFileExW(descriptor.full_path.c_str(), destination_path.c_str(),
+        BOOL ok = CopyFileExW(storage::fsutil::long_path(descriptor.full_path).c_str(), storage::fsutil::long_path(destination_path).c_str(),
                               native_progress_routine, &state, &cancel_flag, flags);
         DWORD last_error = ok ? 0 : GetLastError();
 
@@ -3594,7 +3594,10 @@ private:
             if (copied_source_hash.has_value()) {
                 emit_log("Using source hash captured during copy: " + relative_path);
             }
-            auto destination_hash = compute_file_hash(destination_path, cancel);
+            // The destination was just written through the system cache. A
+            // cached read would hash those same pages and prove nothing about
+            // the media, so the destination side is always read unbuffered.
+            auto destination_hash = compute_file_hash(destination_path, cancel, /*uncached*/ true);
             if (source_hash != destination_hash) {
                 throw IoError("Verification hash mismatch: " + relative_path);
             }
@@ -3610,8 +3613,10 @@ private:
         }
         if (source_length <= 0) return;
 
-        std::int32_t chunk_size = static_cast<std::int32_t>(std::min<std::int64_t>(
-            source_length, std::max(4096, options_.SampleVerificationChunkBytes)));
+        // Sample offsets and sizes are sector-aligned so the destination side
+        // can be read unbuffered (see verify_file_with_retries).
+        const std::int32_t chunk_size = static_cast<std::int32_t>(AlignedBuffer::align_up(
+            std::max(4096, options_.SampleVerificationChunkBytes)));
         std::int32_t chunk_count = std::max(1, options_.SampleVerificationChunkCount);
 
         std::vector<std::int64_t> offsets;
@@ -3623,21 +3628,23 @@ private:
             for (std::int32_t index = 0; index < chunk_count; ++index) {
                 double raw = step * index;
                 std::int64_t value = static_cast<std::int64_t>(raw + (raw >= 0 ? 0.5 : -0.5));
-                offsets.push_back(std::clamp<std::int64_t>(value, 0, max_offset));
+                offsets.push_back(
+                    AlignedBuffer::align_down(std::clamp<std::int64_t>(value, 0, max_offset)));
             }
             std::sort(offsets.begin(), offsets.end());
             offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
         }
 
-        std::vector<unsigned char> buffer(static_cast<std::size_t>(chunk_size));
+        AlignedBuffer buffer(static_cast<std::size_t>(chunk_size));
         for (std::int64_t sample_offset : offsets) {
             cancel.throw_if_cancelled();
             std::int32_t sample_length = static_cast<std::int32_t>(
                 std::min<std::int64_t>(chunk_size, source_length - sample_offset));
             auto source_hash = read_and_hash_chunk(source_path, sample_offset, sample_length,
-                                                   buffer, cancel);
-            auto destination_hash = read_and_hash_chunk(destination_path, sample_offset, sample_length,
-                                                        buffer, cancel);
+                                                   buffer, cancel, /*uncached*/ false);
+            auto destination_hash = read_and_hash_chunk(destination_path, sample_offset,
+                                                        sample_length, buffer, cancel,
+                                                        /*uncached*/ true);
             if (source_hash != destination_hash) {
                 throw IoError("Sample verification mismatch: " + relative_path + " at offset " +
                               std::to_string(sample_offset) + ".");
@@ -3645,61 +3652,121 @@ private:
         }
     }
 
-    std::vector<unsigned char> read_and_hash_chunk(const std::wstring& path, std::int64_t offset,
-                                                   std::int32_t count,
-                                                   std::vector<unsigned char>& buffer,
-                                                   const CancelContext& cancel) {
-        HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ,
-                                    FILE_SHARE_READ, nullptr,
-                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+    // Opens a file for verification reads. An unbuffered open the filesystem
+    // rejects (some network redirectors and virtual filesystems) falls back to
+    // a cached read and records that the check was weaker; `uncached` reports
+    // which mode is in effect.
+    HANDLE open_for_verification(const std::wstring& path, bool& uncached) {
+        const DWORD base = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED;
+        if (uncached) {
+            HANDLE handle = CreateFileW(storage::fsutil::long_path(path).c_str(), GENERIC_READ,
+                                        FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                        base | FILE_FLAG_NO_BUFFERING, nullptr);
+            if (handle != INVALID_HANDLE_VALUE) return handle;
+            const DWORD error = GetLastError();
+            if (error != ERROR_INVALID_PARAMETER && error != ERROR_NOT_SUPPORTED) {
+                throw IoError::from_win32("Unable to open file for verification.", error);
+            }
+            note_cached_verification_fallback();
+            uncached = false;
+        }
+        HANDLE handle = CreateFileW(storage::fsutil::long_path(path).c_str(), GENERIC_READ,
+                                    FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                    base | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
         if (handle == INVALID_HANDLE_VALUE) {
             throw IoError::from_win32("Unable to open file for verification.", GetLastError());
         }
+        return handle;
+    }
+
+    void note_cached_verification_fallback() {
+        add_integrity_warning(
+            "The destination did not support unbuffered reads for one or more files; those "
+            "files were verified through the system cache.");
+    }
+
+    static bool is_unbuffered_rejection(const IoError& ex) {
+        return ex.win32 == ERROR_INVALID_PARAMETER || ex.win32 == ERROR_NOT_SUPPORTED;
+    }
+
+    std::vector<unsigned char> read_and_hash_chunk(const std::wstring& path, std::int64_t offset,
+                                                   std::int32_t count, AlignedBuffer& buffer,
+                                                   const CancelContext& cancel, bool uncached) {
+        HANDLE handle = open_for_verification(path, uncached);
+        // Unbuffered requests must cover whole sectors; a short final sample
+        // asks for the aligned size and EOF returns only the real bytes.
+        const std::int32_t request = uncached
+            ? static_cast<std::int32_t>(AlignedBuffer::align_up(count))
+            : count;
         std::int32_t read = 0;
         try {
-            read = timed_io::read_at(handle, offset, buffer.data(), count, operation_timeout_ms(), cancel);
+            read = timed_io::read_at(handle, offset, buffer.data(), request,
+                                     operation_timeout_ms(), cancel, uncached);
+        } catch (const IoError& ex) {
+            CloseHandle(handle);
+            if (uncached && is_unbuffered_rejection(ex)) {
+                note_cached_verification_fallback();
+                return read_and_hash_chunk(path, offset, count, buffer, cancel, false);
+            }
+            throw;
         } catch (...) {
             CloseHandle(handle);
             throw;
         }
         CloseHandle(handle);
-        if (read != count) {
+        if (read < count) {
             throw IoError("Short read while sampling verification chunk. Expected " +
                           std::to_string(count) + ", got " + std::to_string(read) + ".");
         }
-        bytes_verified_.fetch_add(read);
+        bytes_verified_.fetch_add(count);
         return crypto::hash_buffer(buffer.data(), static_cast<std::size_t>(count), use_sha512());
     }
 
-    std::vector<unsigned char> compute_file_hash(const std::wstring& path, const CancelContext& cancel) {
-        HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ,
-                                    FILE_SHARE_READ, nullptr,
-                                    OPEN_EXISTING,
-                                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN,
-                                    nullptr);
-        if (handle == INVALID_HANDLE_VALUE) {
-            throw IoError::from_win32("Unable to open file for hashing.", GetLastError());
+    std::vector<unsigned char> compute_file_hash(const std::wstring& path, const CancelContext& cancel,
+                                                 bool uncached = false) {
+        HANDLE handle = open_for_verification(path, uncached);
+
+        LARGE_INTEGER expected_length{};
+        if (!GetFileSizeEx(handle, &expected_length)) {
+            const DWORD error = GetLastError();
+            CloseHandle(handle);
+            throw IoError::from_win32("Unable to read file length for hashing.", error);
         }
 
         crypto::detail::StreamingHash hasher(use_sha512());
-        std::vector<unsigned char> buffer(1 << 20);
+        AlignedBuffer buffer(1 << 20);
         std::int64_t offset = 0;
         try {
             while (true) {
                 std::int32_t read = timed_io::read_at(handle, offset, buffer.data(),
                                                       static_cast<std::int32_t>(buffer.size()),
-                                                      operation_timeout_ms(), cancel);
+                                                      operation_timeout_ms(), cancel, uncached);
                 if (read <= 0) break;
                 hasher.update(buffer.data(), static_cast<std::size_t>(read));
                 bytes_verified_.fetch_add(read);
                 offset += read;
                 if (read < static_cast<std::int32_t>(buffer.size())) break;
             }
+        } catch (const IoError& ex) {
+            CloseHandle(handle);
+            if (uncached && is_unbuffered_rejection(ex)) {
+                note_cached_verification_fallback();
+                bytes_verified_.fetch_sub(offset);
+                return compute_file_hash(path, cancel, false);
+            }
+            throw;
         } catch (...) {
             CloseHandle(handle);
             throw;
         }
         CloseHandle(handle);
+        // A short read is end-of-file only if the whole file was covered;
+        // otherwise a truncated stream would hash as if it were complete.
+        if (offset != expected_length.QuadPart) {
+            throw IoError("Short read while hashing: expected " +
+                          std::to_string(expected_length.QuadPart) + " bytes, read " +
+                          std::to_string(offset) + ".");
+        }
         return hasher.finish();
     }
 
@@ -4088,7 +4155,7 @@ private:
         if (full.size() < 2 || full[1] != L':') return std::nullopt;
         std::wstring volume = L"\\\\.\\" + full.substr(0, 2);
         HANDLE handle = CreateFileW(
-            volume.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            storage::fsutil::long_path(volume).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr, OPEN_EXISTING, 0, nullptr);
         if (handle == INVALID_HANDLE_VALUE) return std::nullopt;
 
@@ -5037,7 +5104,7 @@ private:
                         NamedStreamEnumeration source_streams = enumerate_named_streams(descriptor.full_path);
                         DestinationStage stage(destination_path, cancel);
                         const std::wstring& working_path = stage.working_path();
-                        HANDLE reset = CreateFileW(working_path.c_str(), GENERIC_WRITE,
+                        HANDLE reset = CreateFileW(storage::fsutil::long_path(working_path).c_str(), GENERIC_WRITE,
                                                    FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
                                                    FILE_ATTRIBUTE_NORMAL, nullptr);
                         if (reset == INVALID_HANDLE_VALUE) {
@@ -5052,7 +5119,7 @@ private:
                         if (descriptor.length >= 16LL * 1024 * 1024) flags |= COPY_FILE_NO_BUFFERING;
                         QuietCallbackState state{&cancel, control_};
                         BOOL cancel_flag = FALSE;
-                        BOOL ok = CopyFileExW(descriptor.full_path.c_str(), working_path.c_str(),
+                        BOOL ok = CopyFileExW(storage::fsutil::long_path(descriptor.full_path).c_str(), storage::fsutil::long_path(working_path).c_str(),
                                               quiet_routine, &state, &cancel_flag, flags);
                         if (!ok) {
                             failed_count += 1;
@@ -5399,7 +5466,7 @@ private:
         wait_for_path_access(
             [&source_path]() {
                 if (!storage::fsutil::file_exists(source_path)) return false;
-                HANDLE handle = CreateFileW(source_path.c_str(), GENERIC_READ,
+                HANDLE handle = CreateFileW(storage::fsutil::long_path(source_path).c_str(), GENERIC_READ,
                                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (handle == INVALID_HANDLE_VALUE) return false;
@@ -5415,7 +5482,7 @@ private:
             [&destination_path]() {
                 std::wstring directory = storage::fsutil::get_directory_name(destination_path);
                 if (!directory.empty()) storage::fsutil::create_directories(directory);
-                HANDLE handle = CreateFileW(destination_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                HANDLE handle = CreateFileW(storage::fsutil::long_path(destination_path).c_str(), GENERIC_WRITE, FILE_SHARE_READ,
                                             nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (handle == INVALID_HANDLE_VALUE) return false;
                 CloseHandle(handle);
@@ -5514,7 +5581,7 @@ private:
         if (full.size() < 2 || full[1] != L':') return;
         std::wstring root = full.substr(0, 2) + L"\\";
         ULARGE_INTEGER available{}, total{}, free_total{};
-        if (!GetDiskFreeSpaceExW(root.c_str(), &available, &total, &free_total)) return;
+        if (!GetDiskFreeSpaceExW(storage::fsutil::long_path(root).c_str(), &available, &total, &free_total)) return;
         if (static_cast<std::int64_t>(available.QuadPart) < total_bytes) {
             emit_log("Destination free-space warning: estimated " + format_bytes(total_bytes) +
                      " required, " + format_bytes(static_cast<std::int64_t>(available.QuadPart)) +

@@ -263,7 +263,7 @@ public:
         }
 
         HANDLE volume = CreateFileW(
-            raw_volume_path.c_str(), GENERIC_READ,
+            storage::fsutil::long_path(raw_volume_path).c_str(), GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, nullptr);
         if (volume == INVALID_HANDLE_VALUE) {
@@ -476,7 +476,7 @@ private:
             volume_size_bytes_ = partition.PartitionLength.QuadPart;
         } else {
             ULARGE_INTEGER free_bytes{}, total_bytes{}, total_free_bytes{};
-            if (!GetDiskFreeSpaceExW(volume_root_.c_str(), &free_bytes, &total_bytes,
+            if (!GetDiskFreeSpaceExW(storage::fsutil::long_path(volume_root_).c_str(), &free_bytes, &total_bytes,
                                      &total_free_bytes) || total_bytes.QuadPart == 0 ||
                 total_bytes.QuadPart > static_cast<ULONGLONG>(INT64_MAX)) {
                 reason = "unable to determine raw volume size.";
@@ -554,7 +554,7 @@ private:
     bool try_get_file_snapshot(const std::wstring& path, FileLayout& layout,
                                std::string& reason, std::vector<RawDiskExtent>* extents) const {
         reason.clear();
-        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+        HANDLE file = CreateFileW(storage::fsutil::long_path(path).c_str(), GENERIC_READ,
                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file == INVALID_HANDLE_VALUE) {
@@ -675,7 +675,7 @@ private:
             return layout;
         }
 
-        DWORD attributes = GetFileAttributesW(path.c_str());
+        DWORD attributes = GetFileAttributesW(storage::fsutil::long_path(path).c_str());
         if (attributes == INVALID_FILE_ATTRIBUTES) {
             reason = "GetFileAttributes failed (" + std::to_string(GetLastError()) + ").";
             return layout;
@@ -798,7 +798,7 @@ private:
 
     bool is_cached_file_snapshot_current(const std::wstring& path, const FileLayout& layout) const {
         if (!layout.IsSupported) return false;
-        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+        HANDLE file = CreateFileW(storage::fsutil::long_path(path).c_str(), GENERIC_READ,
                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file == INVALID_HANDLE_VALUE) return false;

@@ -9,6 +9,9 @@
 
 IDI_XACTCOPY ICON "..\\..\\Icons\\xactcopy.ico"
 
+// Embedded manifest: long-path awareness (see worker.manifest).
+1 24 "worker.manifest"
+
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION XACTCOPY_VERSION_COMMA
  PRODUCTVERSION XACTCOPY_VERSION_COMMA

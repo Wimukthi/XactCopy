@@ -6,7 +6,9 @@
 //          native ResilientCopyEngine with throttled progress/log telemetry.
 // -----------------------------------------------------------------------------
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <mutex>
 #include <optional>
@@ -92,6 +94,7 @@ private:
     std::int32_t log_window_sent_ = 0;
     std::int64_t suppressed_logs_ = 0;
     std::mutex telemetry_lock_;
+    std::mutex progress_order_lock_;
 
     // ---- Sending ----------------------------------------------------------
 
@@ -187,9 +190,12 @@ private:
         suppressed_logs_ = 0;
     }
 
-    // Rate-limited progress with the file-transition guarantee: when the
-    // current file changes, the previous pending snapshot is sent first so the
-    // UI always observes each file's completion event.
+    // Rate-limited progress. Snapshots inside one send interval are coalesced
+    // to the newest, so the UI does not see every per-file transition; the
+    // counters in each snapshot are cumulative, so nothing is lost by
+    // skipping intermediates. A pending snapshot is delivered by the next
+    // in-interval event, by the heartbeat thread once it goes stale (so a
+    // long single read or journal save cannot strand it), and at job end.
     void on_engine_progress(const std::string& job_id, const models::CopyProgressSnapshot& snapshot) {
         {
             std::lock_guard<std::mutex> guard(job_state_lock_);
@@ -199,8 +205,9 @@ private:
 
         // Coalesce to the send interval. The engine emits a snapshot per file,
         // so a whole-drive scan of many small files would otherwise flood the
-        // pipe (thousands of frames/sec). The newest un-sent snapshot is kept in
-        // pending_progress_ and delivered by flush_pending_progress at job end.
+        // pipe (thousands of frames/sec). progress_order_lock_ keeps this
+        // thread and the heartbeat flush from delivering snapshots out of order.
+        std::lock_guard<std::mutex> order(progress_order_lock_);
         bool send_now = false;
         {
             std::lock_guard<std::mutex> guard(telemetry_lock_);
@@ -219,18 +226,55 @@ private:
     }
 
     void flush_pending_progress(const std::string& job_id) {
+        std::lock_guard<std::mutex> order(progress_order_lock_);
         std::optional<models::CopyProgressSnapshot> pending;
         {
             std::lock_guard<std::mutex> guard(telemetry_lock_);
             pending = std::move(pending_progress_);
             pending_progress_.reset();
+            if (pending.has_value()) last_progress_sent_tick_ = GetTickCount64();
         }
         if (pending.has_value()) send_progress_event(job_id, *pending);
+    }
+
+    // Heartbeat-thread variant: deliver a pending snapshot only once it has
+    // waited a full send interval, so it never preempts normal coalescing.
+    void flush_stale_pending_progress() {
+        std::string job_id = active_job_id_snapshot();
+        if (job_id.empty() || !job_running_.load()) return;
+        {
+            std::lock_guard<std::mutex> guard(telemetry_lock_);
+            if (!pending_progress_.has_value()) return;
+            if (GetTickCount64() - last_progress_sent_tick_ <
+                static_cast<ULONGLONG>(progress_interval_ms_)) {
+                return;
+            }
+        }
+        flush_pending_progress(job_id);
+    }
+
+    // Failures, errors, mismatches, and warnings are the lines a user needs to
+    // reconstruct what went wrong, so the rate limit never drops them; it only
+    // thins routine traffic. The terms match the UI's error/warning colouring
+    // (ui::classify_log_line), minus the high-volume retry/skip chatter.
+    static bool is_priority_log(const std::string& message) {
+        std::string lower = message;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        for (const char* term : {"fatal", "failed", "error", "mismatch", "warning"}) {
+            if (lower.find(term) != std::string::npos) return true;
+        }
+        return false;
     }
 
     void on_engine_log(const std::string& job_id, const std::string& message) {
         std::int64_t suppressed_summary = 0;
         bool should_send = false;
+        if (is_priority_log(message)) {
+            send_log(job_id, message);
+            return;
+        }
         {
             std::lock_guard<std::mutex> guard(telemetry_lock_);
             ULONGLONG now = GetTickCount64();
@@ -432,6 +476,7 @@ private:
         while (!lifetime_.is_cancelled()) {
             try {
                 send_heartbeat();
+                flush_stale_pending_progress();
             } catch (const std::exception&) {
                 return;
             }

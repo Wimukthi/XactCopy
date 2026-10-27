@@ -550,6 +550,14 @@ private:
             case WM_APP_APPLY_LAUNCH:
                 apply_explorer_launch_options();
                 return 0;
+            case WM_POWERBROADCAST:
+                // Keep the worker watchdog from mistaking a sleep for a hang.
+                if (wparam == PBT_APMSUSPEND) {
+                    supervisor_.notify_system_suspending();
+                } else if (wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND) {
+                    supervisor_.notify_system_resumed();
+                }
+                return TRUE;
             case WM_TIMER:
                 if (wparam == IdSelectionTimer) {
                     commit_selection();
@@ -2242,7 +2250,7 @@ private:
     }
 
     static bool directory_exists(const std::wstring& path) {
-        DWORD attributes = GetFileAttributesW(path.c_str());
+        DWORD attributes = GetFileAttributesW(storage::fsutil::long_path(path).c_str());
         return attributes != INVALID_FILE_ATTRIBUTES &&
                (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     }
