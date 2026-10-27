@@ -12,11 +12,15 @@
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "../src/ui/elevation.h"
 #include "../src/ui/job_manager.h"
+#include "../src/ui/journal_report.h"
+#include "../src/ui/log_model.h"
+#include "../src/ui/range_map.h"
 #include "../src/ui/recovery.h"
 #include "../src/ui/settings.h"
 #include "../src/ui/supervisor.h"
@@ -573,6 +577,173 @@ void test_recovery_service() {
     }
 }
 
+void test_recovery_writer_coalesces() {
+    std::printf("--- recovery writer: coalescing and shutdown ---\n");
+    std::mutex mutex;
+    std::condition_variable signal;
+    bool entered = false;
+    bool release = false;
+    std::vector<ui::RecoveryState> saved;
+    ui::AppSettings settings(make_work_dir() + L"\\settings.json");
+    {
+        ui::RecoveryService service(ui::RecoveryStateStore(make_work_dir() + L"\\state.json"), false,
+            [&](const ui::RecoveryState& state) {
+                std::unique_lock<std::mutex> guard(mutex);
+                saved.push_back(state);
+                if (saved.size() == 1) {
+                    entered = true;
+                    signal.notify_all();
+                    signal.wait(guard, [&] { return release; });
+                }
+            });
+        models::CopyJobOptions options;
+        options.SelectedRelativePaths = {"first.bin", "folder\\second.bin"};
+        service.mark_job_started("coalesce", "Test", options, "journal", settings);
+        {
+            std::unique_lock<std::mutex> guard(mutex);
+            check(signal.wait_for(guard, std::chrono::seconds(5), [&] { return entered; }),
+                  "background writer begins without waiting on the UI");
+        }
+        for (int i = 0; i < 100; ++i)
+            service.update_media_identities("coalesce", "source-" + std::to_string(i), "dest");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            release = true;
+        }
+        signal.notify_all();
+    }
+    check(saved.size() == 2 && saved.back().ActiveRun.has_value() &&
+              saved.back().ActiveRun->Options.ExpectedSourceIdentity == "source-99" &&
+              saved.back().ActiveRun->Options.SelectedRelativePaths ==
+                  std::vector<std::string>({"first.bin", "folder\\second.bin"}),
+          "blocked writes coalesce to the latest state and destructor joins the writer");
+
+    const auto path = make_work_dir() + L"\\recovery.json";
+    {
+        ui::RecoveryService service(ui::RecoveryStateStore(path), false);
+        models::CopyJobOptions options;
+        service.mark_job_started("final", "Test", options, "journal", settings);
+        service.update_media_identities("final", "latest", "dest");
+        service.mark_clean_shutdown();
+    }
+    const auto final_state = ui::RecoveryStateStore(path).load();
+    check(final_state.CleanShutdown && final_state.ActiveRun.has_value() &&
+              final_state.ActiveRun->Options.ExpectedSourceIdentity == "latest",
+          "clean shutdown persists the final state after pending writes");
+}
+
+void test_log_model() {
+    std::printf("--- log model: ring, filtering and search ---\n");
+    ui::LogModel log(3);
+    const auto timestamp = std::chrono::system_clock::time_point(std::chrono::seconds(42));
+    log.append(L"first", ui::LogSeverity::Normal, timestamp);
+    log.append(L"WARNING: second", ui::classify_log_line("WARNING: second"), timestamp);
+    log.append(L"ERROR: third", ui::classify_log_line("ERROR: third"), timestamp);
+    check(log.size() == 3 && log.size(ui::LogFilter::WarningsAndErrors) == 2 &&
+              log.size(ui::LogFilter::ErrorsOnly) == 1 && log.at(ui::LogFilter::All, 0)->timestamp == timestamp,
+          "model retains timestamp and maintains each severity view");
+    log.append(L"fourth", ui::LogSeverity::Normal, timestamp);
+    check(log.size() == 3 && log.at(ui::LogFilter::All, 0)->text == L"WARNING: second" &&
+              log.size(ui::LogFilter::ErrorsOnly) == 1,
+          "oldest entry is evicted without losing retained filtered entries");
+    check(log.find_next(ui::LogFilter::WarningsAndErrors, L"error", 1) == 1 &&
+              log.find_next(ui::LogFilter::All, L"warning", 2) == 0,
+          "case-insensitive search wraps in the selected view");
+    log.set_capacity(1);
+    check(log.size() == 1 && log.size(ui::LogFilter::WarningsAndErrors) == 0 &&
+              log.at(ui::LogFilter::All, 0)->text == L"fourth",
+          "capacity changes evict exactly the excess lines");
+    log.clear();
+    check(log.size() == 0, "clear empties every view");
+    ui::LogModel concurrent(2);
+    concurrent.append(L"old one", ui::LogSeverity::Normal, timestamp);
+    concurrent.append(L"old two", ui::LogSeverity::Warning, timestamp);
+    auto snapshot = concurrent.begin_snapshot();
+    concurrent.append(L"new three", ui::LogSeverity::Error, timestamp);
+    concurrent.clear();
+    concurrent.append(L"new job", ui::LogSeverity::Normal, timestamp);
+    const auto first = concurrent.next_snapshot(snapshot);
+    const auto second = concurrent.next_snapshot(snapshot);
+    check(first && second && first->text == L"old one" && second->text == L"old two" &&
+              !concurrent.next_snapshot(snapshot),
+          "background snapshot keeps its original lines across eviction and reset");
+    concurrent.end_snapshot(snapshot);
+    check(concurrent.size() == 1 && concurrent.at(ui::LogFilter::All, 0)->text == L"new job",
+          "snapshot does not disturb the live ring after a reset");
+    ui::LogModel large(20001);
+    for (int i = 0; i < 20002; ++i)
+        large.append(std::to_wstring(i), ui::LogSeverity::Normal, timestamp);
+    check(large.size() == 20001 && large.at(ui::LogFilter::All, 0)->text == L"1",
+          "configured capacity above 20000 is honored exactly");
+}
+
+void test_journal_report_and_range_map() {
+    std::printf("--- journal report and range-map geometry ---\n");
+    storage::JobJournal journal;
+    journal.RunOptions = models::CopyJobOptions{};
+    storage::JournalFileEntry entry;
+    entry.RelativePath = "folder/a,\"b\".txt";
+    entry.SourceLength = 1000;
+    entry.BytesCopied = 900;
+    entry.LastError = "line one\r\nline two";
+    entry.RescueRanges = {{0, 400, storage::RescueRangeState::Good},
+                          {400, 100, storage::RescueRangeState::Recovered},
+                          {500, 50, storage::RescueRangeState::Bad},
+                          {550, 50, storage::RescueRangeState::KnownBad}};
+    entry.RecoveredRanges = {{420, 20}};
+    journal.Files.set(entry.RelativePath, entry);
+    std::ostringstream output;
+    ui::write_journal_report_csv(output, journal);
+    const auto csv = output.str();
+    check(csv.rfind("\xEF\xBB\xBF", 0) == 0 &&
+              csv.find("\"folder/a,\"\"b\"\".txt\"") != std::string::npos &&
+              csv.find("\"line one\r\nline two\"") != std::string::npos,
+          "CSV has UTF-8 BOM and RFC 4180 quoting for paths and multiline errors");
+    check(csv.find(",120,100,500:100,400:100,420:20,") != std::string::npos,
+          "report merges bad ranges and separately identifies synthetic fill");
+    journal.RunOptions->OperationMode = models::JobOperationMode::ScanOnly;
+    std::ostringstream scan_output;
+    ui::write_journal_report_csv(scan_output, journal);
+    check(scan_output.str().find(",120,100,420:20; 500:100,400:100,,") != std::string::npos,
+          "scan journals treat legacy recovered-range entries as unreadable ranges");
+    journal.RunOptions.reset();
+    std::ostringstream legacy_output;
+    ui::write_journal_report_csv(legacy_output, journal);
+    check(legacy_output.str().find(",100,100,500:100,400:100,,420:20\r\n") != std::string::npos,
+          "ambiguous legacy ranges are reported separately instead of guessed");
+    journal.RunOptions = models::CopyJobOptions{};
+    entry.RescueRanges.clear();
+    journal.Files.set(entry.RelativePath, entry);
+    std::ostringstream legacy_copy_output;
+    ui::write_journal_report_csv(legacy_copy_output, journal);
+    check(legacy_copy_output.str().find(",20,20,,420:20,420:20,") != std::string::npos,
+          "legacy copy fill contributes to recovered and unreadable bytes");
+    const auto spans = ui::range_map_spans(1000000,
+        {{0, 1000000, storage::RescueRangeState::Good},
+         {500000, 1, storage::RescueRangeState::Bad},
+         {700000, 1, storage::RescueRangeState::KnownBad}}, 100);
+    bool bad_visible = false, known_visible = false;
+    for (const auto& span : spans) {
+        if (span.state == storage::RescueRangeState::Bad && span.right > span.left &&
+            span.offset == 500000 && span.length == 1) bad_visible = true;
+        if (span.state == storage::RescueRangeState::KnownBad && span.right > span.left)
+            known_visible = true;
+    }
+    check(bad_visible && known_visible, "sub-pixel bad and known-bad ranges stay visible");
+    check(ui::range_map_spans(0, entry.RescueRanges, 100).empty() &&
+              ui::range_map_spans(1000, entry.RescueRanges, 0).empty(),
+          "empty files and empty viewports have no spans");
+    const auto tiny = ui::range_map_spans(1, {}, 10);
+    check(tiny.size() == 1 && tiny[0].left == 0 && tiny[0].right == 10 &&
+              tiny[0].offset == 0 && tiny[0].length == 1,
+          "pending pixels in tiny files retain a nonempty byte interval");
+    const auto clipped = ui::range_map_spans(100, {{95, INT64_MAX,
+        storage::RescueRangeState::Bad}}, 10);
+    check(!clipped.empty() && clipped.back().state == storage::RescueRangeState::Bad &&
+              clipped.back().offset == 95 && clipped.back().length == 5,
+          "range geometry clips overflowing lengths at the file boundary");
+}
+
 void test_settings_preservation() {
     std::printf("--- settings: DOM preservation ---\n");
     std::wstring work = make_work_dir();
@@ -587,6 +758,11 @@ void test_settings_preservation() {
                                     seeded.size(), false, false);
 
     ui::AppSettings settings(path);
+    check(settings.get_bool("ProgressBarShowPercentage", true),
+          "new settings default to progress percentages enabled");
+    settings.set_bool("ProgressBarShowPercentage", false);
+    check(!settings.get_bool("ProgressBarShowPercentage", true),
+          "explicitly disabled progress percentages override the new default");
     check(settings.theme() == "dark", "theme read");
     check(settings.get_int("DefaultBufferSizeMb", 1, 256, 4) == 8, "int read");
     auto options = settings.build_default_options();
@@ -599,6 +775,8 @@ void test_settings_preservation() {
     settings.save();
 
     ui::AppSettings reloaded(path);
+    check(!reloaded.get_bool("ProgressBarShowPercentage", true),
+          "saved disabled progress percentages remain disabled after reload");
     check(reloaded.theme() == "light", "edited theme persisted");
     check(reloaded.get_int("DefaultBufferSizeMb", 1, 256, 4) == 16, "edited int persisted");
     check(reloaded.get_string("AccentColorHex", "") == "#5A78C8", "untouched key preserved");
@@ -1027,6 +1205,17 @@ void test_job_manager_service() {
         storage::fsutil::wide_to_utf8(assessment_journal_path),
         &assessment_options);
     manager.mark_run_completed(assessment_run.RunId, assessment_result);
+    const auto report_journal = manager.load_run_journal(assessment_run.RunId);
+    check(report_journal.has_value() && report_journal->Files.size() == 3,
+          "report loader authenticates and loads the selected run's journal");
+    auto wrong_options = assessment_options;
+    wrong_options.SourceRoot = "C:\\different-source";
+    const auto wrong_run = manager.create_ad_hoc_run(wrong_options, "Wrong roots", "scan");
+    manager.mark_run_running(wrong_run.RunId,
+                             storage::fsutil::wide_to_utf8(assessment_journal_path), &wrong_options);
+    check(!manager.load_run_journal(wrong_run.RunId).has_value(),
+          "report loader rejects an authenticated journal belonging to different roots");
+    manager.delete_run(wrong_run.RunId);
     auto runs_after_assessment = manager.get_recent_runs();
     check(!runs_after_assessment.empty() &&
               runs_after_assessment[0].Status == storage::ManagedJobRunStatus::Completed &&
@@ -1148,6 +1337,9 @@ int main() {
     test_settings_failure_reporting();
     test_settings_option_mapping();
     test_recovery_service();
+    test_recovery_writer_coalesces();
+    test_log_model();
+    test_journal_report_and_range_map();
     test_job_catalog_store();
     test_job_manager_service();
     test_clean_job();

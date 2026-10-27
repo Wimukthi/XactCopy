@@ -9,10 +9,15 @@
 #include <shellapi.h>
 
 #include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <thread>
+#include <shobjidl.h>
 
 #include "dialogs.h"
 #include "job_manager.h"
+#include "journal_report.h"
+#include "range_map_dialog.h"
 
 namespace xact::ui {
 
@@ -283,16 +288,20 @@ private:
     static constexpr int IdClearHistory = 2123;
     static constexpr int IdClose = 2124;
     static constexpr int IdDetailsList = 2130;
+    static constexpr int IdExportReport = 2131;
+    static constexpr int IdRangeMap = 2132;
     static constexpr UINT_PTR AutoRefreshTimerId = 1;
     static constexpr UINT_PTR SearchDebounceTimerId = 2;
     static constexpr UINT JournalExportCompleteMessage = WM_APP + 0x521;
     static constexpr UINT FindingsLoadCompleteMessage = WM_APP + 0x522;
 
     struct JournalExportResult {
+        enum class Kind { OpenJournal, Report, RangeMap } kind = Kind::OpenJournal;
         bool exported = false;
         std::wstring readable_path;
         std::wstring view_root;
         std::string error;
+        std::vector<RangeMapFile> map_files;
     };
 
     struct FindingsLoadResult {
@@ -562,6 +571,15 @@ private:
         return nullptr;
     }
 
+    bool has_resumable_journal(const storage::ManagedJobRun& run) const {
+        if (!storage::catalog_detail::is_blank(run.JournalPath)) return true;
+        // Legacy paths are discovered by the findings worker, never by the
+        // selection/paint handlers on the UI thread.
+        return findings_cache_.has_value() && findings_cache_->Loaded &&
+               models::detail::equals_ignore_case(findings_cache_row_id_, run.RunId) &&
+               findings_cache_run_updated_ticks_ == run.LastUpdatedUtc.utc_ticks();
+    }
+
     void update_action_states() {
         const Row* row = selected_row();
         auto enable = [](HWND button, bool enabled) {
@@ -571,10 +589,8 @@ private:
         bool is_queue = row != nullptr && row->kind == RowKind::QueueEntry;
         bool is_run = row != nullptr && row->kind == RowKind::RunHistory;
         const storage::ManagedJobRun* run = selected_run();
-        const std::string resume_journal_path =
-            run != nullptr ? manager_.get_resume_journal_path(run->RunId) : std::string();
         const bool can_resume =
-            run != nullptr && !resume_journal_path.empty() &&
+            run != nullptr && has_resumable_journal(*run) &&
             run->Status != storage::ManagedJobRunStatus::Completed &&
             run->Status != storage::ManagedJobRunStatus::Running &&
             run->Status != storage::ManagedJobRunStatus::Paused &&
@@ -594,6 +610,8 @@ private:
         enable(buttons_[IdDeleteJob], is_saved);
         enable(buttons_[IdDeleteRun], is_run);
         enable(buttons_[IdOpenJournal], is_run && !journal_worker_.joinable());
+        enable(buttons_[IdExportReport], is_run && !journal_worker_.joinable());
+        enable(buttons_[IdRangeMap], is_run && !journal_worker_.joinable());
         enable(buttons_[IdClearQueue], !queue_entries_.empty());
         enable(buttons_[IdClearHistory], !runs_.empty());
     }
@@ -662,11 +680,13 @@ private:
 
     void append_journal_findings(const storage::ManagedJobRun& run,
                                  std::vector<std::wstring>& lines) {
-        const std::string journal_path = manager_.get_resume_journal_path(run.RunId);
-        if (journal_path.empty()) {
+        if (storage::catalog_detail::is_blank(run.JournalPath) &&
+            storage::catalog_detail::is_blank(run.SourceRoot)) {
             lines.push_back(L"Findings: No resumable journal could be located for this run.");
             return;
         }
+        const std::string journal_path = storage::catalog_detail::is_blank(run.JournalPath)
+            ? "legacy:" + run.SourceRoot + "|" + run.DestinationRoot : run.JournalPath;
         const bool cached =
             findings_cache_.has_value() &&
             models::detail::equals_ignore_case(findings_cache_row_id_, run.RunId) &&
@@ -755,6 +775,7 @@ private:
         findings_cache_loaded_tick_ = GetTickCount64();
         findings_cache_ = std::move(result.inspection);
         render_selected_details();
+        update_action_states();
     }
 
     void run_now_selected(HWND hwnd) {
@@ -775,10 +796,7 @@ private:
                 return;
             case RowKind::RunHistory: {
                 const storage::ManagedJobRun* run = selected_run();
-                const std::string journal_path =
-                    run != nullptr ? manager_.get_resume_journal_path(run->RunId)
-                                   : std::string();
-                if (run == nullptr || journal_path.empty() ||
+                if (run == nullptr || !has_resumable_journal(*run) ||
                     run->Status == storage::ManagedJobRunStatus::Completed ||
                     run->Status == storage::ManagedJobRunStatus::Running ||
                     run->Status == storage::ManagedJobRunStatus::Paused ||
@@ -825,49 +843,140 @@ private:
             info_box(hwnd, L"A journal is already being validated and opened.");
             return;
         }
-        const Row* row = selected_row();
-        if (row == nullptr || row->kind != RowKind::RunHistory) return;
-        for (const auto& run : runs_) {
-            if (!models::detail::equals_ignore_case(run.RunId, row->primary_id)) continue;
-            const std::string resolved_journal_path =
-                manager_.get_resume_journal_path(run.RunId, /*validate_roots*/ true);
-            if (resolved_journal_path.empty()) {
-                info_box(hwnd, L"No resumable journal could be located for this run.");
-                return;
+        const auto* run = selected_run();
+        if (run == nullptr) return;
+        const std::string run_id = run->RunId;
+        journal_dialog_closing_ = false;
+        EnableWindow(buttons_[IdOpenJournal], FALSE);
+        EnableWindow(buttons_[IdExportReport], FALSE);
+        EnableWindow(buttons_[IdRangeMap], FALSE);
+        SetWindowTextW(buttons_[IdOpenJournal], L"Validating...");
+        journal_worker_ = std::thread([this, hwnd, run_id] {
+            auto result = std::make_unique<JournalExportResult>();
+            try {
+                auto journal = manager_.load_run_journal(run_id);
+                const auto path = manager_.get_resume_journal_path(run_id);
+                if (!journal.has_value() || path.empty()) {
+                    result->error = "No authenticated journal matching this run could be loaded.";
+                } else {
+                    const std::wstring file_name = storage::fsutil::get_file_name(
+                        storage::fsutil::utf8_to_wide(path));
+                    std::wstring base_name, extension;
+                    storage::fsutil::split_extension(file_name, base_name, extension);
+                    result->view_root = storage::fsutil::local_app_data() +
+                                        L"\\XactCopy\\journal-views";
+                    result->readable_path = result->view_root + L"\\" + base_name + L"-readable.json";
+                    storage::fsutil::create_directories(result->view_root);
+                    json::Writer writer(/*indented*/ true);
+                    journal->to_json(writer);
+                    result->exported = storage::fsutil::write_atomic_bytes(
+                        result->readable_path, writer.take());
+                    if (!result->exported) result->error = "The readable journal could not be written.";
+                }
+            } catch (const std::exception& error) {
+                result->error = error.what();
             }
-            std::wstring journal_path =
-                storage::fsutil::utf8_to_wide(resolved_journal_path);
-            if (storage::fsutil::file_exists(journal_path)) {
-                std::wstring file_name = storage::fsutil::get_file_name(journal_path);
-                std::wstring base_name;
-                std::wstring extension;
-                storage::fsutil::split_extension(file_name, base_name, extension);
-                std::wstring view_root = storage::fsutil::local_app_data() +
-                                         L"\\XactCopy\\journal-views";
-                std::wstring readable_path = view_root + L"\\" + base_name +
-                                             L"-readable.json";
-                journal_dialog_closing_ = false;
-                EnableWindow(buttons_[IdOpenJournal], FALSE);
-                SetWindowTextW(buttons_[IdOpenJournal], L"Validating...");
-                journal_worker_ = std::thread(
-                    [this, hwnd, journal_path, readable_path, view_root]() {
-                        auto* result = new JournalExportResult;
-                        result->readable_path = readable_path;
-                        result->view_root = view_root;
-                        storage::JobJournalStore store;
-                        result->exported = store.export_readable_json(
-                            journal_path, readable_path, &result->error);
-                        if (journal_dialog_closing_.load() ||
-                            !PostMessageW(hwnd, JournalExportCompleteMessage, 0,
-                                          reinterpret_cast<LPARAM>(result))) {
-                            delete result;
-                        }
-                    });
-            } else {
-                info_box(hwnd, L"The journal file no longer exists on disk.");
+            if (!journal_dialog_closing_.load() &&
+                PostMessageW(hwnd, JournalExportCompleteMessage, 0,
+                             reinterpret_cast<LPARAM>(result.get()))) result.release();
+        });
+    }
+
+    void start_journal_report_or_map(HWND hwnd, bool map) {
+        if (journal_worker_.joinable()) return;
+        const auto* run = selected_run();
+        if (run == nullptr) return;
+        const std::string run_id = run->RunId;
+        std::wstring destination;
+        if (!map) {
+            IFileSaveDialog* dialog = nullptr;
+            if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                        IID_PPV_ARGS(&dialog)))) return;
+            const COMDLG_FILTERSPEC filters[] = {{L"CSV files", L"*.csv"}, {L"All files", L"*.*"}};
+            dialog->SetFileTypes(2, filters);
+            dialog->SetDefaultExtension(L"csv");
+            dialog->SetFileName(L"XactCopy-report.csv");
+            if (SUCCEEDED(dialog->Show(hwnd))) {
+                IShellItem* item = nullptr;
+                if (SUCCEEDED(dialog->GetResult(&item))) {
+                    PWSTR path = nullptr;
+                    if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                        destination = path;
+                        CoTaskMemFree(path);
+                    }
+                    item->Release();
+                }
             }
-            return;
+            dialog->Release();
+            if (destination.empty()) return;
         }
+        journal_dialog_closing_ = false;
+        EnableWindow(buttons_[IdOpenJournal], FALSE);
+        EnableWindow(buttons_[IdExportReport], FALSE);
+        EnableWindow(buttons_[IdRangeMap], FALSE);
+        journal_worker_ = std::thread([this, hwnd, run_id, destination, map] {
+            auto result = std::make_unique<JournalExportResult>();
+            result->kind = map ? JournalExportResult::Kind::RangeMap : JournalExportResult::Kind::Report;
+            try {
+                auto journal = manager_.load_run_journal(run_id);
+                if (!journal.has_value()) {
+                    result->error = "No authenticated journal matching this run could be loaded.";
+                } else {
+                    // Older journals may omit options even when the signed run
+                    // record retains them; those options disambiguate legacy ranges.
+                    if (!journal->RunOptions.has_value()) {
+                        const auto run = manager_.get_run_by_id(run_id);
+                        if (run.has_value() && run->Options.has_value())
+                            journal->RunOptions = run->Options;
+                    }
+                    if (map) {
+                        for (auto& [key, entry] : journal->Files.entries) {
+                            if (entry.RescueRanges.empty() && !entry.RecoveredRanges.empty() &&
+                                journal->RunOptions.has_value()) {
+                                const auto state = journal->RunOptions->OperationMode ==
+                                        models::JobOperationMode::ScanOnly
+                                    ? storage::RescueRangeState::Bad
+                                    : storage::RescueRangeState::Recovered;
+                                for (const auto& range : entry.RecoveredRanges)
+                                    entry.RescueRanges.push_back({range.Offset, range.Length, state});
+                            }
+                            if (entry.RescueRanges.empty()) continue;
+                            RangeMapFile file;
+                            file.path = storage::fsutil::utf8_to_wide(
+                                entry.RelativePath.empty() ? key : entry.RelativePath);
+                            file.size = entry.SourceLength;
+                            file.ranges = std::move(entry.RescueRanges);
+                            result->map_files.push_back(std::move(file));
+                        }
+                        result->exported = true;
+                    } else {
+                        const auto journal_path = manager_.get_resume_journal_path(run_id);
+                        const auto normalized_output = storage::fsutil::normalize_path(destination);
+                        const auto normalized_journal = storage::fsutil::normalize_path(
+                            storage::fsutil::utf8_to_wide(journal_path));
+                        if (!journal_path.empty() &&
+                            (normalized_output == normalized_journal ||
+                             normalized_output.starts_with(normalized_journal + L"."))) {
+                            result->error = "The report destination is part of the journal set.";
+                        } else {
+                            std::ofstream stream(std::filesystem::path(destination),
+                                                 std::ios::binary | std::ios::trunc);
+                            if (!stream) throw std::runtime_error("The report file could not be opened.");
+                            write_journal_report_csv(stream, *journal);
+                            stream.close();
+                            if (!stream) throw std::runtime_error("The report could not be fully written.");
+                            result->exported = true;
+                            result->readable_path = destination;
+                        }
+                    }
+                }
+            } catch (const std::exception& error) {
+                result->error = error.what();
+            }
+            if (!journal_dialog_closing_.load() &&
+                PostMessageW(hwnd, JournalExportCompleteMessage, 0,
+                             reinterpret_cast<LPARAM>(result.get()))) result.release();
+        });
     }
 
     void on_command(HWND hwnd, int id, int code) {
@@ -952,6 +1061,8 @@ private:
             return;
         }
         if (id == IdOpenJournal) { open_journal_selected(hwnd); return; }
+        if (id == IdExportReport) { start_journal_report_or_map(hwnd, false); return; }
+        if (id == IdRangeMap) { start_journal_report_or_map(hwnd, true); return; }
         if (id == IdClearQueue) {
             if (confirm_box(hwnd, L"Remove every entry from the queue?")) {
                 manager_.clear_queue();
@@ -978,6 +1089,15 @@ private:
                 L"The journal could not be validated and exported:\n\n" +
                     storage::fsutil::utf8_to_wide(result.error),
                 MessageIcon::Warning);
+            return;
+        }
+        if (result.kind == JournalExportResult::Kind::RangeMap) {
+            if (result.map_files.empty()) info_box(hwnd, L"This journal has no rescue ranges.");
+            else RangeMapDialog::show(hwnd, theme_, std::move(result.map_files));
+            return;
+        }
+        if (result.kind == JournalExportResult::Kind::Report) {
+            info_box(hwnd, L"Report saved to:\n" + result.readable_path);
             return;
         }
         HINSTANCE opened = ShellExecuteW(hwnd, L"open", result.readable_path.c_str(), nullptr,
@@ -1019,6 +1139,8 @@ private:
             case IdDeleteJob: return L"Delete the selected saved job and remove every queue entry that refers to it.";
             case IdDeleteRun: return L"Delete only the selected run-history record. It does not delete copied files or the saved job.";
             case IdOpenJournal: return L"Validate the selected run's journal, export a readable JSON view, and open it. Large internal journals are stored in a compressed XCJZ container.";
+            case IdExportReport: return L"Export a CSV report from the selected run's authenticated journal.";
+            case IdRangeMap: return L"View rescue ranges from the selected run's authenticated journal.";
             case IdClearQueue: return L"Remove every pending queue entry after confirmation. Saved jobs are retained.";
             case IdClearHistory: return L"Delete all run-history records after confirmation. Journals and copied files are not removed here.";
             case IdClose: return L"Close Job Manager and return to the main window.";
@@ -1227,6 +1349,7 @@ private:
             {IdMoveBottom, L"Bottom", 62},     {IdRename, L"Rename", 70},
             {IdDuplicate, L"Duplicate", 80},   {IdDeleteJob, L"Delete Job", 84},
             {IdDeleteRun, L"Delete Run", 86},  {IdOpenJournal, L"Open Journal", 100},
+            {IdExportReport, L"Export report...", 112}, {IdRangeMap, L"Range map...", 104},
             {IdClearQueue, L"Clear Queue", 92}, {IdClearHistory, L"Clear History", 96},
             {IdClose, L"Close", 66},
         };

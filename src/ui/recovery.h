@@ -9,10 +9,13 @@
 #pragma once
 
 #include <mutex>
+#include <condition_variable>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../core/models.h"
@@ -231,11 +234,20 @@ public:
     std::function<void(const std::string&)> on_persistence_warning;
 
     explicit RecoveryService(RecoveryStateStore store = RecoveryStateStore{},
-                             bool manage_run_once = true)
-        : store_(std::move(store)), manage_run_once_(manage_run_once) {
+                             bool manage_run_once = true,
+                             std::function<void(const RecoveryState&)> save_override = {})
+        : store_(std::move(store)), manage_run_once_(manage_run_once),
+          save_override_(std::move(save_override)) {
         state_ = store_.load();
         pending_load_warning_ = store_.load_warning();
+        refresh_options_snapshot();
+        writer_ = std::thread([this] { writer_loop(); });
     }
+
+    ~RecoveryService() { stop_writer(); }
+
+    RecoveryService(const RecoveryService&) = delete;
+    RecoveryService& operator=(const RecoveryService&) = delete;
 
     RecoveryStartupInfo initialize_session(const AppSettings& settings,
                                            const LaunchOptions& launch) {
@@ -245,6 +257,7 @@ public:
             pending_load_warning_.clear();
         }
         state_ = store_.load();
+        refresh_options_snapshot();
         if (!store_.load_warning().empty()) report_warning(store_.load_warning());
 
         RecoveryStartupInfo info;
@@ -313,6 +326,7 @@ public:
         run.LastProgressUtc = now;
         run.JournalPath = journal_path;
         state_.ActiveRun = std::move(run);
+        refresh_options_snapshot();
 
         state_.PendingResumePrompt = false;
         state_.LastInterruptionReason.clear();
@@ -376,6 +390,7 @@ public:
         if (state_.ActiveRun.has_value() &&
             models::detail::equals_ignore_case(state_.ActiveRun->RunId, run_id)) {
             state_.ActiveRun.reset();
+            options_snapshot_.reset();
             state_.PendingResumePrompt = false;
             state_.LastInterruptionReason.clear();
             save_no_throw();
@@ -398,7 +413,10 @@ public:
         std::lock_guard<std::mutex> guard(lock_);
         state_.CleanShutdown = true;
         state_.LastExitUtc = time::DateTimeOffset::now_utc();
-        save_no_throw();
+        // The final state must follow every queued write, including one already
+        // in progress, and be durable before shutdown returns.
+        stop_writer();
+        save_snapshot_no_throw(state_);
         if (manage_run_once_ && !startup_.clear_recovery_run_once()) {
             report_warning("Windows recovery startup registration could not be cleared.");
         }
@@ -413,18 +431,106 @@ private:
     RecoveryStateStore store_;
     WindowsStartupService startup_;
     bool manage_run_once_;
+    std::function<void(const RecoveryState&)> save_override_;
     std::mutex lock_;
     RecoveryState state_;
+    std::shared_ptr<const models::CopyJobOptions> options_snapshot_;
+    struct RecoveryWrite {
+        RecoveryState state;
+        std::shared_ptr<const models::CopyJobOptions> options;
+        std::string source_identity;
+        std::string destination_identity;
+    };
+    std::mutex writer_lock_;
+    std::condition_variable writer_ready_;
+    std::optional<RecoveryWrite> pending_state_;
+    bool writer_stopping_ = false;
+    std::thread writer_;
     std::string pending_load_warning_;
     ULONGLONG last_touch_tick_ = 0;
     ULONGLONG touch_interval_ms_ = 2000;
 
+    void refresh_options_snapshot() {
+        options_snapshot_ = state_.ActiveRun.has_value()
+            ? std::make_shared<const models::CopyJobOptions>(state_.ActiveRun->Options)
+            : nullptr;
+    }
+
     void save_no_throw() {
+        RecoveryWrite write;
+        write.state.ProcessSessionId = state_.ProcessSessionId;
+        write.state.LastStartUtc = state_.LastStartUtc;
+        write.state.LastExitUtc = state_.LastExitUtc;
+        write.state.CleanShutdown = state_.CleanShutdown;
+        write.state.PendingResumePrompt = state_.PendingResumePrompt;
+        write.state.LastInterruptionReason = state_.LastInterruptionReason;
+        if (state_.ActiveRun.has_value()) {
+            const auto& active = *state_.ActiveRun;
+            RecoveryActiveRun metadata;
+            metadata.RunId = active.RunId;
+            metadata.ManagedRunId = active.ManagedRunId;
+            metadata.JobId = active.JobId;
+            metadata.JobName = active.JobName;
+            metadata.Trigger = active.Trigger;
+            metadata.StartedUtc = active.StartedUtc;
+            metadata.LastHeartbeatUtc = active.LastHeartbeatUtc;
+            metadata.LastProgressUtc = active.LastProgressUtc;
+            metadata.JournalPath = active.JournalPath;
+            write.state.ActiveRun = std::move(metadata);
+            write.options = options_snapshot_;
+            write.source_identity = active.Options.ExpectedSourceIdentity;
+            write.destination_identity = active.Options.ExpectedDestinationIdentity;
+        }
+        {
+            std::lock_guard<std::mutex> guard(writer_lock_);
+            pending_state_ = std::move(write);
+        }
+        writer_ready_.notify_one();
+    }
+
+    void save_snapshot_no_throw(const RecoveryState& snapshot) {
         try {
-            store_.save(state_);
+            if (save_override_) save_override_(snapshot);
+            else store_.save(snapshot);
         } catch (const std::exception& ex) {
             report_warning(std::string("Crash-recovery state could not be saved: ") + ex.what());
         }
+    }
+
+    void writer_loop() {
+        for (;;) {
+            std::optional<RecoveryWrite> snapshot;
+            {
+                std::unique_lock<std::mutex> guard(writer_lock_);
+                writer_ready_.wait(guard, [this] {
+                    return writer_stopping_ || pending_state_.has_value();
+                });
+                if (!pending_state_.has_value() && writer_stopping_) return;
+                snapshot.swap(pending_state_);
+            }
+            // Options may contain a large exact-item selection. Reconstruct it
+            // here rather than copying that list in every UI progress event.
+            try {
+                if (snapshot->state.ActiveRun.has_value() && snapshot->options) {
+                    auto& options = snapshot->state.ActiveRun->Options;
+                    options = *snapshot->options;
+                    options.ExpectedSourceIdentity = std::move(snapshot->source_identity);
+                    options.ExpectedDestinationIdentity = std::move(snapshot->destination_identity);
+                }
+                save_snapshot_no_throw(snapshot->state);
+            } catch (const std::exception& ex) {
+                report_warning(std::string("Crash-recovery state could not be saved: ") + ex.what());
+            }
+        }
+    }
+
+    void stop_writer() {
+        {
+            std::lock_guard<std::mutex> guard(writer_lock_);
+            writer_stopping_ = true;
+        }
+        writer_ready_.notify_one();
+        if (writer_.joinable()) writer_.join();
     }
 
     void report_warning(const std::string& message) {

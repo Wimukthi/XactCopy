@@ -22,6 +22,7 @@
 #include <gdiplus.h>
 
 #include "icons.h"
+#include "log_model.h"
 #include <wimukthi/win32_theme.hpp>
 
 #if defined(_MSC_VER)
@@ -716,36 +717,6 @@ inline void draw_combo_item(const DRAWITEMSTRUCT& draw, const ThemePalette& them
 // ---------------------------------------------------------------------------
 // Log severity classification (mirrors the .NET UI's colorize-by-severity).
 // ---------------------------------------------------------------------------
-
-enum class LogSeverity { Normal, Error, Warning, Success, Supervisor };
-
-inline LogSeverity classify_log_line(const std::string& line) {
-    auto contains_ci = [&line](const char* fragment) {
-        std::string lower;
-        lower.reserve(line.size());
-        for (char c : line) {
-            lower.push_back(c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c);
-        }
-        return lower.find(fragment) != std::string::npos;
-    };
-    if (contains_ci("fatal") || contains_ci("failed") || contains_ci("error") ||
-        contains_ci("mismatch")) {
-        return LogSeverity::Error;
-    }
-    if (contains_ci("recovered") || contains_ci("salvag") || contains_ci("succeeded") ||
-        contains_ci("completed:")) {
-        return LogSeverity::Success;
-    }
-    if (contains_ci("retry") || contains_ci("warning") || contains_ci("stale") ||
-        contains_ci("skipped") || contains_ci("waiting") || contains_ci("fallback")) {
-        return LogSeverity::Warning;
-    }
-    if (contains_ci("[supervisor]") || contains_ci("[devfault]") ||
-        contains_ci("[workertelemetry]")) {
-        return LogSeverity::Supervisor;
-    }
-    return LogSeverity::Normal;
-}
 
 inline COLORREF severity_color(const ThemePalette& theme, LogSeverity severity) {
     switch (severity) {

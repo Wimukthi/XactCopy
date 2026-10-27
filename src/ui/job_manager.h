@@ -181,6 +181,20 @@ public:
         }
     }
 
+    // Resolve, authenticate, and bind the same snapshot to the selected run.
+    // Callers must invoke this from a worker because journal loading does I/O.
+    std::optional<storage::JobJournal> load_run_journal(const std::string& run_id) {
+        auto run = get_run_by_id(run_id);
+        if (!run.has_value()) return std::nullopt;
+        const auto path = resolve_run_journal_path(*run);
+        if (path.empty()) return std::nullopt;
+        storage::JobJournalStore store;
+        auto journal = store.load(storage::fsutil::utf8_to_wide(path));
+        if (!journal.has_value() || !journal_matches_run_roots(*journal, *run))
+            return std::nullopt;
+        return journal;
+    }
+
     RunJournalInspection inspect_run_journal(const std::string& run_id) {
         RunJournalInspection inspection;
         auto run = get_run_by_id(run_id);
