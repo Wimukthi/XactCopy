@@ -15,6 +15,7 @@
 #include <shobjidl.h>
 
 #include "dialogs.h"
+#include "elevation.h"
 #include "job_manager.h"
 #include "journal_report.h"
 #include "range_map_dialog.h"
@@ -1100,12 +1101,11 @@ private:
             info_box(hwnd, L"Report saved to:\n" + result.readable_path);
             return;
         }
-        HINSTANCE opened = ShellExecuteW(hwnd, L"open", result.readable_path.c_str(), nullptr,
-                                         result.view_root.c_str(), SW_SHOWNORMAL);
-        if (reinterpret_cast<INT_PTR>(opened) <= 32) {
+        // As the signed-in user, so an elevated XactCopy does not open the
+        // viewer or Explorer as Administrator.
+        if (!elevation::open_as_user(hwnd, result.readable_path)) {
             std::wstring arguments = L"/select,\"" + result.readable_path + L"\"";
-            ShellExecuteW(hwnd, L"open", L"explorer.exe", arguments.c_str(), nullptr,
-                          SW_SHOWNORMAL);
+            elevation::open_as_user(hwnd, L"explorer.exe", arguments);
         }
     }
 
