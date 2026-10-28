@@ -5,6 +5,36 @@ All notable changes to XactCopy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions are four-part (`major.minor.build.revision`) and tagged `v<version>`.
 
+## [2.1.1.0] — 2026-10-28
+
+### Added
+
+- **Direct NTFS reads for copies.** The **Read method** choice now applies to
+  copies as well as assessments (one setting for both; the Recover Media
+  profile turns it on). Reads go straight to the volume and are abandoned at
+  the timeout instead of stalling inside the filesystem on failing media. A
+  file is read directly only when Windows confirms its whole length holds
+  written data; compressed, encrypted, very small, pre-allocated, and
+  read-only files are read through Windows, and the log names each one.
+- **Journal folder** setting (Settings → Diagnostics). New runs write their
+  journals there; the mirror copy stays in your profile, runs started before a
+  change still resume, and journal clean-up covers both folders.
+
+### Changed
+
+- Options follow what each pipeline actually uses. **Skip known-bad ranges**
+  now covers what "Use bad-range map" did (that box had no effect on its own),
+  copies gain a visible **Record bad ranges**, and in Assess mode
+  Fragile-media mode locks **Scan** on *Precise*, which it always forced.
+- The copy profiles say what they mean: Verified Copy turns recording and
+  direct reads off; Recover Media turns them on along with salvage,
+  continue-on-error, fragile pacing, adaptive 1 MB reads, and wait for media.
+
+### Fixed
+
+- Raw volume reads flush a file's cached writes first, so a recently written
+  file is never read stale.
+
 ## [2.1.0.0] — 2026-10-28
 
 ### Changed
@@ -270,6 +300,7 @@ supersedes the 1.x VB.NET releases.
   and the `vbnet-final` tag. Its on-disk journals, bad-range maps, and settings
   remain compatible with this release.
 
+[2.1.1.0]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.1.1.0
 [2.1.0.0]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.1.0.0
 [2.0.0.8]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.0.0.8
 [2.0.0.7]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.0.0.7
