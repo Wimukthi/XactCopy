@@ -5,6 +5,65 @@ All notable changes to XactCopy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions are four-part (`major.minor.build.revision`) and tagged `v<version>`.
 
+## [2.1.0.0] — 2026-10-28
+
+### Changed
+
+- **New main window.** A **Copy | Assess readability** switch picks the mode;
+  the choices below it are captioned and relabel themselves for scanning, and
+  switching modes never moves the layout. The item list and the task list share
+  one top and height, and splitters size the log and the two columns (both
+  remembered; double-click resets).
+- **What to copy** groups everything one action adds (several folders picked in
+  one dialog, a paste, a drop) into one row. **Add to tasks**, beside the list,
+  turns the selected rows (or all of them) into tasks; Ctrl+Enter adds and
+  queues. A row spanning several folders or drives becomes one task with
+  several parts, run back to back.
+- **Tasks and History replace the Job Manager window.** Tasks lists the running
+  task, then the queue in run order, then everything else; two buttons follow
+  the selected row (Run / Queue, Start now / Unqueue, Pause / Stop), and **Hold**
+  lets the current task finish before the queue waits. Run and Start now start
+  the chosen task even while the queue is held. History lists every run with
+  its details and journal findings, plus Resume, Journal, Report, Range map,
+  and Delete. Tasks, the queue, and history live in the signed job catalog.
+- **Pinned tasks** always stay; tasks added from the builder follow an on-exit
+  choice (Ask / Keep / Discard, with "Remember my choice" and a setting).
+  Existing saved jobs become pinned tasks, and leftover unstarted tasks from
+  earlier builds move into the queue once.
+- **Explorer** gains **Assess with XactCopy** next to **Copy with XactCopy** on
+  files, folders, drives, and folder backgrounds; each opens in its mode.
+- **Direct NTFS assessments elevate automatically.** A task, a queued task, or a
+  crash-recovery resume that needs raw volume reads relaunches XactCopy as
+  administrator and continues the same run. Links and folders opened from an
+  elevated window still open as the signed-in user.
+- **Settings** were audited: choices the main window already shows are saved
+  with **File → Save as defaults** instead of being repeated, the Job Manager
+  grid settings are gone, and interrupted-run handling is one choice (Ask /
+  Resume automatically / Leave in History).
+
+### Fixed
+
+- Paths longer than 260 characters copy and verify correctly.
+- Full verification reads the destination from disk (unbuffered) instead of
+  from the file cache.
+- Sleep and resume no longer make the watchdog restart a healthy worker.
+- Failure, error, mismatch, and warning log lines are never rate-limited away.
+- Closing with a run active shows one prompt that names a copy or an
+  assessment. The interrupted-run prompt can be told not to ask at startup;
+  History keeps offering Resume.
+- Salvage and "Treat Access Denied as contention" can no longer be combined
+  into a run the worker refuses.
+- Task rows, list borders, and owner-drawn controls no longer show overlapping
+  text, white flashes, or stale slivers while resizing or switching modes.
+
+### Performance
+
+- Resume no longer re-verifies finished files twice; small files copy in
+  parallel by default; per-file media checks are cached; verification hashes
+  source and destination concurrently.
+- The log is virtual (owner-data), filters by severity, searches, and saves
+  without blocking the window.
+
 ## [2.0.0.8] — 2026-08-18
 
 ### Fixed
@@ -211,6 +270,7 @@ supersedes the 1.x VB.NET releases.
   and the `vbnet-final` tag. Its on-disk journals, bad-range maps, and settings
   remain compatible with this release.
 
+[2.1.0.0]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.1.0.0
 [2.0.0.8]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.0.0.8
 [2.0.0.7]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.0.0.7
 [2.0.0.6]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.0.0.6

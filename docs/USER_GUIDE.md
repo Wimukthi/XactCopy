@@ -21,7 +21,7 @@ Quick Start in the [README](../README.md) is enough.
 
 ## The main window
 
-![The XactCopy main window during a copy](images/main-window.png)
+![The XactCopy main window](images/main-window.png)
 
 The window has two columns: on the left you build tasks, on the right the
 tasks run. The operations log spans the bottom.

@@ -13,7 +13,7 @@ XactCopy copies files that ordinary tools give up on — failing drives, scratch
 discs, flaky USB sticks, and network shares that drop out — and recovers as much
 readable data as possible instead of aborting at the first error.
 
-![XactCopy copying from a failing drive](docs/images/main-window.png)
+![The XactCopy main window](docs/images/main-window.png)
 
 </div>
 
