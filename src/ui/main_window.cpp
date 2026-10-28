@@ -391,6 +391,9 @@ private:
     HWND scan_info_label_ = nullptr;
     // Client height the current mode/options need; feeds WM_GETMINMAXINFO.
     int required_client_height_ = 0;
+    // Last rect layout() gave each control, so a relayout moves and repaints
+    // only the controls that actually changed.
+    std::map<HWND, RECT> placed_rects_;
 
     // Splitters: the bar between the lists and the log, and the gap between
     // the two columns. Rects come from layout(); 0 means automatic. The log
@@ -677,6 +680,14 @@ private:
                                                                                : DefWindowProcW(
                                                                                      hwnd_, message,
                                                                                      wparam, lparam);
+            case WM_CTLCOLORBTN: {
+                // Owner-draw buttons and checks are erased with this brush
+                // before WM_DRAWITEM; the default is white, which flashed
+                // through on every relayout (splitter drags, mode switches).
+                HDC dc = reinterpret_cast<HDC>(wparam);
+                SetBkColor(dc, theme_.window);
+                return reinterpret_cast<LRESULT>(window_brush_);
+            }
             case WM_CTLCOLORSTATIC: {
                 HDC dc = reinterpret_cast<HDC>(wparam);
                 const HWND control = reinterpret_cast<HWND>(lparam);
@@ -1629,7 +1640,28 @@ private:
         SendMessageW(engine_combo_, CB_SETCURSEL, copy_profile_index_, 0);
     }
 
+    // Runs a change that shows, hides, relabels, and moves many controls with
+    // painting suspended, then repaints the window once, so the user never
+    // sees the intermediate states. Skipped before the window is shown,
+    // because WM_SETREDRAW TRUE would make it visible.
+    template <typename Change>
+    void with_redraw_suspended(Change&& change) {
+        if (hwnd_ == nullptr || !IsWindowVisible(hwnd_)) {
+            change();
+            return;
+        }
+        SendMessageW(hwnd_, WM_SETREDRAW, FALSE, 0);
+        change();
+        SendMessageW(hwnd_, WM_SETREDRAW, TRUE, 0);
+        RedrawWindow(hwnd_, nullptr, nullptr,
+                     RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
+
     void sync_mode_ui(bool user_changed = false) {
+        with_redraw_suspended([&] { apply_mode_ui(user_changed); });
+    }
+
+    void apply_mode_ui(bool user_changed) {
         int requested = static_cast<int>(SendMessageW(mode_combo_, CB_GETCURSEL, 0, 0));
         if (requested != 1) requested = 0;
 
@@ -2450,9 +2482,11 @@ private:
     void set_options_expanded(bool expanded) {
         options_expanded_ = expanded;
         settings_.set_bool("UiOptionsExpanded", expanded);
-        layout();
-        ensure_window_fits_layout();
-        InvalidateRect(options_toggle_, nullptr, TRUE);
+        with_redraw_suspended([&] {
+            layout();
+            ensure_window_fits_layout();
+            InvalidateRect(options_toggle_, nullptr, TRUE);
+        });
     }
 
     // ---- Recent destinations ------------------------------------------------
@@ -3094,9 +3128,16 @@ private:
         bool commit = false;
         auto place = [&](HWND handle, int x, int w, int h = 0) {
             if (!commit || handle == nullptr) return;
-            MoveWindow(handle, origin_x + x, y, std::max(0, w), h == 0 ? row_height : h, TRUE);
-            // MoveWindow only invalidates a resized control's newly exposed
-            // strip, so widened statics/bars keep stale pixels.
+            const RECT target{origin_x + x, y, origin_x + x + std::max(0, w),
+                              y + (h == 0 ? row_height : h)};
+            auto [slot, inserted] = placed_rects_.try_emplace(handle, target);
+            if (!inserted && EqualRect(&slot->second, &target)) return;
+            slot->second = target;
+            MoveWindow(handle, target.left, target.top, target.right - target.left,
+                       target.bottom - target.top, FALSE);
+            // One full repaint per moved control (MoveWindow alone would only
+            // invalidate a resized control's newly exposed strip). The parent
+            // background it uncovered is repainted at the end of layout().
             InvalidateRect(handle, nullptr, TRUE);
         };
         auto show = [&](HWND handle, bool visible) {
