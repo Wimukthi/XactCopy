@@ -59,8 +59,8 @@ same name into the destination. Ctrl+Enter adds the rows and queues them.
 ### Destination and options
 
 Choose a **Destination** with *Browse…*, type it, or pick a recent one from the
-**▾** button. Below it are three captioned choices. Copy mode shows
-**Profile**, **If file exists**, and **Verify**; assessment mode shows **Scan**
+**▾** button. Below it are captioned choices. Copy mode shows **Profile**,
+**If file exists**, **Verify**, and **Read method**; assessment mode shows **Scan**
 (Auto/Fast/Precise), **Read method** (standard file reads or direct NTFS), and
 **Findings** (whether the bad-range map is updated). The resilience toggles
 and numeric tuning fields sit in the **Options** section, which is collapsed by
@@ -178,8 +178,8 @@ and falls back visibly to standard file reads rather than claiming a raw scan
 it did not do. On unstable media, direct reads together with Fragile-media mode
 keep a scan moving: a read that hangs is abandoned at the timeout.
 
-Copies can read the same way: **Direct NTFS reads (admin)** in Options (on in
-the Recover Media profile). A copy needs the exact bytes, so a file is read
+Copies can read the same way: copy mode has the same **Read method** choice
+(set to direct NTFS by the Recover Media profile). A copy needs the exact bytes, so a file is read
 directly only when its whole length is backed by written data; compressed,
 encrypted, very small (stored inside the file table), and pre-allocated files
 are read through Windows, and the log names each one once.
@@ -194,7 +194,6 @@ These toggles shape how XactCopy handles trouble.
 | **Resume from journal** | Continue an interrupted job from its journal instead of restarting. On by default; every job is journaled either way. |
 | **Record bad ranges** *(copy)* | Add the bad ranges this copy finds to the source's map. Assessments set this with **Findings**. See [Bad-range maps](#bad-range-maps). |
 | **Skip known-bad ranges** | Don't re-read ranges that have the same file/media identity and were observed bad in at least two matching runs. This makes a later pass faster without trusting a one-off error. |
-| **Direct NTFS reads (admin)** *(copy)* | Read file data from the raw volume, as the assessment Read method does. See [Assess Readable Files mode](#assess-readable-files-mode). |
 | **Adaptive buffer** | Size the read buffer dynamically from measured throughput and latency, backing off on slow or high-latency media. |
 | **Continue on error** | Keep going past a file that ultimately can't be copied. Earlier files may already have been atomically published, so the destination can contain a mixed, incomplete generation; the run cannot be a clean success. |
 | **Wait for media** | If the source or destination disappears — a drive spins down, a disc is ejected — pause and wait for it to come back rather than failing. |

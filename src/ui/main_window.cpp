@@ -95,7 +95,7 @@ constexpr int IdLogList = 1016;
 constexpr int IdSettingsButton = 1017;
 constexpr int IdContinueCheck = 1019;
 constexpr int IdSkipKnownBadCheck = 1020;
-constexpr int IdRawReadsCheck = 1097; // copy mode: direct NTFS reads
+constexpr int IdReadMethodCombo = 1098; // both modes: standard or direct NTFS reads
 constexpr int IdWaitMediaCheck = 1021;
 constexpr int IdFragileCheck = 1022;
 constexpr int IdBufferEdit = 1023;
@@ -479,7 +479,9 @@ private:
     HWND adaptive_check_ = nullptr;
     HWND continue_check_ = nullptr;
     HWND skip_known_bad_check_ = nullptr;
-    HWND raw_reads_check_ = nullptr;
+    // One Read method choice for both modes (one setting, one control).
+    HWND read_method_label_ = nullptr;
+    HWND read_method_combo_ = nullptr;
     // The Scan choice while Fragile-media mode forces Precise (Assess mode).
     int scan_profile_before_lock_ = -1;
     HWND wait_media_check_ = nullptr;
@@ -594,7 +596,6 @@ private:
     int copy_verify_index_ = 2;
     bool applying_copy_profile_ = false;
     int scan_profile_index_ = 0;
-    int scan_backend_index_ = 0;
     int scan_map_index_ = 0;
     models::TransferEnginePolicy custom_transfer_engine_ =
         models::TransferEnginePolicy::Auto;
@@ -761,6 +762,7 @@ private:
                 // Captions and secondary lines recede; values stay full contrast.
                 const bool muted = control == profile_label_ || control == policy_label_ ||
                                    control == verify_label_ || control == sources_footer_ ||
+                                   control == read_method_label_ ||
                                    control == scan_info_label_ || control == pane_footer_ ||
                                    control == file_progress_label_ ||
                                    control == overall_progress_label_ ||
@@ -1091,7 +1093,7 @@ private:
             clear_selection_,  mode_combo_,          engine_combo_,
             overwrite_combo_,  verify_combo_,        salvage_check_,    resume_check_,
             map_check_,        adaptive_check_,      continue_check_,   skip_known_bad_check_,
-            raw_reads_check_,
+            read_method_combo_, read_method_label_,
             wait_media_check_, fragile_check_,       buffer_label_,     buffer_edit_,
             retries_label_,    retries_edit_,        timeout_label_,    timeout_edit_,
             start_button_,     pause_button_,        cancel_button_,    settings_button_,
@@ -1125,7 +1127,8 @@ private:
             SendMessageW(tasks_list_, LB_SETITEMHEIGHT, 0, MulDiv(46, effective_dpi(), 96));
         }
         const int combo_item_height = MulDiv(22, effective_dpi(), 96);
-        for (HWND combo : {mode_combo_, engine_combo_, overwrite_combo_, verify_combo_, log_filter_}) {
+        for (HWND combo : {mode_combo_, engine_combo_, overwrite_combo_, verify_combo_, read_method_combo_,
+                           log_filter_}) {
             if (combo == nullptr) continue;
             SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), combo_item_height);
             SendMessageW(combo, CB_SETITEMHEIGHT, 0, combo_item_height);
@@ -1214,6 +1217,11 @@ private:
         engine_combo_ = create(L"COMBOBOX", L"", combo_style, IdEngineCombo);
         overwrite_combo_ = create(L"COMBOBOX", L"", combo_style, IdOverwriteCombo);
         verify_combo_ = create(L"COMBOBOX", L"", combo_style, IdVerifyCombo);
+        read_method_combo_ = create(L"COMBOBOX", L"", combo_style, IdReadMethodCombo);
+        for (const wchar_t* item : {L"Standard file reads", L"Direct NTFS (admin)"}) {
+            SendMessageW(read_method_combo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+        }
+        SendMessageW(read_method_combo_, CB_SETCURSEL, 0, 0);
         for (const wchar_t* item : {L"Verified Copy / Recovery", L"Assess Readable Files"}) {
             SendMessageW(mode_combo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
         }
@@ -1224,6 +1232,7 @@ private:
         profile_label_ = create(L"STATIC", L"Profile", SS_NOPREFIX | SS_CENTERIMAGE, 0);
         policy_label_ = create(L"STATIC", L"If file exists", SS_NOPREFIX | SS_CENTERIMAGE, 0);
         verify_label_ = create(L"STATIC", L"Verify", SS_NOPREFIX | SS_CENTERIMAGE, 0);
+        read_method_label_ = create(L"STATIC", L"Read method", SS_NOPREFIX | SS_CENTERIMAGE, 0);
         scan_info_label_ = create(L"STATIC",
                                   L"Read-only: nothing is written except the optional bad-range map.",
                                   SS_NOPREFIX | SS_CENTERIMAGE | SS_ENDELLIPSIS, 0);
@@ -1241,8 +1250,7 @@ private:
                                  IdContinueCheck);
         skip_known_bad_check_ = create(L"BUTTON", L"Skip known-bad ranges",
                                        WS_TABSTOP | BS_OWNERDRAW, IdSkipKnownBadCheck);
-        raw_reads_check_ = create(L"BUTTON", L"Direct NTFS reads (admin)",
-                                  WS_TABSTOP | BS_OWNERDRAW, IdRawReadsCheck);
+
         wait_media_check_ = create(L"BUTTON", L"Wait for media", WS_TABSTOP | BS_OWNERDRAW,
                                    IdWaitMediaCheck);
         fragile_check_ = create(L"BUTTON", L"Fragile-media mode", WS_TABSTOP | BS_OWNERDRAW,
@@ -1396,13 +1404,13 @@ private:
         add(mode_copy_tab_, L"Copy or recover the listed items into a destination, with verification.");
         add(mode_scan_tab_, L"Read the listed items without copying them and record which ranges are unreadable. Nothing is written except the optional bad-range map.");
         add(engine_combo_, L"In copy mode choose a safe workflow profile. In assessment mode choose Auto, Fast, or Precise scanning. Low-level engine selection remains under Settings.");
-        add(overwrite_combo_, L"In copy mode this controls destination conflicts. In assessment mode it selects standard file reads or direct NTFS allocated-extent reads, which require administrator access.");
+        add(overwrite_combo_, L"What to do when a destination file already exists.");
         add(verify_combo_, L"In copy mode choose destination verification. In assessment mode choose whether findings are saved to the source-specific bad-range map.");
 
         add(salvage_check_, L"If source blocks remain unreadable, write the configured fill pattern so readable data can still be recovered. The result is reported as recovered/incomplete, never as an exact copy.");
         add(resume_check_, L"Load the matching journal and continue interrupted work. Completed files are reused only after the configured validation allows it.");
         add(map_check_, L"Record the bad ranges this copy finds in the source's bad-range map, so later runs can skip them. (Assess mode sets this with Findings.)");
-        add(raw_reads_check_, L"Read file data straight from the NTFS volume instead of through the filesystem: reads that hang on failing media are abandoned at the timeout. Needs administrator rights (XactCopy asks to restart elevated). Files whose layout cannot be read exactly (compressed, encrypted, stored inside the file table, or pre-allocated) use standard reads.");
+        add(read_method_combo_, L"Direct NTFS reads go straight to the volume instead of through the filesystem, so a read that hangs on failing media is abandoned at the timeout. Needs administrator rights (XactCopy asks to restart elevated). Files that cannot be read exactly that way (compressed, encrypted, stored inside the file table, or, for copies, pre-allocated) use standard reads.");
         add(adaptive_check_, L"Let XactCopy grow or shrink I/O buffers from observed performance and failures instead of using one fixed size.");
         add(continue_check_, L"Continue with later files after an error. Failed or skipped files remain visible and the run cannot be reported as an exact success.");
         add(skip_known_bad_check_, L"Don't read ranges a compatible bad-range map has seen fail twice. Spares failing media; the skipped bytes are not read (a copy fills them only with Salvage on).");
@@ -1711,7 +1719,8 @@ private:
                              buffer_edit_, retries_edit_, timeout_edit_}) {
             ui::apply_control_theme(control, theme_.dark);
         }
-        for (HWND combo : {mode_combo_, engine_combo_, overwrite_combo_, verify_combo_, log_filter_}) {
+        for (HWND combo : {mode_combo_, engine_combo_, overwrite_combo_, verify_combo_, read_method_combo_,
+                           log_filter_}) {
             ui::apply_combo_theme(combo, theme_.dark);
         }
         InvalidateRect(current_bar_, nullptr, FALSE);
@@ -1749,7 +1758,7 @@ private:
         set_check(IdAdaptiveCheck, recovery);
         set_check(IdWaitMediaCheck, recovery);
         set_check(IdMapCheck, recovery);
-        set_check(IdRawReadsCheck, recovery);
+        SendMessageW(read_method_combo_, CB_SETCURSEL, recovery ? 1 : 0, 0);
         set_check(IdSkipKnownBadCheck, false);
         set_check(IdResumeCheck, true);
         copy_verify_index_ = 2;
@@ -1812,8 +1821,6 @@ private:
         } else if (active_mode_index_ == 1) {
             scan_profile_index_ = std::max(
                 0, static_cast<int>(SendMessageW(engine_combo_, CB_GETCURSEL, 0, 0)));
-            scan_backend_index_ = std::max(
-                0, static_cast<int>(SendMessageW(overwrite_combo_, CB_GETCURSEL, 0, 0)));
             scan_map_index_ = std::max(
                 0, static_cast<int>(SendMessageW(verify_combo_, CB_GETCURSEL, 0, 0)));
         }
@@ -1821,11 +1828,8 @@ private:
         active_mode_index_ = requested;
         if (requested == 1) {
             replace_combo_items(engine_combo_, {L"Auto", L"Fast", L"Precise"});
-            replace_combo_items(overwrite_combo_,
-                                {L"Standard file reads", L"Direct NTFS (admin)"});
             replace_combo_items(verify_combo_, {L"Save to bad-range map", L"Do not save"});
             SendMessageW(engine_combo_, CB_SETCURSEL, scan_profile_index_, 0);
-            SendMessageW(overwrite_combo_, CB_SETCURSEL, scan_backend_index_, 0);
             SendMessageW(verify_combo_, CB_SETCURSEL, scan_map_index_, 0);
             SetWindowTextW(resume_check_, L"Resume previous scan");
         } else {
@@ -1849,9 +1853,11 @@ private:
             if (control != nullptr) ShowWindow(control, scan ? SW_HIDE : SW_SHOW);
         }
         if (scan_info_label_ != nullptr) ShowWindow(scan_info_label_, scan ? SW_SHOW : SW_HIDE);
+        for (HWND control : {policy_label_, overwrite_combo_}) {
+            if (control != nullptr) ShowWindow(control, scan ? SW_HIDE : SW_SHOW);
+        }
         SetWindowTextW(source_label_, scan ? L"What to assess" : L"What to copy");
         SetWindowTextW(profile_label_, scan ? L"Scan" : L"Profile");
-        SetWindowTextW(policy_label_, scan ? L"Read method" : L"If file exists");
         SetWindowTextW(verify_label_, scan ? L"Findings" : L"Verify");
         sync_scan_profile_lock();
         InvalidateRect(mode_copy_tab_, nullptr, FALSE);
@@ -1869,7 +1875,6 @@ private:
         copy_overwrite_index_ = static_cast<int>(defaults.OverwritePolicyValue);
         copy_verify_index_ = ui::verification_combo_index(defaults);
         scan_profile_index_ = static_cast<int>(defaults.ScanPerformanceProfileValue);
-        scan_backend_index_ = defaults.UseExperimentalRawDiskScan ? 1 : 0;
         // A new installation saves scan findings by default. An explicit
         // existing setting still wins, including a deliberate read-only map
         // policy saved from the assessment UI.
@@ -1881,7 +1886,7 @@ private:
         set_check(IdSalvageCheck, defaults.SalvageUnreadableBlocks);
         set_check(IdResumeCheck, defaults.ResumeFromJournal);
         set_check(IdMapCheck, defaults.UpdateBadRangeMapFromRun);
-        set_check(IdRawReadsCheck, defaults.UseExperimentalRawDiskScan);
+        SendMessageW(read_method_combo_, CB_SETCURSEL, defaults.UseExperimentalRawDiskScan ? 1 : 0, 0);
         set_check(IdAdaptiveCheck, defaults.UseAdaptiveBufferSizing);
         set_check(IdContinueCheck, defaults.ContinueOnFileError);
         set_check(IdSkipKnownBadCheck, defaults.UseBadRangeMap && defaults.SkipKnownBadRanges);
@@ -1964,8 +1969,7 @@ private:
     static bool is_checkbox_id(int id) {
         return id == IdSalvageCheck || id == IdResumeCheck || id == IdMapCheck ||
                id == IdAdaptiveCheck || id == IdContinueCheck || id == IdSkipKnownBadCheck ||
-               id == IdWaitMediaCheck || id == IdFragileCheck || id == IdPauseListCheck ||
-               id == IdRawReadsCheck;
+               id == IdWaitMediaCheck || id == IdFragileCheck || id == IdPauseListCheck;
     }
 
     static bool is_button_id(int id) {
@@ -4075,9 +4079,9 @@ private:
         // Each mode's options, in display order (two per row).
         HWND option_checks[] = {salvage_check_,    resume_check_,    map_check_,
                                 skip_known_bad_check_, adaptive_check_, continue_check_,
-                                wait_media_check_, fragile_check_,   raw_reads_check_};
+                                wait_media_check_, fragile_check_};
         auto copy_only = [&](HWND control) {
-            return control == salvage_check_ || control == map_check_ || control == raw_reads_check_;
+            return control == salvage_check_ || control == map_check_;
         };
         // Both modes reserve the larger mode's rows, so switching never moves
         // the controls below.
@@ -4129,33 +4133,37 @@ private:
                 y += row_height + gap + scale(4);
             }
 
-            // The three mode-specific choices, captioned: three across when
-            // there is room (caption above), otherwise one per row.
-            HWND captions[] = {profile_label_, policy_label_, verify_label_};
-            HWND combos[] = {engine_combo_, overwrite_combo_, verify_combo_};
+            // The mode's captioned choices (copy: profile, if file exists,
+            // verify, read method; assess: scan, read method, findings), side
+            // by side with the caption above, so both modes take one row.
+            std::vector<std::pair<HWND, HWND>> choices;
+            if (scan) {
+                choices = {{profile_label_, engine_combo_},
+                           {read_method_label_, read_method_combo_},
+                           {verify_label_, verify_combo_}};
+            } else {
+                choices = {{profile_label_, engine_combo_},
+                           {policy_label_, overwrite_combo_},
+                           {verify_label_, verify_combo_},
+                           {read_method_label_, read_method_combo_}};
+            }
+            const int count = static_cast<int>(choices.size());
             // A closed owner-draw combo is its item height plus its frame.
             const int combo_height =
                 engine_combo_ != nullptr
                     ? static_cast<int>(SendMessageW(engine_combo_, CB_GETITEMHEIGHT,
                                                     static_cast<WPARAM>(-1), 0)) + scale(6)
                     : row_height;
-            if (width >= scale(500)) {
-                const int third = (width - gap * 2) / 3;
-                for (int i = 0; i < 3; ++i) {
-                    place(captions[i], i * (third + gap), third, label_height);
+            {
+                const int cell = (width - gap * (count - 1)) / count;
+                for (int i = 0; i < count; ++i) {
+                    place(choices[i].first, i * (cell + gap), cell, label_height);
                 }
                 y += label_height + scale(2);
-                for (int i = 0; i < 3; ++i) {
-                    place(combos[i], i * (third + gap), third, row_height * 8);
+                for (int i = 0; i < count; ++i) {
+                    place(choices[i].second, i * (cell + gap), cell, row_height * 8);
                 }
                 y += combo_height + gap;
-            } else {
-                const int caption_width = scale(92);
-                for (int i = 0; i < 3; ++i) {
-                    place(captions[i], 0, caption_width, combo_height);
-                    place(combos[i], caption_width, width - caption_width, row_height * 8);
-                    y += combo_height + scale(6);
-                }
             }
 
             y += scale(4);
@@ -4457,7 +4465,7 @@ private:
             return;
         }
         if (!is_scan_mode() && notification == CBN_SELCHANGE &&
-            (id == IdOverwriteCombo || id == IdVerifyCombo)) {
+            (id == IdOverwriteCombo || id == IdVerifyCombo || id == IdReadMethodCombo)) {
             mark_copy_profile_custom();
             return;
         }
@@ -4982,7 +4990,6 @@ private:
         copy_verify_index_ = ui::verification_combo_index(options);
         scan_profile_index_ =
             std::clamp(static_cast<int>(options.ScanPerformanceProfileValue), 0, 2);
-        scan_backend_index_ = options.UseExperimentalRawDiskScan ? 1 : 0;
         scan_map_index_ = options.UpdateBadRangeMapFromRun ? 0 : 1;
 
         active_mode_index_ = -1;
@@ -4993,7 +5000,7 @@ private:
         set_check(IdSalvageCheck, options.SalvageUnreadableBlocks);
         set_check(IdResumeCheck, true);
         set_check(IdMapCheck, options.UpdateBadRangeMapFromRun);
-        set_check(IdRawReadsCheck, options.UseExperimentalRawDiskScan);
+        SendMessageW(read_method_combo_, CB_SETCURSEL, options.UseExperimentalRawDiskScan ? 1 : 0, 0);
         set_check(IdAdaptiveCheck, options.UseAdaptiveBufferSizing);
         set_check(IdContinueCheck, options.ContinueOnFileError);
         set_check(IdSkipKnownBadCheck,
@@ -5028,8 +5035,6 @@ private:
                 profile == 1   ? models::ScanPerformanceProfile::Fast
                 : profile == 2 ? models::ScanPerformanceProfile::Precise
                                : models::ScanPerformanceProfile::Auto;
-            options.UseExperimentalRawDiskScan =
-                SendMessageW(overwrite_combo_, CB_GETCURSEL, 0, 0) == 1;
             options.UpdateBadRangeMapFromRun =
                 SendMessageW(verify_combo_, CB_GETCURSEL, 0, 0) != 1;
             options.TransferEnginePolicyValue = models::TransferEnginePolicy::ManagedRescue;
@@ -5043,7 +5048,6 @@ private:
                 : profile == 1 ? models::TransferEnginePolicy::ManagedRescue
                                : custom_transfer_engine_;
             options.UpdateBadRangeMapFromRun = get_check(IdMapCheck);
-            options.UseExperimentalRawDiskScan = get_check(IdRawReadsCheck);
             int overwrite = static_cast<int>(
                 SendMessageW(overwrite_combo_, CB_GETCURSEL, 0, 0));
             options.OverwritePolicyValue = static_cast<models::OverwritePolicy>(
@@ -5059,6 +5063,8 @@ private:
         }
 
         options.ResumeFromJournal = get_check(IdResumeCheck);
+        options.UseExperimentalRawDiskScan =
+            SendMessageW(read_method_combo_, CB_GETCURSEL, 0, 0) == 1;
         // Using the map only changes reads together with skipping, so one
         // checkbox carries both.
         const bool skip_known_bad = get_check(IdSkipKnownBadCheck);

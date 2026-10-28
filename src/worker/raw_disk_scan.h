@@ -705,6 +705,16 @@ private:
             return layout;
         }
 
+        // Bytes written recently can still be in the cache, not yet on disk,
+        // and a raw volume read would see the old contents. Flush first. A copy
+        // that cannot flush (no write access, e.g. a read-only file) reads
+        // through Windows instead; an assessment carries on, since it only
+        // tests the sectors' readability.
+        if (!flush_cached_writes(path) && require_vdl_) {
+            reason = "cached writes could not be flushed (no write access); reading through Windows.";
+            return layout;
+        }
+
         std::vector<RawDiskExtent> extents;
         if (!try_get_file_snapshot(path, layout, reason, &extents)) return layout;
         if (layout.VolumeSerial != volume_serial_) {
@@ -1023,6 +1033,18 @@ private:
             stream += next;
         }
         return std::nullopt;
+    }
+
+    // Writes any of the file's cached data to disk. FlushFileBuffers writes
+    // nothing when nothing is dirty and does not touch timestamps.
+    static bool flush_cached_writes(const std::wstring& path) {
+        HANDLE file = CreateFileW(storage::fsutil::long_path(path).c_str(), GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return false;
+        const bool flushed = FlushFileBuffers(file) != FALSE;
+        CloseHandle(file);
+        return flushed;
     }
 
     bool require_vdl_ = false;
