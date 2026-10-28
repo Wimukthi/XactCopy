@@ -2716,6 +2716,10 @@ private:
             task.options.SelectedRelativePaths = group.relative_paths;
             tasks_.add(std::move(task));
         }
+        // The items now live in their tasks; empty the list for the next
+        // batch. Destination and options stay, since the next batch usually
+        // shares them (and "Edit in builder" brings a task's items back).
+        set_sources({});
         append_log("Added " + std::to_string(groups.size()) +
                    (groups.size() == 1 ? " task." : " tasks (one per source folder)."));
         tasks_changed();

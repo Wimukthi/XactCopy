@@ -73,7 +73,9 @@ Job...** (or **Save as job** on a task) to keep an exact job.
 ### Tasks
 
 **Start** (Ctrl+Enter) adds tasks for the current sources and runs the task
-list; **Add to tasks** only queues them. Tasks run one at a time, in order, and
+list; **Add to tasks** only queues them. Either one moves the items into their
+tasks and empties the list (the destination and options stay for the next
+batch; **Edit in builder** on a task brings its items back). Tasks run one at a time, in order, and
 the builder stays usable while one runs, so more work can be queued at any
 time. Each task row shows its state and, while running, progress, speed, and
 time remaining. Right-click a task to start it now, move it, retry it from its
