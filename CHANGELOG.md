@@ -5,6 +5,20 @@ All notable changes to XactCopy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions are four-part (`major.minor.build.revision`) and tagged `v<version>`.
 
+## [2.1.3.0] — 2026-10-28
+
+### Added
+
+- **Low-space warning.** Copy rows are checked against the free space where
+  they are going (rows bound for the same drive are totalled) as sizes and
+  destinations come in. Rows that may not fit show "Not enough space", the list
+  footer says so, and the log gets one warning. Nothing is blocked: the size is
+  an estimate and files the copy replaces give space back.
+
+### Fixed
+
+- Settings no longer opens with a white, unpainted area around the page list.
+
 ## [2.1.2.0] — 2026-10-28
 
 ### Added
@@ -326,6 +340,7 @@ supersedes the 1.x VB.NET releases.
   and the `vbnet-final` tag. Its on-disk journals, bad-range maps, and settings
   remain compatible with this release.
 
+[2.1.3.0]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.1.3.0
 [2.1.2.0]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.1.2.0
 [2.1.1.0]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.1.1.0
 [2.1.0.0]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.1.0.0
