@@ -5,6 +5,32 @@ All notable changes to XactCopy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions are four-part (`major.minor.build.revision`) and tagged `v<version>`.
 
+## [2.1.2.0] — 2026-10-28
+
+### Added
+
+- **Destination asked when adding.** In Copy mode every add (+ Files,
+  + Folder, Paste, drag-and-drop, Explorer) asks where the items go;
+  cancelling adds nothing. Each row keeps its own destination, shown in the
+  list, and becomes a task with that destination.
+- **Source box** under the list, with **Browse…** to pick other files or
+  folders for the selected row. Source and Destination edit the selected row
+  and can never be left empty; a source path that does not exist is refused
+  and the row is put back.
+- **Browse…** for the journal folder in Settings.
+- The main window title shows the version.
+
+### Changed
+
+- Settings has five pages instead of seven (Verification moved into Copy
+  Defaults, the Explorer switch into Recovery & Startup), is shorter, and
+  balances sections across its two columns.
+
+### Fixed
+
+- No white flash when switching Settings pages: every page is built once and
+  swapped with redraw suspended.
+
 ## [2.1.1.0] — 2026-10-28
 
 ### Added
@@ -300,6 +326,7 @@ supersedes the 1.x VB.NET releases.
   and the `vbnet-final` tag. Its on-disk journals, bad-range maps, and settings
   remain compatible with this release.
 
+[2.1.2.0]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.1.2.0
 [2.1.1.0]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.1.1.0
 [2.1.0.0]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.1.0.0
 [2.0.0.8]: https://github.com/Wimukthi/XactCopy/releases/tag/v2.0.0.8
