@@ -102,6 +102,12 @@ public:
         return jobs;
     }
 
+    // Jobs in the order they were added (the main window's Tasks list).
+    std::vector<storage::ManagedJob> get_jobs_in_order() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return catalog_.Jobs;
+    }
+
     std::vector<storage::ManagedJobRun> get_recent_runs(std::int32_t take = 200) {
         std::lock_guard<std::mutex> lock(mutex_);
         std::size_t bounded = static_cast<std::size_t>(std::max(1, take));
@@ -333,8 +339,11 @@ public:
         return std::nullopt;
     }
 
+    // `pinned` applies to a new job (default pinned); an existing job keeps its
+    // pin unless one is given.
     std::optional<storage::ManagedJob> save_job(const std::string& name, const models::CopyJobOptions& options,
-                                                const std::string& existing_job_id = std::string()) {
+                                                const std::string& existing_job_id = std::string(),
+                                                std::optional<bool> pinned = std::nullopt) {
         if (storage::catalog_detail::is_blank(name)) return std::nullopt;
 
         std::lock_guard<std::mutex> lock(mutex_);
@@ -350,8 +359,11 @@ public:
             storage::ManagedJob created;
             created.JobId = storage::detail::new_guid_n();
             created.CreatedUtc = now_utc;
+            created.Pinned = pinned.value_or(true);
             catalog_.Jobs.push_back(std::move(created));
             job = &catalog_.Jobs.back();
+        } else if (pinned.has_value()) {
+            job->Pinned = *pinned;
         }
 
         job->Name = trimmed_name;
@@ -364,6 +376,44 @@ public:
         storage::ManagedJob saved = *job;
         if (!save_catalog_locked()) return std::nullopt;
         return saved;
+    }
+
+    bool set_job_pinned(const std::string& job_id, bool pinned) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        storage::ManagedJob* job = find_job_by_id_locked(job_id);
+        if (job == nullptr || job->Pinned == pinned) return false;
+        job->Pinned = pinned;
+        job->UpdatedUtc = DateTimeOffset::now_utc();
+        return save_catalog_locked();
+    }
+
+    std::int32_t count_unpinned_jobs() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return static_cast<std::int32_t>(std::count_if(
+            catalog_.Jobs.begin(), catalog_.Jobs.end(),
+            [](const storage::ManagedJob& job) { return !job.Pinned; }));
+    }
+
+    // Removes every unpinned job and its queue entries ("Discard" on exit).
+    // Run history keeps its own copy of each run's options, so it stays.
+    std::int32_t delete_unpinned_jobs() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::string> removed;
+        for (const auto& job : catalog_.Jobs) {
+            if (!job.Pinned) removed.push_back(job.JobId);
+        }
+        if (removed.empty()) return 0;
+        auto is_removed = [&](const std::string& id) {
+            return std::any_of(removed.begin(), removed.end(), [&](const std::string& r) {
+                return models::detail::equals_ignore_case(r, id);
+            });
+        };
+        std::erase_if(catalog_.Jobs, [](const storage::ManagedJob& job) { return !job.Pinned; });
+        std::erase_if(catalog_.QueueEntries, [&](const storage::ManagedJobQueueEntry& entry) {
+            return is_removed(entry.JobId);
+        });
+        std::erase_if(catalog_.QueuedJobIds, is_removed);
+        return save_catalog_locked() ? static_cast<std::int32_t>(removed.size()) : 0;
     }
 
     bool rename_job(const std::string& job_id, const std::string& new_name) {
@@ -448,6 +498,42 @@ public:
 
         catalog_.QueueEntries.push_back(std::move(entry));
         return save_catalog_locked();
+    }
+
+    // Puts a job in the queue (at the front or the back) and returns its entry
+    // id. A job that is already queued keeps its single entry, moved to the
+    // front when asked. Empty on failure.
+    std::string enqueue_job(const std::string& job_id, bool front,
+                            const std::string& trigger = "manual") {
+        if (storage::catalog_detail::is_blank(job_id)) return std::string();
+        std::lock_guard<std::mutex> lock(mutex_);
+        const storage::ManagedJob* job = find_job_by_id_locked(job_id);
+        if (job == nullptr) return std::string();
+        build_sanitized_queue_locked();
+        auto existing = std::find_if(catalog_.QueueEntries.begin(), catalog_.QueueEntries.end(),
+                                     [&](const storage::ManagedJobQueueEntry& entry) {
+                                         return models::detail::equals_ignore_case(entry.JobId, job_id);
+                                     });
+        DateTimeOffset now_utc = DateTimeOffset::now_utc();
+        storage::ManagedJobQueueEntry entry;
+        if (existing != catalog_.QueueEntries.end()) {
+            if (!front) return existing->QueueEntryId;
+            entry = std::move(*existing);
+            catalog_.QueueEntries.erase(existing);
+            entry.LastUpdatedUtc = now_utc;
+        } else {
+            entry.QueueEntryId = storage::detail::new_guid_n();
+            entry.JobId = job->JobId;
+            entry.EnqueuedUtc = now_utc;
+            entry.LastUpdatedUtc = now_utc;
+            entry.Trigger = storage::catalog_detail::is_blank(trigger)
+                                ? std::string("manual")
+                                : storage::catalog_detail::trim_copy(trigger);
+        }
+        const std::string id = entry.QueueEntryId;
+        if (front) catalog_.QueueEntries.insert(catalog_.QueueEntries.begin(), std::move(entry));
+        else catalog_.QueueEntries.push_back(std::move(entry));
+        return save_catalog_locked() ? id : std::string();
     }
 
     bool remove_queued_job(const std::string& queue_entry_id_or_job_id) {

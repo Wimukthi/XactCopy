@@ -11,7 +11,6 @@ Quick Start in the [README](../README.md) is enough.
 - [Resilience options](#resilience-options)
 - [Verification](#verification)
 - [Bad-range maps](#bad-range-maps)
-- [The Job Manager](#the-job-manager)
 - [Crash recovery](#crash-recovery)
 - [Explorer integration](#explorer-integration)
 - [Settings](#settings)
@@ -67,24 +66,47 @@ it grows the window if it needs the room.
 
 The values are per-task. Use **File → Save current settings as defaults** to
 persist the reusable engine, overwrite, verification, resilience, buffer,
-retry, and timeout choices for future runs, and **Jobs → Save Current Options As
-Job...** (or **Save as job** on a task) to keep an exact job.
+retry, and timeout choices for future runs.
 
-### Tasks
+### Tasks, Queue, and History
 
-**Start** (Ctrl+Enter) adds tasks for the current sources and runs the task
-list; **Add to tasks** only queues them. Either one moves the items into their
-tasks and empties the list (the destination and options stay for the next
-batch; **Edit in builder** on a task brings its items back). Tasks run one at a time, in order, and
-the builder stays usable while one runs, so more work can be queued at any
-time. Each task row shows its state and, while running, progress, speed, and
-time remaining. Right-click a task to start it now, move it, retry it from its
-journal, open its destination, load it back into the builder, or save it as a
-job. **Pause after current task** holds the list after the running task ends.
+**Add to tasks** turns the items into tasks (one per source folder) and empties
+the list; **Add to queue** (Ctrl+Enter) also queues them. The destination and
+options stay for the next batch. The right column switches between three views:
 
-Tasks that never started are kept: if XactCopy closes with tasks still queued,
-it offers to restore them the next time it starts. Jobs started from the Job
-Manager or a crash-recovery prompt appear in the list too.
+- **Tasks** — everything you have set up, in the order you added it. Each row
+  shows whether the task is ready, queued, or running, or how its last run ended.
+  **Run** starts the selected task now, or next if another task is running;
+  **Queue** adds it to the end of the queue. Right-click to pin, rename,
+  duplicate, edit in the builder (also a double-click), open the destination,
+  or remove a task (<kbd>Del</kbd>).
+- **Queue** — the running task on top, then what waits, in order. Tasks run one
+  at a time. **Start now** runs the selected task next; **Stop** cancels the
+  running task (it can resume from its journal later) or takes a waiting one off
+  the queue. Tick **Hold** to let the current task finish and then wait. Run and
+  Start now still start the task you picked while the queue is held; the hold
+  keeps covering the rest. Reorder with the right-click menu or
+  <kbd>Ctrl</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd>.
+- **History** — every run, newest first. Selecting a run shows its details in
+  the space below the list, including its authenticated checkpoint: completed and
+  pending counts and every unreadable, recovered, or failed file. **Resume**
+  continues an interrupted, cancelled, incomplete, or failed run from its journal;
+  **Journal** exports a readable JSON view of it and opens that. Right-click for
+  a CSV report, the bad-range map, or to delete runs.
+
+**Pinned tasks** always stay. Tasks you add from the builder start unpinned, and
+when XactCopy closes it asks whether to keep them, with a **Remember my choice**
+box. **Settings → Recovery & Startup → Unpinned tasks on exit** (Ask / Keep /
+Discard) changes that later. **Tasks → Save Current Options As Pinned Task…**
+adds a pinned task directly. Tasks, the queue, and history live in XactCopy's
+signed job catalog, so they survive a crash or power loss either way.
+
+After a restart the queue is held, so nothing starts on its own, unless
+**Settings → Recovery & Startup → Run the queue automatically on startup** is
+on. That automatic run requires bound source/destination media identities, full
+verification, Continue on error off, and both recovered-overwrite/plaintext
+expert overrides off; tasks outside that policy are skipped, stay queued, and
+say why.
 
 Below the list, the running task's detail is headed with its name and the
 **Pause** and **Cancel** buttons, then shows the current file, the **File**
@@ -253,36 +275,6 @@ salvage-filled ranges are not promoted into future skip hints. **Settings → Co
 Defaults** controls whether runs update the map and how old a map may be before
 it is ignored.
 
-## The Job Manager
-
-**Jobs → Job Manager…** opens the Jobs Console: saved jobs, the run queue, and
-run history in one grid.
-
-![The XactCopy Job Manager](images/job-manager.png)
-
-- **Saved jobs** — save a configured copy or scan as a named job (**Jobs → Save
-  Current Options As Job…**), then run, rename, duplicate, or delete it.
-- **Queue** — line jobs up to run back-to-back; reorder with Top/Up/Down/Bottom,
-  or clear the queue. Queued jobs can run automatically at startup (**Settings →
-  Recovery & Startup**). Automatic execution requires bound source/destination
-  media identities, full verification, Continue on error off, and both
-  recovered-overwrite/plaintext expert overrides off. Jobs outside that policy
-  remain available for a reviewed manual run.
-- **History** — every run is recorded with its type, state (Running, Completed,
-  Failed, Cancelled, Interrupted…), timings, source and destination, and a
-  summary. Selecting a run loads its authenticated checkpoint in the details
-  pane, including completed/pending counts and every recorded unreadable,
-  recovered, or failed filename. An interrupted, cancelled, incomplete, or
-  failed run with journal state changes **Run Now** to **Resume**. **Open
-  Journal** validates the same journal, exports a readable JSON view, and opens
-  that view. Large resumable journals use XactCopy's compressed `XCJZ` container
-  internally even though their compatibility filename ends in `.json`; this is
-  expected, not encryption or corruption.
-
-Filter with the **View** and **Run Status** combos or the **Search** box. The
-grid refreshes automatically; double-click a run to open its journal, and use
-<kbd>Del</kbd>, <kbd>F5</kbd>, and <kbd>Enter</kbd> as shortcuts.
-
 ## Crash recovery
 
 Because every run is journaled, XactCopy can recover from an unclean shutdown. If
@@ -295,7 +287,7 @@ current main-window defaults: copy versus assessment mode, selected files,
 direct-NTFS versus standard scanning, scan profile, conflict/verification
 policy, rescue and bad-map behavior, buffers, workers, retries, and timeouts.
 Older journals created before task definitions were embedded remain readable;
-when their exact settings cannot be reconstructed, Job Manager identifies the
+when their exact settings cannot be reconstructed, XactCopy identifies the
 run as legacy and requires review rather than silently guessing.
 
 **Settings → Recovery & Startup** controls whether you are prompted, whether
@@ -454,7 +446,7 @@ package file against the extracted SHA-256 before restarting.
 | --- | --- |
 | **File** | Start · Add to tasks · Pause / Resume / Cancel Operation · Save current settings as defaults · Open Journal Folder · Open Crash Folder · Exit |
 | **Tools** | Assess Readable Files… · Inspect/Clear Source Bad-Range Map… · Settings… · Check for Updates… |
-| **Jobs** | Save Current Options As Job… · Job Manager… · Resume Interrupted Job · Run Next Queued Job |
+| **Tasks** | Save Current Options As Pinned Task… · Show Tasks / Queue / History · Start the Queue · Resume Interrupted Run |
 | **Help** | About XactCopy |
 
 ## Command line
@@ -489,7 +481,7 @@ Everything lives under `%LOCALAPPDATA%\XactCopy\`:
 | Path | Contents |
 | --- | --- |
 | `journals\` | Per-run journals, their rotating backups, and mirrors; snapshots over 64 KB may be compressed XCJZ containers |
-| `journal-views\` | Readable JSON views exported on demand by Job Manager's **Open Journal** action |
+| `journal-views\` | Readable JSON views exported on demand by the History view's **Journal** action |
 | `badmaps\` | Bad-range maps |
 | `jobs\catalog.json` / `jobs-mirror\` | Signed saved jobs, queue, run history, rotations, and mirror |
 | `runtime\recovery-state.json` | The active run and clean-shutdown marker |

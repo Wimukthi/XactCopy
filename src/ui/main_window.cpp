@@ -45,7 +45,8 @@
 #include "task_model.h"
 #include "explorer_integration.h"
 #include "job_manager.h"
-#include "job_manager_dialog.h"
+#include "job_manager.h"
+#include "run_history.h"
 #include "recovery.h"
 #include "selection.h"
 #include "settings.h"
@@ -120,7 +121,6 @@ constexpr int IdMenuScanBadBlocks = 1108;
 constexpr int IdMenuSettings = 1109;
 constexpr int IdMenuCheckUpdates = 1110;
 constexpr int IdMenuSaveAsJob = 1111;
-constexpr int IdMenuJobManager = 1112;
 constexpr int IdMenuResumeInterrupted = 1113;
 constexpr int IdMenuRunNextQueued = 1114;
 constexpr int IdMenuAbout = 1115;
@@ -136,23 +136,48 @@ constexpr int IdTasksList = 1044;
 constexpr int IdAddTaskButton = 1045;
 constexpr int IdOptionsToggle = 1046;
 constexpr int IdRecentDestinations = 1047;
-constexpr int IdPauseListCheck = 1048;
-constexpr int IdClearFinished = 1049;
+constexpr int IdPauseListCheck = 1048; // "Hold" (the queue)
 constexpr int IdModeCopyTab = 1050;
 constexpr int IdModeScanTab = 1051;
+constexpr int IdTasksTab = 1052;
+constexpr int IdQueueTab = 1053;
+constexpr int IdHistoryTab = 1054;
+constexpr int IdTaskRunButton = 1080;
+constexpr int IdTaskQueueButton = 1081;
+constexpr int IdQueueStartButton = 1082;
+constexpr int IdQueueStopButton = 1083;
+constexpr int IdHistoryResumeButton = 1084;
+constexpr int IdHistoryJournalButton = 1085;
+constexpr int IdHistoryDetails = 1086;
 // Context-menu commands for the sources and tasks lists.
 constexpr int IdSourceRemove = 1060;
 constexpr int IdSourceContentsOnly = 1061;
 constexpr int IdSourceOpenLocation = 1062;
 constexpr int IdSourceCopyPath = 1063;
-constexpr int IdTaskStartNow = 1070;
-constexpr int IdTaskMoveUp = 1071;
-constexpr int IdTaskMoveDown = 1072;
-constexpr int IdTaskRemove = 1073;
-constexpr int IdTaskRetry = 1074;
-constexpr int IdTaskOpenDestination = 1075;
-constexpr int IdTaskSaveAsJob = 1076;
-constexpr int IdTaskEdit = 1077;
+// Pane context-menu commands.
+constexpr int IdCtxRun = 1130;
+constexpr int IdCtxQueue = 1131;
+constexpr int IdCtxPin = 1132;
+constexpr int IdCtxRename = 1133;
+constexpr int IdCtxDuplicate = 1134;
+constexpr int IdCtxEdit = 1135;
+constexpr int IdCtxOpenDestination = 1136;
+constexpr int IdCtxRemove = 1137;
+constexpr int IdCtxStartNow = 1138;
+constexpr int IdCtxMoveTop = 1139;
+constexpr int IdCtxMoveUp = 1140;
+constexpr int IdCtxMoveDown = 1141;
+constexpr int IdCtxStop = 1142;
+constexpr int IdCtxClearQueue = 1143;
+constexpr int IdCtxResume = 1144;
+constexpr int IdCtxJournal = 1145;
+constexpr int IdCtxReport = 1146;
+constexpr int IdCtxMap = 1147;
+constexpr int IdCtxDeleteRun = 1148;
+constexpr int IdCtxClearHistory = 1149;
+constexpr int IdMenuViewTasks = 1150;
+constexpr int IdMenuViewQueue = 1151;
+constexpr int IdMenuViewHistory = 1152;
 constexpr int IdRecentDestinationBase = 1200; // 1200..1209
 constexpr int MaxRecentDestinations = 10;
 
@@ -289,8 +314,9 @@ public:
         }
 
         sources_changed();
-        refresh_tasks_view();
-        restore_pending_tasks();
+        migrate_legacy_session_tasks();
+        initialize_queue_state();
+        refresh_pane_data();
 
         // An elevated relaunch exists to run one specific request; start it
         // before any startup queue drain could take the worker first.
@@ -303,11 +329,11 @@ public:
                            request.DisplayName);
         }
 
-        // Startup queue drain (MainForm honors AutoRunQueuedJobsOnStartup).
-        if (!supervisor_.is_job_running() && !starting_ &&
-            settings_.get_bool("AutoRunQueuedJobsOnStartup", false)) {
-            append_log("Startup queue mode enabled. Looking for queued jobs.");
-            run_next_queued_job(/*manual*/ false);
+        // Startup auto-run (AutoRunQueuedJobsOnStartup): initialize_queue_state
+        // left the queue running in unattended mode.
+        if (queue_unattended_ && !supervisor_.is_job_running() && !starting_) {
+            append_log("Running the queue automatically (startup setting).");
+            run_next_in_queue();
         }
 
         MSG message;
@@ -363,17 +389,37 @@ private:
     bool options_expanded_ = false;
     HWND add_task_button_ = nullptr;
 
-    // "Tasks" panel: the session task list (task_model.h).
-    HWND tasks_label_ = nullptr;
-    HWND tasks_list_ = nullptr;
-    HWND pause_list_check_ = nullptr;
-    HWND clear_finished_button_ = nullptr;
+    // Right pane: Tasks | Queue | History over the job catalog (job_manager_).
+    enum class PaneView { Tasks, Queue, History };
+    PaneView pane_view_ = PaneView::Tasks;
+    HWND tasks_tab_ = nullptr;
+    HWND queue_tab_ = nullptr;
+    HWND history_tab_ = nullptr;
+    HWND tasks_list_ = nullptr; // the pane's list; shows the current view
+    HWND pane_footer_ = nullptr;
+    HWND run_task_button_ = nullptr;
+    HWND queue_task_button_ = nullptr;
+    HWND queue_start_button_ = nullptr;
+    HWND queue_stop_button_ = nullptr;
+    HWND hold_queue_check_ = nullptr;
+    HWND history_resume_button_ = nullptr;
+    HWND history_journal_button_ = nullptr;
+    HWND history_details_ = nullptr; // replaces the running detail in History
     HWND detail_label_ = nullptr;
-    ui::TaskList tasks_;
-    std::uint64_t running_task_id_ = 0; // task bound to the job currently starting/running
-    bool tasks_running_ = false;        // user started the list; advance automatically
+    std::vector<storage::ManagedJob> pane_jobs_;
+    std::vector<ui::JobQueueEntryView> pane_queue_;
+    std::vector<storage::ManagedJobRun> pane_runs_;
+    std::vector<std::pair<std::string, std::size_t>> latest_runs_;
+    std::optional<ui::SessionTask> active_; // the job starting or running
+    bool queue_held_ = false;               // finish the current task, then wait
+    bool queue_unattended_ = false;         // startup auto-run: skip attended-only tasks
+    // The one entry Run / Start now asked for. It starts as soon as nothing is
+    // running, even while the queue is held; the hold still covers the rest.
+    std::string run_next_entry_id_;
     bool closing_for_handoff_ = false;
-    std::unique_ptr<ui::PendingTaskWriter> pending_task_writer_;
+    std::unique_ptr<ui::RunHistory> run_history_;
+    std::vector<std::wstring> history_detail_lines_;
+    std::string history_detail_run_id_;
     // A start's result can be processed before its WM_APP_START_DONE (a run
     // that ends at once); the late start notification must not revive it.
     bool result_applied_since_start_ = false;
@@ -475,6 +521,7 @@ private:
     HFONT font_ = nullptr;
     HFONT mono_font_ = nullptr;
     HFONT header_font_ = nullptr; // semibold section headings
+    HFONT icon_font_ = nullptr;   // Segoe Fluent Icons / MDL2 Assets (the task pin)
     HBRUSH window_brush_ = nullptr;
     HBRUSH edit_brush_ = nullptr;
     HMENU menu_bar_ = nullptr;
@@ -694,7 +741,7 @@ private:
                 // Captions and secondary lines recede; values stay full contrast.
                 const bool muted = control == profile_label_ || control == policy_label_ ||
                                    control == verify_label_ || control == sources_footer_ ||
-                                   control == scan_info_label_ ||
+                                   control == scan_info_label_ || control == pane_footer_ ||
                                    control == file_progress_label_ ||
                                    control == overall_progress_label_ ||
                                    control == journal_label_ || control == diagnostics_label_;
@@ -776,11 +823,9 @@ private:
                 }
                 taskbar_.set_state(hwnd_, paused_ ? ui::TaskbarProgressState::Paused
                                                   : ui::TaskbarProgressState::Normal);
-                if (ui::SessionTask* task = tasks_.find(running_task_id_)) {
-                    if (ui::is_active(task->state)) {
-                        task->state = paused_ ? ui::TaskState::Paused : ui::TaskState::Running;
-                        invalidate_task_row(task->id);
-                    }
+                if (active_.has_value() && ui::is_active(active_->state)) {
+                    active_->state = paused_ ? ui::TaskState::Paused : ui::TaskState::Running;
+                    invalidate_active_row();
                 }
                 update_menu_state();
                 return 0;
@@ -791,6 +836,17 @@ private:
             }
             case WM_APP_RUN_NEXT_TASK:
                 on_run_next_task();
+                return 0;
+            case ui::RunHistory::ExportDoneMessage:
+                run_history_->finish_export(lparam, theme_);
+                update_pane_toolbar();
+                return 0;
+            case ui::RunHistory::FindingsDoneMessage:
+                if (run_history_->finish_findings(lparam, selected_run())) {
+                    history_detail_lines_.clear();
+                    refresh_history_details();
+                    update_pane_toolbar();
+                }
                 return 0;
             case WM_COPYDATA: {
                 // A second instance handed us its command line: adopt any
@@ -873,24 +929,24 @@ private:
                 queue_selection(paths, /*scan_mode*/ false, /*want_destination*/ false);
                 return 0;
             }
-            case WM_CLOSE:
-                if (!closing_for_handoff_ && !supervisor_.is_job_running()) {
-                    const auto counts = tasks_.counts();
-                    if (counts.queued > 0 &&
-                        !confirm_box(std::to_wstring(counts.queued) +
-                                         (counts.queued == 1 ? L" task has" : L" tasks have") +
-                                         L" not started yet. Exit anyway?\n\nThey will be offered "
-                                         L"again the next time XactCopy starts.",
-                                     L"XactCopy", ui::MessageIcon::Question)) {
-                        return 0;
-                    }
+            case WM_CLOSE: {
+                // Decide everything first; act only once nothing can cancel.
+                const bool running = supervisor_.is_job_running();
+                if (running &&
+                    !confirm_box(L"A copy job is running. Cancel it and exit?\n\n"
+                                 L"The journal keeps progress, so the run can resume next time.",
+                                 L"XactCopy", ui::MessageIcon::Warning)) {
+                    return 0;
                 }
-                if (supervisor_.is_job_running()) {
-                    if (!confirm_box(L"A copy job is running. Cancel it and exit?\n\n"
-                                     L"The journal keeps progress, so the run can resume next time.",
-                                     L"XactCopy", ui::MessageIcon::Warning)) {
-                        return 0;
-                    }
+                bool discard_unpinned = false;
+                if (!closing_for_handoff_ && !decide_unpinned_tasks_on_exit(discard_unpinned)) {
+                    return 0;
+                }
+                if (discard_unpinned) {
+                    const auto removed = job_manager_.delete_unpinned_jobs();
+                    if (removed > 0) append_log("Discarded " + std::to_string(removed) + " unpinned task(s).");
+                }
+                if (running) {
                     recovery_.mark_run_interrupted("User exited while a run was active.");
                     if (!active_managed_run_id_.empty()) {
                         job_manager_.mark_run_interrupted(active_managed_run_id_,
@@ -903,6 +959,7 @@ private:
                 }
                 DestroyWindow(hwnd_);
                 return 0;
+            }
             case WM_DESTROY:
                 KillTimer(hwnd_, IdSelectionTimer);
                 KillTimer(hwnd_, IdDiagnosticsTimer);
@@ -914,13 +971,7 @@ private:
                 if (start_thread_.joinable()) start_thread_.join();
                 if (update_thread_.joinable()) update_thread_.join();
                 stop_sizer();
-                if (pending_task_writer_ != nullptr) {
-                    // Final synchronous write; the window is going away. The
-                    // running task (if any) is not "pending": crash recovery
-                    // owns it.
-                    pending_task_writer_->flush(
-                        ui::pending_tasks_to_json(tasks_.queued(), tasks_running_));
-                }
+                if (run_history_ != nullptr) run_history_->shutdown();
                 supervisor_.stop();
                 if (log_save_thread_.joinable()) log_save_thread_.join();
                 {
@@ -970,6 +1021,8 @@ private:
         if (font_ != nullptr) DeleteObject(font_);
         if (mono_font_ != nullptr) DeleteObject(mono_font_);
         if (header_font_ != nullptr) DeleteObject(header_font_);
+        if (icon_font_ != nullptr) DeleteObject(icon_font_);
+        icon_font_ = create_icon_font(-MulDiv(9, eff, 72));
         font_ = CreateFontW(-MulDiv(9, eff, 72), 0, 0, 0, FW_NORMAL, FALSE,
                             FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                             CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
@@ -986,6 +1039,26 @@ private:
                                  DEFAULT_PITCH, log_font.c_str());
     }
 
+    // The system icon font: Segoe Fluent Icons (Windows 11), else Segoe MDL2
+    // Assets (Windows 10). nullptr if neither exists, so no junk glyph shows.
+    static HFONT create_icon_font(int height) {
+        for (const wchar_t* face : {L"Segoe Fluent Icons", L"Segoe MDL2 Assets"}) {
+            HFONT font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                     CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
+            if (font == nullptr) continue;
+            wchar_t actual[LF_FACESIZE]{};
+            HDC dc = GetDC(nullptr);
+            HGDIOBJ old = SelectObject(dc, font);
+            GetTextFaceW(dc, LF_FACESIZE, actual);
+            SelectObject(dc, old);
+            ReleaseDC(nullptr, dc);
+            if (_wcsicmp(actual, face) == 0) return font;
+            DeleteObject(font);
+        }
+        return nullptr;
+    }
+
     void apply_fonts() {
         int log_points = settings_.get_int("LogFontSizePoints", 7, 20, 9);
         // Must cover EVERY control that references font_: rebuild_fonts() deletes
@@ -996,7 +1069,10 @@ private:
             source_label_,     destination_label_,   destination_edit_,  sources_list_,
             source_browse_,    destination_browse_,  source_add_files_,  source_paste_,
             sources_footer_,   recent_destinations_button_, options_toggle_, add_task_button_,
-            tasks_label_,      tasks_list_,          pause_list_check_,  clear_finished_button_,
+            tasks_tab_,        queue_tab_,           history_tab_,       tasks_list_,
+            pane_footer_,      run_task_button_,     queue_task_button_, queue_start_button_,
+            queue_stop_button_, hold_queue_check_,   history_resume_button_, history_journal_button_,
+            history_details_,
             detail_label_,     mode_copy_tab_,       mode_scan_tab_,     profile_label_,
             policy_label_,     verify_label_,        scan_info_label_,
             clear_selection_,  mode_combo_,          engine_combo_,
@@ -1016,7 +1092,7 @@ private:
                 SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
             }
         }
-        for (HWND heading : {source_label_, tasks_label_, detail_label_}) {
+        for (HWND heading : {source_label_, detail_label_}) {
             if (heading != nullptr) {
                 SendMessageW(heading, WM_SETFONT, reinterpret_cast<WPARAM>(header_font_), TRUE);
             }
@@ -1169,7 +1245,7 @@ private:
         log_area_logical_ = settings_.get_int("UiLogAreaHeight", 0, 8000, 0);
         left_column_permille_ = settings_.get_int("UiLeftColumnPermille", 0, 900, 0);
 
-        start_button_ = create(L"BUTTON", L"Start \x2192", WS_TABSTOP | BS_OWNERDRAW, IdStartButton);
+        start_button_ = create(L"BUTTON", L"Add to queue", WS_TABSTOP | BS_OWNERDRAW, IdStartButton);
         add_task_button_ =
             create(L"BUTTON", L"Add to tasks", WS_TABSTOP | BS_OWNERDRAW, IdAddTaskButton);
         pause_button_ = create(L"BUTTON", L"Pause", WS_TABSTOP | BS_OWNERDRAW, IdPauseButton);
@@ -1179,20 +1255,35 @@ private:
         EnableWindow(pause_button_, FALSE);
         EnableWindow(cancel_button_, FALSE);
 
-        // ---- Tasks ----
-        tasks_label_ = create(L"STATIC", L"Tasks", SS_NOPREFIX | SS_CENTERIMAGE | SS_ENDELLIPSIS, 0);
-        pause_list_check_ = create(L"BUTTON", L"Pause after current task",
-                                   WS_TABSTOP | BS_OWNERDRAW, IdPauseListCheck);
-        clear_finished_button_ =
-            create(L"BUTTON", L"Clear finished", WS_TABSTOP | BS_OWNERDRAW, IdClearFinished);
+        // ---- Tasks | Queue | History ----
+        tasks_tab_ = create(L"BUTTON", L"Tasks", WS_TABSTOP | BS_OWNERDRAW, IdTasksTab);
+        queue_tab_ = create(L"BUTTON", L"Queue", WS_TABSTOP | BS_OWNERDRAW, IdQueueTab);
+        history_tab_ = create(L"BUTTON", L"History", WS_TABSTOP | BS_OWNERDRAW, IdHistoryTab);
+        run_task_button_ = create(L"BUTTON", L"Run", WS_TABSTOP | BS_OWNERDRAW, IdTaskRunButton);
+        queue_task_button_ = create(L"BUTTON", L"Queue", WS_TABSTOP | BS_OWNERDRAW, IdTaskQueueButton);
+        queue_start_button_ =
+            create(L"BUTTON", L"Start now", WS_TABSTOP | BS_OWNERDRAW, IdQueueStartButton);
+        queue_stop_button_ = create(L"BUTTON", L"Stop", WS_TABSTOP | BS_OWNERDRAW, IdQueueStopButton);
+        hold_queue_check_ = create(L"BUTTON", L"Hold", WS_TABSTOP | BS_OWNERDRAW, IdPauseListCheck);
+        history_resume_button_ =
+            create(L"BUTTON", L"Resume", WS_TABSTOP | BS_OWNERDRAW, IdHistoryResumeButton);
+        history_journal_button_ =
+            create(L"BUTTON", L"Journal", WS_TABSTOP | BS_OWNERDRAW, IdHistoryJournalButton);
         tasks_list_ = create(L"LISTBOX", L"",
                              WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOINTEGRALHEIGHT |
                                  LBS_NODATA | LBS_OWNERDRAWFIXED | LBS_NOTIFY,
                              IdTasksList);
         SetWindowSubclass(tasks_list_, &panel_list_subclass, 3, reinterpret_cast<DWORD_PTR>(this));
+        pane_footer_ = create(L"STATIC", L"", SS_ENDELLIPSIS | SS_NOPREFIX, 0);
+        history_details_ = create(L"LISTBOX", L"",
+                                  WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOINTEGRALHEIGHT |
+                                      LBS_NOSEL,
+                                  IdHistoryDetails);
+        ShowWindow(history_details_, SW_HIDE);
         detail_label_ =
             create(L"STATIC", L"No task running", SS_NOPREFIX | SS_ENDELLIPSIS | SS_CENTERIMAGE, 0);
-        pending_task_writer_ = std::make_unique<ui::PendingTaskWriter>();
+        run_history_ = std::make_unique<ui::RunHistory>(job_manager_);
+        run_history_->set_owner(hwnd_);
 
         current_label_ = create(L"STATIC", L"Current: —", SS_ENDELLIPSIS | SS_NOPREFIX, 0);
         // Owner-drawn flat progress bars: classic msctls_progress32 draws a
@@ -1261,10 +1352,18 @@ private:
         add(recent_destinations_button_, L"Pick a recently used destination.");
         add(options_toggle_, L"Show or hide the detailed options. The summary shows what the next task will use.");
         add(add_task_button_, L"Add tasks for these sources to the task list without starting them.");
-        add(tasks_label_, L"Tasks run one at a time, in order. Right-click a task for more actions.");
-        add(tasks_list_, L"Queued, running, and finished tasks. Enter starts the selected queued task; Del removes it; right-click for retry, move, open destination, and save as job.");
-        add(pause_list_check_, L"When checked, the next queued task waits after the current one finishes.");
-        add(clear_finished_button_, L"Remove finished tasks from the list. Run history stays in the Job Manager.");
+        add(tasks_tab_, L"Your tasks. Pinned tasks always stay; the others follow your on-exit choice. Right-click for pin, rename, edit, and more.");
+        add(queue_tab_, L"Tasks waiting to run, top first. One runs at a time.");
+        add(history_tab_, L"Every run, newest first, with its journal, report, and range map.");
+        add(tasks_list_, L"Enter runs the selected task (Queue view: starts it now; History: resumes it). Del removes. Right-click for more.");
+        add(run_task_button_, L"Run the selected task now, or next if another task is running. A held queue stays held for the other tasks.");
+        add(queue_task_button_, L"Add the selected task to the end of the queue.");
+        add(queue_start_button_, L"Run the selected task now, or next if another task is running. Hold still applies to the rest.");
+        add(queue_stop_button_, L"Stop the selected task: cancels the running one (it can resume later), or takes a waiting one off the queue.");
+        add(hold_queue_check_, L"Let the current task finish, then wait instead of starting the next one.");
+        add(history_resume_button_, L"Resume the selected run from its journal.");
+        add(history_journal_button_, L"Open the selected run's authenticated journal as readable JSON.");
+        add(pane_footer_, L"What the current view shows.");
         add(detail_label_, L"Live detail for the running task.");
         add(destination_label_, L"The folder that receives copied files. Assess Readable Files mode is read-only and does not require a destination.");
         add(destination_edit_, L"Enter the destination folder. XactCopy stages and verifies each file beside its final path before replacement.");
@@ -1340,11 +1439,14 @@ private:
         AppendMenuW(tools_menu, MF_STRING, IdMenuCheckUpdates, L"Check for &Updates...");
 
         HMENU jobs_menu = CreatePopupMenu();
-        AppendMenuW(jobs_menu, MF_STRING, IdMenuSaveAsJob, L"&Save Current Options As Job...");
-        AppendMenuW(jobs_menu, MF_STRING, IdMenuJobManager, L"&Job Manager...");
+        AppendMenuW(jobs_menu, MF_STRING, IdMenuSaveAsJob, L"&Save Current Options As Pinned Task...");
         AppendMenuW(jobs_menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(jobs_menu, MF_STRING, IdMenuResumeInterrupted, L"&Resume Interrupted Job");
-        AppendMenuW(jobs_menu, MF_STRING, IdMenuRunNextQueued, L"Run &Next Queued Job");
+        AppendMenuW(jobs_menu, MF_STRING, IdMenuViewTasks, L"Show &Tasks");
+        AppendMenuW(jobs_menu, MF_STRING, IdMenuViewQueue, L"Show &Queue");
+        AppendMenuW(jobs_menu, MF_STRING, IdMenuViewHistory, L"Show &History");
+        AppendMenuW(jobs_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(jobs_menu, MF_STRING, IdMenuRunNextQueued, L"Start the &Queue");
+        AppendMenuW(jobs_menu, MF_STRING, IdMenuResumeInterrupted, L"&Resume Interrupted Run");
 
         HMENU help_menu = CreatePopupMenu();
         AppendMenuW(help_menu, MF_STRING, IdMenuAbout, L"&About XactCopy");
@@ -1352,7 +1454,7 @@ private:
         menu_bar_ = CreateMenu();
         AppendMenuW(menu_bar_, MF_POPUP, reinterpret_cast<UINT_PTR>(file_menu), L"&File");
         AppendMenuW(menu_bar_, MF_POPUP, reinterpret_cast<UINT_PTR>(tools_menu), L"&Tools");
-        AppendMenuW(menu_bar_, MF_POPUP, reinterpret_cast<UINT_PTR>(jobs_menu), L"&Jobs");
+        AppendMenuW(menu_bar_, MF_POPUP, reinterpret_cast<UINT_PTR>(jobs_menu), L"T&asks");
         AppendMenuW(menu_bar_, MF_POPUP, reinterpret_cast<UINT_PTR>(help_menu), L"&Help");
         SetMenu(hwnd_, menu_bar_);
     }
@@ -1374,8 +1476,7 @@ private:
         set_enabled(IdMenuResumeInterrupted,
                     !running && recovery_.get_pending_interrupted_run().has_value());
         set_enabled(IdMenuSaveAsJob, !running);
-        set_enabled(IdMenuJobManager, true);
-        set_enabled(IdMenuRunNextQueued, !running);
+        set_enabled(IdMenuRunNextQueued, true);
         set_enabled(IdMenuCheckUpdates, !checking_updates_);
         DrawMenuBar(hwnd_);
     }
@@ -1811,11 +1912,13 @@ private:
     }
 
     static bool is_button_id(int id) {
-        return id == IdSourceBrowse || id == IdDestinationBrowse || id == IdStartButton ||
+        return id == IdTaskRunButton || id == IdTaskQueueButton || id == IdQueueStartButton ||
+               id == IdQueueStopButton || id == IdHistoryResumeButton || id == IdHistoryJournalButton ||
+               id == IdSourceBrowse || id == IdDestinationBrowse || id == IdStartButton ||
                id == IdPauseButton || id == IdCancelButton || id == IdSettingsButton ||
                id == IdSourceAddFiles || id == IdClearSelection || id == IdLogFindNext ||
                id == IdSourcePaste || id == IdAddTaskButton || id == IdRecentDestinations ||
-               id == IdClearFinished;
+               false;
     }
 
     bool on_draw_item(const DRAWITEMSTRUCT& draw) {
@@ -1841,7 +1944,14 @@ private:
             return true;
         }
         if (draw.CtlType == ODT_LISTBOX && id == IdTasksList) {
-            draw_task_item(draw);
+            draw_pane_item(draw);
+            return true;
+        }
+        if (draw.CtlType == ODT_BUTTON && (id == IdTasksTab || id == IdQueueTab || id == IdHistoryTab)) {
+            const PaneView view = id == IdTasksTab   ? PaneView::Tasks
+                                  : id == IdQueueTab ? PaneView::Queue
+                                                     : PaneView::History;
+            draw_mode_tab(draw, view == pane_view_);
             return true;
         }
         if (draw.CtlType == ODT_BUTTON && id == IdOptionsToggle) {
@@ -1996,7 +2106,8 @@ private:
         if (add_task_button_ != nullptr) EnableWindow(add_task_button_, can_queue);
         if (start_button_ != nullptr) {
             const bool busy = supervisor_.is_job_running() || starting_;
-            SetWindowTextW(start_button_, busy ? L"Queue \x2192" : L"Start \x2192");
+            (void)busy;
+            SetWindowTextW(start_button_, L"Add to queue");
             InvalidateRect(start_button_, nullptr, FALSE);
         }
     }
@@ -2550,14 +2661,19 @@ private:
         }
     }
 
-    // ---- Tasks panel ---------------------------------------------------------
+    // ---- Tasks | Queue | History pane ----------------------------------------
+    //
+    // Tasks are the job catalog's saved jobs, the queue is its queue, and
+    // History is its run records (job_manager_). The pane keeps a snapshot of
+    // each (refresh_pane_data) and one owner-data list shows the current view.
 
     COLORREF task_state_color(ui::TaskState state) const {
         COLORREF color;
         switch (state) {
             case ui::TaskState::Running: color = RGB(20, 140, 60); break;
             case ui::TaskState::Starting:
-            case ui::TaskState::WaitingForElevation: color = RGB(40, 120, 190); break;
+            case ui::TaskState::WaitingForElevation:
+            case ui::TaskState::Queued: color = RGB(40, 120, 190); break;
             case ui::TaskState::Paused: color = RGB(140, 80, 180); break;
             case ui::TaskState::Completed: color = RGB(30, 100, 180); break;
             case ui::TaskState::CompletedWithRecovery:
@@ -2570,11 +2686,126 @@ private:
         return color;
     }
 
-    void draw_task_item(const DRAWITEMSTRUCT& draw) {
+    const storage::ManagedJobRun* latest_run_for(const std::string& job_id) const {
+        for (const auto& [id, index] : latest_runs_) {
+            if (models::detail::equals_ignore_case(id, job_id)) return &pane_runs_[index];
+        }
+        return nullptr;
+    }
+
+    const ui::JobQueueEntryView* queue_entry_for(const std::string& job_id) const {
+        for (const auto& entry : pane_queue_) {
+            if (models::detail::equals_ignore_case(entry.JobId, job_id)) return &entry;
+        }
+        return nullptr;
+    }
+
+    bool is_active_job(const std::string& job_id) const {
+        return active_.has_value() && !active_->job_id.empty() &&
+               models::detail::equals_ignore_case(active_->job_id, job_id);
+    }
+
+    std::string active_status_text() const {
+        std::string status = ui::to_display(active_->state);
+        if (active_->state == ui::TaskState::Running || active_->state == ui::TaskState::Paused) {
+            status += " \xC2\xB7 " + std::to_string(static_cast<int>(active_->progress * 100.0 + 0.5)) + "%";
+            if (active_->bytes_per_second > 0 && active_->state == ui::TaskState::Running) {
+                status += " \xC2\xB7 " +
+                          format_bytes_short(static_cast<std::int64_t>(active_->bytes_per_second)) + "/s";
+            }
+            if (active_->eta_seconds >= 0 && active_->state == ui::TaskState::Running) {
+                status += " \xC2\xB7 " + format_eta(static_cast<double>(active_->eta_seconds)) + " left";
+            }
+        }
+        return status;
+    }
+
+    // Short local "MM-DD HH:MM" for list rows (details show the full time).
+    static std::string short_time(const xact::time::DateTimeOffset& value) {
+        const std::wstring full = ui::format_local_time(value);
+        if (full.size() < 16) return storage::fsutil::wide_to_utf8(full);
+        return storage::fsutil::wide_to_utf8(full.substr(5, 11));
+    }
+
+    struct PaneRow {
+        std::string title;
+        std::string status;
+        ui::TaskState state = ui::TaskState::Ready;
+        bool pinned = false;
+        bool show_progress = false;
+        double progress = 0.0;
+    };
+
+    std::size_t pane_row_count() const {
+        switch (pane_view_) {
+            case PaneView::Tasks: return pane_jobs_.size();
+            case PaneView::Queue: return pane_queue_.size() + (active_.has_value() ? 1 : 0);
+            case PaneView::History: return pane_runs_.size();
+        }
+        return 0;
+    }
+
+    PaneRow pane_row(std::size_t index) const {
+        PaneRow row;
+        if (pane_view_ == PaneView::Tasks) {
+            const storage::ManagedJob& job = pane_jobs_[index];
+            row.title = job.Name;
+            row.pinned = job.Pinned;
+            if (is_active_job(job.JobId)) {
+                row.state = active_->state;
+                row.status = active_status_text();
+                row.show_progress = true;
+                row.progress = active_->progress;
+            } else if (const ui::JobQueueEntryView* entry = queue_entry_for(job.JobId)) {
+                row.state = ui::TaskState::Queued;
+                row.status = "Queued \xC2\xB7 #" + std::to_string(entry->Position);
+                if (entry->QueueEntryId == run_next_entry_id_) row.status += " (runs next)";
+                else if (queue_held_) row.status += " (queue held)";
+            } else if (const storage::ManagedJobRun* run = latest_run_for(job.JobId)) {
+                row.state = ui::state_from_run(*run);
+                row.status = std::string(ui::to_display(row.state)) + " \xC2\xB7 " +
+                             short_time(run->FinishedUtc.value_or(run->StartedUtc));
+                if (!run->Summary.empty()) row.status += " \xC2\xB7 " + run->Summary;
+            } else {
+                row.status = "Ready \xC2\xB7 added " + short_time(job.CreatedUtc);
+            }
+            return row;
+        }
+        if (pane_view_ == PaneView::Queue) {
+            if (active_.has_value()) {
+                if (index == 0) {
+                    row.title = active_->display_name.empty() ? ui::task_title(active_->options)
+                                                              : active_->display_name;
+                    row.state = active_->state;
+                    row.status = active_status_text();
+                    row.show_progress = true;
+                    row.progress = active_->progress;
+                    return row;
+                }
+                --index;
+            }
+            const ui::JobQueueEntryView& entry = pane_queue_[index];
+            row.title = entry.JobName;
+            row.state = ui::TaskState::Queued;
+            const bool next = entry.QueueEntryId == run_next_entry_id_;
+            row.status = (next ? "Next \xC2\xB7 #" : queue_held_ ? "Held \xC2\xB7 #" : "Waiting \xC2\xB7 #") +
+                         std::to_string(entry.Position);
+            if (!entry.LastErrorMessage.empty()) row.status += " \xC2\xB7 " + entry.LastErrorMessage;
+            return row;
+        }
+        const storage::ManagedJobRun& run = pane_runs_[index];
+        row.title = run.DisplayName;
+        row.state = ui::state_from_run(run);
+        row.status = std::string(ui::to_display(row.state)) + " \xC2\xB7 " + short_time(run.StartedUtc);
+        if (!run.Summary.empty() && row.state != ui::TaskState::Running) row.status += " \xC2\xB7 " + run.Summary;
+        return row;
+    }
+
+    void draw_pane_item(const DRAWITEMSTRUCT& draw) {
         const bool selected = (draw.itemState & ODS_SELECTED) != 0;
         ui::themedraw::fill_rect(draw.hDC, draw.rcItem, selected ? theme_.selection : theme_.edit);
-        if (draw.itemID == static_cast<UINT>(-1) || draw.itemID >= tasks_.size()) return;
-        const ui::SessionTask& task = tasks_.at(draw.itemID);
+        if (draw.itemID == static_cast<UINT>(-1) || draw.itemID >= pane_row_count()) return;
+        const PaneRow row = pane_row(draw.itemID);
         const int dpi = effective_dpi();
         auto scale = [dpi](int value) { return MulDiv(value, dpi, 96); };
 
@@ -2582,13 +2813,12 @@ private:
         rect.left += scale(10);
         rect.right -= scale(8);
         const int line = (rect.bottom - rect.top - scale(8)) / 2;
-        RECT title_rect{rect.left + scale(14), rect.top + scale(3), rect.right,
+        const int pin_width = row.pinned ? scale(18) : 0;
+        RECT title_rect{rect.left + scale(14), rect.top + scale(3), rect.right - pin_width,
                         rect.top + scale(3) + line};
-        RECT status_rect{rect.left + scale(14), title_rect.bottom, rect.right,
-                         title_rect.bottom + line};
+        RECT status_rect{rect.left + scale(14), title_rect.bottom, rect.right, title_rect.bottom + line};
 
-        // State dot.
-        const COLORREF state_color = task_state_color(task.state);
+        const COLORREF state_color = task_state_color(row.state);
         const int dot = scale(8);
         RECT dot_rect{rect.left, title_rect.top + (line - dot) / 2, rect.left + dot,
                       title_rect.top + (line - dot) / 2 + dot};
@@ -2597,36 +2827,28 @@ private:
         HGDIOBJ old_font = SelectObject(draw.hDC, font_);
         SetBkMode(draw.hDC, TRANSPARENT);
         SetTextColor(draw.hDC, selected ? theme_.selection_text : theme_.text);
-        const std::wstring title = storage::fsutil::utf8_to_wide(ui::task_title(task.options));
+        const std::wstring title = storage::fsutil::utf8_to_wide(row.title);
         DrawTextW(draw.hDC, title.c_str(), -1, &title_rect,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-
-        std::string status = ui::to_display(task.state);
-        if (task.state == ui::TaskState::Running || task.state == ui::TaskState::Paused) {
-            status += " \xC2\xB7 " + std::to_string(static_cast<int>(task.progress * 100.0 + 0.5)) + "%";
-            if (task.bytes_per_second > 0 && task.state == ui::TaskState::Running) {
-                status += " \xC2\xB7 " + format_bytes_short(
-                                              static_cast<std::int64_t>(task.bytes_per_second)) + "/s";
-            }
-            if (task.eta_seconds >= 0 && task.state == ui::TaskState::Running) {
-                status += " \xC2\xB7 " + format_eta(static_cast<double>(task.eta_seconds)) + " left";
-            }
-        } else if (!task.outcome.empty()) {
-            status += " \xC2\xB7 " + task.outcome;
-        }
         SetTextColor(draw.hDC, selected ? theme_.selection_text : state_color);
-        const std::wstring status_wide = storage::fsutil::utf8_to_wide(status);
-        DrawTextW(draw.hDC, status_wide.c_str(), -1, &status_rect,
+        const std::wstring status = storage::fsutil::utf8_to_wide(row.status);
+        DrawTextW(draw.hDC, status.c_str(), -1, &status_rect,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        if (row.pinned && icon_font_ != nullptr) {
+            // Segoe Fluent Icons / MDL2 Assets "Pin" glyph.
+            SelectObject(draw.hDC, icon_font_);
+            SetTextColor(draw.hDC, selected ? theme_.selection_text : theme_.muted_text);
+            RECT pin_rect{rect.right - pin_width, title_rect.top, rect.right, title_rect.bottom};
+            DrawTextW(draw.hDC, L"\xE718", 1, &pin_rect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
         SelectObject(draw.hDC, old_font);
 
-        // Thin inline progress bar along the bottom edge for an active task.
-        if (ui::is_active(task.state)) {
+        if (row.show_progress) {
             RECT track{rect.left, draw.rcItem.bottom - scale(5), rect.right, draw.rcItem.bottom - scale(2)};
             ui::themedraw::fill_rect(draw.hDC, track, theme_.panel);
             RECT fill = track;
             fill.right = track.left + static_cast<LONG>((track.right - track.left) *
-                                                        std::clamp(task.progress, 0.0, 1.0));
+                                                        std::clamp(row.progress, 0.0, 1.0));
             if (fill.right > fill.left) ui::themedraw::fill_rect(draw.hDC, fill, theme_.accent);
         }
         RECT divider{draw.rcItem.left, draw.rcItem.bottom - 1, draw.rcItem.right, draw.rcItem.bottom};
@@ -2634,48 +2856,151 @@ private:
         if ((draw.itemState & ODS_FOCUS) != 0) DrawFocusRect(draw.hDC, &draw.rcItem);
     }
 
-    void refresh_tasks_view() {
+    // Reloads the catalog snapshot (tasks, queue, history) and redraws.
+    void refresh_pane_data() {
+        pane_jobs_ = job_manager_.get_jobs_in_order();
+        pane_queue_ = job_manager_.get_queue_entries();
+        pane_runs_ = job_manager_.get_recent_runs(500);
+        latest_runs_ = ui::latest_run_per_job(pane_runs_);
+        refresh_pane_view();
+    }
+
+    void refresh_pane_view() {
+        if (tasks_list_ == nullptr) return;
         const int selected = static_cast<int>(SendMessageW(tasks_list_, LB_GETCURSEL, 0, 0));
-        SendMessageW(tasks_list_, LB_SETCOUNT, tasks_.size(), 0);
-        if (selected >= 0 && static_cast<std::size_t>(selected) < tasks_.size()) {
+        const std::size_t count = pane_row_count();
+        SendMessageW(tasks_list_, LB_SETCOUNT, count, 0);
+        if (selected >= 0 && static_cast<std::size_t>(selected) < count) {
             SendMessageW(tasks_list_, LB_SETCURSEL, selected, 0);
         }
         InvalidateRect(tasks_list_, nullptr, TRUE);
-        const auto counts = tasks_.counts();
-        std::wstring label = L"Tasks";
-        if (tasks_.size() > 0) {
-            label += L"  \x00B7  " + std::to_wstring(counts.active) + L" running, " +
-                     std::to_wstring(counts.queued) + L" queued, " +
-                     std::to_wstring(counts.finished) + L" finished";
+
+        const std::size_t queued = pane_queue_.size() + (active_.has_value() ? 1 : 0);
+        SetWindowTextW(tasks_tab_, pane_jobs_.empty() ? L"Tasks"
+                                                      : (L"Tasks  " + std::to_wstring(pane_jobs_.size())).c_str());
+        SetWindowTextW(queue_tab_, queued == 0 ? L"Queue" : (L"Queue  " + std::to_wstring(queued)).c_str());
+        for (HWND tab : {tasks_tab_, queue_tab_, history_tab_}) InvalidateRect(tab, nullptr, FALSE);
+
+        std::wstring footer;
+        if (pane_view_ == PaneView::Tasks) {
+            footer = pane_jobs_.empty()
+                         ? L"No tasks yet. Add items on the left, then Add to tasks."
+                         : L"Run starts a task now (or next); Queue adds it to the end.";
+        } else if (pane_view_ == PaneView::Queue) {
+            if (queued == 0) footer = L"Nothing queued.";
+            else if (queue_held_) footer = L"Held: untick Hold, or use Start now.";
+            else footer = L"Tasks run one at a time, top first.";
+        } else {
+            footer = pane_runs_.empty() ? L"No runs yet." : L"Newest first. Right-click for reports and the range map.";
         }
-        SetWindowTextW(tasks_label_, label.c_str());
-        EnableWindow(clear_finished_button_, counts.finished > 0 ? TRUE : FALSE);
+        SetWindowTextW(pane_footer_, footer.c_str());
+        update_pane_toolbar();
+        if (pane_view_ == PaneView::History) refresh_history_details();
     }
 
-    void invalidate_task_row(std::uint64_t id) {
-        auto index = tasks_.index_of(id);
-        if (!index.has_value()) return;
+    void invalidate_active_row() {
+        if (!active_.has_value() || tasks_list_ == nullptr) return;
+        int index = -1;
+        if (pane_view_ == PaneView::Queue) {
+            index = 0;
+        } else if (pane_view_ == PaneView::Tasks) {
+            for (std::size_t i = 0; i < pane_jobs_.size(); ++i) {
+                if (is_active_job(pane_jobs_[i].JobId)) index = static_cast<int>(i);
+            }
+        }
         RECT row{};
-        if (SendMessageW(tasks_list_, LB_GETITEMRECT, *index, reinterpret_cast<LPARAM>(&row)) != LB_ERR) {
+        if (index >= 0 &&
+            SendMessageW(tasks_list_, LB_GETITEMRECT, index, reinterpret_cast<LPARAM>(&row)) != LB_ERR) {
             InvalidateRect(tasks_list_, &row, FALSE);
         }
     }
 
-    void persist_pending_tasks() {
-        if (pending_task_writer_ == nullptr) return;
-        pending_task_writer_->post(ui::pending_tasks_to_json(tasks_.queued(), tasks_running_));
+    void set_pane_view(PaneView view) {
+        if (pane_view_ == view) return;
+        with_redraw_suspended([&] {
+            pane_view_ = view;
+            SendMessageW(tasks_list_, LB_SETCURSEL, static_cast<WPARAM>(-1), 0);
+            history_detail_run_id_.clear();
+            layout(); // each view shows its own toolbar and detail area
+            refresh_pane_data();
+        });
     }
 
-    void tasks_changed() {
-        refresh_tasks_view();
-        persist_pending_tasks();
+    int pane_selection() const {
+        const int index = static_cast<int>(SendMessageW(tasks_list_, LB_GETCURSEL, 0, 0));
+        return index >= 0 && static_cast<std::size_t>(index) < pane_row_count() ? index : -1;
     }
 
-    // Turns the builder (sources + destination + options) into tasks: one per
-    // source folder group. Returns how many tasks were added.
-    int add_tasks_from_builder() {
+    const storage::ManagedJob* selected_job() const {
+        const int index = pane_selection();
+        return pane_view_ == PaneView::Tasks && index >= 0 ? &pane_jobs_[static_cast<std::size_t>(index)]
+                                                           : nullptr;
+    }
+
+    bool active_row_selected() const {
+        return pane_view_ == PaneView::Queue && active_.has_value() && pane_selection() == 0;
+    }
+
+    const ui::JobQueueEntryView* selected_queue_entry() const {
+        if (pane_view_ != PaneView::Queue) return nullptr;
+        int index = pane_selection();
+        if (index < 0) return nullptr;
+        if (active_.has_value()) {
+            if (index == 0) return nullptr;
+            --index;
+        }
+        return &pane_queue_[static_cast<std::size_t>(index)];
+    }
+
+    const storage::ManagedJobRun* selected_run() const {
+        const int index = pane_selection();
+        return pane_view_ == PaneView::History && index >= 0 ? &pane_runs_[static_cast<std::size_t>(index)]
+                                                             : nullptr;
+    }
+
+    void update_pane_toolbar() {
+        auto enable = [](HWND button, bool enabled) {
+            if (button != nullptr) EnableWindow(button, enabled ? TRUE : FALSE);
+        };
+        const storage::ManagedJob* job = selected_job();
+        enable(run_task_button_, job != nullptr && !is_active_job(job->JobId));
+        enable(queue_task_button_, job != nullptr && !is_active_job(job->JobId));
+        enable(queue_start_button_, selected_queue_entry() != nullptr);
+        enable(queue_stop_button_, selected_queue_entry() != nullptr || active_row_selected());
+        const storage::ManagedJobRun* run = selected_run();
+        const bool idle = !supervisor_.is_job_running() && !starting_;
+        enable(history_resume_button_, run != nullptr && idle && run_history_->can_resume(*run));
+        enable(history_journal_button_, run != nullptr && !run_history_->busy());
+    }
+
+    void refresh_history_details() {
+        if (history_details_ == nullptr) return;
+        const storage::ManagedJobRun* run = selected_run();
+        std::vector<std::wstring> lines =
+            run != nullptr ? run_history_->details(*run)
+                           : std::vector<std::wstring>{L"Select a run to see its details."};
+        if (lines == history_detail_lines_) return; // keep the scroll position
+        const bool same_run = run != nullptr && history_detail_run_id_ == run->RunId;
+        const int top = same_run ? static_cast<int>(SendMessageW(history_details_, LB_GETTOPINDEX, 0, 0)) : 0;
+        history_detail_lines_ = std::move(lines);
+        history_detail_run_id_ = run != nullptr ? run->RunId : std::string();
+        SendMessageW(history_details_, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(history_details_, LB_RESETCONTENT, 0, 0);
+        for (const auto& text : history_detail_lines_) {
+            SendMessageW(history_details_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text.c_str()));
+        }
+        if (top > 0) SendMessageW(history_details_, LB_SETTOPINDEX, top, 0);
+        SendMessageW(history_details_, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(history_details_, nullptr, TRUE);
+    }
+
+    // ---- Adding tasks from the builder ----
+
+    // Turns the builder (sources + destination + options) into tasks, one
+    // per source folder group, optionally queuing them. Returns how many.
+    int add_tasks_from_builder(bool queue) {
         if (sources_.empty()) {
-            info_box(L"Add files or folders to copy first: + Files, + Folder, Paste, or drag them "
+            info_box(L"Add files or folders first: + Files, + Folder, Paste, or drag them "
                      L"onto the list.");
             return 0;
         }
@@ -2709,85 +3034,162 @@ private:
             }
             remember_destination(base.DestinationRoot);
         }
+        int added = 0;
         for (const auto& group : groups) {
-            ui::SessionTask task;
-            task.options = base;
-            task.options.SourceRoot = storage::fsutil::wide_to_utf8(group.root);
-            task.options.SelectedRelativePaths = group.relative_paths;
-            tasks_.add(std::move(task));
+            models::CopyJobOptions options = base;
+            options.SourceRoot = storage::fsutil::wide_to_utf8(group.root);
+            options.SelectedRelativePaths = group.relative_paths;
+            auto saved = job_manager_.save_job(ui::task_title(options), options, std::string(),
+                                               /*pinned*/ false);
+            if (!saved.has_value()) {
+                warn_box(L"The task could not be saved to the job catalog." +
+                             (job_manager_.load_warning().empty()
+                                  ? std::wstring()
+                                  : L"\n\n" + storage::fsutil::utf8_to_wide(job_manager_.load_warning())),
+                         L"XactCopy");
+                break;
+            }
+            if (queue) job_manager_.enqueue_job(saved->JobId, /*front*/ false, "builder");
+            ++added;
         }
+        if (added == 0) return 0;
         // The items now live in their tasks; empty the list for the next
         // batch. Destination and options stay, since the next batch usually
         // shares them (and "Edit in builder" brings a task's items back).
         set_sources({});
-        append_log("Added " + std::to_string(groups.size()) +
-                   (groups.size() == 1 ? " task." : " tasks (one per source folder)."));
-        tasks_changed();
-        return static_cast<int>(groups.size());
+        append_log("Added " + std::to_string(added) + (added == 1 ? " task" : " tasks") +
+                   (queue ? " to the queue." : ".") +
+                   (groups.size() > 1 ? " (one per source folder)" : ""));
+        set_pane_view(queue ? PaneView::Queue : PaneView::Tasks);
+        refresh_pane_data();
+        if (queue) run_next_in_queue();
+        return added;
     }
 
-    // Starts the next queued task when nothing else is running.
-    void run_next_task() {
+    // ---- Running the queue ----
+
+    void set_queue_held(bool held) {
+        queue_held_ = held;
+        set_check(IdPauseListCheck, held);
+        settings_.set_bool("QueueHeld", held);
+        refresh_pane_view();
+        if (!held) run_next_in_queue();
+    }
+
+    // Starts the first runnable queue entry when nothing is running and the
+    // queue is not held. In unattended mode (startup auto-run) entries with
+    // attended-only settings are skipped and marked, not consumed.
+    void run_next_in_queue() {
         if (supervisor_.is_job_running() || starting_ || outgoing_handoff_.has_value()) return;
-        if (running_task_id_ != 0) return;
-        ui::SessionTask* task = tasks_.next_queued();
-        if (task == nullptr) {
-            if (tasks_running_) append_log("All queued tasks have been started.");
-            tasks_running_ = false;
-            persist_pending_tasks();
+        if (active_.has_value()) return;
+        const auto queue = job_manager_.get_queue_entries();
+        if (!run_next_entry_id_.empty()) {
+            const std::string chosen = run_next_entry_id_;
+            run_next_entry_id_.clear();
+            const bool still_queued = std::any_of(queue.begin(), queue.end(), [&](const auto& entry) {
+                return entry.QueueEntryId == chosen;
+            });
+            if (still_queued) {
+                start_queue_entry(chosen);
+                return;
+            }
+        }
+        if (queue_held_) return;
+        if (queue.empty()) {
+            queue_unattended_ = false;
             return;
         }
-        running_task_id_ = task->id;
-        task->state = ui::TaskState::Starting;
-        const std::uint64_t id = task->id;
-        models::CopyJobOptions options = task->options;
-        const bool from_recovery = task->from_recovery;
-        const std::string managed_run_id = task->managed_run_id;
-        const std::string display_name = task->display_name;
-        tasks_changed();
-        start_job_with(options, from_recovery, managed_run_id, display_name);
-        settle_unstarted_task(id, "Not started");
+        std::string target;
+        if (queue_unattended_) {
+            for (const auto& candidate : queue) {
+                auto job = job_manager_.get_job_by_id(candidate.JobId);
+                if (!job.has_value()) continue;
+                const std::string issue = job->Options.unattended_policy_issue();
+                if (issue.empty()) {
+                    target = candidate.QueueEntryId;
+                    break;
+                }
+                if (job_manager_.mark_queue_entry_blocked(candidate.QueueEntryId, issue)) {
+                    append_log("Skipped '" + job->Name + "' in the automatic run: " + issue + ".");
+                }
+            }
+            if (target.empty()) {
+                queue_unattended_ = false;
+                refresh_pane_data();
+                return;
+            }
+        } else {
+            target = queue.front().QueueEntryId;
+        }
+        start_queue_entry(target);
     }
 
-    // start_job_with can decline (validation, a risk prompt answered No,
-    // elevation declined without fallback). Leave the task visibly not run and
-    // stop advancing instead of looping over the queue.
-    void settle_unstarted_task(std::uint64_t id, const std::string& outcome) {
-        if (running_task_id_ != id) return;
-        ui::SessionTask* task = tasks_.find(id);
-        if (task == nullptr) {
-            running_task_id_ = 0;
+    // Dequeues one entry and starts it. A start that is declined (a prompt
+    // answered No, a validation problem) puts the task back at the front and
+    // holds the queue instead of looping over it.
+    void start_queue_entry(const std::string& entry_id) {
+        ui::QueuedJobWorkItem work_item;
+        if (!job_manager_.try_dequeue_queued_entry(entry_id, work_item)) {
+            refresh_pane_data();
             return;
         }
-        if (outgoing_handoff_.has_value()) {
-            task->state = ui::TaskState::WaitingForElevation;
-        } else if (!starting_ && !supervisor_.is_job_running()) {
-            task->state = ui::TaskState::Cancelled;
-            task->outcome = outcome;
-            running_task_id_ = 0;
-            tasks_running_ = false;
+        const std::string trigger = queue_unattended_ ? "queued-auto" : "queued-manual";
+        auto run = job_manager_.create_run_for_job(work_item.Job.JobId, trigger,
+                                                   work_item.QueueEntryId, work_item.Attempt);
+        const std::string managed_run_id = run.has_value() ? run->RunId : std::string();
+        ui::SessionTask task;
+        task.job_id = work_item.Job.JobId;
+        task.options = work_item.Job.Options;
+        task.display_name = work_item.Job.Name;
+        task.managed_run_id = managed_run_id;
+        active_ = std::move(task);
+        refresh_pane_data();
+        start_job_with(work_item.Job.Options, false, managed_run_id, work_item.Job.Name);
+        if (!settle_after_start_attempt()) {
+            if (!managed_run_id.empty()) job_manager_.delete_run(managed_run_id); // it never ran
+            job_manager_.enqueue_job(work_item.Job.JobId, /*front*/ true, work_item.Trigger);
+            queue_unattended_ = false;
+            run_next_entry_id_.clear();
+            set_queue_held(true);
+            append_log("Queue held: '" + work_item.Job.Name + "' did not start.");
+            refresh_pane_data();
         }
-        tasks_changed();
+    }
+
+    // After a start attempt: true when it is starting, running, or waiting for
+    // an elevated window; false (and the active row cleared) when declined.
+    bool settle_after_start_attempt() {
+        if (!active_.has_value()) return starting_ || supervisor_.is_job_running();
+        if (outgoing_handoff_.has_value()) {
+            active_->state = ui::TaskState::WaitingForElevation;
+            refresh_pane_view();
+            return true;
+        }
+        if (starting_ || supervisor_.is_job_running()) return true;
+        active_.reset();
+        refresh_pane_data();
+        return false;
     }
 
     // Every start path funnels through start_job_with; a job started outside
-    // the task list (Job Manager, crash recovery, an elevation handoff) gets a
-    // task row too, so the panel always shows what is running.
+    // the queue (History resume, crash recovery, an elevation handoff) gets
+    // the active row too, so the pane always shows what is running.
     void bind_started_job_to_task() {
-        ui::SessionTask* task = running_task_id_ != 0 ? tasks_.find(running_task_id_) : nullptr;
-        if (task == nullptr) {
+        if (!active_.has_value()) {
             ui::SessionTask external;
             external.options = pending_start_options_;
             external.display_name = pending_start_job_name_;
-            external.managed_run_id = active_managed_run_id_;
-            running_task_id_ = tasks_.add(std::move(external));
-            task = tasks_.find(running_task_id_);
+            if (auto run = job_manager_.get_run_by_id(active_managed_run_id_)) external.job_id = run->JobId;
+            active_ = std::move(external);
         }
-        task->state = paused_ ? ui::TaskState::Paused : ui::TaskState::Running;
-        task->progress = 0.0;
-        set_detail_heading(L"Running: " +
-                           storage::fsutil::utf8_to_wide(ui::task_title(task->options)));
-        tasks_changed();
+        active_->managed_run_id = active_managed_run_id_;
+        active_->state = paused_ ? ui::TaskState::Paused : ui::TaskState::Running;
+        active_->progress = 0.0;
+        set_detail_heading(L"Running: " + storage::fsutil::utf8_to_wide(
+                                              active_->display_name.empty()
+                                                  ? ui::task_title(active_->options)
+                                                  : active_->display_name));
+        refresh_pane_data();
     }
 
     void set_detail_heading(const std::wstring& text) {
@@ -2795,181 +3197,367 @@ private:
     }
 
     void finish_running_task(const models::CopyJobResult& result) {
-        ui::SessionTask* task = running_task_id_ != 0 ? tasks_.find(running_task_id_) : nullptr;
-        // Only one job runs at a time, so a row still marked active belongs
-        // to this result even if its binding was lost.
-        if (task == nullptr) task = tasks_.active();
-        running_task_id_ = 0;
-        if (task == nullptr) {
-            set_detail_heading(L"Last task");
-            return;
-        }
-        task->state = ui::state_from_result(result);
-        task->progress = task->state == ui::TaskState::Completed ? 1.0 : task->progress;
-        task->bytes_per_second = 0;
-        task->eta_seconds = -1;
-        std::string outcome = std::to_string(result.CompletedFiles) + "/" +
-                              std::to_string(result.TotalFiles) + " files";
-        if (result.FailedFiles > 0) outcome += ", " + std::to_string(result.FailedFiles) + " failed";
-        if (result.RecoveredFiles > 0) outcome += ", " + std::to_string(result.RecoveredFiles) + " recovered";
-        if (result.SkippedFiles > 0) outcome += ", " + std::to_string(result.SkippedFiles) + " skipped";
-        if (!result.ErrorMessage.empty() && task->state == ui::TaskState::Failed) {
-            outcome += " \xE2\x80\x94 " + result.ErrorMessage;
-        }
-        task->outcome = std::move(outcome);
+        active_.reset();
         set_detail_heading(L"Last task: " +
-                           storage::fsutil::utf8_to_wide(ui::to_display(task->state)));
-        tasks_changed();
+                           storage::fsutil::utf8_to_wide(ui::to_display(ui::state_from_result(result))));
+        refresh_pane_data(); // the task's row now shows this run's result
     }
 
-    void show_tasks_context_menu(LPARAM screen_point) {
+    // ---- Pane commands ----
+
+    // Runs this task now, or next if one is running. Only this task: a held
+    // queue stays held for everything else.
+    void run_task(const storage::ManagedJob& job) {
+        const std::string entry = job_manager_.enqueue_job(job.JobId, /*front*/ true, "run");
+        if (entry.empty()) {
+            warn_box(L"The task could not be queued.", L"XactCopy");
+            return;
+        }
+        run_next_entry_id_ = entry;
+        if (supervisor_.is_job_running() || starting_ || active_.has_value()) {
+            append_log("'" + job.Name + "' runs next, after the current task.");
+        }
+        refresh_pane_data();
+        run_next_in_queue();
+    }
+
+    void queue_task(const storage::ManagedJob& job) {
+        if (job_manager_.enqueue_job(job.JobId, /*front*/ false, "queued").empty()) {
+            warn_box(L"The task could not be queued.", L"XactCopy");
+            return;
+        }
+        refresh_pane_data();
+        if (queue_held_) append_log("Added '" + job.Name + "' to the held queue.");
+        run_next_in_queue();
+    }
+
+    void remove_task(const storage::ManagedJob& job) {
+        if (is_active_job(job.JobId)) {
+            info_box(L"This task is running. Stop it first (Queue, Stop).");
+            return;
+        }
+        if (job.Pinned &&
+            !confirm_box(L"Remove the pinned task '" + storage::fsutil::utf8_to_wide(job.Name) +
+                             L"'? Its run history stays.",
+                         L"XactCopy", ui::MessageIcon::Question)) {
+            return;
+        }
+        job_manager_.delete_job(job.JobId);
+        refresh_pane_data();
+    }
+
+    void stop_selected_queue_row() {
+        if (active_row_selected()) {
+            supervisor_.cancel_job("");
+            return;
+        }
+        if (const ui::JobQueueEntryView* entry = selected_queue_entry()) {
+            if (entry->QueueEntryId == run_next_entry_id_) run_next_entry_id_.clear();
+            job_manager_.remove_queued_job(entry->QueueEntryId);
+            refresh_pane_data();
+        }
+    }
+
+    void start_selected_queue_entry() {
+        const ui::JobQueueEntryView* entry = selected_queue_entry();
+        if (entry == nullptr) return;
+        job_manager_.move_queue_entry(entry->QueueEntryId, ui::QueueMoveDirection::Top);
+        run_next_entry_id_ = entry->QueueEntryId;
+        if (supervisor_.is_job_running() || starting_ || active_.has_value()) {
+            append_log("'" + entry->JobName + "' runs next, after the current task.");
+        }
+        refresh_pane_data();
+        SendMessageW(tasks_list_, LB_SETCURSEL, active_.has_value() ? 1 : 0, 0);
+        run_next_in_queue();
+    }
+
+    void show_pane_context_menu(LPARAM screen_point) {
         POINT point{GET_X_LPARAM(screen_point), GET_Y_LPARAM(screen_point)};
         if (point.x == -1 && point.y == -1) GetCursorPos(&point);
-        const ui::SessionTask* task = selected_task();
-        const bool queued = task != nullptr && task->state == ui::TaskState::Queued;
-        const bool finished = task != nullptr && ui::is_finished(task->state);
-        const bool copy = task != nullptr &&
-                          task->options.OperationMode == models::JobOperationMode::Copy;
         auto flag = [](bool enabled) { return MF_STRING | (enabled ? 0u : static_cast<UINT>(MF_GRAYED)); };
         HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, flag(queued), IdTaskStartNow, L"&Start now");
-        AppendMenuW(menu, flag(queued), IdTaskMoveUp, L"Move &up");
-        AppendMenuW(menu, flag(queued), IdTaskMoveDown, L"Move &down");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, flag(finished && task->state != ui::TaskState::Completed), IdTaskRetry,
-                    L"&Retry (resume from journal)");
-        AppendMenuW(menu, flag(copy), IdTaskOpenDestination, L"&Open destination");
-        AppendMenuW(menu, flag(task != nullptr), IdTaskEdit, L"&Edit in builder");
-        AppendMenuW(menu, flag(task != nullptr), IdTaskSaveAsJob, L"Save as &job...");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, flag(task != nullptr && !ui::is_active(task->state)), IdTaskRemove,
-                    L"Re&move\tDel");
+        if (pane_view_ == PaneView::Tasks) {
+            const storage::ManagedJob* job = selected_job();
+            const bool any = job != nullptr;
+            const bool idle_job = any && !is_active_job(job->JobId);
+            AppendMenuW(menu, flag(idle_job), IdCtxRun, L"&Run\tEnter");
+            AppendMenuW(menu, flag(idle_job), IdCtxQueue, L"&Queue");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, flag(any) | (any && job->Pinned ? MF_CHECKED : 0u), IdCtxPin,
+                        L"&Pin (always keep)");
+            AppendMenuW(menu, flag(any), IdCtxRename, L"Re&name...");
+            AppendMenuW(menu, flag(any), IdCtxDuplicate, L"D&uplicate");
+            AppendMenuW(menu, flag(any), IdCtxEdit, L"&Edit in builder");
+            AppendMenuW(menu, flag(any && job->Options.OperationMode == models::JobOperationMode::Copy),
+                        IdCtxOpenDestination, L"&Open destination");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, flag(idle_job), IdCtxRemove, L"Re&move\tDel");
+        } else if (pane_view_ == PaneView::Queue) {
+            const bool waiting = selected_queue_entry() != nullptr;
+            AppendMenuW(menu, flag(waiting), IdCtxStartNow, L"&Start now\tEnter");
+            AppendMenuW(menu, flag(waiting), IdCtxMoveTop, L"Move to &top");
+            AppendMenuW(menu, flag(waiting), IdCtxMoveUp, L"Move &up\tCtrl+Up");
+            AppendMenuW(menu, flag(waiting), IdCtxMoveDown, L"Move &down\tCtrl+Down");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, flag(waiting || active_row_selected()), IdCtxStop,
+                        active_row_selected() ? L"S&top (cancel the run)" : L"&Remove from queue\tDel");
+            AppendMenuW(menu, flag(!pane_queue_.empty()), IdCtxClearQueue, L"&Clear waiting tasks");
+        } else {
+            const storage::ManagedJobRun* run = selected_run();
+            const bool any = run != nullptr;
+            const bool idle = !supervisor_.is_job_running() && !starting_;
+            const bool free = !run_history_->busy();
+            AppendMenuW(menu, flag(any && idle && run_history_->can_resume(*run)), IdCtxResume,
+                        L"&Resume\tEnter");
+            AppendMenuW(menu, flag(any && free), IdCtxJournal, L"Open &journal");
+            AppendMenuW(menu, flag(any && free), IdCtxReport, L"Export &report...");
+            AppendMenuW(menu, flag(any && free), IdCtxMap, L"Show range &map");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, flag(any && run->Status != storage::ManagedJobRunStatus::Running &&
+                                   run->Status != storage::ManagedJobRunStatus::Paused),
+                        IdCtxDeleteRun, L"&Delete run\tDel");
+            AppendMenuW(menu, flag(!pane_runs_.empty()), IdCtxClearHistory, L"&Clear history...");
+        }
         TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd_, nullptr);
         DestroyMenu(menu);
     }
 
-    ui::SessionTask* selected_task() {
-        const int index = static_cast<int>(SendMessageW(tasks_list_, LB_GETCURSEL, 0, 0));
-        if (index < 0 || static_cast<std::size_t>(index) >= tasks_.size()) return nullptr;
-        return &tasks_.at(static_cast<std::size_t>(index));
-    }
-
-    void select_task(std::uint64_t id) {
-        if (auto index = tasks_.index_of(id)) {
-            SendMessageW(tasks_list_, LB_SETCURSEL, *index, 0);
-        }
-    }
-
-    void on_task_command(int id) {
-        ui::SessionTask* task = selected_task();
-        if (task == nullptr) return;
-        const std::uint64_t task_id = task->id;
+    void on_pane_command(int id) {
         switch (id) {
-            case IdTaskStartNow:
-                tasks_.move_to_front(task_id);
-                tasks_running_ = true;
-                tasks_changed();
-                select_task(task_id);
-                run_next_task();
-                break;
-            case IdTaskMoveUp:
-            case IdTaskMoveDown:
-                if (tasks_.move(task_id, id == IdTaskMoveUp ? -1 : 1)) {
-                    tasks_changed();
-                    select_task(task_id);
+            case IdTaskRunButton:
+            case IdCtxRun:
+                if (const auto* job = selected_job()) run_task(*job);
+                return;
+            case IdTaskQueueButton:
+            case IdCtxQueue:
+                if (const auto* job = selected_job()) queue_task(*job);
+                return;
+            case IdCtxRemove:
+                if (const auto* job = selected_job()) remove_task(*job);
+                return;
+            case IdCtxPin:
+                if (const auto* job = selected_job()) {
+                    job_manager_.set_job_pinned(job->JobId, !job->Pinned);
+                    refresh_pane_data();
                 }
-                break;
-            case IdTaskRemove:
-                if (tasks_.remove(task_id)) tasks_changed();
-                break;
-            case IdTaskRetry: {
-                ui::SessionTask retry;
-                retry.options = task->options;
-                retry.options.ResumeFromJournal = true;
-                retry.display_name = task->display_name;
-                const std::uint64_t retry_id = tasks_.add(std::move(retry));
-                tasks_changed();
-                select_task(retry_id);
-                if (!supervisor_.is_job_running() && !starting_) {
-                    tasks_.move_to_front(retry_id);
-                    tasks_running_ = true;
-                    run_next_task();
-                }
-                break;
-            }
-            case IdTaskOpenDestination:
-                if (!ui_is_blank(task->options.DestinationRoot)) {
-                    open_folder_in_explorer(storage::fsutil::utf8_to_wide(task->options.DestinationRoot));
-                }
-                break;
-            case IdTaskEdit:
-                apply_run_options_to_ui(task->options);
-                append_log("Loaded the task's settings into the builder.");
-                break;
-            case IdTaskSaveAsJob: {
-                models::CopyJobOptions options = task->options;
-                bind_media_identities(options);
-                auto name = ui::TextPromptDialog::show(hwnd_, theme_, L"Save Job",
-                                                       L"Name for this saved job:",
-                                                       suggest_job_name(options));
-                if (name.has_value() && !ui_is_blank(*name)) {
-                    if (auto saved = job_manager_.save_job(*name, options)) {
-                        append_log("Saved job '" + saved->Name + "'.");
+                return;
+            case IdCtxRename:
+                if (const auto* job = selected_job()) {
+                    const std::string job_id = job->JobId;
+                    auto name = ui::TextPromptDialog::show(hwnd_, theme_, L"Rename Task",
+                                                           L"Name for this task:", job->Name);
+                    if (name.has_value() && !ui_is_blank(*name)) {
+                        job_manager_.rename_job(job_id, *name);
+                        refresh_pane_data();
                     }
                 }
-                break;
-            }
-            default:
-                break;
-        }
-    }
-
-    // Offers tasks that never started in the previous session. An elevated
-    // relaunch restores them silently: the unelevated window wrote them a
-    // moment ago as part of the same session.
-    void restore_pending_tasks() {
-        ui::PendingTasks pending = ui::load_pending_tasks();
-        if (pending.tasks.empty()) return;
-        const bool silent = incoming_handoff_.has_value();
-        if (!silent) {
-            const std::wstring text = std::to_wstring(pending.tasks.size()) +
-                                      (pending.tasks.size() == 1
-                                           ? L" task from your last session did not run. Restore it?"
-                                           : L" tasks from your last session did not run. Restore them?");
-            if (!confirm_box(text, L"XactCopy - Unstarted tasks")) {
-                persist_pending_tasks(); // forget them
                 return;
-            }
+            case IdCtxDuplicate:
+                if (const auto* job = selected_job()) {
+                    job_manager_.duplicate_job(job->JobId, job->Name + " (copy)");
+                    refresh_pane_data();
+                }
+                return;
+            case IdCtxEdit:
+                if (const auto* job = selected_job()) {
+                    apply_run_options_to_ui(job->Options);
+                    append_log("Loaded '" + job->Name + "' into the builder.");
+                }
+                return;
+            case IdCtxOpenDestination:
+                if (const auto* job = selected_job(); job != nullptr && !ui_is_blank(job->Options.DestinationRoot)) {
+                    open_folder_in_explorer(storage::fsutil::utf8_to_wide(job->Options.DestinationRoot));
+                }
+                return;
+            case IdQueueStartButton:
+            case IdCtxStartNow:
+                start_selected_queue_entry();
+                return;
+            case IdQueueStopButton:
+            case IdCtxStop:
+                stop_selected_queue_row();
+                return;
+            case IdCtxMoveTop:
+            case IdCtxMoveUp:
+            case IdCtxMoveDown:
+                if (const auto* entry = selected_queue_entry()) {
+                    const std::string entry_id = entry->QueueEntryId;
+                    const auto direction = id == IdCtxMoveTop  ? ui::QueueMoveDirection::Top
+                                           : id == IdCtxMoveUp ? ui::QueueMoveDirection::Up
+                                                               : ui::QueueMoveDirection::Down;
+                    if (job_manager_.move_queue_entry(entry_id, direction)) {
+                        refresh_pane_data();
+                        const std::size_t offset = active_.has_value() ? 1 : 0;
+                        for (std::size_t i = 0; i < pane_queue_.size(); ++i) {
+                            if (pane_queue_[i].QueueEntryId == entry_id) {
+                                SendMessageW(tasks_list_, LB_SETCURSEL, i + offset, 0);
+                            }
+                        }
+                        update_pane_toolbar();
+                    }
+                }
+                return;
+            case IdCtxClearQueue:
+                if (confirm_box(L"Remove every waiting task from the queue? The tasks themselves stay.",
+                                L"XactCopy", ui::MessageIcon::Question)) {
+                    job_manager_.clear_queue();
+                    refresh_pane_data();
+                }
+                return;
+            case IdHistoryResumeButton:
+            case IdCtxResume:
+                if (const auto* run = selected_run()) {
+                    const std::string run_id = run->RunId;
+                    resume_managed_run(run_id);
+                }
+                return;
+            case IdHistoryJournalButton:
+            case IdCtxJournal:
+                if (const auto* run = selected_run()) {
+                    run_history_->open_journal(run->RunId);
+                    update_pane_toolbar();
+                }
+                return;
+            case IdCtxReport:
+                if (const auto* run = selected_run()) {
+                    run_history_->export_report(run->RunId);
+                    update_pane_toolbar();
+                }
+                return;
+            case IdCtxMap:
+                if (const auto* run = selected_run()) {
+                    run_history_->show_range_map(run->RunId);
+                    update_pane_toolbar();
+                }
+                return;
+            case IdCtxDeleteRun:
+                if (const auto* run = selected_run()) {
+                    job_manager_.delete_run(run->RunId);
+                    refresh_pane_data();
+                }
+                return;
+            case IdCtxClearHistory:
+                if (confirm_box(L"Delete all run history? Journals and copied files are not touched.",
+                                L"XactCopy", ui::MessageIcon::Warning)) {
+                    job_manager_.clear_run_history();
+                    refresh_pane_data();
+                }
+                return;
+            default:
+                return;
         }
-        for (auto& task : pending.tasks) {
-            task.state = ui::TaskState::Queued;
-            tasks_.add(std::move(task));
-        }
-        tasks_running_ = silent && pending.list_running;
-        append_log("Restored " + std::to_string(pending.tasks.size()) + " unstarted task(s)." +
-                   (tasks_running_ ? "" : " Press Start to run them."));
-        tasks_changed();
     }
 
-    // Keyboard handling for the two panel lists (Del removes; Enter starts a
-    // queued task), and right-click context menus.
+    // Moves pre-catalog session tasks (session-tasks.json) into the catalog as
+    // unpinned, queued tasks, then removes the file.
+    void migrate_legacy_session_tasks() {
+        const std::wstring path = ui::pending_tasks_path();
+        const auto legacy = ui::load_pending_tasks(path);
+        bool all_saved = true;
+        for (const auto& task : legacy) {
+            const std::string name =
+                task.display_name.empty() ? ui::task_title(task.options) : task.display_name;
+            auto saved = job_manager_.save_job(name, task.options, std::string(), /*pinned*/ false);
+            if (!saved.has_value()) {
+                all_saved = false;
+                continue;
+            }
+            job_manager_.enqueue_job(saved->JobId, /*front*/ false, "migration");
+        }
+        if (!legacy.empty()) {
+            append_log("Moved " + std::to_string(legacy.size()) +
+                       " unstarted task(s) from the previous version into the queue.");
+        }
+        if (all_saved) DeleteFileW(path.c_str());
+    }
+
+    // The queue waits for the user after a restart unless startup auto-run is
+    // on. An elevated relaunch continues the state the other window had.
+    void initialize_queue_state() {
+        const bool has_queue = !job_manager_.get_queue_entries().empty();
+        const bool auto_run = settings_.get_bool("AutoRunQueuedJobsOnStartup", false);
+        if (incoming_handoff_.has_value()) {
+            queue_held_ = settings_.get_bool("QueueHeld", false);
+        } else if (auto_run) {
+            queue_held_ = false;
+            queue_unattended_ = has_queue;
+        } else {
+            queue_held_ = has_queue;
+        }
+        set_check(IdPauseListCheck, queue_held_);
+        settings_.set_bool("QueueHeld", queue_held_);
+        if (has_queue && queue_held_ && !incoming_handoff_.has_value()) {
+            append_log("The queue from your last session is held. Untick Hold or use Start now to run it.");
+        }
+    }
+
+    // Asks what to do with unpinned tasks when the window closes. Returns
+    // false to cancel the close. `discard` is set when they should go.
+    bool decide_unpinned_tasks_on_exit(bool& discard) {
+        discard = false;
+        const std::int32_t unpinned = job_manager_.count_unpinned_jobs();
+        if (unpinned <= 0) return true;
+        const auto policy = ui::parse_task_exit_policy(settings_.get_string("TaskListOnExit", "ask"));
+        if (policy == ui::TaskExitPolicy::Keep) return true;
+        if (policy == ui::TaskExitPolicy::Discard) {
+            discard = true;
+            return true;
+        }
+        constexpr int KeepChoice = 101;
+        constexpr int DiscardChoice = 102;
+        bool remember = false;
+        const std::wstring text =
+            std::to_wstring(unpinned) +
+            (unpinned == 1 ? L" task is not pinned. Keep it for next time?"
+                           : L" tasks are not pinned. Keep them for next time?") +
+            L"\n\nPinned tasks and run history always stay.";
+        const int choice = ui::MessageDialog::show_choice(
+            hwnd_, theme_, L"XactCopy", text, ui::MessageIcon::Question,
+            {{L"Keep", KeepChoice}, {L"Discard", DiscardChoice}, {L"Cancel", IDCANCEL}},
+            L"Remember my choice (Settings \x2192 Recovery & Startup)", &remember);
+        if (choice != KeepChoice && choice != DiscardChoice) return false;
+        discard = choice == DiscardChoice;
+        if (remember) {
+            const char* value = ui::to_setting(discard ? ui::TaskExitPolicy::Discard : ui::TaskExitPolicy::Keep);
+            settings_.update_and_save([&](ui::AppSettings& target) { target.set_string("TaskListOnExit", value); });
+        }
+        return true;
+    }
+
+    // Keyboard handling for the two panel lists, and right-click menus.
     static LRESULT CALLBACK panel_list_subclass(HWND control, UINT message, WPARAM wparam,
                                                 LPARAM lparam, UINT_PTR, DWORD_PTR data) {
         auto* self = reinterpret_cast<MainWindow*>(data);
         if (message == WM_KEYDOWN) {
+            const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             if (control == self->sources_list_) {
                 if (wparam == VK_DELETE) { self->remove_selected_sources(); return 0; }
-                if (wparam == 'V' && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+                if (wparam == 'V' && ctrl) {
                     self->paste_sources();
                     return 0;
                 }
-                if (wparam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+                if (wparam == 'A' && ctrl) {
                     SendMessageW(control, LB_SETSEL, TRUE, -1);
                     return 0;
                 }
             } else if (control == self->tasks_list_) {
-                if (wparam == VK_DELETE) { self->on_task_command(IdTaskRemove); return 0; }
-                if (wparam == VK_RETURN) { self->on_task_command(IdTaskStartNow); return 0; }
+                const PaneView view = self->pane_view_;
+                if (wparam == VK_DELETE) {
+                    self->on_pane_command(view == PaneView::Tasks   ? IdCtxRemove
+                                          : view == PaneView::Queue ? IdCtxStop
+                                                                    : IdCtxDeleteRun);
+                    return 0;
+                }
+                if (wparam == VK_RETURN) {
+                    self->on_pane_command(view == PaneView::Tasks   ? IdCtxRun
+                                          : view == PaneView::Queue ? IdCtxStartNow
+                                                                    : IdCtxResume);
+                    return 0;
+                }
+                if (view == PaneView::Queue && ctrl && (wparam == VK_UP || wparam == VK_DOWN)) {
+                    self->on_pane_command(wparam == VK_UP ? IdCtxMoveUp : IdCtxMoveDown);
+                    return 0;
+                }
             }
         }
         if (message == WM_GETDLGCODE && (wparam == VK_RETURN || wparam == VK_DELETE)) {
@@ -2977,7 +3565,7 @@ private:
         }
         if (message == WM_CONTEXTMENU) {
             if (control == self->sources_list_) self->show_sources_context_menu(lparam);
-            else self->show_tasks_context_menu(lparam);
+            else self->show_pane_context_menu(lparam);
             return 0;
         }
         if (message == WM_RBUTTONDOWN) {
@@ -2987,6 +3575,8 @@ private:
                 const int index = LOWORD(hit);
                 if (control == self->tasks_list_) {
                     SendMessageW(control, LB_SETCURSEL, index, 0);
+                    self->update_pane_toolbar();
+                    if (self->pane_view_ == PaneView::History) self->refresh_history_details();
                 } else if (SendMessageW(control, LB_GETSEL, index, 0) <= 0) {
                     SendMessageW(control, LB_SETSEL, FALSE, -1);
                     SendMessageW(control, LB_SETSEL, TRUE, index);
@@ -3295,16 +3885,46 @@ private:
             y = margin;
             const int width = right_width;
 
-            place(tasks_label_, 0, width, tab_height);
+            // Tasks | Queue | History switch, level with Copy | Assess.
+            const int tab_width = std::min(width / 3, scale(124));
+            place(tasks_tab_, 0, tab_width, tab_height);
+            place(queue_tab_, tab_width - 1, tab_width + 1, tab_height);
+            place(history_tab_, tab_width * 2 - 1, tab_width + 1, tab_height);
             y += tab_height + section_gap;
-            // Toolbar row level with the add buttons opposite.
+            // The view's few actions, level with the add buttons opposite.
             y += header_height - row_height;
-            const int finished_width = scale(118);
-            place(pause_list_check_, 0, std::max(0, width - finished_width - gap), row_height);
-            place(clear_finished_button_, width - finished_width, finished_width);
+            {
+                const bool tasks_view = pane_view_ == PaneView::Tasks;
+                const bool queue_view = pane_view_ == PaneView::Queue;
+                const bool history_view = pane_view_ == PaneView::History;
+                for (HWND control : {run_task_button_, queue_task_button_}) show(control, tasks_view);
+                for (HWND control : {queue_start_button_, queue_stop_button_, hold_queue_check_}) {
+                    show(control, queue_view);
+                }
+                for (HWND control : {history_resume_button_, history_journal_button_}) {
+                    show(control, history_view);
+                }
+                const int narrow = scale(78);
+                const int wide = scale(96);
+                if (tasks_view) {
+                    place(run_task_button_, 0, narrow);
+                    place(queue_task_button_, narrow + gap, narrow);
+                } else if (queue_view) {
+                    place(queue_start_button_, 0, wide);
+                    place(queue_stop_button_, wide + gap, narrow);
+                    const int hold_width = scale(70);
+                    place(hold_queue_check_, width - hold_width, hold_width);
+                } else {
+                    place(history_resume_button_, 0, wide);
+                    place(history_journal_button_, wide + gap, wide);
+                }
+            }
             y += row_height + scale(6);
             place(tasks_list_, 0, width, tasks_height);
-            y += tasks_height + scale(3) + label_height + section_gap;
+            y += tasks_height + scale(3);
+            place(pane_footer_, 0, width, label_height);
+            y += label_height + section_gap;
+            const int detail_top = y;
 
             // Running task: heading with Pause/Cancel beside it, then detail.
             const int control_width = scale(92);
@@ -3337,8 +3957,6 @@ private:
                 y += label_height;
             };
             place_two(throughput_label_, eta_label_);
-            show(buffer_usage_label_, show_buffer_row_);
-            show(rescue_label_, show_rescue_row_);
             if (show_buffer_row_ || show_rescue_row_) {
                 place_two(show_buffer_row_ ? buffer_usage_label_ : nullptr,
                           show_rescue_row_ ? rescue_label_ : nullptr);
@@ -3347,10 +3965,27 @@ private:
             y += label_height;
             place(journal_label_, 0, width, label_height);
             y += label_height;
-            show(diagnostics_label_, show_diagnostics_);
             if (show_diagnostics_) {
                 place(diagnostics_label_, 0, width, label_height);
                 y += label_height;
+            }
+            // History shows the selected run in the same space instead.
+            const bool running_view = pane_view_ != PaneView::History;
+            for (HWND control : {detail_label_, pause_button_, cancel_button_, current_label_,
+                                 file_progress_label_, current_bar_, overall_progress_label_,
+                                 overall_bar_, stats_label_, throughput_label_, eta_label_,
+                                 job_summary_label_, journal_label_}) {
+                show(control, running_view);
+            }
+            show(buffer_usage_label_, running_view && show_buffer_row_);
+            show(rescue_label_, running_view && show_rescue_row_);
+            show(diagnostics_label_, running_view && show_diagnostics_);
+            show(history_details_, !running_view);
+            if (!running_view) {
+                const int detail_bottom = y;
+                y = detail_top;
+                place(history_details_, 0, width, std::max(scale(40), detail_bottom - detail_top));
+                y = detail_bottom;
             }
             return y - margin;
         };
@@ -3447,23 +4082,32 @@ private:
             InvalidateRect(options_toggle_, nullptr, FALSE);
         }
         if (id == IdPauseListCheck && notification == BN_CLICKED) {
-            set_check(id, !get_check(id));
-            InvalidateRect(pause_list_check_, nullptr, FALSE);
+            set_queue_held(!queue_held_);
+            return;
+        }
+        if ((id == IdTasksTab || id == IdQueueTab || id == IdHistoryTab) && notification == BN_CLICKED) {
+            set_pane_view(id == IdTasksTab   ? PaneView::Tasks
+                          : id == IdQueueTab ? PaneView::Queue
+                                             : PaneView::History);
+            return;
+        }
+        if (id == IdTasksList && notification == LBN_SELCHANGE) {
+            update_pane_toolbar();
+            if (pane_view_ == PaneView::History) refresh_history_details();
             return;
         }
         if (id == IdTasksList && notification == LBN_DBLCLK) {
-            if (const ui::SessionTask* task = selected_task()) {
-                if (task->state == ui::TaskState::Queued) on_task_command(IdTaskStartNow);
-                else if (ui::is_finished(task->state)) on_task_command(IdTaskEdit);
-            }
+            // Safe on a double-click: never starts a copy.
+            if (pane_view_ == PaneView::Tasks) on_pane_command(IdCtxEdit);
+            return;
+        }
+        if ((id >= IdTaskRunButton && id <= IdHistoryJournalButton) ||
+            (id >= IdCtxRun && id <= IdCtxClearHistory)) {
+            on_pane_command(id);
             return;
         }
         if (id >= IdSourceRemove && id <= IdSourceCopyPath) {
             on_source_command(id);
-            return;
-        }
-        if (id >= IdTaskStartNow && id <= IdTaskEdit) {
-            on_task_command(id);
             return;
         }
         if (id == IdModeCombo && notification == CBN_SELCHANGE) {
@@ -3517,11 +4161,7 @@ private:
                 set_options_expanded(!options_expanded_);
                 break;
             case IdAddTaskButton:
-                add_tasks_from_builder();
-                break;
-            case IdClearFinished:
-                tasks_.clear_finished();
-                tasks_changed();
+                add_tasks_from_builder(/*queue*/ false);
                 break;
             case IdStartButton:
                 start_job();
@@ -3603,11 +4243,18 @@ private:
             case IdMenuSaveAsJob:
                 save_current_as_job();
                 break;
-            case IdMenuJobManager:
-                open_job_manager();
+            case IdMenuViewTasks:
+                set_pane_view(PaneView::Tasks);
+                break;
+            case IdMenuViewQueue:
+                set_pane_view(PaneView::Queue);
+                break;
+            case IdMenuViewHistory:
+                set_pane_view(PaneView::History);
                 break;
             case IdMenuRunNextQueued:
-                run_next_queued_job(/*manual*/ true);
+                set_pane_view(PaneView::Queue);
+                set_queue_held(false);
                 break;
             case IdMenuCheckUpdates:
                 check_for_updates(/*show_dialog*/ true);
@@ -3664,27 +4311,9 @@ private:
                                                L"Name for this saved job:", suggested);
         if (!name.has_value() || ui_is_blank(*name)) return;
         if (auto saved = job_manager_.save_job(*name, options)) {
-            append_log("Saved job '" + saved->Name + "'.");
-        }
-    }
-
-    void open_job_manager() {
-        ui::JobManagerRequest request =
-            ui::JobManagerDialog::show(hwnd_, job_manager_, theme_, settings_);
-        switch (request.action) {
-            case ui::JobManagerRequestAction::RunSavedJob:
-                if (!ui_is_blank(request.job_id)) run_saved_job(request.job_id);
-                break;
-            case ui::JobManagerRequestAction::RunQueuedEntry:
-                if (!ui_is_blank(request.queue_entry_id)) {
-                    run_queued_entry(request.queue_entry_id, /*manual*/ true);
-                }
-                break;
-            case ui::JobManagerRequestAction::ResumeRun:
-                if (!ui_is_blank(request.run_id)) resume_managed_run(request.run_id);
-                break;
-            default:
-                break;
+            append_log("Saved pinned task '" + saved->Name + "'.");
+            set_pane_view(PaneView::Tasks);
+            refresh_pane_data();
         }
     }
 
@@ -3739,75 +4368,6 @@ private:
         apply_run_options_to_ui(options);
         append_log("Resuming run '" + run->DisplayName + "' from " + journal_path + ".");
         start_job_with(options, true, run->RunId, run->DisplayName);
-    }
-
-    void run_saved_job(const std::string& job_id) {
-        if (supervisor_.is_job_running()) {
-            info_box(L"A copy run is already in progress.");
-            return;
-        }
-        auto job = job_manager_.get_job_by_id(job_id);
-        if (!job.has_value()) {
-            warn_box(L"Selected job no longer exists.");
-            return;
-        }
-        auto run = job_manager_.create_run_for_job(job->JobId, "job-manager");
-        std::string managed_run_id = run.has_value() ? run->RunId : std::string();
-        start_job_with(job->Options, false, managed_run_id, job->Name);
-    }
-
-    void run_next_queued_job(bool manual) { run_queued_entry(std::string(), manual); }
-
-    // Dequeues (a specific entry or the next) and starts it; skips empties and
-    // keeps draining like MainForm.RunQueuedEntryByIdAsync.
-    void run_queued_entry(const std::string& queue_entry_id, bool manual) {
-        if (supervisor_.is_job_running()) return;
-        std::string target = queue_entry_id;
-        bool show_empty_dialog = manual;
-        if (!manual && ui_is_blank(target)) {
-            // Do not dequeue attended-only jobs merely to reject them. Leave
-            // each one in place with a concrete reason, and continue looking
-            // for a later queue entry that is safe to run unattended.
-            const auto queued = job_manager_.get_queue_entries();
-            target.clear();
-            for (const auto& candidate : queued) {
-                auto job = job_manager_.get_job_by_id(candidate.JobId);
-                if (!job.has_value()) continue;
-                const std::string issue = job->Options.unattended_policy_issue();
-                if (issue.empty()) {
-                    target = candidate.QueueEntryId;
-                    break;
-                }
-                if (job_manager_.mark_queue_entry_blocked(candidate.QueueEntryId, issue)) {
-                    append_log("Deferred automatic queued job '" + job->Name + "': " + issue + ".");
-                }
-            }
-            if (target.empty()) return;
-        }
-        for (;;) {
-            ui::QueuedJobWorkItem work_item;
-            bool dequeued = ui_is_blank(target)
-                                ? job_manager_.try_dequeue_next_job(work_item)
-                                : job_manager_.try_dequeue_queued_entry(target, work_item);
-            if (!dequeued) {
-                if (show_empty_dialog) {
-                    const wchar_t* message =
-                        ui_is_blank(target)
-                            ? L"No queued jobs are waiting to run."
-                            : L"Selected queue entry no longer exists.";
-                    info_box(message);
-                }
-                return;
-            }
-
-            std::string trigger = manual ? "queued-manual" : "queued-auto";
-            auto run = job_manager_.create_run_for_job(work_item.Job.JobId, trigger,
-                                                       work_item.QueueEntryId, work_item.Attempt);
-            std::string managed_run_id = run.has_value() ? run->RunId : std::string();
-            append_log("Dequeued job '" + work_item.Job.Name + "'.");
-            start_job_with(work_item.Job.Options, false, managed_run_id, work_item.Job.Name);
-            return;
-        }
     }
 
     static std::string display_source(const models::CopyJobOptions& options) {
@@ -4235,16 +4795,7 @@ private:
 
     // Start: add tasks for the builder's sources and run the list. While a
     // task is running the new tasks simply queue behind it.
-    void start_job() {
-        if (add_tasks_from_builder() <= 0) return;
-        tasks_running_ = true;
-        persist_pending_tasks();
-        if (supervisor_.is_job_running() || starting_) {
-            append_log("Queued; the new task(s) start after the current one.");
-            return;
-        }
-        run_next_task();
-    }
+    void start_job() { add_tasks_from_builder(/*queue*/ true); }
 
     static void bind_media_identities(models::CopyJobOptions& options) {
         if (options.ExpectedSourceIdentity.empty()) {
@@ -4517,7 +5068,7 @@ private:
                            request.DisplayName);
             pending_recovery_run_id_.clear();
         }
-        settle_unstarted_task(running_task_id_, "Not started: administrator approval unavailable");
+        settle_after_start_attempt();
     }
 
     void on_start_done(bool ok, const std::string& error) {
@@ -4558,13 +5109,12 @@ private:
                 job_manager_.mark_run_completed(active_managed_run_id_, failure);
                 active_managed_run_id_.clear();
             }
-            if (ui::SessionTask* task = tasks_.find(running_task_id_)) {
-                task->state = ui::TaskState::Failed;
-                task->outcome = "Could not start: " + error;
-            }
-            running_task_id_ = 0;
-            tasks_running_ = false; // a start failure would repeat for every queued task
-            tasks_changed();
+            active_.reset();
+            // A start failure would repeat for every queued task.
+            queue_held_ = true;
+            set_check(IdPauseListCheck, true);
+            settings_.set_bool("QueueHeld", true);
+            refresh_pane_data();
             set_inputs_enabled(true);
             SetWindowTextW(status_label_, L"Status: Idle");
             update_menu_state();
@@ -5043,15 +5593,15 @@ private:
         }
 
         // Mirror the headline numbers onto the running task's row.
-        if (ui::SessionTask* task = tasks_.find(running_task_id_)) {
-            task->progress = snapshot.overall_progress();
-            task->bytes_per_second = smoothed_bytes_per_second_;
-            task->eta_seconds = remaining_bytes <= 0 ? 0
-                                : reference_speed > 1.0
-                                    ? static_cast<std::int64_t>(static_cast<double>(remaining_bytes) /
-                                                                reference_speed)
-                                    : -1;
-            invalidate_task_row(task->id);
+        if (active_.has_value()) {
+            active_->progress = snapshot.overall_progress();
+            active_->bytes_per_second = smoothed_bytes_per_second_;
+            active_->eta_seconds = remaining_bytes <= 0 ? 0
+                                   : reference_speed > 1.0
+                                       ? static_cast<std::int64_t>(static_cast<double>(remaining_bytes) /
+                                                                   reference_speed)
+                                       : -1;
+            invalidate_active_row();
         }
 
         if (snapshot.BufferSizeBytes > 0 && snapshot.LastChunkBytesTransferred > 0) {
@@ -5167,21 +5717,11 @@ private:
 
     void on_run_next_task() {
         if (supervisor_.is_job_running() || starting_ || outgoing_handoff_.has_value()) return;
-        if (tasks_running_ && tasks_.next_queued() != nullptr) {
-            if (get_check(IdPauseListCheck)) {
-                tasks_running_ = false;
-                persist_pending_tasks();
-                append_log("Task list paused after the current task. Press Start or use Start now to continue.");
-                return;
-            }
-            run_next_task();
+        if (queue_held_ && run_next_entry_id_.empty() && !pane_queue_.empty()) {
+            append_log("The queue is held. Untick Hold or use Start now to continue.");
             return;
         }
-        if (tasks_running_) {
-            tasks_running_ = false;
-            persist_pending_tasks();
-        }
-        run_next_queued_job(/*manual*/ false);
+        run_next_in_queue();
     }
 
     // ---- Journal retention -------------------------------------------------

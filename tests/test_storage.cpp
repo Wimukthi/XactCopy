@@ -1024,7 +1024,8 @@ storage::JobCatalog build_canonical_catalog() {
 }
 
 void verify_canonical_catalog(const storage::JobCatalog& catalog, const std::string& tag) {
-    check(catalog.SchemaVersion == 3, tag + ": catalog schema 3");
+    check(catalog.SchemaVersion == storage::JobCatalogStore::CurrentSchemaVersion,
+          tag + ": catalog schema current");
     check(catalog.Jobs.size() == 1, tag + ": one job");
     if (catalog.Jobs.size() == 1) {
         const auto& job = catalog.Jobs[0];

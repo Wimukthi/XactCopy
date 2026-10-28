@@ -215,7 +215,7 @@ are stable and inspectable.
   still readable in a text editor. Reads sniff the magic, so plain-JSON snapshots
   — written by older builds, or by the retired .NET build — keep loading
   unchanged. The ledger hashes the bytes as written, compressed or not.
-  Job Manager's **Open Journal** action validates the trusted snapshot, exports
+  The History view's **Journal** action validates the trusted snapshot, exports
   a readable JSON view under `%LOCALAPPDATA%\XactCopy\journal-views\`, and opens
   that view; the resumable XCJZ snapshot is never modified.
   Bad-range maps, the job catalog, ledgers, and anchors are all small and stay

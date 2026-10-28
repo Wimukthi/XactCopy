@@ -303,8 +303,32 @@ public:
         return dialog.run(owner, title);
     }
 
+    // A message with caller-named buttons ({label, result id}, leftmost first)
+    // and an optional checkbox, e.g. "Remember my choice". Esc / the close box
+    // returns IDCANCEL. `checked` is read for the initial state and updated.
+    static int show_choice(HWND owner, const ThemePalette& theme, const std::wstring& title,
+                           const std::wstring& message, MessageIcon icon,
+                           const std::vector<std::pair<std::wstring, int>>& buttons,
+                           const std::wstring& check_text = std::wstring(),
+                           bool* checked = nullptr) {
+        MessageDialog dialog(theme, message, icon, MessageButtons::OkCancel);
+        dialog.custom_labels_.clear();
+        for (const auto& button : buttons) dialog.custom_labels_.push_back(button.first);
+        dialog.button_specs_.clear();
+        for (std::size_t i = 0; i < buttons.size(); ++i) {
+            dialog.button_specs_.push_back({dialog.custom_labels_[i].c_str(), buttons[i].second});
+        }
+        dialog.result_ = IDCANCEL;
+        dialog.check_text_ = check_text;
+        dialog.checked_ = checked != nullptr && *checked;
+        const int result = dialog.run(owner, title);
+        if (checked != nullptr) *checked = dialog.checked_;
+        return result;
+    }
+
 private:
     static constexpr int IdFirstButton = 2400;
+    static constexpr int IdCheck = 2450;
 
     ThemePalette theme_;
     std::wstring message_;
@@ -320,6 +344,10 @@ private:
     std::vector<ButtonSpec> button_specs_;
     std::vector<HWND> button_windows_;
     TooltipManager tooltips_;
+    std::vector<std::wstring> custom_labels_; // backs button_specs_ for show_choice
+    std::wstring check_text_;
+    bool checked_ = false;
+    HWND check_window_ = nullptr;
 
     MessageDialog(const ThemePalette& theme, const std::wstring& message, MessageIcon icon,
                   MessageButtons buttons)
@@ -372,8 +400,12 @@ private:
             MoveWindow(button, x, y, button_width, button_height, TRUE);
             x -= button_width + gap;
         }
+        if (check_window_ != nullptr) {
+            // Its own row above the buttons, so a long label never collides.
+            MoveWindow(check_window_, margin, y - s(34), client.right - margin * 2, s(24), TRUE);
+        }
         text_rect_ = {margin + (icon_ == MessageIcon::None ? 0 : s(48)), margin,
-                      client.right - margin, y - s(12)};
+                      client.right - margin, y - s(check_window_ != nullptr ? 46 : 12)};
         tooltips_.update_layout();
     }
 
@@ -415,6 +447,7 @@ private:
         // Buttons need room too (max 3 at 96 + gaps).
         width = std::max(width, 40 + static_cast<int>(button_specs_.size()) * 104);
         int height = 24 + std::max(text_h, (icon_ == MessageIcon::None) ? 0 : 32) + 24 + 30 + 20;
+        if (!check_text_.empty()) height += 34;
         height = std::max(height, 150);
 
         HWND hwnd = host_.create(owner, L"XactCopyMessageDlg", title.c_str(), width, height,
@@ -445,6 +478,14 @@ private:
                     button_windows_.push_back(b);
                 }
                 if (!button_windows_.empty()) SetFocus(button_windows_.back());
+                if (!check_text_.empty()) {
+                    check_window_ = CreateWindowExW(
+                        0, L"BUTTON", check_text_.c_str(),
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, hwnd,
+                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IdCheck)),
+                        GetModuleHandleW(nullptr), nullptr);
+                    SendMessageW(check_window_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                }
                 tooltips_.create(hwnd, dpi_, theme_.dark);
                 for (HWND button : button_windows_) {
                     switch (GetDlgCtrlID(button)) {
@@ -481,6 +522,9 @@ private:
                 for (HWND button : button_windows_) {
                     SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
                 }
+                if (check_window_ != nullptr) {
+                    SendMessageW(check_window_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                }
                 tooltips_.update_dpi(dpi_);
                 apply_window_icons(hwnd);
                 relayout(hwnd);
@@ -514,12 +558,28 @@ private:
                 handled = true;
                 return 0;
             }
-            case WM_DRAWITEM:
-                themedraw::draw_button(*reinterpret_cast<DRAWITEMSTRUCT*>(lparam), theme_);
+            case WM_DRAWITEM: {
+                const auto& draw = *reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
+                if (static_cast<int>(draw.CtlID) == IdCheck) {
+                    themedraw::draw_checkbox(draw, theme_, checked_);
+                } else {
+                    themedraw::draw_button(draw, theme_);
+                }
                 handled = true;
                 return TRUE;
+            }
+            case WM_CTLCOLORBTN:
+                SetBkColor(reinterpret_cast<HDC>(wparam), theme_.window);
+                handled = true;
+                return reinterpret_cast<LRESULT>(window_brush_);
             case WM_COMMAND: {
                 int id = LOWORD(wparam);
+                if (id == IdCheck) {
+                    checked_ = !checked_;
+                    InvalidateRect(check_window_, nullptr, FALSE);
+                    handled = true;
+                    return 0;
+                }
                 for (const auto& spec : button_specs_) {
                     if (spec.id == id) {
                         result_ = id;
@@ -779,8 +839,11 @@ private:
             section(5, "Startup");
             check(5, "Auto-start on next logon after interruption", "EnableRecoveryAutostart",
                   true);
-            check(5, "Automatically run queued jobs on startup", "AutoRunQueuedJobsOnStartup",
+            check(5, "Run the queue automatically on startup", "AutoRunQueuedJobsOnStartup",
                   false);
+            section(5, "Tasks");
+            combo(5, "Unpinned tasks on exit", "TaskListOnExit",
+                  {L"Ask", L"Keep", L"Discard"}, {"ask", "keep", "discard"}, "ask");
             section(5, "Interrupted Run Handling");
             check(5, "Prompt to resume interrupted runs", "PromptResumeAfterCrash", true);
             check(5, "Auto-resume interrupted runs", "AutoResumeAfterCrash", false);
@@ -883,7 +946,8 @@ private:
         if (setting == "DefaultSampleVerificationChunkCount") return L"Number of distributed regions compared in Sampled mode. More samples improve coverage and cost more reads.";
 
         if (setting == "EnableRecoveryAutostart") return L"Register XactCopy to start at the next logon after an interrupted run so recovery can be offered.";
-        if (setting == "AutoRunQueuedJobsOnStartup") return L"Automatically dequeue and run saved jobs when XactCopy starts.";
+        if (setting == "AutoRunQueuedJobsOnStartup") return L"Start the queue when XactCopy starts instead of holding it. Tasks with attended-only settings are skipped and stay queued.";
+        if (setting == "TaskListOnExit") return L"What happens to tasks you have not pinned when XactCopy closes: ask each time, always keep them, or discard them. Pinned tasks always stay.";
         if (setting == "PromptResumeAfterCrash") return L"Offer to resume a journaled run after XactCopy or the worker ended unexpectedly.";
         if (setting == "AutoResumeAfterCrash") return L"Resume an interrupted run without asking. Leave disabled when source or destination media may have changed.";
         if (setting == "KeepResumePromptUntilResolved") return L"Continue showing the recovery prompt on later launches until the interrupted run is resumed or dismissed.";
@@ -2005,5 +2069,195 @@ private:
         InvalidateRect(hwnd, nullptr, TRUE);
     }
 };
+
+// ---------------------------------------------------------------------------
+// TextPromptDialog — one-line text input (mirrors .NET TextPromptDialog).
+// ---------------------------------------------------------------------------
+
+class TextPromptDialog {
+public:
+    static std::optional<std::string> show(HWND owner, const ThemePalette& theme,
+                                           const std::wstring& title, const std::wstring& prompt,
+                                           const std::string& initial_value) {
+        TextPromptDialog dialog(theme, prompt, initial_value);
+        dialog.host_.set_density_percent(theme.density_percent);
+        dialog.host_.set_scale_percent(theme.scale_percent);
+        dialog.host_.create(owner, L"XactCopyTextPrompt", title.c_str(), 380, 150,
+                            [&dialog](HWND h, UINT m, WPARAM w, LPARAM l, bool& handled) {
+                                return dialog.proc(h, m, w, l, handled);
+                            });
+        dialog.host_.run_modal();
+        if (dialog.font_ != nullptr) DeleteObject(dialog.font_);
+        if (dialog.window_brush_ != nullptr) DeleteObject(dialog.window_brush_);
+        if (dialog.edit_brush_ != nullptr) DeleteObject(dialog.edit_brush_);
+        return dialog.result_;
+    }
+
+private:
+    static constexpr int IdEdit = 2001;
+    static constexpr int IdOk = 2002;
+    static constexpr int IdCancel = 2003;
+
+    TextPromptDialog(const ThemePalette& theme, std::wstring prompt, std::string initial)
+        : theme_(theme), prompt_(std::move(prompt)), initial_(std::move(initial)) {}
+
+    void rebuild_font(UINT monitor_dpi) {
+        dpi_ = ui_layout_dpi(monitor_dpi, theme_.density_percent, theme_.scale_percent);
+        if (font_ != nullptr) DeleteObject(font_);
+        font_ = CreateFontW(-MulDiv(9, static_cast<int>(dpi_), 72), 0, 0, 0, FW_NORMAL,
+                            FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    }
+
+    void relayout(HWND hwnd) {
+        if (label_ == nullptr) return;
+        auto scale = [this](int value) { return MulDiv(value, static_cast<int>(dpi_), 96); };
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        MoveWindow(label_, scale(12), scale(10), client.right - scale(24), scale(18), TRUE);
+        MoveWindow(edit_, scale(12), scale(32), client.right - scale(24), scale(24), TRUE);
+        MoveWindow(ok_button_, client.right - scale(188), client.bottom - scale(36), scale(84),
+                   scale(26), TRUE);
+        MoveWindow(cancel_button_, client.right - scale(96), client.bottom - scale(36), scale(84),
+                   scale(26), TRUE);
+        tooltips_.update_layout();
+    }
+
+    LRESULT proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam, bool& handled) {
+        switch (message) {
+            case WM_CREATE: {
+                set_dark_title_bar(hwnd, theme_.dark && theme_.themed_chrome);
+                apply_window_icons(hwnd);
+                window_brush_ = CreateSolidBrush(theme_.window);
+                edit_brush_ = CreateSolidBrush(theme_.edit);
+                rebuild_font(GetDpiForWindow(hwnd));
+                label_ = CreateWindowExW(0, L"STATIC", prompt_.c_str(),
+                                         WS_CHILD | WS_VISIBLE | SS_NOPREFIX, 0, 0, 0, 0, hwnd,
+                                         nullptr, GetModuleHandleW(nullptr), nullptr);
+                SendMessageW(label_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                edit_ = CreateWindowExW(0, L"EDIT",
+                                        storage::fsutil::utf8_to_wide(initial_).c_str(),
+                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL |
+                                            WS_BORDER,
+                                        0, 0, 0, 0, hwnd,
+                                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IdEdit)),
+                                        GetModuleHandleW(nullptr), nullptr);
+                SendMessageW(edit_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                apply_control_theme(edit_, theme_.dark);
+                SendMessageW(edit_, EM_SETSEL, 0, -1);
+                auto make_button = [&](int id, const wchar_t* text) {
+                    HWND button = CreateWindowExW(
+                        0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                        0, 0, 0, 0, hwnd,
+                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                        GetModuleHandleW(nullptr), nullptr);
+                    SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                    return button;
+                };
+                ok_button_ = make_button(IdOk, L"OK");
+                cancel_button_ = make_button(IdCancel, L"Cancel");
+                tooltips_.create(hwnd, dpi_, theme_.dark);
+                tooltips_.add(label_, prompt_.c_str());
+                tooltips_.add(edit_, L"Enter the requested name or value. The current text is selected so typing replaces it.");
+                tooltips_.add(ok_button_, L"Accept the entered value and continue.");
+                tooltips_.add(cancel_button_, L"Close this prompt without applying the entered value.");
+                relayout(hwnd);
+                SetFocus(edit_);
+                handled = true;
+                return 0;
+            }
+            case WM_SIZE:
+                relayout(hwnd);
+                handled = true;
+                return 0;
+            case WM_DPICHANGED: {
+                rebuild_font(HIWORD(wparam) != 0 ? HIWORD(wparam) : LOWORD(wparam));
+                const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
+                SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+                for (HWND control : {label_, edit_, ok_button_, cancel_button_}) {
+                    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                }
+                tooltips_.update_dpi(dpi_);
+                apply_window_icons(hwnd);
+                relayout(hwnd);
+                RedrawWindow(hwnd, nullptr, nullptr,
+                             RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+                handled = true;
+                return 0;
+            }
+            case WM_ERASEBKGND: {
+                RECT client;
+                GetClientRect(hwnd, &client);
+                themedraw::fill_rect(reinterpret_cast<HDC>(wparam), client, theme_.window);
+                handled = true;
+                return 1;
+            }
+            case WM_CTLCOLORSTATIC: {
+                HDC dc = reinterpret_cast<HDC>(wparam);
+                SetTextColor(dc, theme_.text);
+                SetBkColor(dc, theme_.window);
+                handled = true;
+                return reinterpret_cast<LRESULT>(window_brush_);
+            }
+            case WM_CTLCOLOREDIT: {
+                HDC dc = reinterpret_cast<HDC>(wparam);
+                SetTextColor(dc, theme_.text);
+                SetBkColor(dc, theme_.edit);
+                handled = true;
+                return reinterpret_cast<LRESULT>(edit_brush_);
+            }
+            case WM_DRAWITEM:
+                themedraw::draw_button(*reinterpret_cast<DRAWITEMSTRUCT*>(lparam), theme_);
+                handled = true;
+                return TRUE;
+            case WM_COMMAND: {
+                int id = LOWORD(wparam);
+                if (id == IdOk || (id == IDOK && HIWORD(wparam) == 0)) {
+                    wchar_t buffer[512]{};
+                    GetWindowTextW(edit_, buffer, 511);
+                    result_ = storage::fsutil::wide_to_utf8(buffer);
+                    host_.destroy();
+                    handled = true;
+                    return 0;
+                }
+                if (id == IdCancel || id == IDCANCEL) {
+                    host_.destroy();
+                    handled = true;
+                    return 0;
+                }
+                return 0;
+            }
+            case WM_CLOSE:
+                host_.destroy();
+                handled = true;
+                return 0;
+            case WM_DESTROY:
+                handled = true;
+                return 0;
+            default:
+                return 0;
+        }
+        (void)lparam;
+    }
+
+    dialog_detail::ModalHost host_;
+    ThemePalette theme_;
+    std::wstring prompt_;
+    std::string initial_;
+    std::optional<std::string> result_;
+    HWND label_ = nullptr;
+    HWND edit_ = nullptr;
+    HWND ok_button_ = nullptr;
+    HWND cancel_button_ = nullptr;
+    UINT dpi_ = 96;
+    HFONT font_ = nullptr;
+    HBRUSH window_brush_ = nullptr;
+    HBRUSH edit_brush_ = nullptr;
+    TooltipManager tooltips_;
+};
+
 
 } // namespace xact::ui

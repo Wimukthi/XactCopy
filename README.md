@@ -47,9 +47,10 @@ transfer. XactCopy treats bad media as the expected case:
   extents directly on local NTFS volumes and falls back safely when unsupported.
 - **Integrity verification** — full SHA-256 verification is the safe default;
   sampled and unverified modes remain available as attended-only choices.
-- **Job Manager** — save copy/scan jobs in a signed, rotating catalog, queue
-  integrity-safe jobs for unattended execution, and review run history with
-  per-run status and journal links.
+- **Tasks, queue, and history** — build tasks, line them up in a queue you can
+  hold, reorder, and stop, and review every run with its journal, report, and
+  bad-range map, all in the main window and kept in a signed, rotating catalog.
+  Pin the tasks you want to keep; integrity-safe tasks can run unattended.
 - **Crash recovery** — if XactCopy or the machine goes down mid-transfer, the
   next launch offers to resume the interrupted run.
 - **Explorer integration** — right-click any file, folder, or drive to *Copy with
@@ -84,13 +85,14 @@ file next to every asset so you can verify the download.
    - **Copy**: copy and verify data from source to destination.
    - **Assess readability**: read allocated source files and map unreadable regions (no
      destination needed).
-3. Adjust options if you like — the defaults are sensible — then press **Start**.
-   The work appears in the **Tasks** list with progress, throughput, and ETA;
-   more tasks can be queued while one runs, and **Pause** and **Cancel** stay
-   available throughout.
+3. Adjust options if you like (the defaults are sensible), then press **Add to
+   queue** to run it, or **Add to tasks** to keep it for later and press **Run**
+   when you are ready. The **Queue** view shows progress, throughput, and ETA;
+   more work can be queued while one task runs, and **Pause**, **Cancel**, and
+   **Stop** stay available throughout.
 
 The main-window choices are per-task overrides. Use **Save defaults** when you
-want the reusable options to seed future runs; use a saved job when the mode,
+want the reusable options to seed future runs; pin a task when the mode,
 paths, and complete option set must be retained together.
 
 For an actively failing drive, copy the irreplaceable data first with **Recover

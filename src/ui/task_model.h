@@ -1,25 +1,23 @@
 // -----------------------------------------------------------------------------
 // File: src\ui\task_model.h
-// Purpose: HWND-free model behind the main window's "What to copy" and "Tasks"
-//          panels: the user's source items, how they split into worker jobs,
-//          the session task list and its states, and the small pending-task
-//          file that lets unstarted tasks survive a restart or an elevation
-//          handoff. Everything here is pure logic so it can be unit-tested.
+// Purpose: HWND-free model behind the main window's "What to copy" list and
+//          the Tasks / Queue / History panes: the user's source items, how they
+//          split into worker jobs, task states and labels, the on-exit policy,
+//          and the reader for the legacy session-task file. Everything here is
+//          pure logic so it can be unit-tested.
 // -----------------------------------------------------------------------------
 
 #pragma once
 
 #include <algorithm>
-#include <condition_variable>
 #include <cstdint>
-#include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "../core/json.h"
 #include "../core/models.h"
+#include "../storage/job_catalog.h"
 #include "../storage/stores.h"
 
 namespace xact::ui {
@@ -180,8 +178,15 @@ inline std::string summarize_options(const models::CopyJobOptions& options) {
 }
 
 // ---- Tasks -------------------------------------------------------------------
+//
+// Tasks are the job catalog's saved jobs (JobManagerService): a pinned job
+// always stays, an unpinned one was added from the builder and follows the
+// on-exit choice. The queue is the catalog's queue, and history is its run
+// records. What lives here is the state of the one job that is starting or
+// running, and the pure helpers the panes draw from.
 
 enum class TaskState {
+    Ready,      // never run
     Queued,
     Starting,
     WaitingForElevation,
@@ -196,6 +201,7 @@ enum class TaskState {
 
 inline const char* to_display(TaskState state) {
     switch (state) {
+        case TaskState::Ready: return "Ready";
         case TaskState::Queued: return "Queued";
         case TaskState::Starting: return "Starting";
         case TaskState::WaitingForElevation: return "Waiting for administrator approval";
@@ -236,17 +242,36 @@ inline TaskState state_from_result(const models::CopyJobResult& result) {
     return TaskState::Failed;
 }
 
+// The state a history record shows as (its colour and label in the panes).
+inline TaskState state_from_run(const storage::ManagedJobRun& run) {
+    using storage::ManagedJobRunStatus;
+    switch (run.Status) {
+        case ManagedJobRunStatus::Queued: return TaskState::Queued;
+        case ManagedJobRunStatus::Running: return TaskState::Running;
+        case ManagedJobRunStatus::Paused: return TaskState::Paused;
+        case ManagedJobRunStatus::Completed:
+            return run.Result.has_value() ? state_from_result(*run.Result) : TaskState::Completed;
+        case ManagedJobRunStatus::Failed: return TaskState::Failed;
+        case ManagedJobRunStatus::Cancelled: return TaskState::Cancelled;
+        case ManagedJobRunStatus::Interrupted:
+        case ManagedJobRunStatus::Incomplete: return TaskState::Incomplete;
+    }
+    return TaskState::Failed;
+}
+
+// The job that is starting or running (at most one: the worker runs one job
+// at a time). It may come from the queue, a history resume, crash recovery, or
+// an elevation handoff, so job_id can be empty.
 struct SessionTask {
-    std::uint64_t id = 0;
+    std::string job_id;
     models::CopyJobOptions options;
-    std::string display_name;   // job name for catalog records ("Manual run", a saved job name)
-    std::string managed_run_id; // Job Manager run already created for this task, if any
+    std::string display_name;   // job name for catalog records
+    std::string managed_run_id; // catalog run for this attempt
     bool from_recovery = false;
-    TaskState state = TaskState::Queued;
+    TaskState state = TaskState::Starting;
     double progress = 0.0;      // 0..1 overall
     double bytes_per_second = 0.0;
     std::int64_t eta_seconds = -1;
-    std::string outcome;        // short result text for finished tasks
 };
 
 inline std::string task_title(const models::CopyJobOptions& options) {
@@ -269,174 +294,68 @@ inline std::string task_title(const models::CopyJobOptions& options) {
     return "Copy " + what + " \xE2\x86\x92 " + options.DestinationRoot; // right arrow
 }
 
-class TaskList {
-public:
-    std::uint64_t add(SessionTask task) {
-        task.id = next_id_++;
-        tasks_.push_back(std::move(task));
-        return tasks_.back().id;
-    }
-
-    // Removes a task that is not running. Returns false for an active task.
-    bool remove(std::uint64_t id) {
-        auto found = locate(id);
-        if (found == tasks_.end() || is_active(found->state)) return false;
-        tasks_.erase(found);
-        return true;
-    }
-
-    // Moves a queued task among the queued tasks (delta -1 up, +1 down).
-    bool move(std::uint64_t id, int delta) {
-        auto found = locate(id);
-        if (found == tasks_.end() || found->state != TaskState::Queued || delta == 0) return false;
-        std::size_t index = static_cast<std::size_t>(found - tasks_.begin());
-        std::size_t target = index;
-        for (;;) {
-            if (delta < 0 && target == 0) return false;
-            if (delta > 0 && target + 1 >= tasks_.size()) return false;
-            target = delta < 0 ? target - 1 : target + 1;
-            if (tasks_[target].state == TaskState::Queued) break;
-        }
-        std::swap(tasks_[index], tasks_[target]);
-        return true;
-    }
-
-    // Moves a queued task ahead of every other queued task.
-    bool move_to_front(std::uint64_t id) {
-        auto found = locate(id);
-        if (found == tasks_.end() || found->state != TaskState::Queued) return false;
-        SessionTask task = std::move(*found);
-        tasks_.erase(found);
-        auto first_queued = std::find_if(tasks_.begin(), tasks_.end(), [](const SessionTask& t) {
-            return t.state == TaskState::Queued;
+// Newest run per job id (runs are stored newest first), as indexes into `runs`.
+inline std::vector<std::pair<std::string, std::size_t>> latest_run_per_job(
+    const std::vector<storage::ManagedJobRun>& runs) {
+    std::vector<std::pair<std::string, std::size_t>> latest;
+    for (std::size_t i = 0; i < runs.size(); ++i) {
+        if (runs[i].JobId.empty()) continue;
+        const bool seen = std::any_of(latest.begin(), latest.end(), [&](const auto& entry) {
+            return models::detail::equals_ignore_case(entry.first, runs[i].JobId);
         });
-        tasks_.insert(first_queued, std::move(task));
-        return true;
+        if (!seen) latest.emplace_back(runs[i].JobId, i);
     }
+    return latest;
+}
 
-    SessionTask* find(std::uint64_t id) {
-        auto found = locate(id);
-        return found == tasks_.end() ? nullptr : &*found;
+// What to do with unpinned tasks when XactCopy closes (TaskListOnExit).
+enum class TaskExitPolicy { Ask, Keep, Discard };
+
+inline TaskExitPolicy parse_task_exit_policy(const std::string& text) {
+    if (models::detail::equals_ignore_case(text, "keep")) return TaskExitPolicy::Keep;
+    if (models::detail::equals_ignore_case(text, "discard")) return TaskExitPolicy::Discard;
+    return TaskExitPolicy::Ask;
+}
+
+inline const char* to_setting(TaskExitPolicy policy) {
+    switch (policy) {
+        case TaskExitPolicy::Keep: return "keep";
+        case TaskExitPolicy::Discard: return "discard";
+        case TaskExitPolicy::Ask: break;
     }
+    return "ask";
+}
 
-    SessionTask* next_queued() {
-        auto found = std::find_if(tasks_.begin(), tasks_.end(), [](const SessionTask& task) {
-            return task.state == TaskState::Queued;
-        });
-        return found == tasks_.end() ? nullptr : &*found;
-    }
+// ---- Legacy session-task file ---------------------------------------------------
 
-    SessionTask* active() {
-        auto found = std::find_if(tasks_.begin(), tasks_.end(), [](const SessionTask& task) {
-            return is_active(task.state);
-        });
-        return found == tasks_.end() ? nullptr : &*found;
-    }
-
-    void clear_finished() {
-        tasks_.erase(std::remove_if(tasks_.begin(), tasks_.end(),
-                                    [](const SessionTask& task) { return is_finished(task.state); }),
-                     tasks_.end());
-    }
-
-    struct Counts {
-        int queued = 0;
-        int active = 0;
-        int finished = 0;
-    };
-
-    Counts counts() const {
-        Counts counts;
-        for (const auto& task : tasks_) {
-            if (task.state == TaskState::Queued) ++counts.queued;
-            else if (is_active(task.state)) ++counts.active;
-            else ++counts.finished;
-        }
-        return counts;
-    }
-
-    std::size_t size() const noexcept { return tasks_.size(); }
-    SessionTask& at(std::size_t index) { return tasks_[index]; }
-    const SessionTask& at(std::size_t index) const { return tasks_[index]; }
-
-    std::optional<std::size_t> index_of(std::uint64_t id) const {
-        for (std::size_t i = 0; i < tasks_.size(); ++i) {
-            if (tasks_[i].id == id) return i;
-        }
-        return std::nullopt;
-    }
-
-    std::vector<const SessionTask*> queued() const {
-        std::vector<const SessionTask*> result;
-        for (const auto& task : tasks_) {
-            if (task.state == TaskState::Queued) result.push_back(&task);
-        }
-        return result;
-    }
-
-private:
-    std::vector<SessionTask> tasks_;
-    std::uint64_t next_id_ = 1;
-
-    std::vector<SessionTask>::iterator locate(std::uint64_t id) {
-        return std::find_if(tasks_.begin(), tasks_.end(),
-                            [id](const SessionTask& task) { return task.id == id; });
-    }
-};
-
-// ---- Pending-task persistence --------------------------------------------------
-
-// Only tasks that never started are written: options and display name. The
-// file is a convenience, not a trust anchor; nothing in it runs until the user
-// starts the task list (or, for an elevation handoff, the unelevated window
-// that just wrote it asked for that run).
+// Before tasks moved into the job catalog, tasks that never started were kept
+// in session-tasks.json. It is read once at startup to migrate them, then
+// deleted. Nothing in it runs by itself.
 inline std::wstring pending_tasks_path() {
     return storage::fsutil::local_app_data() + L"\\XactCopy\\session-tasks.json";
 }
 
-struct PendingTasks {
-    std::vector<SessionTask> tasks;
-    bool list_running = false; // the user had started the list; continue after a handoff
+struct PendingTask {
+    std::string display_name;
+    models::CopyJobOptions options;
 };
 
-inline std::string pending_tasks_to_json(const std::vector<const SessionTask*>& tasks,
-                                         bool list_running) {
-    json::Writer w(true);
-    w.begin_object();
-    w.key("SchemaVersion"); w.value(static_cast<std::int32_t>(1));
-    w.key("ListRunning"); w.value(list_running);
-    w.key("Tasks");
-    w.begin_array();
-    for (const SessionTask* task : tasks) {
-        w.begin_object();
-        w.key("DisplayName"); w.value(task->display_name);
-        w.key("Options"); task->options.to_json(w);
-        w.end_object();
-    }
-    w.end_array();
-    w.end_object();
-    return w.take();
-}
-
-inline PendingTasks pending_tasks_from_json(std::string_view text) {
-    PendingTasks pending;
-    std::vector<SessionTask>& tasks = pending.tasks;
+inline std::vector<PendingTask> pending_tasks_from_json(std::string_view text) {
+    std::vector<PendingTask> tasks;
     try {
         const json::Value parsed = json::parse(text);
         const json::Object* root = parsed.as_object();
-        if (root == nullptr) return pending;
+        if (root == nullptr) return tasks;
         const json::Value* schema = root->find("SchemaVersion");
-        if (schema == nullptr || schema->as_int64() != 1) return pending;
-        const json::Value* running = root->find("ListRunning");
-        pending.list_running = running != nullptr && running->as_bool();
+        if (schema == nullptr || schema->as_int64() != 1) return tasks;
         const json::Value* list = root->find("Tasks");
-        if (list == nullptr || list->as_array() == nullptr) return pending;
+        if (list == nullptr || list->as_array() == nullptr) return tasks;
         for (const auto& entry : *list->as_array()) {
             const json::Object* object = entry.as_object();
             if (object == nullptr) continue;
             const json::Value* options = object->find("Options");
             if (options == nullptr || options->as_object() == nullptr) continue;
-            SessionTask task;
+            PendingTask task;
             task.options = models::CopyJobOptions::from_json(*options);
             if (task.options.SourceRoot.empty()) continue;
             const json::Value* name = object->find("DisplayName");
@@ -445,82 +364,14 @@ inline PendingTasks pending_tasks_from_json(std::string_view text) {
         }
     } catch (const std::exception&) {
         tasks.clear();
-        pending.list_running = false;
     }
-    return pending;
+    return tasks;
 }
 
-inline PendingTasks load_pending_tasks(const std::wstring& path = pending_tasks_path()) {
+inline std::vector<PendingTask> load_pending_tasks(const std::wstring& path = pending_tasks_path()) {
     auto bytes = storage::fsutil::read_all_bytes(path, 64ULL * 1024ULL * 1024ULL);
     if (!bytes.has_value() || bytes->empty()) return {};
     return pending_tasks_from_json(std::string(bytes->begin(), bytes->end()));
 }
-
-// Writes the pending-task file off the UI thread. The latest payload wins;
-// flush() writes synchronously on the caller's thread for shutdown.
-class PendingTaskWriter {
-public:
-    explicit PendingTaskWriter(std::wstring path = pending_tasks_path())
-        : path_(std::move(path)), thread_([this] { loop(); }) {}
-
-    ~PendingTaskWriter() {
-        {
-            std::lock_guard<std::mutex> guard(lock_);
-            stopping_ = true;
-        }
-        ready_.notify_one();
-        if (thread_.joinable()) thread_.join();
-    }
-
-    PendingTaskWriter(const PendingTaskWriter&) = delete;
-    PendingTaskWriter& operator=(const PendingTaskWriter&) = delete;
-
-    void post(std::string payload) {
-        {
-            std::lock_guard<std::mutex> guard(lock_);
-            pending_ = std::move(payload);
-        }
-        ready_.notify_one();
-    }
-
-    // Waits for any in-flight write, then writes `payload` now.
-    void flush(const std::string& payload) {
-        std::lock_guard<std::mutex> write_guard(write_lock_);
-        {
-            std::lock_guard<std::mutex> guard(lock_);
-            pending_.reset();
-        }
-        write(payload);
-    }
-
-private:
-    std::wstring path_;
-    std::mutex lock_;
-    std::mutex write_lock_;
-    std::condition_variable ready_;
-    std::optional<std::string> pending_;
-    bool stopping_ = false;
-    std::thread thread_;
-
-    void write(const std::string& payload) {
-        storage::fsutil::create_directories(storage::fsutil::get_directory_name(path_));
-        (void)storage::fsutil::write_atomic_bytes(path_, payload);
-    }
-
-    void loop() {
-        for (;;) {
-            std::string payload;
-            {
-                std::unique_lock<std::mutex> guard(lock_);
-                ready_.wait(guard, [this] { return stopping_ || pending_.has_value(); });
-                if (!pending_.has_value()) return;
-                payload = std::move(*pending_);
-                pending_.reset();
-            }
-            std::lock_guard<std::mutex> write_guard(write_lock_);
-            write(payload);
-        }
-    }
-};
 
 } // namespace xact::ui

@@ -89,11 +89,16 @@ struct ManagedJob {
     models::CopyJobOptions Options;
     DateTimeOffset CreatedUtc = DateTimeOffset::now_utc();
     DateTimeOffset UpdatedUtc = DateTimeOffset::now_utc();
+    // Pinned jobs always stay. Unpinned ones are tasks added from the main
+    // window, which follow the user's on-exit choice. Jobs from schema <= 3
+    // were all saved deliberately, so a missing field reads as pinned.
+    bool Pinned = true;
 
     void to_json(json::Writer& w) const {
         w.begin_object();
         w.key("JobId"); w.value(JobId);
         w.key("Name"); w.value(Name);
+        w.key("Pinned"); w.value(Pinned);
         w.key("Options"); Options.to_json(w);
         w.key("CreatedUtc"); w.value_literal_string(CreatedUtc.to_string());
         w.key("UpdatedUtc"); w.value_literal_string(UpdatedUtc.to_string());
@@ -106,6 +111,7 @@ struct ManagedJob {
         if (obj == nullptr) return job;
         models::detail::read(obj, "JobId", job.JobId);
         models::detail::read(obj, "Name", job.Name);
+        models::detail::read(obj, "Pinned", job.Pinned);
         if (const auto* options = obj->find("Options"); options != nullptr && !options->is_null()) {
             job.Options = models::CopyJobOptions::from_json(*options);
         }
@@ -238,7 +244,7 @@ struct ManagedJobRun {
 };
 
 struct JobCatalog {
-    std::int32_t SchemaVersion = 3;
+    std::int32_t SchemaVersion = 4;
     std::vector<ManagedJob> Jobs;
     std::vector<ManagedJobRun> Runs;
     std::vector<ManagedJobQueueEntry> QueueEntries;
@@ -290,7 +296,8 @@ struct JobCatalog {
 
 class JobCatalogStore {
 public:
-    static constexpr std::int32_t CurrentSchemaVersion = 3;
+    // 4: ManagedJob.Pinned.
+    static constexpr std::int32_t CurrentSchemaVersion = 4;
     static constexpr std::int32_t CurrentEnvelopeSchemaVersion = 1;
     static constexpr int BackupGenerationCount = 2;
 

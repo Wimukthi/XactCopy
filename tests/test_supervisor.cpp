@@ -316,31 +316,43 @@ void test_task_model() {
     result.ErrorMessage = "boom";
     check(ui::state_from_result(result) == ui::TaskState::Failed, "an error maps to Failed");
 
-    // Task list operations.
-    ui::TaskList list;
-    auto make = [](const char* root) {
-        ui::SessionTask task;
-        task.options.SourceRoot = root;
-        task.options.DestinationRoot = "E:\\Backup";
-        return task;
-    };
-    const auto a = list.add(make("C:\\a"));
-    const auto b = list.add(make("C:\\b"));
-    const auto c = list.add(make("C:\\c"));
-    check(list.next_queued()->id == a, "the first queued task runs first");
-    check(list.move(c, -1) && list.at(1).id == c, "move up swaps with the previous queued task");
-    check(list.move_to_front(c) && list.at(0).id == c, "Start now moves a task to the front");
-    list.find(c)->state = ui::TaskState::Running;
-    check(!list.remove(c), "a running task cannot be removed");
-    check(list.next_queued()->id == a, "the next queued task skips the running one");
-    list.find(a)->state = ui::TaskState::Completed;
-    const auto counts = list.counts();
-    check(counts.active == 1 && counts.queued == 1 && counts.finished == 1, "task counts by state");
-    list.clear_finished();
-    check(list.size() == 2 && !list.find(a), "Clear finished removes only finished tasks");
-    check(list.queued().size() == 1 && list.queued()[0]->id == b, "only queued tasks are pending");
+    // Run records map onto the states the panes draw.
+    storage::ManagedJobRun run;
+    run.Status = storage::ManagedJobRunStatus::Completed;
+    check(ui::state_from_run(run) == ui::TaskState::Completed, "a completed run without a result");
+    models::CopyJobResult recovered;
+    recovered.Succeeded = true;
+    recovered.RecoveredFiles = 2;
+    run.Result = recovered;
+    check(ui::state_from_run(run) == ui::TaskState::CompletedWithRecovery,
+          "a completed run keeps its recovered-data outcome");
+    run.Status = storage::ManagedJobRunStatus::Interrupted;
+    check(ui::state_from_run(run) == ui::TaskState::Incomplete, "an interrupted run is incomplete");
 
-    check(ui::task_title(make("C:\\a").options) =="Copy contents of C:\\a \xE2\x86\x92 E:\\Backup",
+    // Latest run per job: runs are stored newest first.
+    std::vector<storage::ManagedJobRun> runs(4);
+    runs[0].JobId = "job-b";
+    runs[1].JobId = "";        // ad-hoc run, no job
+    runs[2].JobId = "JOB-A";
+    runs[3].JobId = "job-b";   // older run of job-b
+    const auto latest = ui::latest_run_per_job(runs);
+    check(latest.size() == 2 && latest[0].first == "job-b" && latest[0].second == 0 &&
+              latest[1].second == 2,
+          "the newest run wins per job and ad-hoc runs are skipped");
+
+    // On-exit policy setting.
+    check(ui::parse_task_exit_policy("Keep") == ui::TaskExitPolicy::Keep &&
+              ui::parse_task_exit_policy("discard") == ui::TaskExitPolicy::Discard &&
+              ui::parse_task_exit_policy("") == ui::TaskExitPolicy::Ask &&
+              ui::parse_task_exit_policy("bogus") == ui::TaskExitPolicy::Ask,
+          "on-exit policy parses with Ask as the fallback");
+    check(std::string(ui::to_setting(ui::TaskExitPolicy::Discard)) == "discard",
+          "on-exit policy round-trips to its setting value");
+
+    models::CopyJobOptions copy;
+    copy.SourceRoot = "C:\\a";
+    copy.DestinationRoot = "E:\\Backup";
+    check(ui::task_title(copy) == "Copy contents of C:\\a \xE2\x86\x92 E:\\Backup",
           "task title for a whole folder");
     models::CopyJobOptions scan;
     scan.OperationMode = models::JobOperationMode::ScanOnly;
@@ -351,24 +363,18 @@ void test_task_model() {
     check(ui::summarize_options(models::CopyJobOptions{}).find("verify full") != std::string::npos,
           "option summary names the verification mode");
 
-    // Pending-task persistence round trip, including the running flag.
-    std::vector<const ui::SessionTask*> pending = list.queued();
-    const auto parsed = ui::pending_tasks_from_json(ui::pending_tasks_to_json(pending, true));
-    check(parsed.list_running && parsed.tasks.size() == 1 &&
-              parsed.tasks[0].options.SourceRoot == "C:\\b",
-          "pending tasks round-trip with the list-running flag");
-    check(ui::pending_tasks_from_json("{not json").tasks.empty(),
-          "a corrupt pending-task file restores nothing");
-
+    // The legacy session-task file is still readable for the one-time migration.
+    const std::string legacy =
+        R"({"SchemaVersion":1,"ListRunning":true,"Tasks":[{"DisplayName":"Old","Options":{"SourceRoot":"C:\\b"}},{"Options":{}}]})";
+    const auto migrated = ui::pending_tasks_from_json(legacy);
+    check(migrated.size() == 1 && migrated[0].options.SourceRoot == "C:\\b" &&
+              migrated[0].display_name == "Old",
+          "legacy session tasks migrate, skipping entries without a source");
+    check(ui::pending_tasks_from_json("{not json").empty(),
+          "a corrupt legacy file migrates nothing");
     const std::wstring file = make_work_dir() + L"\\session-tasks.json";
-    {
-        ui::PendingTaskWriter writer(file);
-        writer.post(ui::pending_tasks_to_json(pending, false));
-        writer.flush(ui::pending_tasks_to_json(pending, true));
-    }
-    const auto loaded = ui::load_pending_tasks(file);
-    check(loaded.tasks.size() == 1 && loaded.list_running,
-          "the background writer leaves the latest flushed state on disk");
+    check(storage::fsutil::write_atomic_bytes(file, legacy) && ui::load_pending_tasks(file).size() == 1,
+          "the legacy file loads from disk");
 }
 
 void test_elevation_handoff() {
@@ -1136,8 +1142,9 @@ void test_job_catalog_store() {
     check(store.save(catalog), "save catalog");
 
     storage::JobCatalog loaded = store.load();
-    check(loaded.SchemaVersion == 3, "schema version 3");
+    check(loaded.SchemaVersion == 4, "schema version 4");
     check(loaded.Jobs.size() == 1 && loaded.Jobs[0].Name == "Nightly Backup", "job round-trip");
+    check(loaded.Jobs[0].Pinned, "a saved job is pinned by default");
     check(loaded.Jobs[0].Options.MaxRetries == 7, "job options round-trip");
     check(loaded.QueueEntries.size() == 1 && !loaded.QueueEntries[0].LastAttemptUtc.has_value(),
           "queue entry nullable LastAttemptUtc stays null");
@@ -1165,7 +1172,20 @@ void test_job_catalog_store() {
     legacy.Jobs.push_back(job);
     legacy.QueuedJobIds.push_back(" " + job.JobId + " ");
     storage::JobCatalogStore::normalize(legacy);
-    check(legacy.SchemaVersion == 3, "legacy schema upgraded");
+    check(legacy.SchemaVersion == 4, "legacy schema upgraded");
+    {
+        // Schema <= 3 jobs carry no Pinned field: they were saved on purpose.
+        const json::Value parsed = json::parse(R"({"JobId":"a","Name":"Old","Options":{}})");
+        check(storage::ManagedJob::from_json(parsed).Pinned, "a pre-v4 job reads as pinned");
+        storage::ManagedJob task;
+        task.JobId = "b";
+        task.Name = "Task";
+        task.Pinned = false;
+        json::Writer writer(false);
+        task.to_json(writer);
+        check(!storage::ManagedJob::from_json(json::parse(writer.take())).Pinned,
+              "an unpinned task round-trips");
+    }
     check(legacy.QueueEntries.size() == 1 && legacy.QueueEntries[0].JobId == job.JobId &&
               legacy.QueueEntries[0].Trigger == "legacy-migration" &&
               legacy.QueueEntries[0].EnqueuedBy == "migration",
@@ -1450,6 +1470,63 @@ void test_job_manager_service() {
 
 } // namespace
 
+void test_job_manager_tasks() {
+    std::printf("--- job manager: tasks, pins, and the shared queue ---\n");
+    std::wstring work = make_work_dir();
+    std::wstring path = work + L"\\catalog.json";
+    {
+        ui::JobManagerService manager(path);
+        models::CopyJobOptions options;
+        options.SourceRoot = "C:\\Src";
+        options.DestinationRoot = "D:\\Dst";
+        auto saved = manager.save_job("Saved", options);
+        auto task_a = manager.save_job("Task A", options, std::string(), /*pinned*/ false);
+        auto task_b = manager.save_job("Task B", options, std::string(), /*pinned*/ false);
+        check(saved.has_value() && saved->Pinned, "save_job pins by default");
+        check(task_a.has_value() && !task_a->Pinned, "a builder task starts unpinned");
+        check(manager.count_unpinned_jobs() == 2, "two unpinned tasks");
+
+        auto ordered = manager.get_jobs_in_order();
+        check(ordered.size() == 3 && ordered[0].Name == "Saved" && ordered[2].Name == "Task B",
+              "tasks list in the order they were added");
+
+        // Re-saving an existing job keeps its pin unless one is given.
+        check(manager.save_job("Task A renamed", options, task_a->JobId).has_value() &&
+                  !manager.get_job_by_id(task_a->JobId)->Pinned,
+              "editing a task keeps it unpinned");
+
+        // Shared queue: back, front, and a job queued twice keeps one entry.
+        const std::string entry_a = manager.enqueue_job(task_a->JobId, /*front*/ false);
+        const std::string entry_b = manager.enqueue_job(task_b->JobId, /*front*/ false);
+        check(!entry_a.empty() && !entry_b.empty(), "tasks enqueue");
+        check(manager.enqueue_job(task_a->JobId, false) == entry_a &&
+                  manager.get_queue_entries().size() == 2,
+              "queuing an already-queued task keeps its single entry");
+        check(manager.enqueue_job(task_b->JobId, /*front*/ true) == entry_b &&
+                  manager.get_queue_entries()[0].QueueEntryId == entry_b,
+              "Run moves an already-queued task to the front");
+
+        check(manager.set_job_pinned(task_b->JobId, true), "pin a task");
+        check(!manager.set_job_pinned(task_b->JobId, true), "pinning twice changes nothing");
+
+        // Discard removes unpinned tasks and their queue entries, not history.
+        auto run = manager.create_run_for_job(task_a->JobId, "manual");
+        check(run.has_value(), "a run for the unpinned task");
+        check(manager.delete_unpinned_jobs() == 1, "discard removes the one unpinned task");
+        check(manager.get_jobs_in_order().size() == 2, "pinned jobs stay");
+        auto queue = manager.get_queue_entries();
+        check(queue.size() == 1 && queue[0].JobId == task_b->JobId,
+              "the discarded task's queue entry is gone");
+        check(manager.get_run_by_id(run->RunId).has_value(), "run history survives a discard");
+    }
+    // Everything above was persisted through the signed catalog.
+    ui::JobManagerService reopened(path);
+    auto jobs = reopened.get_jobs_in_order();
+    check(jobs.size() == 2 && jobs[1].Name == "Task B" && jobs[1].Pinned,
+          "pins and order survive a reload");
+    check(reopened.get_queue_entries().size() == 1, "the queue survives a reload");
+}
+
 int main() {
     test_automatic_recovery_budget();
     test_settings_preservation();
@@ -1461,6 +1538,7 @@ int main() {
     test_journal_report_and_range_map();
     test_job_catalog_store();
     test_job_manager_service();
+    test_job_manager_tasks();
     test_clean_job();
     test_kill_recovery();
     test_sleep_resume_does_not_restart_worker();

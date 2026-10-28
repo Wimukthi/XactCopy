@@ -9,8 +9,8 @@ each option means, see the [User Guide](USER_GUIDE.md).
   the first place to look. Increase its detail with **Settings → Diagnostics →
   Worker telemetry profile** (Normal → Verbose → Debug).
 - The **journal** for a run records every file and its state.
-  **File → Open Journal Folder**, or select a run in the Job Manager and press
-  **Open Journal**.
+  **File → Open Journal Folder**, or select a run in the **History** view and
+  press **Journal**.
 - **Help → About XactCopy** has the exact version and build, which any bug report
   needs.
 
