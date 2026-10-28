@@ -224,6 +224,7 @@ public:
         window_class.lpfnWndProc = &MainWindow::static_window_proc;
         window_class.hInstance = instance;
         window_class.lpszClassName = WindowClassName;
+        window_class.style = CS_DBLCLKS; // double-click resets a splitter
         window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         window_class.hbrBackground = nullptr; // painted per-theme in WM_ERASEBKGND
         ui::assign_window_class_icons(window_class);
@@ -390,6 +391,18 @@ private:
     HWND scan_info_label_ = nullptr;
     // Client height the current mode/options need; feeds WM_GETMINMAXINFO.
     int required_client_height_ = 0;
+
+    // Splitters: the bar between the lists and the log, and the gap between
+    // the two columns. Rects come from layout(); 0 means automatic. The log
+    // size is the height below the bar (log, its toolbar, status) in 96-DPI
+    // pixels, so resizing the window grows the lists and keeps the log.
+    enum class SplitterDrag { None, Log, Columns };
+    RECT log_splitter_{};
+    RECT column_splitter_{};
+    SplitterDrag splitter_drag_ = SplitterDrag::None;
+    int splitter_grab_offset_ = 0;
+    int log_area_logical_ = 0;
+    int left_column_permille_ = 0;
     HWND mode_combo_ = nullptr;
     HWND engine_combo_ = nullptr;
     HWND overwrite_combo_ = nullptr;
@@ -599,7 +612,62 @@ private:
                 RECT client;
                 GetClientRect(hwnd_, &client);
                 ui::themedraw::fill_rect(reinterpret_cast<HDC>(wparam), client, theme_.window);
+                draw_splitters(reinterpret_cast<HDC>(wparam));
                 return 1;
+            }
+            case WM_SETCURSOR:
+                if (reinterpret_cast<HWND>(wparam) == hwnd_ && LOWORD(lparam) == HTCLIENT) {
+                    POINT point{};
+                    GetCursorPos(&point);
+                    ScreenToClient(hwnd_, &point);
+                    const SplitterDrag hit = splitter_at(point);
+                    if (hit != SplitterDrag::None) {
+                        SetCursor(LoadCursorW(nullptr, hit == SplitterDrag::Log ? IDC_SIZENS
+                                                                                 : IDC_SIZEWE));
+                        return TRUE;
+                    }
+                }
+                return DefWindowProcW(hwnd_, message, wparam, lparam);
+            case WM_LBUTTONDOWN: {
+                const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                splitter_drag_ = splitter_at(point);
+                if (splitter_drag_ != SplitterDrag::None) {
+                    splitter_grab_offset_ = splitter_drag_ == SplitterDrag::Log
+                                                ? point.y - log_splitter_.top
+                                                : point.x - column_splitter_.left;
+                    SetCapture(hwnd_);
+                    InvalidateRect(hwnd_, nullptr, TRUE);
+                }
+                return 0;
+            }
+            case WM_MOUSEMOVE:
+                if (splitter_drag_ != SplitterDrag::None) {
+                    drag_splitter(POINT{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
+                }
+                return 0;
+            case WM_LBUTTONUP:
+                if (splitter_drag_ != SplitterDrag::None) ReleaseCapture();
+                return 0;
+            case WM_CAPTURECHANGED:
+                if (splitter_drag_ != SplitterDrag::None) {
+                    splitter_drag_ = SplitterDrag::None;
+                    settings_.set_int("UiLogAreaHeight", log_area_logical_);
+                    settings_.set_int("UiLeftColumnPermille", left_column_permille_);
+                    InvalidateRect(hwnd_, nullptr, TRUE);
+                }
+                return 0;
+            case WM_LBUTTONDBLCLK: {
+                // Double-click returns a splitter to the automatic split.
+                const SplitterDrag hit = splitter_at(POINT{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
+                if (hit == SplitterDrag::Log) log_area_logical_ = 0;
+                if (hit == SplitterDrag::Columns) left_column_permille_ = 0;
+                if (hit != SplitterDrag::None) {
+                    settings_.set_int("UiLogAreaHeight", log_area_logical_);
+                    settings_.set_int("UiLeftColumnPermille", left_column_permille_);
+                    layout();
+                    InvalidateRect(hwnd_, nullptr, TRUE);
+                }
+                return 0;
             }
             case WM_COMMAND:
                 on_command(LOWORD(wparam), HIWORD(wparam));
@@ -1087,6 +1155,8 @@ private:
 
         options_toggle_ = create(L"BUTTON", L"", WS_TABSTOP | BS_OWNERDRAW, IdOptionsToggle);
         options_expanded_ = settings_.get_bool("UiOptionsExpanded", false);
+        log_area_logical_ = settings_.get_int("UiLogAreaHeight", 0, 8000, 0);
+        left_column_permille_ = settings_.get_int("UiLeftColumnPermille", 0, 900, 0);
 
         start_button_ = create(L"BUTTON", L"Start \x2192", WS_TABSTOP | BS_OWNERDRAW, IdStartButton);
         add_task_button_ =
@@ -2912,6 +2982,76 @@ private:
         SelectObject(draw.hDC, old_font);
     }
 
+    // ---- Splitters ---------------------------------------------------------
+
+    SplitterDrag splitter_at(POINT point) const {
+        if (PtInRect(&log_splitter_, point)) return SplitterDrag::Log;
+        if (PtInRect(&column_splitter_, point)) return SplitterDrag::Columns;
+        return SplitterDrag::None;
+    }
+
+    void drag_splitter(POINT point) {
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        const int dpi = effective_dpi();
+        const int margin = MulDiv(12, dpi, 96);
+        if (splitter_drag_ == SplitterDrag::Log) {
+            const int bar_top = static_cast<int>(point.y) - splitter_grab_offset_;
+            const int area = static_cast<int>(client.bottom) - margin - bar_top;
+            log_area_logical_ = std::max(1, MulDiv(area, 96, dpi));
+        } else {
+            const int client_width = static_cast<int>(client.right) - margin * 2;
+            const int left = static_cast<int>(point.x) - splitter_grab_offset_ - margin;
+            if (client_width > 0) {
+                left_column_permille_ = std::clamp(left * 1000 / client_width, 1, 900);
+            }
+        }
+        layout();
+        // layout() clamps; store what it actually used so the bar never
+        // drifts away from the cursor past a limit.
+        if (splitter_drag_ == SplitterDrag::Log) {
+            log_area_logical_ = std::max(
+                1, MulDiv(static_cast<int>(client.bottom) - margin - log_splitter_.top, 96, dpi));
+        } else {
+            const int client_width = static_cast<int>(client.right) - margin * 2;
+            if (client_width > 0) {
+                left_column_permille_ = std::clamp(
+                    static_cast<int>(column_splitter_.left - margin) * 1000 / client_width, 1, 900);
+            }
+        }
+        InvalidateRect(hwnd_, nullptr, TRUE);
+        UpdateWindow(hwnd_);
+    }
+
+    // A hairline through each splitter with a short grip in its middle; the
+    // dragged one is drawn in the accent colour.
+    void draw_splitters(HDC dc) {
+        const int dpi = effective_dpi();
+        auto scale = [dpi](int value) { return MulDiv(value, dpi, 96); };
+        const COLORREF line = ui::blend_color(theme_.window, theme_.border, 70);
+        auto draw = [&](const RECT& bar, bool horizontal, bool active) {
+            if (bar.right <= bar.left || bar.bottom <= bar.top) return;
+            const COLORREF grip = active ? theme_.accent : theme_.border;
+            if (horizontal) {
+                const int mid = (bar.top + bar.bottom) / 2;
+                RECT hairline{bar.left, mid, bar.right, mid + 1};
+                ui::themedraw::fill_rect(dc, hairline, active ? theme_.accent : line);
+                const int cx = (bar.left + bar.right) / 2;
+                RECT handle{cx - scale(18), mid - 1, cx + scale(18), mid + 2};
+                ui::themedraw::fill_rect(dc, handle, grip);
+            } else {
+                const int mid = (bar.left + bar.right) / 2;
+                RECT hairline{mid, bar.top, mid + 1, bar.bottom};
+                ui::themedraw::fill_rect(dc, hairline, active ? theme_.accent : line);
+                const int cy = (bar.top + bar.bottom) / 2;
+                RECT handle{mid - 1, cy - scale(18), mid + 2, cy + scale(18)};
+                ui::themedraw::fill_rect(dc, handle, grip);
+            }
+        };
+        draw(log_splitter_, true, splitter_drag_ == SplitterDrag::Log);
+        draw(column_splitter_, false, splitter_drag_ == SplitterDrag::Columns);
+    }
+
     // ---- Layout ------------------------------------------------------------
 
     // Two columns above a full-width log. Left, the task builder: the Copy /
@@ -2941,7 +3081,12 @@ private:
         const int client_height = static_cast<int>(client.bottom - client.top);
         const bool scan = is_scan_mode();
 
-        const int left_width = std::max(scale(400), (client_width - column_gap) * 46 / 100);
+        const int min_left = scale(400);
+        const int max_left = std::max(min_left, client_width - column_gap - scale(380));
+        const int left_width =
+            left_column_permille_ > 0
+                ? std::clamp(client_width * left_column_permille_ / 1000, min_left, max_left)
+                : std::clamp((client_width - column_gap) * 46 / 100, min_left, max_left);
         const int right_width = std::max(scale(200), client_width - left_width - column_gap);
 
         int origin_x = margin;
@@ -3178,7 +3323,14 @@ private:
         const int list_target = scale(160);
         int top_height = std::max({top_min, (body - bottom_fixed) * 66 / 100,
                                    std::max(left_fixed, right_fixed) + list_target});
+        if (log_area_logical_ > 0) {
+            top_height = client_height - margin * 2 - scale(log_area_logical_);
+        }
         top_height = std::max(top_min, std::min(top_height, body - bottom_fixed - min_log));
+        log_splitter_ = {margin, margin + top_height, margin + client_width,
+                         margin + top_height + gap};
+        column_splitter_ = {margin + left_width, margin, margin + left_width + column_gap,
+                            margin + top_height};
 
         // One height for both lists, so they line up top and bottom.
         commit = true;
@@ -3203,6 +3355,7 @@ private:
         y += log_height + gap;
         place(status_label_, 0, client_width);
         tooltips_.update_layout();
+        InvalidateRect(hwnd_, nullptr, TRUE); // WS_CLIPCHILDREN: repaints only the gaps
     }
 
     // Grows the window (within its monitor's work area) when the current mode

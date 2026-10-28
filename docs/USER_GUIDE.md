@@ -33,6 +33,12 @@ only reads them and records unreadable ranges, so the destination row
 disappears and the choices below relabel themselves for scanning. Switching
 remembers each mode's own choices.
 
+Two splitters set the proportions: drag the bar above the log to trade log
+height for list height (both lists always stay the same size), or the line
+between the columns to widen one side. XactCopy remembers both, keeps the log
+height when the window is resized, and a double-click on a splitter returns it
+to the automatic split.
+
 ### What to copy
 
 Add files and folders with **+ Files**, **+ Folder**, **Paste** (files copied in
