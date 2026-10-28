@@ -158,7 +158,7 @@ kept regardless. Snapshots over 64 KB are already compressed.
 
 ### The Explorer context menu didn't appear
 
-Toggle **Settings → Explorer Integration** off and on. The entries are per-user
+Toggle **Settings → Recovery & Startup → Context Menu** off and on. The entries are per-user
 under `HKCU\Software\Classes`; Explorer sometimes needs a restart
 (`taskkill /f /im explorer.exe & start explorer`) to pick them up.
 

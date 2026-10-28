@@ -33,6 +33,7 @@ struct SourceItem {
     bool is_directory = false;
     bool contents_only = false;
     std::uint32_t batch = 0; // the add action that brought it in; one list row per batch
+    std::wstring destination; // copy target chosen for the batch (empty when added in Assess)
 };
 
 // The items one add action brought in (several folders picked in one dialog,

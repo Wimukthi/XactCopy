@@ -80,6 +80,10 @@ constexpr UINT WM_APP_RUN_NEXT_TASK = WM_APP + 11; // start the next queued sess
 constexpr int IdSourceBrowse = 1002;
 constexpr int IdDestinationEdit = 1003;
 constexpr int IdDestinationBrowse = 1004;
+constexpr int IdSourcePathEdit = 1005;
+constexpr int IdSourcePathBrowse = 1099;
+constexpr int IdSourcePickFolders = 1170;
+constexpr int IdSourcePickFiles = 1171;
 constexpr int IdModeCombo = 1005;
 constexpr int IdEngineCombo = 1006;
 constexpr int IdOverwriteCombo = 1007;
@@ -262,7 +266,7 @@ public:
         // progress bars.
         const int initial_dpi = effective_dpi();
         hwnd_ = CreateWindowExW(
-            0, WindowClassName, L"XactCopy", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            0, WindowClassName, L"XactCopy " XACTCOPY_VERSION_WSTRING, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(960, initial_dpi, 96),
             MulDiv(800, initial_dpi, 96), nullptr, nullptr, instance, this);
         if (hwnd_ == nullptr) return 1;
@@ -279,7 +283,7 @@ public:
             // Explorer verbs and drag-and-drop come from normal-integrity
             // processes; let them reach this High-integrity window.
             ui::elevation::allow_unelevated_messages(hwnd_);
-            SetWindowTextW(hwnd_, L"XactCopy (Administrator)");
+            SetWindowTextW(hwnd_, L"XactCopy " XACTCOPY_VERSION_WSTRING L" (Administrator)");
         }
         ui::elevation::cleanup_stale_handoffs();
         DragAcceptFiles(hwnd_, TRUE); // dropped items join the selection
@@ -352,6 +356,10 @@ private:
     HINSTANCE instance_ = nullptr;
     HWND hwnd_ = nullptr;
     HWND source_label_ = nullptr;
+    // Source / Destination boxes edit the selected row (never left empty).
+    HWND source_path_label_ = nullptr;
+    HWND source_path_edit_ = nullptr;
+    HWND source_path_browse_ = nullptr;
     HWND destination_label_ = nullptr;
     HWND destination_edit_ = nullptr;
     HWND source_browse_ = nullptr; // "+ Folder"
@@ -587,6 +595,10 @@ private:
     // burst ends, whether to switch mode and ask for a destination.
     bool selection_timer_active_ = false;
     bool selection_wants_destination_ = false;
+    std::vector<std::uint32_t> selection_batches_; // rows a coalescing burst added
+    std::wstring source_box_shown_;      // what the Source box shows for the row
+    std::wstring destination_box_shown_; // what the Destination box shows
+    bool committing_paths_ = false;
     HWND source_add_files_ = nullptr;
     HWND clear_selection_ = nullptr;
     std::map<int, bool> check_states_;
@@ -1082,6 +1094,7 @@ private:
         // their font via WM_GETFONT, so they need it set too.
         HWND ui_controls[] = {
             source_label_,     destination_label_,   destination_edit_,  sources_list_,
+            source_path_label_, source_path_edit_, source_path_browse_,
             source_browse_,    destination_browse_,  source_add_files_,  source_paste_,
             sources_footer_,   recent_destinations_button_, options_toggle_, add_task_button_,
             tasks_tab_,        history_tab_,         tasks_list_,        pane_footer_,
@@ -1204,6 +1217,11 @@ private:
         }
         sizer_thread_ = std::thread([this] { sizer_loop(); });
 
+        source_path_label_ = create(L"STATIC", L"Source", SS_CENTERIMAGE, 0);
+        source_path_edit_ =
+            create(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, IdSourcePathEdit);
+        source_path_browse_ =
+            create(L"BUTTON", L"Browse...", WS_TABSTOP | BS_OWNERDRAW, IdSourcePathBrowse);
         destination_label_ = create(L"STATIC", L"Destination", SS_CENTERIMAGE, 0);
         destination_edit_ =
             create(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, IdDestinationEdit);
@@ -1397,8 +1415,11 @@ private:
         add(history_journal_button_, L"Open the selected run's authenticated journal as readable JSON.");
         add(pane_footer_, L"What the current view shows.");
         add(detail_label_, L"Live detail for the running task.");
-        add(destination_label_, L"The folder that receives copied files. Assess Readable Files mode is read-only and does not require a destination.");
-        add(destination_edit_, L"Enter the destination folder. XactCopy stages and verifies each file beside its final path before replacement.");
+        add(source_path_label_, L"The selected row's files and folders. Edit to change them; separate several paths with semicolons.");
+        add(source_path_edit_, L"The selected row's files and folders, separated by semicolons. A path that does not exist is refused, and the box cannot be left empty.");
+        add(source_path_browse_, L"Pick different files or folders for the selected row. Its destination stays.");
+        add(destination_label_, L"The folder that receives the selected row's files. Assess mode is read-only and does not require a destination.");
+        add(destination_edit_, L"The selected row's destination folder. XactCopy stages and verifies each file beside its final path before replacement. The box cannot be left empty.");
         add(destination_browse_, L"Choose the destination folder.");
 
         add(mode_copy_tab_, L"Copy or recover the listed items into a destination, with verification.");
@@ -1716,7 +1737,7 @@ private:
 
         ui::attach_theme_window(hwnd_);
         for (HWND control : {log_list_, log_find_, sources_list_, tasks_list_, destination_edit_,
-                             buffer_edit_, retries_edit_, timeout_edit_}) {
+                             source_path_edit_, buffer_edit_, retries_edit_, timeout_edit_}) {
             ui::apply_control_theme(control, theme_.dark);
         }
         for (HWND combo : {mode_combo_, engine_combo_, overwrite_combo_, verify_combo_, read_method_combo_,
@@ -1857,6 +1878,7 @@ private:
             if (control != nullptr) ShowWindow(control, scan ? SW_HIDE : SW_SHOW);
         }
         SetWindowTextW(source_label_, scan ? L"What to assess" : L"What to copy");
+        if (sources_list_ != nullptr) InvalidateRect(sources_list_, nullptr, FALSE); // destinations
         SetWindowTextW(profile_label_, scan ? L"Scan" : L"Profile");
         SetWindowTextW(verify_label_, scan ? L"Findings" : L"Verify");
         sync_scan_profile_lock();
@@ -1976,7 +1998,8 @@ private:
         return id == IdTaskRunButton || id == IdTaskQueueButton || id == IdHistoryResumeButton ||
                id == IdHistoryJournalButton || id == IdHistoryReportButton || id == IdHistoryMapButton ||
                id == IdHistoryDeleteButton ||
-               id == IdSourceBrowse || id == IdDestinationBrowse || id == IdStartButton ||
+               id == IdSourceBrowse || id == IdDestinationBrowse || id == IdSourcePathBrowse ||
+               id == IdStartButton ||
                id == IdPauseButton || id == IdCancelButton || id == IdSettingsButton ||
                id == IdSourceAddFiles || id == IdClearSelection || id == IdLogFindNext ||
                id == IdSourcePaste || id == IdAddTaskButton || id == IdRecentDestinations ||
@@ -2262,10 +2285,12 @@ private:
                 folder += leaf;
             }
         }
+        const bool show_destination = !is_scan_mode() && !item.destination.empty();
+        if (show_destination) folder += L"  \x2192  " + item.destination;
         SetTextColor(draw.hDC, muted);
         DrawTextW(draw.hDC, folder.c_str(), -1, &folder_rect,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX |
-                      (multiple ? DT_END_ELLIPSIS : DT_PATH_ELLIPSIS));
+                      (multiple || show_destination ? DT_END_ELLIPSIS : DT_PATH_ELLIPSIS));
         SelectObject(draw.hDC, old_font);
         if ((draw.itemState & ODS_FOCUS) != 0) DrawFocusRect(draw.hDC, &draw.rcItem);
     }
@@ -2286,7 +2311,8 @@ private:
     // Adds existing paths that are not already listed. Returns how many were added.
     // One call is one add action: everything it adds becomes one row (a batch)
     // and later one task.
-    int add_sources(const std::vector<std::wstring>& paths, bool contents_only = false) {
+    int add_sources(const std::vector<std::wstring>& paths, bool contents_only = false,
+                    const std::wstring& destination = {}) {
         int added = 0;
         const std::uint32_t batch = next_source_batch_++;
         for (const auto& raw : paths) {
@@ -2300,6 +2326,7 @@ private:
             }
             if (contents_only && item.is_directory) item.contents_only = true;
             item.batch = batch;
+            item.destination = destination;
             const bool duplicate = std::any_of(sources_.begin(), sources_.end(),
                                                [&](const ui::SourceItem& existing) {
                                                    return _wcsicmp(existing.path.c_str(),
@@ -2309,8 +2336,307 @@ private:
             sources_.push_back(std::move(item));
             ++added;
         }
-        if (added > 0) sources_changed();
+        if (added > 0) {
+            sources_changed();
+            select_source_batches({batch});
+        }
         return added;
+    }
+
+    // True when at least one path exists and is not listed yet, so asking
+    // for a destination is worth it.
+    bool has_new_source(const std::vector<std::wstring>& paths) const {
+        for (const auto& raw : paths) {
+            if (storage::fsutil::trim(raw).empty()) continue;
+            const ui::SourceItem item = make_source_item(raw);
+            if (item.path.empty() ||
+                GetFileAttributesW(storage::fsutil::long_path(item.path).c_str()) ==
+                    INVALID_FILE_ATTRIBUTES) {
+                continue;
+            }
+            const bool listed = std::any_of(sources_.begin(), sources_.end(),
+                                            [&](const ui::SourceItem& existing) {
+                                                return _wcsicmp(existing.path.c_str(),
+                                                                item.path.c_str()) == 0;
+                                            });
+            if (!listed) return true;
+        }
+        return false;
+    }
+
+    // One add action from the pickers, Paste, or the Explorer folder verb. A
+    // copy asks where the items go first; cancelling that adds nothing.
+    int add_sources_asking(const std::vector<std::wstring>& paths, bool contents_only = false) {
+        if (!has_new_source(paths)) return add_sources(paths, contents_only); // logs misses
+        std::wstring destination;
+        if (!is_scan_mode()) {
+            auto picked = pick_destination(L"Choose where to copy these items");
+            if (!picked.has_value()) {
+                append_log("Nothing added: no destination was chosen.");
+                return 0;
+            }
+            destination = std::move(*picked);
+        }
+        return add_sources(paths, contents_only, destination);
+    }
+
+    // Folder picker for a copy destination, opening at the destination box's
+    // folder or the most recent one. nullopt when cancelled.
+    std::optional<std::wstring> pick_destination(const wchar_t* title) {
+        std::wstring start = storage::fsutil::trim(window_text_wide(destination_edit_));
+        if (start.empty()) {
+            const auto recent = recent_destinations();
+            if (!recent.empty()) start = recent.front();
+        }
+        std::optional<std::wstring> result;
+        if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) {
+            return result;
+        }
+        IFileOpenDialog* dialog = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                       IID_PPV_ARGS(&dialog)))) {
+            DWORD options = 0;
+            dialog->GetOptions(&options);
+            dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+            dialog->SetTitle(title);
+            dialog->SetOkButtonLabel(L"Copy here");
+            IShellItem* folder = nullptr;
+            if (!start.empty() && directory_exists(start) &&
+                SUCCEEDED(SHCreateItemFromParsingName(start.c_str(), nullptr,
+                                                      IID_PPV_ARGS(&folder)))) {
+                dialog->SetFolder(folder);
+                folder->Release();
+            }
+            if (SUCCEEDED(dialog->Show(hwnd_))) {
+                IShellItem* item = nullptr;
+                if (SUCCEEDED(dialog->GetResult(&item))) {
+                    PWSTR path = nullptr;
+                    if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                        result = normalize_destination(path);
+                        CoTaskMemFree(path);
+                    }
+                    item->Release();
+                }
+            }
+            dialog->Release();
+        }
+        CoUninitialize();
+        return result;
+    }
+
+    static std::wstring normalize_destination(const std::wstring& raw) {
+        std::wstring full = storage::fsutil::get_full_path(storage::fsutil::trim(raw));
+        while (full.size() > 3 && (full.back() == L'\\' || full.back() == L'/')) full.pop_back();
+        return full;
+    }
+
+    static std::wstring window_text_wide(HWND handle) {
+        wchar_t buffer[4096];
+        const int length = GetWindowTextW(handle, buffer, 4096);
+        return std::wstring(buffer, static_cast<std::size_t>(std::max(length, 0)));
+    }
+
+    // ---- Source / Destination boxes ----
+    //
+    // They show the selected row. Edits apply when the box loses focus; an
+    // emptied box, or a source path that does not exist, is put back.
+
+    std::vector<std::size_t> selected_source_rows() const {
+        std::vector<std::size_t> rows;
+        for (int index : selected_list_indices(sources_list_)) {
+            if (index >= 0 && static_cast<std::size_t>(index) < source_batches_.size()) {
+                rows.push_back(static_cast<std::size_t>(index));
+            }
+        }
+        return rows;
+    }
+
+    void select_source_batches(const std::vector<std::uint32_t>& ids) {
+        SendMessageW(sources_list_, LB_SETSEL, FALSE, -1);
+        int last = -1;
+        for (std::size_t row = 0; row < source_batches_.size(); ++row) {
+            if (std::find(ids.begin(), ids.end(), source_batches_[row].id) == ids.end()) continue;
+            SendMessageW(sources_list_, LB_SETSEL, TRUE, static_cast<LPARAM>(row));
+            last = static_cast<int>(row);
+        }
+        if (last >= 0) SendMessageW(sources_list_, LB_SETCARETINDEX, last, FALSE);
+        update_sources_footer();
+        sync_path_boxes();
+    }
+
+    std::wstring row_source_text(std::size_t row) const {
+        std::wstring text;
+        for (std::size_t index : source_batches_[row].items) {
+            if (!text.empty()) text += L"; ";
+            text += sources_[index].path;
+        }
+        return text;
+    }
+
+    void sync_path_boxes() {
+        if (source_path_edit_ == nullptr) return;
+        const auto rows = selected_source_rows();
+        std::wstring source;
+        if (rows.size() == 1) source = row_source_text(rows[0]);
+        EnableWindow(source_path_edit_, rows.size() == 1 ? TRUE : FALSE);
+        EnableWindow(source_path_browse_, rows.size() == 1 ? TRUE : FALSE);
+        SendMessageW(source_path_edit_, EM_SETCUEBANNER, FALSE,
+                     reinterpret_cast<LPARAM>(rows.size() > 1 ? L"Several rows selected"
+                                                              : L"Select a row to edit its source"));
+        source_box_shown_ = source;
+        if (window_text_wide(source_path_edit_) != source) {
+            SetWindowTextW(source_path_edit_, source.c_str());
+        }
+        if (rows.empty()) {
+            // Keeps the folder the next add's picker opens at.
+            destination_box_shown_ = storage::fsutil::trim(window_text_wide(destination_edit_));
+            return;
+        }
+        std::wstring destination = sources_[source_batches_[rows[0]].items.front()].destination;
+        bool mixed = false;
+        for (std::size_t row : rows) {
+            if (_wcsicmp(sources_[source_batches_[row].items.front()].destination.c_str(),
+                         destination.c_str()) != 0) {
+                mixed = true;
+            }
+        }
+        if (mixed) destination.clear();
+        SendMessageW(destination_edit_, EM_SETCUEBANNER, FALSE,
+                     reinterpret_cast<LPARAM>(mixed ? L"Several destinations"
+                                                    : L"Choose a destination"));
+        destination_box_shown_ = destination;
+        if (window_text_wide(destination_edit_) != destination) {
+            SetWindowTextW(destination_edit_, destination.c_str());
+        }
+    }
+
+    void commit_destination_box() {
+        if (committing_paths_ || destination_edit_ == nullptr) return;
+        const std::wstring text = storage::fsutil::trim(window_text_wide(destination_edit_));
+        if (_wcsicmp(text.c_str(), destination_box_shown_.c_str()) == 0) return;
+        if (text.empty()) {
+            SetWindowTextW(destination_edit_, destination_box_shown_.c_str());
+            if (!destination_box_shown_.empty()) {
+                append_log("A destination cannot be empty; kept " +
+                           storage::fsutil::wide_to_utf8(destination_box_shown_) + ".");
+            }
+            return;
+        }
+        const std::wstring destination = normalize_destination(text);
+        for (std::size_t row : selected_source_rows()) {
+            for (std::size_t index : source_batches_[row].items) {
+                sources_[index].destination = destination;
+            }
+        }
+        destination_box_shown_ = destination;
+        if (text != destination) SetWindowTextW(destination_edit_, destination.c_str());
+        InvalidateRect(sources_list_, nullptr, FALSE);
+    }
+
+    // Browse for the selected row: pick folders or files instead of its
+    // current items. The pick goes through the Source box, so the same checks
+    // apply and the row keeps its destination.
+    void browse_row_sources() {
+        if (selected_source_rows().size() != 1) return;
+        HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING, IdSourcePickFolders, L"Choose folders...");
+        AppendMenuW(menu, MF_STRING, IdSourcePickFiles, L"Choose files...");
+        RECT button{};
+        GetWindowRect(source_path_browse_, &button);
+        const int chosen = static_cast<int>(TrackPopupMenu(
+            menu, TPM_RIGHTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY, button.right,
+            button.bottom, 0, hwnd_, nullptr));
+        DestroyMenu(menu);
+        if (chosen != IdSourcePickFolders && chosen != IdSourcePickFiles) return;
+        const bool folders = chosen == IdSourcePickFolders;
+        const auto picked = pick_paths(folders, folders ? L"Choose folders for this row"
+                                                        : L"Choose files for this row");
+        if (picked.empty()) return; // cancelled: the row stays as it was
+        std::wstring text;
+        for (const auto& path : picked) {
+            if (!text.empty()) text += L"; ";
+            text += path;
+        }
+        SetWindowTextW(source_path_edit_, text.c_str());
+        commit_source_box();
+    }
+
+    void commit_source_box() {
+        if (committing_paths_ || source_path_edit_ == nullptr) return;
+        const auto rows = selected_source_rows();
+        if (rows.size() != 1) return;
+        const std::wstring text = storage::fsutil::trim(window_text_wide(source_path_edit_));
+        if (text == source_box_shown_) return;
+        committing_paths_ = true;
+        // Put the row back first, so a warning that moves focus cannot loop.
+        auto revert = [this] { SetWindowTextW(source_path_edit_, source_box_shown_.c_str()); };
+        if (text.empty()) {
+            revert();
+            append_log("A source cannot be empty; the row was kept as it was.");
+            committing_paths_ = false;
+            return;
+        }
+        const ui::SourceBatch batch = source_batches_[rows[0]];
+        const std::wstring destination = sources_[batch.items.front()].destination;
+        std::vector<ui::SourceItem> replacement;
+        std::wstring missing;
+        std::size_t start = 0;
+        while (start <= text.size()) {
+            const std::size_t end = text.find(L';', start);
+            std::wstring raw = storage::fsutil::trim(
+                text.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start));
+            if (raw.size() >= 2 && raw.front() == L'"' && raw.back() == L'"') {
+                raw = raw.substr(1, raw.size() - 2);
+            }
+            if (!raw.empty()) {
+                ui::SourceItem item = make_source_item(raw);
+                if (item.path.empty() ||
+                    GetFileAttributesW(storage::fsutil::long_path(item.path).c_str()) ==
+                        INVALID_FILE_ATTRIBUTES) {
+                    missing += L"\n  \x2022 " + raw;
+                } else {
+                    auto same_path = [&](const ui::SourceItem& other) {
+                        return _wcsicmp(other.path.c_str(), item.path.c_str()) == 0;
+                    };
+                    const bool elsewhere = std::any_of(
+                        sources_.begin(), sources_.end(), [&](const ui::SourceItem& other) {
+                            return other.batch != batch.id && same_path(other);
+                        });
+                    const bool repeated =
+                        std::any_of(replacement.begin(), replacement.end(), same_path);
+                    if (!elsewhere && !repeated) {
+                        for (std::size_t index : batch.items) {
+                            if (same_path(sources_[index])) {
+                                item.contents_only = sources_[index].contents_only;
+                            }
+                        }
+                        item.batch = batch.id;
+                        item.destination = destination;
+                        replacement.push_back(std::move(item));
+                    }
+                }
+            }
+            if (end == std::wstring::npos) break;
+            start = end + 1;
+        }
+        if (!missing.empty() || replacement.empty()) {
+            revert();
+            committing_paths_ = false;
+            if (!missing.empty()) {
+                warn_box(L"These paths were not found, so the row was kept as it was:" + missing);
+            } else {
+                append_log("Those paths are already listed in other rows; the row was kept.");
+            }
+            return;
+        }
+        const std::size_t at = batch.items.front();
+        std::erase_if(sources_, [&](const ui::SourceItem& item) { return item.batch == batch.id; });
+        sources_.insert(sources_.begin() + static_cast<std::ptrdiff_t>(std::min(at, sources_.size())),
+                        std::make_move_iterator(replacement.begin()),
+                        std::make_move_iterator(replacement.end()));
+        sources_changed();
+        select_source_batches({batch.id});
+        committing_paths_ = false;
     }
 
     void set_sources(std::vector<ui::SourceItem> items) {
@@ -2344,6 +2670,7 @@ private:
         SendMessageW(sources_list_, LB_SETCOUNT, source_batches_.size(), 0);
         InvalidateRect(sources_list_, nullptr, TRUE);
         update_sources_footer();
+        sync_path_boxes();
     }
 
     void update_sources_footer() {
@@ -2547,8 +2874,8 @@ private:
             info_box(L"The clipboard has no file paths. Copy files in Explorer, or copy one path per line.");
             return;
         }
-        const int added = add_sources(paths);
-        append_log("Pasted " + std::to_string(added) + " source item(s).");
+        const int added = add_sources_asking(paths);
+        if (added > 0) append_log("Pasted " + std::to_string(added) + " source item(s).");
     }
 
     void show_sources_context_menu(LPARAM screen_point) {
@@ -2766,6 +3093,7 @@ private:
         const int index = chosen - IdRecentDestinationBase;
         if (chosen != 0 && index >= 0 && static_cast<std::size_t>(index) < list.size()) {
             SetWindowTextW(destination_edit_, list[static_cast<std::size_t>(index)].c_str());
+            commit_destination_box();
         }
     }
 
@@ -3187,6 +3515,9 @@ private:
     // tasks: one task per row, with one part per source folder or drive in
     // it. Optionally queues them. Returns how many tasks were added.
     int add_tasks_from_builder(bool queue, bool pinned = false) {
+        // A box still being edited (menu or accelerator) applies first.
+        commit_source_box();
+        commit_destination_box();
         if (sources_.empty()) {
             info_box(L"Add files or folders first: + Files, + Folder, Paste, or drag them "
                      L"onto the list.");
@@ -3200,11 +3531,6 @@ private:
             return 0;
         }
         const bool scan = base.OperationMode == models::JobOperationMode::ScanOnly;
-        if (!scan && ui_is_blank(base.DestinationRoot)) {
-            info_box(L"Choose a destination folder first.");
-            SetFocus(destination_edit_);
-            return 0;
-        }
         std::vector<std::size_t> rows;
         for (int index : selected_list_indices(sources_list_)) {
             if (index >= 0 && static_cast<std::size_t>(index) < source_batches_.size()) {
@@ -3214,25 +3540,58 @@ private:
         if (rows.empty()) {
             for (std::size_t i = 0; i < source_batches_.size(); ++i) rows.push_back(i);
         }
+        // Each row copies to its own destination. A row added in Assess mode
+        // has none yet, so ask; cancelling adds nothing.
+        if (!scan) {
+            for (std::size_t row : rows) {
+                const auto& items = source_batches_[row].items;
+                if (!sources_[items.front()].destination.empty()) continue;
+                auto picked = pick_destination(L"Choose where to copy this row");
+                if (!picked.has_value()) {
+                    append_log("Nothing added: no destination was chosen.");
+                    return 0;
+                }
+                for (std::size_t index : items) sources_[index].destination = *picked;
+            }
+            InvalidateRect(sources_list_, nullptr, FALSE);
+            sync_path_boxes();
+        }
         struct Pending {
             std::vector<ui::SourceGroup> groups;
             std::size_t items = 0;
+            std::wstring destination;
         };
         std::vector<Pending> pending;
-        std::vector<ui::SourceGroup> all_groups;
         for (std::size_t row : rows) {
             std::vector<ui::SourceItem> items;
             for (std::size_t index : source_batches_[row].items) items.push_back(sources_[index]);
             Pending task;
             task.groups = ui::group_sources(items);
             task.items = items.size();
+            if (!scan) task.destination = items.front().destination;
             if (task.groups.empty()) continue;
-            all_groups.insert(all_groups.end(), task.groups.begin(), task.groups.end());
             pending.push_back(std::move(task));
         }
         if (pending.empty()) return 0;
         if (!scan) {
-            const auto collisions = ui::find_destination_collisions(all_groups);
+            // Only parts that land in the same destination can collide.
+            std::vector<std::wstring> collisions;
+            std::vector<std::wstring> checked;
+            for (const auto& task : pending) {
+                auto same = [&](const std::wstring& other) {
+                    return _wcsicmp(other.c_str(), task.destination.c_str()) == 0;
+                };
+                if (std::any_of(checked.begin(), checked.end(), same)) continue;
+                checked.push_back(task.destination);
+                std::vector<ui::SourceGroup> groups;
+                for (const auto& other : pending) {
+                    if (!same(other.destination)) continue;
+                    groups.insert(groups.end(), other.groups.begin(), other.groups.end());
+                }
+                for (auto& name : ui::find_destination_collisions(groups)) {
+                    collisions.push_back(std::move(name));
+                }
+            }
             if (!collisions.empty()) {
                 std::wstring names;
                 for (const auto& name : collisions) names += L"\n  \x2022 " + name;
@@ -3244,11 +3603,14 @@ private:
                     return 0;
                 }
             }
-            remember_destination(base.DestinationRoot);
+            for (auto it = checked.rbegin(); it != checked.rend(); ++it) {
+                remember_destination(storage::fsutil::wide_to_utf8(*it));
+            }
         }
         int added = 0;
         for (const auto& task : pending) {
             models::CopyJobOptions options = base;
+            if (!scan) options.DestinationRoot = storage::fsutil::wide_to_utf8(task.destination);
             options.SourceRoot = storage::fsutil::wide_to_utf8(task.groups[0].root);
             options.SelectedRelativePaths = task.groups[0].relative_paths;
             std::vector<storage::ManagedJobPart> parts;
@@ -3744,6 +4106,7 @@ private:
         for (std::size_t part = 0; part < ui::JobManagerService::part_count(job); ++part) {
             for (auto item : ui::items_from_options(ui::JobManagerService::part_options(job, part))) {
                 item.batch = batch;
+                item.destination = storage::fsutil::utf8_to_wide(job.Options.DestinationRoot);
                 items.push_back(std::move(item));
             }
         }
@@ -4120,6 +4483,14 @@ private:
 
             // The destination row's slot is kept in Assess mode (a note
             // fills it) so switching modes never moves the lists.
+            {
+                const int label_width = scale(78);
+                const int browse_width = scale(84);
+                place(source_path_label_, 0, label_width);
+                place(source_path_edit_, label_width, width - label_width - browse_width - gap);
+                place(source_path_browse_, width - browse_width, browse_width);
+                y += row_height + gap;
+            }
             place(scan_info_label_, 0, width);
             {
                 const int label_width = scale(78);
@@ -4418,6 +4789,15 @@ private:
         }
         if (id == IdSourcesList && notification == LBN_SELCHANGE) {
             update_sources_footer();
+            sync_path_boxes();
+            return;
+        }
+        if (id == IdSourcePathEdit && notification == EN_KILLFOCUS) {
+            commit_source_box();
+            return;
+        }
+        if (id == IdDestinationEdit && notification == EN_KILLFOCUS) {
+            commit_destination_box();
             return;
         }
         if (id == IdTasksList && notification == LBN_SELCHANGE) {
@@ -4486,8 +4866,12 @@ private:
             case IdClearSelection:
                 set_sources({});
                 break;
+            case IdSourcePathBrowse:
+                browse_row_sources();
+                break;
             case IdDestinationBrowse:
                 browse_folder(destination_edit_);
+                commit_destination_box();
                 break;
             case IdRecentDestinations:
                 show_recent_destinations();
@@ -4718,6 +5102,7 @@ private:
     void queue_selection(const std::vector<std::wstring>& paths, bool scan_mode,
                          bool want_destination) {
         if (paths.empty()) return;
+        selection_batches_.push_back(next_source_batch_);
         add_sources(paths);
         if (scan_mode) launch_.explorer_scan_mode = true;
         if (want_destination) selection_wants_destination_ = true;
@@ -4738,13 +5123,44 @@ private:
         launch_.explorer_scan_mode = false;
         if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
         SetForegroundWindow(hwnd_);
-        if (want_destination) prompt_destination_from_explorer();
+        const auto batches = std::move(selection_batches_);
+        selection_batches_.clear();
+        ask_destination_for(batches);
+    }
+
+    // Rows added by a drop or an Explorer launch: a copy asks once where they
+    // go; cancelling removes them again.
+    void ask_destination_for(const std::vector<std::uint32_t>& batches) {
+        auto in_batches = [&](const ui::SourceItem& item) {
+            return std::find(batches.begin(), batches.end(), item.batch) != batches.end();
+        };
+        const bool needed =
+            !is_scan_mode() &&
+            std::any_of(sources_.begin(), sources_.end(), [&](const ui::SourceItem& item) {
+                return in_batches(item) && item.destination.empty();
+            });
+        if (!needed) {
+            if (!batches.empty()) select_source_batches(batches);
+            return;
+        }
+        auto picked = pick_destination(L"Choose where to copy these items");
+        if (!picked.has_value()) {
+            std::erase_if(sources_, in_batches);
+            sources_changed();
+            append_log("Nothing added: no destination was chosen.");
+            return;
+        }
+        for (auto& item : sources_) {
+            if (in_batches(item) && item.destination.empty()) item.destination = *picked;
+        }
+        InvalidateRect(sources_list_, nullptr, FALSE);
+        select_source_batches(batches);
     }
 
     // Folder picker with multi-select; each folder is added as an item.
     void add_folders_to_sources() {
         auto picked = pick_paths(/*folders*/ true, L"Add folders to copy");
-        add_sources(picked);
+        add_sources_asking(picked);
     }
 
     // Multi-select shell picker for files or folders.
@@ -4787,7 +5203,7 @@ private:
     }
 
     void add_files_to_selection() {
-        add_sources(pick_paths(/*folders*/ false, L"Add files to copy"));
+        add_sources_asking(pick_paths(/*folders*/ false, L"Add files to copy"));
     }
 
     // ---- Explorer launch application (--from-explorer[-folder]) ------------
@@ -4816,19 +5232,14 @@ private:
                 append_log("Explorer folder path was not found: " + launch_.explorer_folder_path);
                 return;
             }
-            // The folder-background verb means "this folder's contents".
-            add_sources({folder}, /*contents_only*/ true);
-            if (launch_.explorer_scan_mode) {
-                SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0);
-                sync_mode_ui();
-            } else {
-                SendMessageW(mode_combo_, CB_SETCURSEL, 0, 0);
-                sync_mode_ui();
-            }
+            SendMessageW(mode_combo_, CB_SETCURSEL, launch_.explorer_scan_mode ? 1 : 0, 0);
+            sync_mode_ui();
             launch_.explorer_scan_mode = false;
-            append_log("Source set from Explorer background folder: " +
-                       storage::fsutil::wide_to_utf8(folder));
-            prompt_destination_from_explorer();
+            // The folder-background verb means "this folder's contents".
+            if (add_sources_asking({folder}, /*contents_only*/ true) > 0) {
+                append_log("Source set from Explorer background folder: " +
+                           storage::fsutil::wide_to_utf8(folder));
+            }
             return;
         }
 
@@ -4839,15 +5250,6 @@ private:
             paths.push_back(resolve_full_path(raw));
         }
         queue_selection(paths, launch_.explorer_scan_mode, /*want_destination*/ true);
-    }
-
-    void prompt_destination_from_explorer() {
-        if (is_scan_mode()) return; // assessments write no destination
-        if (supervisor_.is_job_running()) return;
-        std::string current = window_text_utf8(destination_edit_);
-        if (!ui_is_blank(current)) return;
-        append_log("Explorer launch detected. Choose a destination folder.");
-        browse_folder(destination_edit_);
     }
 
     // ---- Update check (fetch + compare; download handled via the browser) --
@@ -4980,7 +5382,13 @@ private:
     }
 
     void apply_run_options_to_ui(const models::CopyJobOptions& options) {
-        set_sources(ui::items_from_options(options));
+        {
+            auto items = ui::items_from_options(options);
+            for (auto& item : items) {
+                item.destination = storage::fsutil::utf8_to_wide(options.DestinationRoot);
+            }
+            set_sources(std::move(items));
+        }
         SetWindowTextW(destination_edit_,
                        storage::fsutil::utf8_to_wide(options.DestinationRoot).c_str());
 

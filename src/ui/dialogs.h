@@ -1,11 +1,11 @@
 // -----------------------------------------------------------------------------
 // File: src\ui\dialogs.h
-// Purpose: Themed modal dialogs for the native UI. The Settings dialog has seven
+// Purpose: Themed modal dialogs for the native UI. The Settings dialog has five
 //          navigation pages (Appearance, Copy Defaults, Performance,
-//          Diagnostics, Verification, Recovery & Startup, Explorer Integration)
-//          built from a declarative field table bound to the DOM-preserving
-//          settings store. Update settings live in the About dialog. Both sit on
-//          a shared ModalHost.
+//          Diagnostics, Recovery & Startup) built from a declarative field
+//          table bound to the DOM-preserving settings store. Every page is
+//          created once, hidden, and swapped with redraw suspended. Update
+//          settings live in the About dialog. Both sit on a shared ModalHost.
 // -----------------------------------------------------------------------------
 
 #pragma once
@@ -19,6 +19,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <shobjidl.h>
 
 #include "../version.h"
 #include "app_icon.h"
@@ -623,7 +625,7 @@ public:
     }
 
 private:
-    enum class FieldKind { Section, Check, Combo, ComboInt, EditInt, EditText };
+    enum class FieldKind { Section, Check, Combo, ComboInt, EditInt, EditText, EditFolder };
 
     struct FieldSpec {
         int page;
@@ -640,9 +642,8 @@ private:
 
     static const std::vector<const wchar_t*>& page_names() {
         static const std::vector<const wchar_t*> names = {
-            L"Appearance",    L"Copy Defaults", L"Performance",
-            L"Diagnostics",   L"Verification",  L"Recovery & Startup",
-            L"Explorer Integration"};
+            L"Appearance", L"Copy Defaults", L"Performance", L"Diagnostics",
+            L"Recovery & Startup"};
         return names;
     }
 
@@ -685,6 +686,10 @@ private:
                                   const char* fallback) {
                 FieldSpec spec{page, FieldKind::EditText, label, key, {}, {}, {}};
                 spec.fallback_text = fallback;
+                f.push_back(spec);
+            };
+            auto edit_folder = [&f](int page, const char* label, const char* key) {
+                FieldSpec spec{page, FieldKind::EditFolder, label, key, {}, {}, {}};
                 f.push_back(spec);
             };
 
@@ -741,6 +746,12 @@ private:
             section(1, "Bad Range Map");
             edit_int(1, "Map max age (days, 0=never)", "DefaultBadRangeMapMaxAgeDays", 0, 3650,
                      30);
+            section(1, "Verification");
+            combo(1, "Hash algorithm", "DefaultVerificationHashAlgorithm",
+                  {L"SHA-256", L"SHA-512"}, {"sha256", "sha512"}, "sha256");
+            edit_int(1, "Sample chunk size (KB)", "DefaultSampleVerificationChunkKb", 32, 4096,
+                     128);
+            edit_int(1, "Sample count", "DefaultSampleVerificationChunkCount", 1, 64, 3);
 
             // --- Page 2: Performance ------------------------------------
             section(2, "Transfer Tuning");
@@ -795,40 +806,30 @@ private:
             edit_int(3, "Diagnostics refresh (ms)", "UiDiagnosticsRefreshMs", 100, 5000, 250);
             edit_int(3, "Virtual log max lines", "UiMaxLogLines", 1000, 1000000, 50000);
             section(3, "Journal Storage");
-            edit_text(3, "Journal folder (empty = default)", "JournalDirectory", "");
+            edit_folder(3, "Journal folder (empty = default)", "JournalDirectory");
             check(3, "Discard backups after a run completes", "CompactJournalsOnCompletion", true);
             edit_int(3, "Delete journals after (days, 0=keep)", "JournalRetentionDays", 0, 3650, 30);
             edit_int(3, "Always keep newest journals", "JournalKeepMinimum", 0, 1000, 10);
 
-            // --- Page 4: Verification -----------------------------------
-            section(4, "Verification");
-            combo(4, "Hash algorithm", "DefaultVerificationHashAlgorithm",
-                  {L"SHA-256", L"SHA-512"}, {"sha256", "sha512"}, "sha256");
-            section(4, "Sampled Mode");
-            edit_int(4, "Sample chunk size (KB)", "DefaultSampleVerificationChunkKb", 32, 4096,
-                     128);
-            edit_int(4, "Sample count", "DefaultSampleVerificationChunkCount", 1, 64, 3);
-
             // Update settings live in the About dialog, not here.
 
-            // --- Page 5: Recovery & Startup -----------------------------
-            section(5, "Tasks");
-            check(5, "Run the queue automatically on startup", "AutoRunQueuedJobsOnStartup",
+            // --- Page 4: Recovery & Startup -----------------------------
+            section(4, "Tasks");
+            check(4, "Run the queue automatically on startup", "AutoRunQueuedJobsOnStartup",
                   false);
-            combo(5, "Unpinned tasks on exit", "TaskListOnExit",
+            combo(4, "Unpinned tasks on exit", "TaskListOnExit",
                   {L"Ask", L"Keep", L"Discard"}, {"ask", "keep", "discard"}, "ask");
-            section(5, "Interrupted Runs");
-            combo(5, "At startup", "InterruptedRunsAtStartup",
+            section(4, "Interrupted Runs");
+            combo(4, "At startup", "InterruptedRunsAtStartup",
                   {L"Ask", L"Resume automatically", L"Leave in History"},
                   {"ask", "resume", "history"}, "ask");
-            check(5, "Auto-start on next logon after interruption", "EnableRecoveryAutostart",
+            check(4, "Auto-start on next logon after interruption", "EnableRecoveryAutostart",
                   true);
-            edit_int(5, "Heartbeat write interval (sec)", "RecoveryTouchIntervalSeconds", 1, 60,
+            edit_int(4, "Heartbeat write interval (sec)", "RecoveryTouchIntervalSeconds", 1, 60,
                      2);
 
-            // --- Page 6: Explorer Integration ---------------------------
-            section(6, "Context Menu");
-            check(6, "Enable Explorer context menu integration", "EnableExplorerContextMenu",
+            section(4, "Context Menu");
+            check(4, "Enable Explorer context menu integration", "EnableExplorerContextMenu",
                   false);
             return f;
         }();
@@ -915,7 +916,6 @@ private:
         if (section == "Theme & Accent") return L"Choose XactCopy's light/dark presentation, accent source, and title-bar treatment.";
         if (section == "Layout") return L"Adjust application density and scaling in addition to Windows per-monitor DPI scaling.";
         if (section == "Operations Log") return L"Control the typeface and severity coloring used by the live operations log.";
-        if (section == "Grid Appearance") return L"Control Job Manager row spacing, alternating backgrounds, and header emphasis.";
         if (section == "Status & Progress") return L"Choose which live status rows are visible and how progress bars are rendered.";
         if (section == "Default Run Behavior") return L"Defaults applied when a new copy or scan is prepared. They can still be changed on the main window.";
         if (section == "Policies") return L"Default conflict, symbolic-link, and unreadable-byte handling policies for new jobs.";
@@ -927,10 +927,9 @@ private:
         if (section == "Worker Telemetry") return L"Control worker progress frequency and diagnostic-log volume sent to the UI.";
         if (section == "UI Diagnostics") return L"Control main-window diagnostics and the number of log lines retained in memory.";
         if (section == "Journal Storage") return L"Control completed-journal compaction and age-based retention without removing active resumable runs.";
-        if (section == "Verification Defaults") return L"Choose the default post-copy verification method and cryptographic hash algorithm.";
-        if (section == "Sampled Mode") return L"Tune how many regions Sampled verification checks and the size of each region.";
-        if (section == "Startup") return L"Choose whether recovery support or queued jobs may run when XactCopy starts or Windows signs in.";
-        if (section == "Interrupted Run Handling") return L"Control prompts, automatic resume, and freshness tracking for interrupted journaled runs.";
+        if (section == "Verification") return L"The hash used when a copy is verified, and how many regions Sampled verification compares.";
+        if (section == "Tasks") return L"Whether the queue runs when XactCopy starts and what happens to unpinned tasks on exit.";
+        if (section == "Interrupted Runs") return L"What happens at startup after a run was interrupted, and how recovery is tracked.";
         if (section == "Context Menu") return L"Enable or remove XactCopy commands in Windows Explorer.";
         return L"Settings in this group are saved together when you select Save.";
     }
@@ -939,6 +938,8 @@ private:
     static constexpr int IdSaveButton = 2002;
     static constexpr int IdCancelButton = 2003;
     static constexpr int IdFieldBase = 2100;
+    static constexpr int IdBrowseBase = 3100; // + field index
+    static constexpr int RailWidth = 168;     // navigation rail, 96-DPI pixels
 
     AppSettings& settings_;
     ThemePalette theme_;
@@ -963,9 +964,12 @@ private:
     std::map<std::string, int> staged_ints_;
     std::map<std::string, std::string> staged_strings_;
 
-    // Live controls for the current page: field-table index -> hwnd.
+    // Live controls on every page: field-table index -> hwnd.
+    // Every page is built once; page_windows_ holds each page's windows so a
+    // switch only toggles visibility.
     std::map<int, HWND> page_controls_;
-    std::vector<HWND> page_labels_;
+    std::map<int, std::vector<HWND>> page_windows_;
+    std::map<int, HWND> browse_targets_; // browse button id -> path edit
     std::map<int, HWND> page_field_labels_;
     std::map<HWND, bool> page_label_enabled_;
     std::map<int, bool> page_checks_; // field index -> checked (owner-draw state)
@@ -999,7 +1003,7 @@ private:
         auto scale = [this](int value) { return MulDiv(value, static_cast<int>(dpi_), 96); };
         RECT client{};
         GetClientRect(hwnd, &client);
-        MoveWindow(nav_list_, scale(8), scale(12), scale(172),
+        MoveWindow(nav_list_, scale(8), scale(12), scale(RailWidth - 16),
                    std::max(scale(80), static_cast<int>(client.bottom) - scale(24)), TRUE);
         MoveWindow(save_button_, client.right - scale(200), client.bottom - scale(38), scale(90),
                    scale(28), TRUE);
@@ -1013,7 +1017,7 @@ private:
         host_.set_density_percent(theme_.density_percent);
         host_.set_scale_percent(theme_.scale_percent);
         HWND hwnd = host_.create(
-            owner, L"XactCopySettingsDlg", L"Settings", 900, 720,
+            owner, L"XactCopySettingsDlg", L"Settings", 880, 500,
             [this](HWND h, UINT m, WPARAM w, LPARAM l, bool& handled) {
                 return proc(h, m, w, l, handled);
             });
@@ -1064,6 +1068,7 @@ private:
                         settings_.get_int(field.key, field.min, field.max, field.fallback_int);
                     break;
                 case FieldKind::EditText:
+                case FieldKind::EditFolder:
                     staged_strings_[field.key] =
                         settings_.get_string(field.key, field.fallback_text);
                     break;
@@ -1077,6 +1082,7 @@ private:
         validation_error_.clear();
         validation_control_ = nullptr;
         if (!harvest_current_page(true)) {
+            reveal_control(validation_control_);
             themed_message_box(host_.hwnd(), theme_, validation_error_, L"Invalid setting",
                                MessageIcon::Warning);
             if (validation_control_ != nullptr) SetFocus(validation_control_);
@@ -1091,13 +1097,10 @@ private:
             const bool valid = color.size() == 7 && color.front() == '#' &&
                                std::all_of(color.begin() + 1, color.end(), is_hex_digit);
             if (!valid) {
-                if (current_page_ != 0) {
-                    SendMessageW(nav_list_, LB_SETCURSEL, 0, 0);
-                    build_page(0);
-                }
                 const int index = field_index_for_key("AccentColorHex");
                 auto control = page_controls_.find(index);
                 validation_control_ = control == page_controls_.end() ? nullptr : control->second;
+                reveal_control(validation_control_);
                 themed_message_box(host_.hwnd(), theme_,
                                    L"Custom accent color must use the form #RRGGBB.",
                                    L"Invalid setting", MessageIcon::Warning);
@@ -1114,6 +1117,7 @@ private:
                         break;
                     case FieldKind::Combo:
                     case FieldKind::EditText:
+                    case FieldKind::EditFolder:
                         target.set_string(field.key, staged_strings_[field.key]);
                         break;
                     case FieldKind::ComboInt:
@@ -1139,19 +1143,71 @@ private:
     // ---- Page building -----------------------------------------------------
 
     void destroy_page_controls() {
-        for (auto& [index, control] : page_controls_) {
-            tooltips_.remove(control);
-            DestroyWindow(control);
+        for (auto& [page, windows] : page_windows_) {
+            for (HWND window : windows) {
+                tooltips_.remove(window);
+                DestroyWindow(window);
+            }
         }
-        for (HWND label : page_labels_) {
-            tooltips_.remove(label);
-            DestroyWindow(label);
-        }
+        page_windows_.clear();
         page_controls_.clear();
-        page_labels_.clear();
         page_field_labels_.clear();
         page_label_enabled_.clear();
         page_checks_.clear();
+        browse_targets_.clear();
+    }
+
+    // Switch to the page that holds `control` (used to point at a field that
+    // failed validation).
+    void reveal_control(HWND control) {
+        if (control == nullptr) return;
+        for (const auto& [page, windows] : page_windows_) {
+            if (std::find(windows.begin(), windows.end(), control) == windows.end()) continue;
+            if (page != current_page_) {
+                SendMessageW(nav_list_, LB_SETCURSEL, page, 0);
+                show_page(page);
+            }
+            return;
+        }
+    }
+
+    void browse_folder(HWND target_edit) {
+        const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        if (FAILED(com)) return;
+        show_folder_picker(target_edit);
+        CoUninitialize();
+    }
+
+    void show_folder_picker(HWND target_edit) {
+        IFileOpenDialog* dialog = nullptr;
+        if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(&dialog)))) {
+            return;
+        }
+        DWORD options = 0;
+        dialog->GetOptions(&options);
+        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        dialog->SetTitle(L"Choose a journal folder");
+        wchar_t current[MAX_PATH]{};
+        GetWindowTextW(target_edit, current, MAX_PATH);
+        IShellItem* start = nullptr;
+        if (current[0] != L'\0' &&
+            SUCCEEDED(SHCreateItemFromParsingName(current, nullptr, IID_PPV_ARGS(&start)))) {
+            dialog->SetFolder(start);
+            start->Release();
+        }
+        if (SUCCEEDED(dialog->Show(host_.hwnd()))) {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(dialog->GetResult(&item))) {
+                PWSTR path = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                    SetWindowTextW(target_edit, path);
+                    CoTaskMemFree(path);
+                }
+                item->Release();
+            }
+        }
+        dialog->Release();
     }
 
     int field_index_for_key(std::string_view key) const {
@@ -1200,9 +1256,7 @@ private:
     }
 
     void sync_page_dependencies() {
-        if (current_page_ == 0) {
-            set_field_enabled("AccentColorHex", staged_combo("AccentColorMode") == "custom");
-        }
+        set_field_enabled("AccentColorHex", staged_combo("AccentColorMode") == "custom");
         // Salvage, the bad-range map, fragile mode, and verification are
         // main-window choices now, so the settings that refine them stay
         // editable here and apply whenever the task turns those on. The
@@ -1255,7 +1309,8 @@ private:
                     staged_ints_[field.key] = static_cast<int>(parsed);
                     break;
                 }
-                case FieldKind::EditText: {
+                case FieldKind::EditText:
+                case FieldKind::EditFolder: {
                     wchar_t buffer[512];
                     int length = GetWindowTextW(control, buffer, 512);
                     staged_strings_[field.key] =
@@ -1269,82 +1324,129 @@ private:
         return true;
     }
 
-    void build_page(int page) {
-        destroy_page_controls();
-        current_page_ = page;
+    // Rows a field occupies: a folder field puts its path box under the label
+    // so the path gets the full column width.
+    static int field_rows(const FieldSpec& field) {
+        return field.kind == FieldKind::EditFolder ? 2 : 1;
+    }
 
+    void create_all_pages() {
+        for (int page = 0; page < static_cast<int>(page_names().size()); ++page) {
+            create_page(page);
+        }
+        sync_page_dependencies();
+        tooltips_.update_layout();
+    }
+
+    // Swap pages with redraw suspended, then paint the content area once, so
+    // no half-built or blank page is ever shown.
+    void show_page(int page) {
         HWND hwnd = host_.hwnd();
+        SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
+        for (const auto& [index, windows] : page_windows_) {
+            const int command = index == page ? SW_SHOWNA : SW_HIDE;
+            for (HWND window : windows) ShowWindow(window, command);
+        }
+        current_page_ = page;
+        SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
+        RECT content{};
+        GetClientRect(hwnd, &content);
+        content.left = MulDiv(RailWidth, static_cast<int>(dpi_), 96);
+        RedrawWindow(hwnd, &content, nullptr,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
+
+    // Controls are created hidden; show_page reveals them.
+    void create_page(int page) {
+        HWND hwnd = host_.hwnd();
+        HINSTANCE instance = GetModuleHandleW(nullptr);
         UINT dpi = dpi_;
         auto scale = [dpi](int value) { return MulDiv(value, static_cast<int>(dpi), 96); };
 
         RECT client;
         GetClientRect(hwnd, &client);
-        const int nav_width = scale(180);
         const int margin = scale(16);
         const int row_height = scale(24);
-        const int row_gap = scale(5);
+        const int pitch = row_height + scale(4);
         const int section_gap = scale(10); // breathing room above a section header
-        const int footer_height = scale(48);
-        const int column_gap = scale(28);
-        const int label_width = scale(176);
+        const int column_gap = scale(24);
         const int control_gap = scale(8);
-        const int top = margin + scale(2);
-        const int content_left = nav_width + margin;
+        const int top = margin;
+        const int content_left = scale(RailWidth) + margin;
         const int content_width = client.right - content_left - margin;
         const int column_width = (content_width - column_gap) / 2;
-        const int usable_bottom = client.bottom - footer_height;
+        const int label_width = std::min(scale(188), column_width * 3 / 5);
         auto column_x = [&](int column) {
             return content_left + column * (column_width + column_gap);
         };
 
         const auto& table = fields();
+        auto& windows = page_windows_[page];
 
-        // First pass: pack whole sections into two columns so a section's fields
-        // never get orphaned from their header across the column break.
-        std::map<int, POINT> pos;
-        int column = 0;
-        int y = top;
+        // Group the page into sections (header plus its fields) and split them
+        // between the two columns at the boundary that best balances heights,
+        // so a section never breaks across columns.
+        std::vector<int> block_rows;
+        std::map<int, int> block_of;
         for (int index = 0; index < static_cast<int>(table.size()); ++index) {
             const FieldSpec& field = table[static_cast<std::size_t>(index)];
             if (field.page != page) continue;
-
-            if (field.kind == FieldKind::Section) {
-                int rows = 1; // header
-                for (int j = index + 1; j < static_cast<int>(table.size()); ++j) {
-                    if (table[static_cast<std::size_t>(j)].page != page) continue;
-                    if (table[static_cast<std::size_t>(j)].kind == FieldKind::Section) break;
-                    ++rows;
-                }
-                const bool at_column_top = (y == top);
-                const int block_height = rows * (row_height + row_gap) + (at_column_top ? 0 : section_gap);
-                if (!at_column_top && column == 0 && y + block_height > usable_bottom) {
-                    column = 1;
-                    y = top;
-                } else if (!at_column_top) {
-                    y += section_gap;
-                }
+            if (field.kind == FieldKind::Section || block_rows.empty()) block_rows.push_back(0);
+            block_rows.back() += field_rows(field);
+            block_of[index] = static_cast<int>(block_rows.size()) - 1;
+        }
+        auto column_height = [&](std::size_t from, std::size_t to) {
+            int height = 0;
+            for (std::size_t block = from; block < to; ++block) {
+                height += block_rows[block] * pitch + (block > from ? section_gap : 0);
             }
-
-            pos[index] = POINT{column_x(column), y};
-            y += row_height + row_gap;
+            return height;
+        };
+        std::size_t split = block_rows.size();
+        int best = INT32_MAX;
+        for (std::size_t candidate = 1; candidate <= block_rows.size(); ++candidate) {
+            const int tallest = std::max(column_height(0, candidate),
+                                         column_height(candidate, block_rows.size()));
+            if (tallest < best) {
+                best = tallest;
+                split = candidate;
+            }
         }
 
-        // Second pass: create the controls at the packed positions.
+        // Drop-down lists open wide enough for their longest entry.
+        HDC measure_dc = GetDC(hwnd);
+        HGDIOBJ old_font = SelectObject(measure_dc, font_);
+        auto text_width = [&](const wchar_t* text) {
+            SIZE size{};
+            GetTextExtentPoint32W(measure_dc, text, static_cast<int>(std::wcslen(text)), &size);
+            return static_cast<int>(size.cx);
+        };
+
+        int y = top;
+        int previous_block = -1;
         for (int index = 0; index < static_cast<int>(table.size()); ++index) {
             const FieldSpec& field = table[static_cast<std::size_t>(index)];
             if (field.page != page) continue;
 
-            const int x = pos[index].x;
-            y = pos[index].y;
-            int control_id = IdFieldBase + index;
+            const int block = block_of[index];
+            const int column = static_cast<std::size_t>(block) >= split ? 1 : 0;
+            if (block != previous_block) {
+                const bool column_start = block == 0 || static_cast<std::size_t>(block) == split;
+                y = column_start ? top : y + section_gap;
+                previous_block = block;
+            }
+            const int x = column_x(column);
+            const int row_y = y;
+            y += field_rows(field) * pitch;
+            const int control_id = IdFieldBase + index;
 
             if (field.kind == FieldKind::Section) {
                 HWND label = CreateWindowExW(
                     0, L"STATIC", storage::fsutil::utf8_to_wide(field.label).c_str(),
-                    WS_CHILD | WS_VISIBLE | SS_NOPREFIX | SS_CENTERIMAGE, x, y, column_width,
-                    row_height, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-                SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(section_font_), TRUE);
-                page_labels_.push_back(label);
+                    WS_CHILD | SS_NOPREFIX | SS_CENTERIMAGE, x, row_y, column_width, row_height,
+                    hwnd, nullptr, instance, nullptr);
+                SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(section_font_), FALSE);
+                windows.push_back(label);
                 tooltips_.add(label, section_help(field.label));
                 continue;
             }
@@ -1352,43 +1454,50 @@ private:
             if (field.kind == FieldKind::Check) {
                 HWND check = CreateWindowExW(
                     0, L"BUTTON", storage::fsutil::utf8_to_wide(field.label).c_str(),
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, x, y, column_width, row_height,
-                    hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(control_id)),
-                    GetModuleHandleW(nullptr), nullptr);
-                SendMessageW(check, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                    WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, x, row_y, column_width, row_height,
+                    hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(control_id)), instance,
+                    nullptr);
+                SendMessageW(check, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
+                windows.push_back(check);
                 page_controls_[index] = check;
                 page_checks_[index] = staged_bools_[field.key];
                 tooltips_.add(check, field_help(field.key));
                 continue;
             }
 
-            // Labeled field: label + control on a shared baseline.
+            // Labeled field: label + control on a shared baseline. A folder
+            // field's label spans the column with the path box below it.
+            const bool folder = field.kind == FieldKind::EditFolder;
             HWND label = CreateWindowExW(
                 0, L"STATIC", storage::fsutil::utf8_to_wide(field.label).c_str(),
-                WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS | SS_NOPREFIX | SS_CENTERIMAGE, x, y,
-                label_width, row_height, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-            SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
-            page_labels_.push_back(label);
+                WS_CHILD | SS_ENDELLIPSIS | SS_NOPREFIX | SS_CENTERIMAGE, x, row_y,
+                folder ? column_width : label_width, row_height, hwnd, nullptr, instance,
+                nullptr);
+            SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
+            windows.push_back(label);
             page_field_labels_[index] = label;
             tooltips_.add(label, field_help(field.key));
 
+            const int control_height = row_height - scale(4);
             int control_x = x + label_width + control_gap;
             int control_width = column_width - label_width - control_gap;
-            int control_height = row_height - scale(4);
-            int control_y = y + (row_height - control_height) / 2;
+            int control_y = row_y + (row_height - control_height) / 2;
 
             if (field.kind == FieldKind::Combo || field.kind == FieldKind::ComboInt) {
                 HWND combo = CreateWindowExW(
                     0, L"COMBOBOX", L"",
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED |
+                    WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED |
                         CBS_HASSTRINGS,
                     control_x, control_y, control_width, row_height * 10, hwnd,
-                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(control_id)),
-                    GetModuleHandleW(nullptr), nullptr);
-                SendMessageW(combo, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(control_id)), instance,
+                    nullptr);
+                SendMessageW(combo, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
+                int widest = control_width;
                 for (const wchar_t* option : field.options) {
                     SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(option));
+                    widest = std::max(widest, text_width(option) + scale(24));
                 }
+                SendMessageW(combo, CB_SETDROPPEDWIDTH, widest, 0);
                 int selection = 0;
                 if (field.kind == FieldKind::Combo) {
                     const std::string& current = staged_strings_[field.key];
@@ -1414,30 +1523,52 @@ private:
                 SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), item_height);
                 SendMessageW(combo, CB_SETITEMHEIGHT, 0, item_height);
                 apply_combo_theme(combo, theme_.dark);
+                windows.push_back(combo);
                 page_controls_[index] = combo;
                 tooltips_.add(combo, field_help(field.key));
                 continue;
             }
 
+            int browse_width = 0;
+            if (folder) {
+                browse_width = scale(80);
+                control_x = x;
+                control_y += pitch;
+                control_width = column_width - browse_width - control_gap;
+            }
             std::wstring initial =
                 field.kind == FieldKind::EditInt
                     ? std::to_wstring(staged_ints_[field.key])
                     : storage::fsutil::utf8_to_wide(staged_strings_[field.key]);
             HWND edit = CreateWindowExW(
                 0, L"EDIT", initial.c_str(),
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER |
+                WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER |
                     (field.kind == FieldKind::EditInt ? ES_NUMBER : 0),
                 control_x, control_y, control_width, control_height, hwnd,
-                reinterpret_cast<HMENU>(static_cast<INT_PTR>(control_id)),
-                GetModuleHandleW(nullptr), nullptr);
-            SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(control_id)), instance, nullptr);
+            SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
             apply_control_theme(edit, theme_.dark);
+            windows.push_back(edit);
             page_controls_[index] = edit;
             tooltips_.add(edit, field_help(field.key));
+
+            if (folder) {
+                SendMessageW(edit, EM_SETCUEBANNER, TRUE,
+                             reinterpret_cast<LPARAM>(L"Default (in your profile)"));
+                const int browse_id = IdBrowseBase + index;
+                HWND browse = CreateWindowExW(
+                    0, L"BUTTON", L"Browse…", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+                    x + column_width - browse_width, row_y + pitch, browse_width, row_height,
+                    hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(browse_id)), instance,
+                    nullptr);
+                SendMessageW(browse, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
+                windows.push_back(browse);
+                browse_targets_[browse_id] = edit;
+                tooltips_.add(browse, L"Pick the folder for run journals.");
+            }
         }
-        sync_page_dependencies();
-        tooltips_.update_layout();
-        InvalidateRect(hwnd, nullptr, TRUE);
+        SelectObject(measure_dc, old_font);
+        ReleaseDC(hwnd, measure_dc);
     }
 
     void on_create() {
@@ -1455,7 +1586,7 @@ private:
             0, L"LISTBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY | LBS_OWNERDRAWFIXED |
                 LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
-            scale(8), scale(12), scale(172), client.bottom - scale(24), hwnd,
+            scale(8), scale(12), scale(RailWidth - 16), client.bottom - scale(24), hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IdNavList)), GetModuleHandleW(nullptr),
             nullptr);
         SendMessageW(nav_list_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
@@ -1484,7 +1615,8 @@ private:
         tooltips_.add(cancel_button_, L"Discard all staged changes from every settings page and close the dialog.");
 
         relayout_shell(hwnd);
-        build_page(0);
+        create_all_pages();
+        show_page(0);
     }
 
     void draw_nav_item(const DRAWITEMSTRUCT& draw) {
@@ -1537,7 +1669,9 @@ private:
                              MulDiv(32, static_cast<int>(dpi_), 96));
                 tooltips_.update_dpi(dpi_);
                 relayout_shell(hwnd);
-                build_page(current_page_);
+                destroy_page_controls();
+                create_all_pages();
+                show_page(current_page_);
                 apply_window_icons(hwnd);
                 RedrawWindow(hwnd, nullptr, nullptr,
                              RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
@@ -1552,9 +1686,9 @@ private:
                 // Left navigation rail: a panel-colored sidebar with a 1px edge.
                 UINT dpi = dpi_;
                 auto s = [dpi](int v) { return MulDiv(v, static_cast<int>(dpi), 96); };
-                RECT rail{0, 0, s(188), client.bottom};
+                RECT rail{0, 0, s(RailWidth), client.bottom};
                 themedraw::fill_rect(dc, rail, theme_.panel);
-                RECT sep{s(188) - 1, 0, s(188), client.bottom};
+                RECT sep{s(RailWidth) - 1, 0, s(RailWidth), client.bottom};
                 themedraw::fill_rect(dc, sep, theme_.border);
                 handled = true;
                 return 1;
@@ -1594,7 +1728,8 @@ private:
                     draw_nav_item(draw);
                 } else if (draw.CtlType == ODT_COMBOBOX) {
                     themedraw::draw_combo_item(draw, theme_);
-                } else if (id == IdSaveButton || id == IdCancelButton) {
+                } else if (id == IdSaveButton || id == IdCancelButton ||
+                           browse_targets_.count(id) != 0) {
                     themedraw::draw_button(draw, theme_);
                 } else if (id >= IdFieldBase) {
                     int index = id - IdFieldBase;
@@ -1607,10 +1742,12 @@ private:
                 int id = LOWORD(wparam);
                 if (id == IdNavList && HIWORD(wparam) == LBN_SELCHANGE) {
                     int page = static_cast<int>(SendMessageW(nav_list_, LB_GETCURSEL, 0, 0));
-                    if (page >= 0 && page != current_page_) {
-                        harvest_current_page();
-                        build_page(page);
-                    }
+                    if (page >= 0 && page != current_page_) show_page(page);
+                    handled = true;
+                    return 0;
+                }
+                if (browse_targets_.count(id) != 0 && HIWORD(wparam) == BN_CLICKED) {
+                    browse_folder(browse_targets_[id]);
                     handled = true;
                     return 0;
                 }

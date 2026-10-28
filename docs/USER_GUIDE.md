@@ -47,6 +47,12 @@ one row: three folders picked in one **+ Folder** dialog show as "3 folders"
 with their names and combined size (sizes are counted in the background).
 **Del** removes the selected rows and **Clear** empties the list.
 
+In Copy mode every add asks where the items go: a folder picker opens at the
+current destination, and cancelling it adds nothing. Each row keeps its own
+destination, shown after an arrow in the list, so rows bound for different
+places can sit side by side and become tasks with different destinations. A row
+added in Assess mode is asked for one when it is added to tasks in Copy mode.
+
 Every item is copied *as itself*: a folder `Photos` lands as
 `Destination\Photos`, exactly as Explorer would place it. To copy only what is
 inside a folder, right-click it and choose **Copy folder contents only**.
@@ -56,10 +62,18 @@ whose items come from several folders or drives becomes one task with several
 parts, run back to back; XactCopy warns first if two of them would write the
 same name into the destination. Ctrl+Enter adds the rows and queues them.
 
-### Destination and options
+### Source, destination, and options
 
-Choose a **Destination** with *Browse…*, type it, or pick a recent one from the
-**▾** button. Below it are captioned choices. Copy mode shows **Profile**,
+The **Source** and **Destination** boxes under the list edit the selected row.
+Type new paths into **Source** (separate several with semicolons) or use its
+*Browse…* to pick other folders or files; the row keeps its destination. Change
+**Destination** by typing, with *Browse…*, or from the recent list on the **▾**
+button; with several rows selected it changes all of them. Edits apply when you
+leave the box. Neither can be left empty, and a source path that does not exist
+is refused; in both cases the row is put back as it was. With no row selected,
+**Destination** holds the folder the next add's picker opens at.
+
+Below them are captioned choices. Copy mode shows **Profile**,
 **If file exists**, **Verify**, and **Read method**; assessment mode shows **Scan**
 (Auto/Fast/Precise), **Read method** (standard file reads or direct NTFS), and
 **Findings** (whether the bad-range map is updated). The resilience toggles
@@ -226,7 +240,7 @@ remain, and the bytes still outstanding.
 | **Full** | Hash the complete default data stream and copied alternate data streams. This is the integrity-first default and is required for unattended copy/resume. |
 
 The hash algorithm (SHA-256 or SHA-512) and the sampling chunk size and count are
-set under **Settings → Verification**. Verification runs after the data is
+set under **Settings → Copy Defaults → Verification**. Verification runs after the data is
 written, and any mismatch is reported in the log and the job summary.
 
 ## Publication and filesystem fidelity
@@ -320,7 +334,7 @@ otherwise XactCopy requires a person to review and confirm the run.
 
 ## Explorer integration
 
-Enable **Settings → Explorer Integration** to add XactCopy to the Windows shell:
+Enable **Settings → Recovery & Startup → Context Menu** to add XactCopy to the Windows shell:
 
 - **Copy with XactCopy** — on files, folders, drives, and folder backgrounds. A
   selected item is shown as the exact source and only that item is copied.
@@ -342,7 +356,7 @@ selection to the running window rather than starting a second copy.
 
 ![XactCopy settings](images/settings.png)
 
-**Tools → Settings…** opens seven pages. Each setting lives in one place: the
+**Tools → Settings…** opens five pages. Each setting lives in one place: the
 choices the main window shows (profile, overwrite, verify, read method, scan,
 findings, the Options toggles, buffer, retries, timeout) are saved as defaults
 with **File → Save as defaults**, and Settings holds everything
@@ -383,6 +397,9 @@ extents from a local NTFS volume with administrator rights, never scans free or
 unallocated space, and falls back to standard file reads when raw access is
 unavailable.
 
+Verification: SHA-256 or SHA-512, and the sampled-mode chunk size and count.
+Whether a task verifies, and how, is the main window's **Verify** choice.
+
 ### Performance
 
 Transfer tuning: transfer engine policy, worker process priority, the per-file
@@ -407,27 +424,19 @@ for each; leave these alone unless you are tuning for a specific drive.
 
 Worker telemetry profile (Normal, Verbose, Debug), progress interval, and a log
 rate cap. UI diagnostics strip and its refresh interval, and the maximum number
-of lines the log keeps. Journal storage: the **Journal folder** (empty means
-the default under your profile; the mirror copy always stays there, and runs
+of lines the log keeps. Journal storage: the **Journal folder** (type it or use
+*Browse…*; empty means the default under your profile; the mirror copy always stays there, and runs
 started before a change still resume from the old folder), whether backups are
 discarded when a run completes, how long journals are kept, and how many are
 always retained.
-
-### Verification
-
-SHA-256 or SHA-512, and the sampled-mode chunk size and count. Whether a task
-verifies, and how, is the main window's **Verify** choice.
 
 ### Recovery & Startup
 
 Tasks: run the queue automatically on startup, and what happens to unpinned
 tasks on exit (Ask, Keep, Discard). Interrupted runs: what happens at startup
 (Ask, Resume automatically, or Leave in History), auto-start at the next logon
-after an interruption, and the heartbeat write interval.
-
-### Explorer Integration
-
-A single switch for the shell entries described in
+after an interruption, and the heartbeat write interval. Context Menu: a
+single switch for the shell entries described in
 [Explorer integration](#explorer-integration).
 
 Settings are stored as JSON. Unknown keys are preserved, so a newer and an older
