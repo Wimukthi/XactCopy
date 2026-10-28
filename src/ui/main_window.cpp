@@ -3133,12 +3133,15 @@ private:
             auto [slot, inserted] = placed_rects_.try_emplace(handle, target);
             if (!inserted && EqualRect(&slot->second, &target)) return;
             slot->second = target;
-            MoveWindow(handle, target.left, target.top, target.right - target.left,
-                       target.bottom - target.top, FALSE);
-            // One full repaint per moved control (MoveWindow alone would only
-            // invalidate a resized control's newly exposed strip). The parent
-            // background it uncovered is repainted at the end of layout().
-            InvalidateRect(handle, nullptr, TRUE);
+            // NOCOPYBITS: don't blit the old pixels to the new position, and
+            // repaint the frame too: a WS_BORDER list's border is non-client,
+            // so a client-only invalidate left stale slivers along its edges
+            // after a splitter drag. The parent background the control
+            // uncovered is repainted at the end of layout().
+            SetWindowPos(handle, nullptr, target.left, target.top, target.right - target.left,
+                         target.bottom - target.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOREDRAW);
+            RedrawWindow(handle, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
         };
         auto show = [&](HWND handle, bool visible) {
             if (commit && handle != nullptr) ShowWindow(handle, visible ? SW_SHOW : SW_HIDE);
