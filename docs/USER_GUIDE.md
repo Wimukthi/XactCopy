@@ -27,6 +27,12 @@ Quick Start in the [README](../README.md) is enough.
 The window has two columns: on the left you build tasks, on the right the
 tasks run. The operations log spans the bottom.
 
+The **Copy | Assess readability** switch at the top left picks what the next
+task does. Copy writes the items to a destination and verifies them; Assess
+only reads them and records unreadable ranges, so the destination row
+disappears and the choices below relabel themselves for scanning. Switching
+remembers each mode's own choices.
+
 ### What to copy
 
 Add files and folders with **+ Files**, **+ Folder**, **Paste** (files copied in
@@ -45,11 +51,13 @@ two of them would write the same name into the destination.
 ### Destination and options
 
 Choose a **Destination** with *Browse…*, type it, or pick a recent one from the
-**▾** button. Below it are four mode-sensitive combos. Copy mode shows
-**Profile**, conflict policy, and verification; assessment mode shows scan
-profile, read backend, and whether findings are saved. The resilience toggles
+**▾** button. Below it are three captioned choices. Copy mode shows
+**Profile**, **If file exists**, and **Verify**; assessment mode shows **Scan**
+(Auto/Fast/Precise), **Read method** (standard file reads or direct NTFS), and
+**Findings** (whether the bad-range map is updated). The resilience toggles
 and numeric tuning fields sit in the **Options** section, which is collapsed by
-default and shows a one-line summary of what the next task will use.
+default and shows a one-line summary of what the next task will use. Expanding
+it grows the window if it needs the room.
 
 The values are per-task. Use **File → Save current settings as defaults** to
 persist the reusable engine, overwrite, verification, resilience, buffer,
@@ -70,10 +78,11 @@ Tasks that never started are kept: if XactCopy closes with tasks still queued,
 it offers to restore them the next time it starts. Jobs started from the Job
 Manager or a crash-recovery prompt appear in the list too.
 
-Below the list, the running task's detail shows the current file, the **File**
+Below the list, the running task's detail is headed with its name and the
+**Pause** and **Cancel** buttons, then shows the current file, the **File**
 and **Overall** progress bars, counters, throughput with a running average, an
-**ETA**, buffer and rescue telemetry, and the run's **Journal** path. **Pause**
-and **Cancel** act on the running task. The first Cancel requests cooperative
+**ETA**, buffer and rescue telemetry, and the run's **Journal** path. When
+nothing runs, the heading shows how the last task ended. The first Cancel requests cooperative
 shutdown; a second click force-stops a worker that is stuck inside a Windows or
 device I/O call.
 
@@ -117,11 +126,12 @@ Scanning runs in a precise profile or a faster parallel one (**Settings →
 Performance → Scan profile**); the fast profile falls back to precise reads
 around any fault it finds, so the resulting map stays accurate.
 
-The three assessment combos choose **Auto/Fast/Precise**, **Standard file
-reads/Raw NTFS extents**, and whether this run updates the bad-range map. Raw
-extent reads require administrator access; choosing them without elevation
-produces a visible fallback to standard file reads rather than a false raw-scan
-claim.
+The three assessment choices are **Scan** (Auto/Fast/Precise), **Read method**
+(standard file reads or direct NTFS allocated-extent reads), and **Findings**
+(whether this run updates the bad-range map). Direct NTFS reads require
+administrator access; XactCopy asks to restart elevated when a task needs them,
+and falls back visibly to standard file reads rather than claiming a raw scan
+it did not do.
 
 ## Resilience options
 

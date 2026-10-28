@@ -80,9 +80,9 @@ file next to every asset so you can verify the download.
 1. Launch **XactCopy**, add files and folders to **What to copy** (buttons,
    paste, drag-and-drop, or Explorer's context menu), and choose a
    **Destination**.
-2. Choose a **Mode**:
-   - **Verified Copy / Recovery** — copy data from source to destination.
-   - **Assess Readable Files** — read allocated source files and map unreadable regions (no
+2. Pick a mode with the switch at the top left:
+   - **Copy**: copy and verify data from source to destination.
+   - **Assess readability**: read allocated source files and map unreadable regions (no
      destination needed).
 3. Adjust options if you like — the defaults are sensible — then press **Start**.
    The work appears in the **Tasks** list with progress, throughput, and ETA;
@@ -105,7 +105,7 @@ its original extension and receives an adjacent `.recovery.json` manifest.
 
 | Control | Choices | Purpose |
 | --- | --- | --- |
-| **Mode** | Verified Copy / Recovery · Assess Readable Files | Copy data, or assess allocated source files without a destination |
+| **Mode switch** | Copy · Assess readability | Copy data, or assess allocated source files without a destination |
 | **Profile** | Verified Copy · Recover Media · Custom | Apply a coherent safe-copy or recovery preset, or use expert defaults |
 | **Conflict** | Overwrite · Skip existing · Overwrite if newer · Stop on conflict | How existing destination files are handled |
 | **Verify** | None · Sampled · Full | Post-copy SHA-256/512 integrity check; Full is the safe default |

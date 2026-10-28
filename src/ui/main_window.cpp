@@ -138,6 +138,8 @@ constexpr int IdOptionsToggle = 1046;
 constexpr int IdRecentDestinations = 1047;
 constexpr int IdPauseListCheck = 1048;
 constexpr int IdClearFinished = 1049;
+constexpr int IdModeCopyTab = 1050;
+constexpr int IdModeScanTab = 1051;
 // Context-menu commands for the sources and tasks lists.
 constexpr int IdSourceRemove = 1060;
 constexpr int IdSourceContentsOnly = 1061;
@@ -371,6 +373,20 @@ private:
     bool tasks_running_ = false;        // user started the list; advance automatically
     bool closing_for_handoff_ = false;
     std::unique_ptr<ui::PendingTaskWriter> pending_task_writer_;
+    // A start's result can be processed before its WM_APP_START_DONE (a run
+    // that ends at once); the late start notification must not revive it.
+    bool result_applied_since_start_ = false;
+
+    // Copy / Assess segmented switch. mode_combo_ stays as the hidden source
+    // of truth so every existing mode read/write keeps working.
+    HWND mode_copy_tab_ = nullptr;
+    HWND mode_scan_tab_ = nullptr;
+    // Captions for the three mode-dependent combos.
+    HWND profile_label_ = nullptr;
+    HWND policy_label_ = nullptr;
+    HWND verify_label_ = nullptr;
+    // Client height the current mode/options need; feeds WM_GETMINMAXINFO.
+    int required_client_height_ = 0;
     HWND mode_combo_ = nullptr;
     HWND engine_combo_ = nullptr;
     HWND overwrite_combo_ = nullptr;
@@ -439,6 +455,7 @@ private:
     int log_horizontal_extent_ = 0;
     HFONT font_ = nullptr;
     HFONT mono_font_ = nullptr;
+    HFONT header_font_ = nullptr; // semibold section headings
     HBRUSH window_brush_ = nullptr;
     HBRUSH edit_brush_ = nullptr;
     HMENU menu_bar_ = nullptr;
@@ -563,8 +580,16 @@ private:
             case WM_GETMINMAXINFO: {
                 auto* limits = reinterpret_cast<MINMAXINFO*>(lparam);
                 const int dpi = effective_dpi();
-                limits->ptMinTrackSize.x = MulDiv(760, dpi, 96);
+                limits->ptMinTrackSize.x = MulDiv(860, dpi, 96);
                 limits->ptMinTrackSize.y = MulDiv(740, dpi, 96); // two columns + log
+                // Never below what the current mode and options need.
+                RECT window{}, client{};
+                if (required_client_height_ > 0 && GetWindowRect(hwnd_, &window) &&
+                    GetClientRect(hwnd_, &client)) {
+                    const int frame = (window.bottom - window.top) - client.bottom;
+                    limits->ptMinTrackSize.y = std::max<LONG>(limits->ptMinTrackSize.y,
+                                                              required_client_height_ + frame);
+                }
                 return 0;
             }
             case WM_ERASEBKGND: {
@@ -583,7 +608,14 @@ private:
                                                                                      wparam, lparam);
             case WM_CTLCOLORSTATIC: {
                 HDC dc = reinterpret_cast<HDC>(wparam);
-                SetTextColor(dc, theme_.text);
+                const HWND control = reinterpret_cast<HWND>(lparam);
+                // Captions and secondary lines recede; values stay full contrast.
+                const bool muted = control == profile_label_ || control == policy_label_ ||
+                                   control == verify_label_ || control == sources_footer_ ||
+                                   control == file_progress_label_ ||
+                                   control == overall_progress_label_ ||
+                                   control == journal_label_ || control == diagnostics_label_;
+                SetTextColor(dc, muted ? theme_.muted_text : theme_.text);
                 SetBkColor(dc, theme_.window);
                 return reinterpret_cast<LRESULT>(window_brush_);
             }
@@ -854,9 +886,14 @@ private:
         int eff = static_cast<int>(dpi) * effective_scale_percent() / 100;
         if (font_ != nullptr) DeleteObject(font_);
         if (mono_font_ != nullptr) DeleteObject(mono_font_);
+        if (header_font_ != nullptr) DeleteObject(header_font_);
         font_ = CreateFontW(-MulDiv(9, eff, 72), 0, 0, 0, FW_NORMAL, FALSE,
                             FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                             CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        header_font_ = CreateFontW(-MulDiv(10, eff, 72), 0, 0, 0, FW_SEMIBOLD, FALSE,
+                                   FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                   CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
+                                   L"Segoe UI");
         std::wstring log_font =
             storage::fsutil::utf8_to_wide(settings_.get_string("LogFontFamily", "Consolas"));
         int log_points = settings_.get_int("LogFontSizePoints", 7, 20, 9);
@@ -877,7 +914,8 @@ private:
             source_browse_,    destination_browse_,  source_add_files_,  source_paste_,
             sources_footer_,   recent_destinations_button_, options_toggle_, add_task_button_,
             tasks_label_,      tasks_list_,          pause_list_check_,  clear_finished_button_,
-            detail_label_,
+            detail_label_,     mode_copy_tab_,       mode_scan_tab_,     profile_label_,
+            policy_label_,     verify_label_,
             clear_selection_,  mode_combo_,          engine_combo_,
             overwrite_combo_,  verify_combo_,        salvage_check_,    resume_check_,
             map_check_,        adaptive_check_,      continue_check_,   skip_known_bad_check_,
@@ -893,6 +931,11 @@ private:
         for (HWND control : ui_controls) {
             if (control != nullptr) {
                 SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+            }
+        }
+        for (HWND heading : {source_label_, tasks_label_, detail_label_}) {
+            if (heading != nullptr) {
+                SendMessageW(heading, WM_SETFONT, reinterpret_cast<WPARAM>(header_font_), TRUE);
             }
         }
         if (log_list_ != nullptr) {
@@ -962,7 +1005,7 @@ private:
         int log_points = settings_.get_int("LogFontSizePoints", 7, 20, 9);
 
         // ---- What to copy ----
-        source_label_ = create(L"STATIC", L"What to copy", SS_NOPREFIX, 0);
+        source_label_ = create(L"STATIC", L"What to copy", SS_NOPREFIX | SS_CENTERIMAGE, 0);
         source_add_files_ =
             create(L"BUTTON", L"+ Files", WS_TABSTOP | BS_OWNERDRAW, IdSourceAddFiles);
         source_browse_ = create(L"BUTTON", L"+ Folder", WS_TABSTOP | BS_OWNERDRAW, IdSourceBrowse);
@@ -985,7 +1028,7 @@ private:
         }
         sizer_thread_ = std::thread([this] { sizer_loop(); });
 
-        destination_label_ = create(L"STATIC", L"Destination", 0, 0);
+        destination_label_ = create(L"STATIC", L"Destination", SS_CENTERIMAGE, 0);
         destination_edit_ =
             create(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER, IdDestinationEdit);
         destination_browse_ =
@@ -1001,6 +1044,13 @@ private:
         for (const wchar_t* item : {L"Verified Copy / Recovery", L"Assess Readable Files"}) {
             SendMessageW(mode_combo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
         }
+        ShowWindow(mode_combo_, SW_HIDE);
+        mode_copy_tab_ = create(L"BUTTON", L"Copy", WS_TABSTOP | BS_OWNERDRAW, IdModeCopyTab);
+        mode_scan_tab_ =
+            create(L"BUTTON", L"Assess readability", WS_TABSTOP | BS_OWNERDRAW, IdModeScanTab);
+        profile_label_ = create(L"STATIC", L"Profile", SS_NOPREFIX | SS_CENTERIMAGE, 0);
+        policy_label_ = create(L"STATIC", L"If file exists", SS_NOPREFIX | SS_CENTERIMAGE, 0);
+        verify_label_ = create(L"STATIC", L"Verify", SS_NOPREFIX | SS_CENTERIMAGE, 0);
 
         salvage_check_ = create(L"BUTTON", L"Salvage unreadable blocks",
                                 WS_TABSTOP | BS_OWNERDRAW, IdSalvageCheck);
@@ -1018,13 +1068,13 @@ private:
         fragile_check_ = create(L"BUTTON", L"Fragile-media mode", WS_TABSTOP | BS_OWNERDRAW,
                                 IdFragileCheck);
 
-        buffer_label_ = create(L"STATIC", L"Buffer (MB):", SS_NOPREFIX, 0);
+        buffer_label_ = create(L"STATIC", L"Buffer (MB)", SS_NOPREFIX | SS_CENTERIMAGE, 0);
         buffer_edit_ = create(L"EDIT", L"", WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL | WS_BORDER,
                               IdBufferEdit);
-        retries_label_ = create(L"STATIC", L"Retries:", SS_NOPREFIX, 0);
+        retries_label_ = create(L"STATIC", L"Retries", SS_NOPREFIX | SS_CENTERIMAGE, 0);
         retries_edit_ = create(L"EDIT", L"", WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL | WS_BORDER,
                                IdRetriesEdit);
-        timeout_label_ = create(L"STATIC", L"Timeout (s):", SS_NOPREFIX, 0);
+        timeout_label_ = create(L"STATIC", L"Timeout (s)", SS_NOPREFIX | SS_CENTERIMAGE, 0);
         timeout_edit_ = create(L"EDIT", L"", WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL | WS_BORDER,
                                IdTimeoutEdit);
 
@@ -1042,7 +1092,7 @@ private:
         EnableWindow(cancel_button_, FALSE);
 
         // ---- Tasks ----
-        tasks_label_ = create(L"STATIC", L"Tasks", SS_NOPREFIX, 0);
+        tasks_label_ = create(L"STATIC", L"Tasks", SS_NOPREFIX | SS_CENTERIMAGE | SS_ENDELLIPSIS, 0);
         pause_list_check_ = create(L"BUTTON", L"Pause after current task",
                                    WS_TABSTOP | BS_OWNERDRAW, IdPauseListCheck);
         clear_finished_button_ =
@@ -1052,7 +1102,8 @@ private:
                                  LBS_NODATA | LBS_OWNERDRAWFIXED | LBS_NOTIFY,
                              IdTasksList);
         SetWindowSubclass(tasks_list_, &panel_list_subclass, 3, reinterpret_cast<DWORD_PTR>(this));
-        detail_label_ = create(L"STATIC", L"Running task", SS_NOPREFIX, 0);
+        detail_label_ =
+            create(L"STATIC", L"No task running", SS_NOPREFIX | SS_ENDELLIPSIS | SS_CENTERIMAGE, 0);
         pending_task_writer_ = std::make_unique<ui::PendingTaskWriter>();
 
         current_label_ = create(L"STATIC", L"Current: —", SS_ENDELLIPSIS | SS_NOPREFIX, 0);
@@ -1064,7 +1115,7 @@ private:
         overall_bar_ = create(L"STATIC", L"", SS_OWNERDRAW, IdOverallBar);
         file_progress_label_ = create(L"STATIC", L"File", SS_CENTERIMAGE | SS_NOPREFIX, 0);
         overall_progress_label_ = create(L"STATIC", L"Overall", SS_CENTERIMAGE | SS_NOPREFIX, 0);
-        stats_label_ = create(L"STATIC", L"", SS_NOPREFIX, 0);
+        stats_label_ = create(L"STATIC", L"\x2014", SS_NOPREFIX | SS_ENDELLIPSIS, 0);
         throughput_label_ =
             create(L"STATIC", L"Speed: 0 B/s (avg 0 B/s)", SS_ENDELLIPSIS | SS_NOPREFIX, 0);
         eta_label_ = create(L"STATIC", L"ETA: -", SS_NOPREFIX, 0);
@@ -1075,7 +1126,7 @@ private:
         journal_label_ = create(L"STATIC", L"Journal: -", SS_ENDELLIPSIS | SS_NOPREFIX, 0);
         diagnostics_label_ =
             create(L"STATIC", L"Diagnostics: -", SS_ENDELLIPSIS | SS_NOPREFIX, 0);
-        status_label_ = create(L"STATIC", L"Status: Idle", SS_NOPREFIX, 0);
+        status_label_ = create(L"STATIC", L"Status: Idle", SS_NOPREFIX | SS_CENTERIMAGE, 0);
         // WS_BORDER (flat 1px, matches the edits) instead of WS_EX_CLIENTEDGE,
         // which draws a white sunken 3D edge the dark theme can't repaint.
         log_filter_ = create(L"COMBOBOX", L"", combo_style, IdLogFilter);
@@ -1099,6 +1150,7 @@ private:
         configure_tooltips();
 
         build_menu_bar();
+        apply_fonts(); // also sets the owner-draw list row heights
         apply_theme();
         apply_appearance_settings();
         configure_diagnostics_timer();
@@ -1130,7 +1182,8 @@ private:
         add(destination_edit_, L"Enter the destination folder. XactCopy stages and verifies each file beside its final path before replacement.");
         add(destination_browse_, L"Choose the destination folder.");
 
-        add(mode_combo_, L"Choose a destination-producing verified copy/recovery workflow, or a read-only assessment of accessible source files.");
+        add(mode_copy_tab_, L"Copy or recover the listed items into a destination, with verification.");
+        add(mode_scan_tab_, L"Read the listed items without copying them and record which ranges are unreadable. Nothing is written except the optional bad-range map.");
         add(engine_combo_, L"In copy mode choose a safe workflow profile. In assessment mode choose Auto, Fast, or Precise scanning. Low-level engine selection remains under Settings.");
         add(overwrite_combo_, L"In copy mode this controls destination conflicts. In assessment mode it selects standard file reads or direct NTFS allocated-extent reads, which require administrator access.");
         add(verify_combo_, L"In copy mode choose destination verification. In assessment mode choose whether findings are saved to the source-specific bad-range map.");
@@ -1521,27 +1574,26 @@ private:
 
         active_mode_index_ = requested;
         if (requested == 1) {
-            replace_combo_items(engine_combo_, {L"Scan: Auto", L"Scan: Fast", L"Scan: Precise"});
+            replace_combo_items(engine_combo_, {L"Auto", L"Fast", L"Precise"});
             replace_combo_items(overwrite_combo_,
-                                {L"Reads: Standard Files", L"Reads: Direct NTFS (Admin)"});
-            replace_combo_items(verify_combo_, {L"Map: Save Findings", L"Map: Do Not Save"});
+                                {L"Standard file reads", L"Direct NTFS (admin)"});
+            replace_combo_items(verify_combo_, {L"Save to bad-range map", L"Do not save"});
             SendMessageW(engine_combo_, CB_SETCURSEL, scan_profile_index_, 0);
             SendMessageW(overwrite_combo_, CB_SETCURSEL, scan_backend_index_, 0);
             SendMessageW(verify_combo_, CB_SETCURSEL, scan_map_index_, 0);
-            SetWindowTextW(resume_check_, L"Reuse previous scan progress");
+            SetWindowTextW(resume_check_, L"Resume previous scan");
         } else {
             replace_combo_items(engine_combo_,
-                                {L"Profile: Verified Copy", L"Profile: Recover Media",
-                                 L"Profile: Custom"});
+                                {L"Verified Copy", L"Recover Media", L"Custom"});
             replace_combo_items(overwrite_combo_,
                                 {L"Overwrite", L"Skip existing", L"Overwrite if newer",
                                  L"Stop on conflict"});
             replace_combo_items(verify_combo_,
-                                {L"Verify: None", L"Verify: Sampled", L"Verify: Full"});
+                                {L"None", L"Sampled", L"Full (SHA)"});
             SendMessageW(engine_combo_, CB_SETCURSEL, copy_profile_index_, 0);
             SendMessageW(overwrite_combo_, CB_SETCURSEL, copy_overwrite_index_, 0);
             SendMessageW(verify_combo_, CB_SETCURSEL, copy_verify_index_, 0);
-            SetWindowTextW(resume_check_, L"Reuse verified previous progress");
+            SetWindowTextW(resume_check_, L"Resume verified progress");
             if (user_changed) launch_.explorer_scan_mode = false;
         }
 
@@ -1550,7 +1602,14 @@ private:
                              recent_destinations_button_}) {
             if (control != nullptr) ShowWindow(control, scan ? SW_HIDE : SW_SHOW);
         }
-        layout(); // the Options section shows/hides salvage per mode
+        SetWindowTextW(source_label_, scan ? L"What to assess" : L"What to copy");
+        SetWindowTextW(profile_label_, scan ? L"Scan" : L"Profile");
+        SetWindowTextW(policy_label_, scan ? L"Read method" : L"If file exists");
+        SetWindowTextW(verify_label_, scan ? L"Findings" : L"Verify");
+        InvalidateRect(mode_copy_tab_, nullptr, FALSE);
+        InvalidateRect(mode_scan_tab_, nullptr, FALSE);
+        layout();
+        ensure_window_fits_layout(); // the Options section shows/hides salvage per mode
         if (options_toggle_ != nullptr) InvalidateRect(options_toggle_, nullptr, TRUE);
     }
 
@@ -1677,6 +1736,10 @@ private:
         }
         if (draw.CtlType == ODT_BUTTON && id == IdOptionsToggle) {
             draw_options_toggle(draw);
+            return true;
+        }
+        if (draw.CtlType == ODT_BUTTON && (id == IdModeCopyTab || id == IdModeScanTab)) {
+            draw_mode_tab(draw, (id == IdModeScanTab) == is_scan_mode());
             return true;
         }
         if (draw.CtlType == ODT_STATIC && (id == IdCurrentBar || id == IdOverallBar)) {
@@ -2242,6 +2305,38 @@ private:
         }
     }
 
+    // ---- Mode switch --------------------------------------------------------
+
+    // One half of the Copy / Assess segmented control: the active half is
+    // filled with the accent, the other reads as a flat button.
+    void draw_mode_tab(const DRAWITEMSTRUCT& draw, bool active) {
+        const bool hot = (draw.itemState & ODS_HOTLIGHT) != 0;
+        const bool focused = (draw.itemState & ODS_FOCUS) != 0;
+        const COLORREF fill = active ? theme_.accent : hot ? theme_.button_hot : theme_.button;
+        ui::themedraw::fill_rect(draw.hDC, draw.rcItem, fill);
+        ui::themedraw::frame_rect(draw.hDC, draw.rcItem, active ? theme_.accent : theme_.border);
+        wchar_t text[64]{};
+        GetWindowTextW(draw.hwndItem, text, 64);
+        HGDIOBJ old_font = SelectObject(draw.hDC, active ? header_font_ : font_);
+        SetBkMode(draw.hDC, TRANSPARENT);
+        SetTextColor(draw.hDC, active ? ui::readable_text_color(theme_.accent) : theme_.text);
+        RECT rect = draw.rcItem;
+        DrawTextW(draw.hDC, text, -1, &rect,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(draw.hDC, old_font);
+        if (focused) {
+            RECT focus = draw.rcItem;
+            InflateRect(&focus, -MulDiv(3, effective_dpi(), 96), -MulDiv(3, effective_dpi(), 96));
+            DrawFocusRect(draw.hDC, &focus);
+        }
+    }
+
+    void select_mode(bool scan) {
+        if (scan == is_scan_mode()) return;
+        SendMessageW(mode_combo_, CB_SETCURSEL, scan ? 1 : 0, 0);
+        sync_mode_ui(true);
+    }
+
     // ---- Options section ----------------------------------------------------
 
     void draw_options_toggle(const DRAWITEMSTRUCT& draw) {
@@ -2278,6 +2373,7 @@ private:
         options_expanded_ = expanded;
         settings_.set_bool("UiOptionsExpanded", expanded);
         layout();
+        ensure_window_fits_layout();
         InvalidateRect(options_toggle_, nullptr, TRUE);
     }
 
@@ -2573,13 +2669,25 @@ private:
         }
         task->state = paused_ ? ui::TaskState::Paused : ui::TaskState::Running;
         task->progress = 0.0;
+        set_detail_heading(L"Running: " +
+                           storage::fsutil::utf8_to_wide(ui::task_title(task->options)));
         tasks_changed();
+    }
+
+    void set_detail_heading(const std::wstring& text) {
+        if (detail_label_ != nullptr) SetWindowTextW(detail_label_, text.c_str());
     }
 
     void finish_running_task(const models::CopyJobResult& result) {
         ui::SessionTask* task = running_task_id_ != 0 ? tasks_.find(running_task_id_) : nullptr;
+        // Only one job runs at a time, so a row still marked active belongs
+        // to this result even if its binding was lost.
+        if (task == nullptr) task = tasks_.active();
         running_task_id_ = 0;
-        if (task == nullptr) return;
+        if (task == nullptr) {
+            set_detail_heading(L"Last task");
+            return;
+        }
         task->state = ui::state_from_result(result);
         task->progress = task->state == ui::TaskState::Completed ? 1.0 : task->progress;
         task->bytes_per_second = 0;
@@ -2593,6 +2701,8 @@ private:
             outcome += " \xE2\x80\x94 " + result.ErrorMessage;
         }
         task->outcome = std::move(outcome);
+        set_detail_heading(L"Last task: " +
+                           storage::fsutil::utf8_to_wide(ui::to_display(task->state)));
         tasks_changed();
     }
 
@@ -2796,152 +2906,161 @@ private:
 
     // ---- Layout ------------------------------------------------------------
 
-    // Two columns: the task builder ("What to copy", destination, options) on
-    // the left and the task list with the running task's detail on the right,
-    // the log full-width below. The two lists absorb any shortage of height
-    // first, then the log, so controls never overlap at the minimum size.
+    // Two columns above a full-width log. Left, the task builder: the Copy /
+    // Assess switch, the item list, destination (copy only), the three
+    // mode-specific choices with captions, the collapsible options, and the
+    // actions. Right, the task list and the running task's detail. Each
+    // column is laid out by one function that can measure without moving
+    // anything, so the fixed parts are known exactly and only the two lists
+    // and the log flex; required_client_height_ keeps the window from going
+    // below what the current mode and options need.
     void layout() {
         RECT client;
         GetClientRect(hwnd_, &client);
-        int dpi = effective_dpi();
+        const int dpi = effective_dpi();
         auto scale = [dpi](int value) { return MulDiv(value, dpi, 96); };
 
         const int margin = scale(12);
         const int row_height = scale(24);
         const int gap = scale(8);
+        const int section_gap = scale(14);
+        const int column_gap = scale(20);
         const int button_height = scale(30);
         const int label_height = scale(18);
-        const int client_width = client.right - client.left - margin * 2;
-        const int client_height = client.bottom - client.top - margin * 2;
+        const int tab_height = scale(30);
+        const int list_floor = scale(72);
+        const int client_width = static_cast<int>(client.right - client.left) - margin * 2;
+        const int client_height = static_cast<int>(client.bottom - client.top);
         const bool scan = is_scan_mode();
+
+        const int left_width = std::max(scale(400), (client_width - column_gap) * 46 / 100);
+        const int right_width = std::max(scale(200), client_width - left_width - column_gap);
 
         int origin_x = margin;
         int y = margin;
+        bool commit = false;
         auto place = [&](HWND handle, int x, int w, int h = 0) {
-            if (handle == nullptr) return;
+            if (!commit || handle == nullptr) return;
             MoveWindow(handle, origin_x + x, y, std::max(0, w), h == 0 ? row_height : h, TRUE);
             // MoveWindow only invalidates a resized control's newly exposed
             // strip, so widened statics/bars keep stale pixels.
             InvalidateRect(handle, nullptr, TRUE);
         };
-        auto show = [](HWND handle, bool visible) {
-            if (handle != nullptr) ShowWindow(handle, visible ? SW_SHOW : SW_HIDE);
+        auto show = [&](HWND handle, bool visible) {
+            if (commit && handle != nullptr) ShowWindow(handle, visible ? SW_SHOW : SW_HIDE);
         };
 
-        // ---- Fixed bottom: log toolbar, log, status ----
-        const int status_height = row_height;
-        const int log_toolbar_height = row_height;
-
-        // ---- Builder column metrics ----
-        const int left_width = std::max(scale(340), (client_width - gap * 2) * 9 / 20);
-        const int right_width = client_width - left_width - gap * 2;
-
-        // Height the builder needs apart from the flexible sources list.
-        const int check_rows = 4;
-        int builder_fixed = row_height + gap            // header + buttons
-                            + label_height + gap       // footer
-                            + (scan ? 0 : row_height + gap)  // destination
-                            + (row_height + gap) * 2   // two combo rows
-                            + row_height + gap         // options toggle
-                            + button_height;           // actions
-        if (options_expanded_) builder_fixed += (row_height + gap) * (check_rows + 1);
-        const int min_sources = scale(96);
-
-        // Detail block under the task list: heading, current file, the two
-        // progress rows, stats, speed/ETA, optional buffer/rescue row, job,
-        // journal, optional diagnostics, then the Pause/Cancel buttons.
-        int detail_height = label_height + gap + row_height + (row_height + gap) * 2 + row_height +
-                            label_height * 3 + gap + button_height;
-        if (show_buffer_row_ || show_rescue_row_) detail_height += label_height;
-        if (show_diagnostics_) detail_height += label_height;
-        const int tasks_header = row_height + gap;
-        const int min_tasks = scale(110);
-
-        // Preferred split gives the top 62%; it never goes below what the
-        // columns need, and never past what leaves the log its minimum. When
-        // the window is too short for both, the lists shrink (to a floor).
-        const int min_log = scale(90);
-        const int needed = std::max(builder_fixed + min_sources,
-                                    tasks_header + min_tasks + gap + detail_height);
-        const int available_top = client_height - status_height - log_toolbar_height - min_log - gap * 2;
-        int top_height = std::max(needed, (client_height - status_height - log_toolbar_height) * 62 / 100);
-        top_height = std::min(top_height, available_top);
-        const int list_floor = scale(48);
-        top_height = std::max(top_height, std::max(builder_fixed, tasks_header + gap + detail_height) +
-                                              list_floor);
-
-        // ---- Left: builder ----
-        {
+        // ---- Left column: returns its height for a given sources height ----
+        HWND option_checks[] = {salvage_check_,    resume_check_,   map_check_,
+                                adaptive_check_,   continue_check_, skip_known_bad_check_,
+                                wait_media_check_, fragile_check_};
+        HWND option_fields[] = {buffer_label_,  buffer_edit_,   retries_label_,
+                                retries_edit_,  timeout_label_, timeout_edit_};
+        auto left_column = [&](int sources_height) {
             origin_x = margin;
             y = margin;
             const int width = left_width;
-            const int compact_width = scale(64);
-            const int files_width = scale(72);
-            const int folder_width = scale(84);
-            int x = width;
-            x -= compact_width;        place(clear_selection_, x, compact_width);
-            x -= gap + compact_width;  place(source_paste_, x, compact_width);
-            x -= gap + folder_width; place(source_browse_, x, folder_width);
-            x -= gap + files_width;  place(source_add_files_, x, files_width);
-            place(source_label_, 0, std::max(0, x - gap));
-            y += row_height + gap;
 
-            const int builder_height = top_height;
-            const int sources_height = std::max(list_floor, builder_height - builder_fixed);
+            // Copy / Assess segmented switch.
+            const int tab_width = std::min(width / 2, scale(180));
+            place(mode_copy_tab_, 0, tab_width, tab_height);
+            place(mode_scan_tab_, tab_width - 1, tab_width + 1, tab_height);
+            y += tab_height + section_gap;
+
+            // Heading + add buttons; the buttons drop to their own row when
+            // the column is too narrow for both.
+            const int files_width = scale(66);
+            const int folder_width = scale(78);
+            const int paste_width = scale(58);
+            const int clear_width = scale(56);
+            const int buttons_width =
+                files_width + folder_width + paste_width + clear_width + gap * 3;
+            const int heading_width = scale(104);
+            const bool one_row = width >= buttons_width + heading_width + gap;
+            place(source_label_, 0, one_row ? width - buttons_width - gap : width, row_height);
+            if (!one_row) y += row_height + scale(4);
+            int x = width;
+            x -= clear_width;          place(clear_selection_, x, clear_width);
+            x -= gap + paste_width;    place(source_paste_, x, paste_width);
+            x -= gap + folder_width;   place(source_browse_, x, folder_width);
+            x -= gap + files_width;    place(source_add_files_, x, files_width);
+            y += row_height + scale(6);
+
             place(sources_list_, 0, width, sources_height);
-            y += sources_height + scale(2);
+            y += sources_height + scale(3);
             place(sources_footer_, 0, width, label_height);
-            y += label_height + gap;
+            y += label_height + section_gap;
 
             if (!scan) {
-                const int label_width = scale(84);
+                const int label_width = scale(78);
                 const int browse_width = scale(84);
-                const int recent_width = scale(28);
-                const int edit_width = width - label_width - browse_width - recent_width - gap * 3;
+                const int recent_width = scale(26);
+                const int edit_width = width - label_width - browse_width - recent_width - gap;
                 place(destination_label_, 0, label_width);
-                place(destination_edit_, label_width + gap, edit_width);
-                place(recent_destinations_button_, label_width + gap + edit_width + gap, recent_width);
+                place(destination_edit_, label_width, edit_width);
+                place(recent_destinations_button_, label_width + edit_width - 1, recent_width);
                 place(destination_browse_, width - browse_width, browse_width);
-                y += row_height + gap;
+                y += row_height + gap + scale(4);
             }
 
-            const int half = (width - gap) / 2;
-            place(mode_combo_, 0, half, row_height * 8);
-            place(engine_combo_, half + gap, half, row_height * 8);
-            y += row_height + gap;
-            place(overwrite_combo_, 0, half, row_height * 8);
-            place(verify_combo_, half + gap, half, row_height * 8);
-            y += row_height + gap;
+            // The three mode-specific choices, captioned: three across when
+            // there is room (caption above), otherwise one per row.
+            HWND captions[] = {profile_label_, policy_label_, verify_label_};
+            HWND combos[] = {engine_combo_, overwrite_combo_, verify_combo_};
+            // A closed owner-draw combo is its item height plus its frame.
+            const int combo_height =
+                engine_combo_ != nullptr
+                    ? static_cast<int>(SendMessageW(engine_combo_, CB_GETITEMHEIGHT,
+                                                    static_cast<WPARAM>(-1), 0)) + scale(6)
+                    : row_height;
+            if (width >= scale(500)) {
+                const int third = (width - gap * 2) / 3;
+                for (int i = 0; i < 3; ++i) {
+                    place(captions[i], i * (third + gap), third, label_height);
+                }
+                y += label_height + scale(2);
+                for (int i = 0; i < 3; ++i) {
+                    place(combos[i], i * (third + gap), third, row_height * 8);
+                }
+                y += combo_height + gap;
+            } else {
+                const int caption_width = scale(92);
+                for (int i = 0; i < 3; ++i) {
+                    place(captions[i], 0, caption_width, combo_height);
+                    place(combos[i], caption_width, width - caption_width, row_height * 8);
+                    y += combo_height + scale(6);
+                }
+            }
 
+            y += scale(4);
             place(options_toggle_, 0, width);
             y += row_height + gap;
 
-            HWND option_checks[] = {salvage_check_, resume_check_, map_check_, adaptive_check_,
-                                    continue_check_, skip_known_bad_check_, wait_media_check_,
-                                    fragile_check_};
-            HWND option_fields[] = {buffer_label_, buffer_edit_, retries_label_, retries_edit_,
-                                    timeout_label_, timeout_edit_};
-            for (HWND control : option_checks) show(control, options_expanded_);
+            for (HWND control : option_checks) show(control, false);
             for (HWND control : option_fields) show(control, options_expanded_);
             if (options_expanded_) {
-                show(salvage_check_, !scan);
                 std::vector<HWND> visible;
                 for (HWND control : option_checks) {
                     if (control == salvage_check_ && scan) continue;
                     visible.push_back(control);
                 }
+                const int half = (width - gap) / 2;
                 for (std::size_t i = 0; i < visible.size(); i += 2) {
-                    place(visible[i], 0, half);
-                    if (i + 1 < visible.size()) place(visible[i + 1], half + gap, half);
-                    y += row_height + gap;
+                    show(visible[i], true);
+                    place(visible[i], scale(4), half - scale(4));
+                    if (i + 1 < visible.size()) {
+                        show(visible[i + 1], true);
+                        place(visible[i + 1], half + gap, half);
+                    }
+                    y += row_height + scale(4);
                 }
-                for (std::size_t i = visible.size(); i < 8; i += 2) y += row_height + gap;
+                y += scale(4);
                 const int slot = (width - gap * 2) / 3;
-                const int field_label = slot * 58 / 100;
+                const int edit_width = std::min(scale(50), slot / 2);
                 int fx = 0;
                 auto place_field = [&](HWND label, HWND edit) {
-                    place(label, fx, field_label);
-                    place(edit, fx + field_label + scale(4), slot - field_label - scale(4));
+                    place(label, fx + scale(4), slot - edit_width - scale(8));
+                    place(edit, fx + slot - edit_width, edit_width);
                     fx += slot + gap;
                 };
                 place_field(buffer_label_, buffer_edit_);
@@ -2950,57 +3069,58 @@ private:
                 y += row_height + gap;
             }
 
+            y += scale(6);
             // Settings on the left, Add/Start on the right; narrow columns
             // shrink the two action buttons rather than overlapping Settings.
             const int settings_width = scale(100);
             const int action_width =
-                std::min(scale(118), (width - settings_width - gap * 2) / 2);
+                std::min(scale(124), (width - settings_width - gap * 2) / 2);
             place(settings_button_, 0, settings_width, button_height);
             place(start_button_, width - action_width, action_width, button_height);
             place(add_task_button_, width - action_width * 2 - gap, action_width, button_height);
             y += button_height;
-        }
+            return y - margin;
+        };
 
-        // ---- Right: tasks + running detail ----
-        {
-            origin_x = margin + left_width + gap * 2;
+        // ---- Right column: returns its height for a given tasks height ----
+        auto right_column = [&](int tasks_height) {
+            origin_x = margin + left_width + column_gap;
             y = margin;
             const int width = right_width;
-            const int column_top = y;
-            const int column_height = top_height;
 
-            const int clear_width = scale(108);
-            const int pause_width = scale(190);
-            place(clear_finished_button_, width - clear_width, clear_width);
-            place(pause_list_check_, width - clear_width - gap - pause_width, pause_width);
-            place(tasks_label_, 0, std::max(0, width - clear_width - pause_width - gap * 2));
-            y += row_height + gap;
-
-            const int tasks_height =
-                std::max(list_floor, column_top + column_height - y - detail_height - gap);
+            place(tasks_label_, 0, width, tab_height);
+            y += tab_height + section_gap;
             place(tasks_list_, 0, width, tasks_height);
-            y += tasks_height + gap;
+            y += tasks_height + scale(4);
+            const int clear_width = scale(118);
+            place(pause_list_check_, 0, std::max(0, width - clear_width - gap), row_height);
+            place(clear_finished_button_, width - clear_width, clear_width);
+            y += row_height + section_gap;
 
-            place(detail_label_, 0, width, label_height);
-            y += label_height + gap;
+            // Running task: heading with Pause/Cancel beside it, then detail.
+            const int control_width = scale(92);
+            place(detail_label_, 0, std::max(0, width - control_width * 2 - gap * 2),
+                  button_height);
+            place(cancel_button_, width - control_width, control_width, button_height);
+            place(pause_button_, width - control_width * 2 - gap, control_width, button_height);
+            y += button_height + scale(4);
             place(current_label_, 0, width);
             y += row_height;
             const int bar_height = scale(bar_show_percentage_
                                              ? std::max(progress_bar_height_logical_, 14)
                                              : progress_bar_height_logical_);
-            const int progress_label_width = scale(60);
+            const int progress_label_width = scale(56);
             const int progress_row_height = std::max(row_height, bar_height);
             for (auto [label, bar] : {std::pair<HWND, HWND>{file_progress_label_, current_bar_},
                                       std::pair<HWND, HWND>{overall_progress_label_, overall_bar_}}) {
                 place(label, 0, progress_label_width, progress_row_height);
-                y += (progress_row_height - bar_height) / 2;
+                const int offset = (progress_row_height - bar_height) / 2;
+                y += offset;
                 place(bar, progress_label_width, width - progress_label_width, bar_height);
-                y -= (progress_row_height - bar_height) / 2;
-                y += progress_row_height + gap;
+                y += progress_row_height - offset + scale(4);
             }
-            place(stats_label_, 0, width);
-            y += row_height;
-
+            place(stats_label_, 0, width, label_height);
+            y += label_height + scale(2);
             const int col_width = (width - gap) / 2;
             auto place_two = [&](HWND left, HWND right) {
                 place(left, 0, col_width, label_height);
@@ -3023,11 +3143,27 @@ private:
                 place(diagnostics_label_, 0, width, label_height);
                 y += label_height;
             }
-            y += gap;
-            const int button_width = scale(100);
-            place(pause_button_, 0, button_width, button_height);
-            place(cancel_button_, button_width + gap, button_width, button_height);
-        }
+            return y - margin;
+        };
+
+        // ---- Measure, then split the height ----
+        const int left_fixed = left_column(0);
+        const int right_fixed = right_column(0);
+        const int status_height = row_height;
+        const int log_toolbar_height = row_height;
+        const int min_log = scale(90);
+        const int bottom_fixed = gap + log_toolbar_height + gap + gap + status_height;
+        const int top_min = std::max(left_fixed, right_fixed) + list_floor;
+        required_client_height_ = margin * 2 + top_min + bottom_fixed + min_log;
+
+        const int body = client_height - margin * 2;
+        int top_height = std::max(top_min, (body - bottom_fixed) * 66 / 100);
+        top_height = std::max(top_min, std::min(top_height, body - bottom_fixed - min_log));
+
+        commit = true;
+        left_column(std::max(list_floor, top_height - left_fixed));
+        right_column(std::max(list_floor, top_height - right_fixed));
+        show(mode_combo_, false);
 
         // ---- Bottom: log ----
         origin_x = margin;
@@ -3040,11 +3176,33 @@ private:
         place(log_find_button_, client_width - find_button_width, find_button_width);
         y += log_toolbar_height + gap;
         const int log_height =
-            std::max(scale(60), static_cast<int>(client.bottom) - margin - status_height - gap - y);
+            std::max(scale(40), client_height - margin - status_height - gap - y);
         place(log_list_, 0, client_width, log_height);
         y += log_height + gap;
         place(status_label_, 0, client_width);
         tooltips_.update_layout();
+    }
+
+    // Grows the window (within its monitor's work area) when the current mode
+    // and options need more height than it has, e.g. after expanding Options.
+    void ensure_window_fits_layout() {
+        if (hwnd_ == nullptr || IsZoomed(hwnd_) || IsIconic(hwnd_)) return;
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        const int shortfall = required_client_height_ - static_cast<int>(client.bottom);
+        if (shortfall <= 0) return;
+        RECT window{};
+        GetWindowRect(hwnd_, &window);
+        MONITORINFO monitor{};
+        monitor.cbSize = sizeof(monitor);
+        if (!GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &monitor)) return;
+        const RECT& work = monitor.rcWork;
+        const int height = std::min<int>(window.bottom - window.top + shortfall,
+                                         work.bottom - work.top);
+        int top = window.top;
+        if (top + height > work.bottom) top = std::max<int>(work.top, work.bottom - height);
+        SetWindowPos(hwnd_, nullptr, window.left, top, window.right - window.left, height,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
     // ---- Commands ----------------------------------------------------------
@@ -3087,6 +3245,10 @@ private:
         }
         if (id == IdModeCombo && notification == CBN_SELCHANGE) {
             sync_mode_ui(true);
+            return;
+        }
+        if ((id == IdModeCopyTab || id == IdModeScanTab) && notification == BN_CLICKED) {
+            select_mode(id == IdModeScanTab);
             return;
         }
         if (id == IdEngineCombo && notification == CBN_SELCHANGE && !is_scan_mode()) {
@@ -3979,6 +4141,7 @@ private:
         // background thread so the UI stays responsive, then finish in
         // WM_APP_START_DONE. Without this the Start click blocks the message loop.
         starting_ = true;
+        result_applied_since_start_ = false;
         set_inputs_enabled(false);
         SetWindowTextW(status_label_, L"Status: Starting worker...");
         append_log("Starting worker...");
@@ -4135,6 +4298,13 @@ private:
 
     void on_start_done(bool ok, const std::string& error) {
         starting_ = false;
+        if (ok && result_applied_since_start_) {
+            // The worker finished (or failed) before this notification was
+            // processed; apply_result already settled the task and run.
+            update_action_buttons();
+            update_menu_state();
+            return;
+        }
         if (ok) {
             active_run_id_ = supervisor_.current_job_id();
             recovery_.mark_job_started(active_run_id_, pending_start_job_name_,
@@ -4689,6 +4859,7 @@ private:
     }
 
     void apply_result(const models::CopyJobResult& result) {
+        result_applied_since_start_ = true;
         recovery_.mark_job_ended(active_run_id_);
         active_run_id_.clear();
         if (!active_managed_run_id_.empty()) {
