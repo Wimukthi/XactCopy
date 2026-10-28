@@ -3,7 +3,8 @@
 // the running app via the EnableExplorerContextMenu setting. It registers:
 //   * "Copy with XactCopy" verbs on files, folders, drives, and folder
 //     backgrounds (the original context-menu integration).
-//   * "Assess Readable Files with XactCopy" verbs on folders and drives.
+//   * "Assess with XactCopy" verbs on the same targets; each verb opens
+//     XactCopy already in the matching mode.
 //   * An Applications\XactCopy.exe entry (FriendlyAppName + DefaultIcon + open
 //     command + SupportedTypes) so XactCopy appears in "Open with" and accepts
 //     files dragged onto it.
@@ -43,14 +44,19 @@ public:
         return table;
     }
 
-    // "Assess Readable Files with XactCopy" verbs (folders + drives).
+    // "Assess with XactCopy" verbs, mirroring the copy verbs.
     static const std::vector<Target>& scan_targets() {
         static const std::vector<Target> table = {
             {L"Directory", L"--scan-from-explorer \"%1\" %*", true},
             {L"Drive", L"--scan-from-explorer \"%1\" %*", true},
+            {L"*", L"--scan-from-explorer \"%1\" %*", true},
+            {L"Directory\\Background", L"--scan-from-explorer-folder \"%V\"", false},
         };
         return table;
     }
+
+    static constexpr const wchar_t* CopyCaption = L"Copy with XactCopy";
+    static constexpr const wchar_t* ScanCaption = L"Assess with XactCopy";
 
     // Registers when enabled, removes otherwise. Returns false (without throwing)
     // if registration was requested with an invalid executable path.
@@ -68,9 +74,14 @@ public:
         for (const auto& target : targets()) {
             if (!key_exists(build_menu_path(target.shell_path, MenuKeyName))) return false;
         }
-        // Also require the comprehensive keys, so an upgrade from a copy-only
-        // install re-syncs the scan verb + Applications entry.
-        if (!key_exists(build_menu_path(L"Drive", ScanKeyName))) return false;
+        // Also require every scan verb with its current caption, so an upgrade
+        // from an older registration re-syncs (copy-only installs, the old
+        // "Assess Readable Files" caption, or scan verbs on folders only).
+        for (const auto& target : scan_targets()) {
+            if (string_value(build_menu_path(target.shell_path, ScanKeyName)) != ScanCaption) {
+                return false;
+            }
+        }
         if (!key_exists(std::wstring(ShellClassesRoot) + L"\\Applications\\" + AppExeName)) {
             return false;
         }
@@ -96,11 +107,21 @@ private:
         return true;
     }
 
+    // The key's default (caption) value, or empty when absent.
+    static std::wstring string_value(const std::wstring& path) {
+        wchar_t buffer[256]{};
+        DWORD bytes = sizeof(buffer) - sizeof(wchar_t);
+        if (RegGetValueW(HKEY_CURRENT_USER, path.c_str(), nullptr, RRF_RT_REG_SZ, nullptr, buffer,
+                         &bytes) != ERROR_SUCCESS) {
+            return std::wstring();
+        }
+        return buffer;
+    }
+
     static bool register_all(const std::wstring& executable_path) {
         bool ok = true;
-        ok &= register_verbs(targets(), MenuKeyName, L"Copy with XactCopy", executable_path);
-        ok &= register_verbs(scan_targets(), ScanKeyName, L"Assess Readable Files with XactCopy",
-                             executable_path);
+        ok &= register_verbs(targets(), MenuKeyName, CopyCaption, executable_path);
+        ok &= register_verbs(scan_targets(), ScanKeyName, ScanCaption, executable_path);
         register_application(executable_path);
         register_app_paths(executable_path);
         register_send_to(executable_path);

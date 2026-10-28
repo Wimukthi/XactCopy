@@ -385,6 +385,9 @@ private:
     HWND profile_label_ = nullptr;
     HWND policy_label_ = nullptr;
     HWND verify_label_ = nullptr;
+    // Fills the destination row's slot in Assess mode so both modes keep the
+    // same geometry.
+    HWND scan_info_label_ = nullptr;
     // Client height the current mode/options need; feeds WM_GETMINMAXINFO.
     int required_client_height_ = 0;
     HWND mode_combo_ = nullptr;
@@ -612,6 +615,7 @@ private:
                 // Captions and secondary lines recede; values stay full contrast.
                 const bool muted = control == profile_label_ || control == policy_label_ ||
                                    control == verify_label_ || control == sources_footer_ ||
+                                   control == scan_info_label_ ||
                                    control == file_progress_label_ ||
                                    control == overall_progress_label_ ||
                                    control == journal_label_ || control == diagnostics_label_;
@@ -915,7 +919,7 @@ private:
             sources_footer_,   recent_destinations_button_, options_toggle_, add_task_button_,
             tasks_label_,      tasks_list_,          pause_list_check_,  clear_finished_button_,
             detail_label_,     mode_copy_tab_,       mode_scan_tab_,     profile_label_,
-            policy_label_,     verify_label_,
+            policy_label_,     verify_label_,        scan_info_label_,
             clear_selection_,  mode_combo_,          engine_combo_,
             overwrite_combo_,  verify_combo_,        salvage_check_,    resume_check_,
             map_check_,        adaptive_check_,      continue_check_,   skip_known_bad_check_,
@@ -1051,6 +1055,9 @@ private:
         profile_label_ = create(L"STATIC", L"Profile", SS_NOPREFIX | SS_CENTERIMAGE, 0);
         policy_label_ = create(L"STATIC", L"If file exists", SS_NOPREFIX | SS_CENTERIMAGE, 0);
         verify_label_ = create(L"STATIC", L"Verify", SS_NOPREFIX | SS_CENTERIMAGE, 0);
+        scan_info_label_ = create(L"STATIC",
+                                  L"Read-only: nothing is written except the optional bad-range map.",
+                                  SS_NOPREFIX | SS_CENTERIMAGE | SS_ENDELLIPSIS, 0);
 
         salvage_check_ = create(L"BUTTON", L"Salvage unreadable blocks",
                                 WS_TABSTOP | BS_OWNERDRAW, IdSalvageCheck);
@@ -1602,6 +1609,7 @@ private:
                              recent_destinations_button_}) {
             if (control != nullptr) ShowWindow(control, scan ? SW_HIDE : SW_SHOW);
         }
+        if (scan_info_label_ != nullptr) ShowWindow(scan_info_label_, scan ? SW_SHOW : SW_HIDE);
         SetWindowTextW(source_label_, scan ? L"What to assess" : L"What to copy");
         SetWindowTextW(profile_label_, scan ? L"Scan" : L"Profile");
         SetWindowTextW(policy_label_, scan ? L"Read method" : L"If file exists");
@@ -2950,7 +2958,18 @@ private:
             if (commit && handle != nullptr) ShowWindow(handle, visible ? SW_SHOW : SW_HIDE);
         };
 
-        // ---- Left column: returns its height for a given sources height ----
+        // Both lists start at the same height: the add buttons share a row
+        // with the "What to copy" heading when the column is wide enough, and
+        // the task list's toolbar row mirrors that.
+        const int files_width = scale(66);
+        const int folder_width = scale(78);
+        const int paste_width = scale(58);
+        const int clear_width = scale(56);
+        const int buttons_width = files_width + folder_width + paste_width + clear_width + gap * 3;
+        const bool one_row = left_width >= buttons_width + scale(104) + gap;
+        const int header_height = one_row ? row_height : row_height * 2 + scale(4);
+
+        // ---- Left column: returns its height for a given list height ----
         HWND option_checks[] = {salvage_check_,    resume_check_,   map_check_,
                                 adaptive_check_,   continue_check_, skip_known_bad_check_,
                                 wait_media_check_, fragile_check_};
@@ -2969,14 +2988,6 @@ private:
 
             // Heading + add buttons; the buttons drop to their own row when
             // the column is too narrow for both.
-            const int files_width = scale(66);
-            const int folder_width = scale(78);
-            const int paste_width = scale(58);
-            const int clear_width = scale(56);
-            const int buttons_width =
-                files_width + folder_width + paste_width + clear_width + gap * 3;
-            const int heading_width = scale(104);
-            const bool one_row = width >= buttons_width + heading_width + gap;
             place(source_label_, 0, one_row ? width - buttons_width - gap : width, row_height);
             if (!one_row) y += row_height + scale(4);
             int x = width;
@@ -2991,7 +3002,10 @@ private:
             place(sources_footer_, 0, width, label_height);
             y += label_height + section_gap;
 
-            if (!scan) {
+            // The destination row's slot is kept in Assess mode (a note
+            // fills it) so switching modes never moves the lists.
+            place(scan_info_label_, 0, width);
+            {
                 const int label_width = scale(78);
                 const int browse_width = scale(84);
                 const int recent_width = scale(26);
@@ -3090,12 +3104,14 @@ private:
 
             place(tasks_label_, 0, width, tab_height);
             y += tab_height + section_gap;
+            // Toolbar row level with the add buttons opposite.
+            y += header_height - row_height;
+            const int finished_width = scale(118);
+            place(pause_list_check_, 0, std::max(0, width - finished_width - gap), row_height);
+            place(clear_finished_button_, width - finished_width, finished_width);
+            y += row_height + scale(6);
             place(tasks_list_, 0, width, tasks_height);
-            y += tasks_height + scale(4);
-            const int clear_width = scale(118);
-            place(pause_list_check_, 0, std::max(0, width - clear_width - gap), row_height);
-            place(clear_finished_button_, width - clear_width, clear_width);
-            y += row_height + section_gap;
+            y += tasks_height + scale(3) + label_height + section_gap;
 
             // Running task: heading with Pause/Cancel beside it, then detail.
             const int control_width = scale(92);
@@ -3151,18 +3167,24 @@ private:
         const int right_fixed = right_column(0);
         const int status_height = row_height;
         const int log_toolbar_height = row_height;
-        const int min_log = scale(90);
+        const int min_log = scale(100);
         const int bottom_fixed = gap + log_toolbar_height + gap + gap + status_height;
         const int top_min = std::max(left_fixed, right_fixed) + list_floor;
         required_client_height_ = margin * 2 + top_min + bottom_fixed + min_log;
 
         const int body = client_height - margin * 2;
-        int top_height = std::max(top_min, (body - bottom_fixed) * 66 / 100);
+        // The lists get a useful height (list_target) before the log grows
+        // past its minimum; beyond that the split is two-thirds / one-third.
+        const int list_target = scale(160);
+        int top_height = std::max({top_min, (body - bottom_fixed) * 66 / 100,
+                                   std::max(left_fixed, right_fixed) + list_target});
         top_height = std::max(top_min, std::min(top_height, body - bottom_fixed - min_log));
 
+        // One height for both lists, so they line up top and bottom.
         commit = true;
-        left_column(std::max(list_floor, top_height - left_fixed));
-        right_column(std::max(list_floor, top_height - right_fixed));
+        const int list_height = std::max(list_floor, top_height - std::max(left_fixed, right_fixed));
+        left_column(list_height);
+        right_column(list_height);
         show(mode_combo_, false);
 
         // ---- Bottom: log ----
@@ -3644,9 +3666,10 @@ private:
         selection_timer_active_ = false;
         const bool want_destination = selection_wants_destination_;
         selection_wants_destination_ = false;
-        if (launch_.explorer_scan_mode) {
-            SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0); // Assess Readable Files
-            sync_mode_ui();
+        // An Explorer verb names its mode ("Copy with" / "Assess with"), so it
+        // wins over whatever mode the window was in; drops keep the mode.
+        if (want_destination || launch_.explorer_scan_mode) {
+            select_mode(launch_.explorer_scan_mode);
         }
         launch_.explorer_scan_mode = false;
         if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
@@ -5083,6 +5106,9 @@ ui::LaunchOptions parse_launch_options(const wchar_t* command_line) {
         } else if ((_wcsicmp(arg, L"--source") == 0 ||
                     _wcsicmp(arg, L"--from-explorer-folder") == 0) &&
                    i + 1 < argc) {
+            launch.explorer_folder_path = storage::fsutil::wide_to_utf8(argv[++i]);
+        } else if (_wcsicmp(arg, L"--scan-from-explorer-folder") == 0 && i + 1 < argc) {
+            launch.explorer_scan_mode = true;
             launch.explorer_folder_path = storage::fsutil::wide_to_utf8(argv[++i]);
         } else if (_wcsnicmp(arg, L"--from-explorer-folder=", 23) == 0) {
             launch.explorer_folder_path = storage::fsutil::wide_to_utf8(arg + 23);

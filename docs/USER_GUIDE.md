@@ -303,9 +303,11 @@ Enable **Settings → Explorer Integration** to add XactCopy to the Windows shel
 - **Copy with XactCopy** — on files, folders, drives, and folder backgrounds. A
   selected item is shown as the exact source and only that item is copied.
   Multi-select copies the selected items together from their shared source
-  folder. The folder-background command copies the whole folder.
-- **Assess Readable Files with XactCopy** — on folders and drives; opens XactCopy
-  ready to scan that target.
+  folder. The folder-background command copies the whole folder. XactCopy
+  opens in Copy mode.
+- **Assess with XactCopy**: on the same files, folders, drives, and folder
+  backgrounds; XactCopy opens in Assess mode with those items listed, ready to
+  start. Either verb switches a running XactCopy to its mode.
 - **Open with / drag-and-drop** — XactCopy is registered as an application, so
   you can drop files onto it or pick it from *Open with*.
 - **Send to → XactCopy**, and a **Run** dialog entry (`XactCopy`).
@@ -458,7 +460,8 @@ interface.
 | `--source <path>` | Set the source folder. |
 | `--from-explorer <path> [<path>…]` | Copy exactly these items. Their shared parent becomes the internal copy root. |
 | `--from-explorer-folder <path>` | Copy the whole folder (what the folder-background verb uses). |
-| `--scan-from-explorer <path> [<path>…]` | Open in Assess Readable Files mode targeting these items. |
+| `--scan-from-explorer <path> [<path>…]` | Open in Assess mode targeting these items. |
+| `--scan-from-explorer-folder <path>` | Assess the whole folder (the folder-background *Assess* verb). |
 | `--resume-interrupted` | Show the resume prompt for an interrupted run on launch. Also accepted as `--force-resume-prompt`. |
 | `--recovery-autostart` | Marks the launch as the post-interruption auto-start. Set by XactCopy itself; not meant to be typed. |
 

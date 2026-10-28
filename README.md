@@ -53,7 +53,7 @@ transfer. XactCopy treats bad media as the expected case:
 - **Crash recovery** — if XactCopy or the machine goes down mid-transfer, the
   next launch offers to resume the interrupted run.
 - **Explorer integration** — right-click any file, folder, or drive to *Copy with
-  XactCopy* or *Assess Readable Files*, plus Open-with, Send-to, and Run-dialog
+  XactCopy* or *Assess with XactCopy* (each opens in its mode), plus Open-with, Send-to, and Run-dialog
   entries.
 - **In-app updates** — checks GitHub for new releases, then downloads, verifies
   (SHA-256), and installs them in place.
