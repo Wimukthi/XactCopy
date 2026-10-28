@@ -1339,15 +1339,19 @@ private:
     }
 
     // Swap pages with redraw suspended, then paint the content area once, so
-    // no half-built or blank page is ever shown.
+    // no half-built or blank page is ever shown. Before the dialog is shown
+    // (WM_CREATE) redraw is left alone: WM_SETREDRAW TRUE would mark the
+    // hidden window visible, and its first paint would then skip the rail.
     void show_page(int page) {
         HWND hwnd = host_.hwnd();
-        SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
+        const bool visible = IsWindowVisible(hwnd) != FALSE;
+        if (visible) SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
         for (const auto& [index, windows] : page_windows_) {
             const int command = index == page ? SW_SHOWNA : SW_HIDE;
             for (HWND window : windows) ShowWindow(window, command);
         }
         current_page_ = page;
+        if (!visible) return;
         SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
         RECT content{};
         GetClientRect(hwnd, &content);

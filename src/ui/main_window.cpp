@@ -599,6 +599,8 @@ private:
     std::wstring source_box_shown_;      // what the Source box shows for the row
     std::wstring destination_box_shown_; // what the Destination box shows
     bool committing_paths_ = false;
+    std::vector<std::uint32_t> short_batches_; // rows whose destination lacks space
+    std::vector<std::wstring> space_warned_;   // shortfalls already logged
     HWND source_add_files_ = nullptr;
     HWND clear_selection_ = nullptr;
     std::map<int, bool> check_states_;
@@ -1878,7 +1880,8 @@ private:
             if (control != nullptr) ShowWindow(control, scan ? SW_HIDE : SW_SHOW);
         }
         SetWindowTextW(source_label_, scan ? L"What to assess" : L"What to copy");
-        if (sources_list_ != nullptr) InvalidateRect(sources_list_, nullptr, FALSE); // destinations
+        if (sources_list_ != nullptr) update_space_warnings(); // destinations apply in Copy only
+        if (sources_list_ != nullptr) InvalidateRect(sources_list_, nullptr, FALSE);
         SetWindowTextW(profile_label_, scan ? L"Scan" : L"Profile");
         SetWindowTextW(verify_label_, scan ? L"Findings" : L"Verify");
         sync_scan_profile_lock();
@@ -2246,8 +2249,10 @@ private:
             }
             if (info.size_incomplete) size_text += L"+";
         }
+        const bool short_of_space = batch_short_of_space(batch.id);
+        if (short_of_space) size_text = L"\x26A0 Not enough space \x00B7 " + size_text;
         RECT size_rect = rect;
-        SetTextColor(draw.hDC, muted);
+        SetTextColor(draw.hDC, short_of_space ? theme_.log_warning : muted);
         DrawTextW(draw.hDC, size_text.c_str(), -1, &size_rect,
                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SIZE size_extent{};
@@ -2436,6 +2441,89 @@ private:
         return std::wstring(buffer, static_cast<std::size_t>(std::max(length, 0)));
     }
 
+    // ---- Destination space ----
+    //
+    // Each row's counted size is checked against the free space where it is
+    // going, as sizes and destinations come in. A shortfall marks the row and
+    // is logged once; it never blocks, because replaced files give space back
+    // and the size is only an estimate.
+
+    // Free bytes for the volume holding `path`, read at its nearest existing folder.
+    static std::optional<std::uint64_t> free_bytes_for(std::wstring path) {
+        for (int depth = 0; depth < 64 && !path.empty(); ++depth) {
+            ULARGE_INTEGER available{};
+            if (directory_exists(path) &&
+                GetDiskFreeSpaceExW(path.c_str(), &available, nullptr, nullptr)) {
+                return available.QuadPart;
+            }
+            const std::wstring parent = storage::fsutil::get_directory_name(path);
+            if (parent.empty() || parent == path) break;
+            path = parent;
+        }
+        return std::nullopt;
+    }
+
+    bool batch_short_of_space(std::uint32_t id) const {
+        return std::find(short_batches_.begin(), short_batches_.end(), id) != short_batches_.end();
+    }
+
+    void update_space_warnings() {
+        std::vector<std::uint32_t> short_ids;
+        if (!is_scan_mode()) {
+            struct Volume {
+                std::wstring root;
+                std::wstring destination; // first destination seen, for the log
+                std::uint64_t need = 0;
+                std::vector<std::uint32_t> ids;
+            };
+            std::vector<Volume> volumes;
+            for (const auto& batch : source_batches_) {
+                const std::wstring& destination = sources_[batch.items.front()].destination;
+                if (destination.empty()) continue;
+                std::uint64_t bytes = 0;
+                bool counted = true;
+                for (std::size_t index : batch.items) {
+                    if (source_rows_[index].bytes < 0) counted = false;
+                    else bytes += static_cast<std::uint64_t>(source_rows_[index].bytes);
+                }
+                if (!counted) continue;
+                wchar_t root[MAX_PATH]{};
+                std::wstring volume = GetVolumePathNameW(destination.c_str(), root, MAX_PATH)
+                                          ? std::wstring(root)
+                                          : destination;
+                auto found = std::find_if(volumes.begin(), volumes.end(), [&](const Volume& v) {
+                    return _wcsicmp(v.root.c_str(), volume.c_str()) == 0;
+                });
+                if (found == volumes.end()) {
+                    volumes.push_back(Volume{volume, destination, 0, {}});
+                    found = volumes.end() - 1;
+                }
+                found->need += bytes;
+                found->ids.push_back(batch.id);
+            }
+            for (const auto& volume : volumes) {
+                const auto free = free_bytes_for(volume.destination);
+                if (!free.has_value() || volume.need <= *free) continue;
+                short_ids.insert(short_ids.end(), volume.ids.begin(), volume.ids.end());
+                const std::wstring key = volume.root + L"|" + std::to_wstring(volume.need);
+                if (std::find(space_warned_.begin(), space_warned_.end(), key) != space_warned_.end()) {
+                    continue;
+                }
+                space_warned_.push_back(key);
+                append_log("WARNING: " + storage::fsutil::wide_to_utf8(volume.root) + " has " +
+                           format_bytes_short(static_cast<std::int64_t>(*free)) +
+                           " free, but the rows copying there need " +
+                           format_bytes_short(static_cast<std::int64_t>(volume.need)) +
+                           ". The copy may run out of space.");
+            }
+        }
+        if (short_ids != short_batches_) {
+            short_batches_ = std::move(short_ids);
+            InvalidateRect(sources_list_, nullptr, FALSE);
+            update_sources_footer();
+        }
+    }
+
     // ---- Source / Destination boxes ----
     //
     // They show the selected row. Edits apply when the box loses focus; an
@@ -2531,6 +2619,7 @@ private:
         destination_box_shown_ = destination;
         if (text != destination) SetWindowTextW(destination_edit_, destination.c_str());
         InvalidateRect(sources_list_, nullptr, FALSE);
+        update_space_warnings();
     }
 
     // Browse for the selected row: pick folders or files instead of its
@@ -2671,6 +2760,7 @@ private:
         InvalidateRect(sources_list_, nullptr, TRUE);
         update_sources_footer();
         sync_path_boxes();
+        update_space_warnings();
     }
 
     void update_sources_footer() {
@@ -2700,6 +2790,9 @@ private:
             text += " \xC2\xB7 " + (selected > 0 ? std::to_string(selected) + " of " : std::string()) +
                     std::to_string(source_batches_.size()) + " rows";
         }
+        if (!short_batches_.empty()) {
+            text += " \xC2\xB7 \xE2\x9A\xA0 destination may run out of space";
+        }
         SetWindowTextW(sources_footer_, storage::fsutil::utf8_to_wide(text).c_str());
     }
 
@@ -2721,6 +2814,7 @@ private:
             }
         }
         update_sources_footer();
+        update_space_warnings();
     }
 
     // Sizes each requested path on this background thread. A newer request
@@ -3555,6 +3649,7 @@ private:
             }
             InvalidateRect(sources_list_, nullptr, FALSE);
             sync_path_boxes();
+            update_space_warnings();
         }
         struct Pending {
             std::vector<ui::SourceGroup> groups;
@@ -5155,6 +5250,7 @@ private:
         }
         InvalidateRect(sources_list_, nullptr, FALSE);
         select_source_batches(batches);
+        update_space_warnings();
     }
 
     // Folder picker with multi-select; each folder is added as an item.
