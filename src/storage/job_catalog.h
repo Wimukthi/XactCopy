@@ -83,6 +83,14 @@ inline std::string trim_copy(const std::string& text) {
 
 } // namespace catalog_detail
 
+// A further source of a multi-part task: one more root (with its selected
+// items) read into the same destination with the same options. Part 0 is the
+// job's own Options.
+struct ManagedJobPart {
+    std::string SourceRoot;
+    std::vector<std::string> SelectedRelativePaths;
+};
+
 struct ManagedJob {
     std::string JobId;
     std::string Name;
@@ -93,6 +101,7 @@ struct ManagedJob {
     // window, which follow the user's on-exit choice. Jobs from schema <= 3
     // were all saved deliberately, so a missing field reads as pinned.
     bool Pinned = true;
+    std::vector<ManagedJobPart> Parts; // parts after the first; usually empty
 
     void to_json(json::Writer& w) const {
         w.begin_object();
@@ -100,6 +109,17 @@ struct ManagedJob {
         w.key("Name"); w.value(Name);
         w.key("Pinned"); w.value(Pinned);
         w.key("Options"); Options.to_json(w);
+        if (!Parts.empty()) {
+            w.key("Parts");
+            w.begin_array();
+            for (const auto& part : Parts) {
+                w.begin_object();
+                w.key("SourceRoot"); w.value(part.SourceRoot);
+                models::detail::write_string_array(w, "SelectedRelativePaths", part.SelectedRelativePaths);
+                w.end_object();
+            }
+            w.end_array();
+        }
         w.key("CreatedUtc"); w.value_literal_string(CreatedUtc.to_string());
         w.key("UpdatedUtc"); w.value_literal_string(UpdatedUtc.to_string());
         w.end_object();
@@ -112,6 +132,16 @@ struct ManagedJob {
         models::detail::read(obj, "JobId", job.JobId);
         models::detail::read(obj, "Name", job.Name);
         models::detail::read(obj, "Pinned", job.Pinned);
+        if (const auto* parts = obj->find("Parts"); parts != nullptr && parts->as_array() != nullptr) {
+            for (const auto& item : *parts->as_array()) {
+                const auto* part_object = item.as_object();
+                if (part_object == nullptr) continue;
+                ManagedJobPart part;
+                models::detail::read(part_object, "SourceRoot", part.SourceRoot);
+                models::detail::read(part_object, "SelectedRelativePaths", part.SelectedRelativePaths);
+                if (!part.SourceRoot.empty()) job.Parts.push_back(std::move(part));
+            }
+        }
         if (const auto* options = obj->find("Options"); options != nullptr && !options->is_null()) {
             job.Options = models::CopyJobOptions::from_json(*options);
         }
@@ -296,7 +326,7 @@ struct JobCatalog {
 
 class JobCatalogStore {
 public:
-    // 4: ManagedJob.Pinned.
+    // 4: ManagedJob.Pinned and ManagedJob.Parts.
     static constexpr std::int32_t CurrentSchemaVersion = 4;
     static constexpr std::int32_t CurrentEnvelopeSchemaVersion = 1;
     static constexpr int BackupGenerationCount = 2;

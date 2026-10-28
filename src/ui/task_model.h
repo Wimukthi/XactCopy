@@ -24,14 +24,38 @@ namespace xact::ui {
 
 // ---- Sources ----------------------------------------------------------------
 
-// One row of the "What to copy" list. A folder is copied as itself (it appears
-// by name inside the destination, as Explorer does) unless `contents_only`,
-// which copies what is inside it, the classic "source folder" behaviour.
+// One file or folder in the "What to copy" list. A folder is copied as itself
+// (it appears by name inside the destination, as Explorer does) unless
+// `contents_only`, which copies what is inside it, the classic "source folder"
+// behaviour.
 struct SourceItem {
     std::wstring path;      // normalized full path, no trailing separator
     bool is_directory = false;
     bool contents_only = false;
+    std::uint32_t batch = 0; // the add action that brought it in; one list row per batch
 };
+
+// The items one add action brought in (several folders picked in one dialog,
+// one paste, one drop). Each batch is one row in the list and becomes one task.
+struct SourceBatch {
+    std::uint32_t id = 0;
+    std::vector<std::size_t> items; // indexes into the source list
+};
+
+// Batches in the order their first item appears.
+inline std::vector<SourceBatch> source_batches(const std::vector<SourceItem>& items) {
+    std::vector<SourceBatch> batches;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        auto found = std::find_if(batches.begin(), batches.end(),
+                                  [&](const SourceBatch& batch) { return batch.id == items[i].batch; });
+        if (found == batches.end()) {
+            batches.push_back(SourceBatch{items[i].batch, {}});
+            found = batches.end() - 1;
+        }
+        found->items.push_back(i);
+    }
+    return batches;
+}
 
 // One worker job's worth of sources: a directory root plus the exact relative
 // items beneath it (empty means "everything under root").
@@ -269,6 +293,13 @@ struct SessionTask {
     std::string managed_run_id; // catalog run for this attempt
     bool from_recovery = false;
     TaskState state = TaskState::Starting;
+    // Multi-part tasks run their parts back to back as one task.
+    std::size_t part_index = 0;
+    std::size_t part_count = 1;
+    bool continue_parts = false; // started from the queue: run the later parts too
+    std::string queue_entry_id;  // the queue entry this attempt came from
+    std::int32_t queue_attempt = 0;
+    std::string trigger;
     double progress = 0.0;      // 0..1 overall
     double bytes_per_second = 0.0;
     std::int64_t eta_seconds = -1;
@@ -292,6 +323,18 @@ inline std::string task_title(const models::CopyJobOptions& options) {
         return "Assess " + what + (options.UseExperimentalRawDiskScan ? " (direct NTFS)" : "");
     }
     return "Copy " + what + " \xE2\x86\x92 " + options.DestinationRoot; // right arrow
+}
+
+// Title for a task that may read several roots (one part per root).
+inline std::string task_title_for_parts(const models::CopyJobOptions& options, std::size_t item_count,
+                                        std::size_t part_count) {
+    if (part_count <= 1) return task_title(options);
+    const std::string what = std::to_string(item_count) + " items from " + std::to_string(part_count) +
+                             " locations";
+    if (options.OperationMode == models::JobOperationMode::ScanOnly) {
+        return "Assess " + what + (options.UseExperimentalRawDiskScan ? " (direct NTFS)" : "");
+    }
+    return "Copy " + what + " \xE2\x86\x92 " + options.DestinationRoot;
 }
 
 // Newest run per job id (runs are stored newest first), as indexes into `runs`.

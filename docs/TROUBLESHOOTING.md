@@ -90,8 +90,8 @@ snapshot.
 
 ### The scan is very slow
 
-Set **Settings → Performance → Scan profile** to *Fast file assessment* and raise
-**Scan workers**. The fast profile still falls back to precise reads around any
+Set the main window's **Scan** choice to *Fast* and raise **Settings →
+Performance → Scan workers**. The fast profile still falls back to precise reads around any
 fault it finds, so the resulting map stays accurate.
 
 ### The raw-volume assessment backend falls back to standard reads
@@ -118,9 +118,9 @@ later copies.
 
 ### It didn't offer to resume after a crash
 
-Check **Settings → Recovery & Startup → Prompt to resume interrupted runs**. If
-you dismissed the prompt with *Later*, **Jobs → Resume Interrupted Job** brings
-it back. Note that discarding a run discards its resume point.
+Check **Settings → Recovery & Startup → Interrupted runs → At startup**. Either
+way, an interrupted run stays in **History**, where **Resume** picks it up; **Tasks
+→ Resume Interrupted Run** does the same for the most recent one.
 
 ### A resumed job re-copies work it had already done
 

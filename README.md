@@ -85,13 +85,13 @@ file next to every asset so you can verify the download.
    - **Copy**: copy and verify data from source to destination.
    - **Assess readability**: read allocated source files and map unreadable regions (no
      destination needed).
-3. Adjust options if you like (the defaults are sensible), then press **Add to
-   queue** to run it, or **Add to tasks** to keep it for later and press **Run**
-   when you are ready. The **Queue** view shows progress, throughput, and ETA;
-   more work can be queued while one task runs, and **Pause**, **Cancel**, and
-   **Stop** stay available throughout.
+3. Adjust options if you like (the defaults are sensible), press **Add to
+   tasks**, then select the task and press **Run** (Ctrl+Enter adds and queues
+   in one step). The **Tasks** list shows progress, throughput, and ETA; more
+   work can be queued while one task runs, and **Pause** and **Stop** act on the
+   running task.
 
-The main-window choices are per-task overrides. Use **Save defaults** when you
+The main-window choices are per-task overrides. Use **File → Save as defaults** when you
 want the reusable options to seed future runs; pin a task when the mode,
 paths, and complete option set must be retained together.
 

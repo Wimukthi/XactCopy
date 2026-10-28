@@ -363,6 +363,24 @@ void test_task_model() {
     check(ui::summarize_options(models::CopyJobOptions{}).find("verify full") != std::string::npos,
           "option summary names the verification mode");
 
+    // Source batches: one row per add action, in first-appearance order.
+    std::vector<ui::SourceItem> batched(4);
+    batched[0].path = L"C:\\a"; batched[0].batch = 7;
+    batched[1].path = L"D:\\b"; batched[1].batch = 3;
+    batched[2].path = L"C:\\c"; batched[2].batch = 7;
+    batched[3].path = L"E:\\d"; batched[3].batch = 3;
+    const auto batches = ui::source_batches(batched);
+    check(batches.size() == 2 && batches[0].id == 7 && batches[0].items == std::vector<std::size_t>{0, 2} &&
+              batches[1].items == std::vector<std::size_t>{1, 3},
+          "items group into one row per add action");
+    models::CopyJobOptions multi;
+    multi.DestinationRoot = "F:\\Out";
+    check(ui::task_title_for_parts(multi, 3, 2) == "Copy 3 items from 2 locations \xE2\x86\x92 F:\\Out",
+          "a multi-part task is titled by items and locations");
+    multi.SourceRoot = "C:\\x";
+    check(ui::task_title_for_parts(multi, 1, 1) == ui::task_title(multi),
+          "a one-part task keeps the plain title");
+
     // The legacy session-task file is still readable for the one-time migration.
     const std::string legacy =
         R"({"SchemaVersion":1,"ListRunning":true,"Tasks":[{"DisplayName":"Old","Options":{"SourceRoot":"C:\\b"}},{"Options":{}}]})";
@@ -1512,12 +1530,36 @@ void test_job_manager_tasks() {
         // Discard removes unpinned tasks and their queue entries, not history.
         auto run = manager.create_run_for_job(task_a->JobId, "manual");
         check(run.has_value(), "a run for the unpinned task");
+        check(manager.count_unpinned_jobs() == 1, "one unpinned task before discard");
         check(manager.delete_unpinned_jobs() == 1, "discard removes the one unpinned task");
         check(manager.get_jobs_in_order().size() == 2, "pinned jobs stay");
         auto queue = manager.get_queue_entries();
         check(queue.size() == 1 && queue[0].JobId == task_b->JobId,
               "the discarded task's queue entry is gone");
         check(manager.get_run_by_id(run->RunId).has_value(), "run history survives a discard");
+        // A task with several parts (one per root) runs them as one task.
+        models::CopyJobOptions first;
+        first.SourceRoot = "C:\\";
+        first.SelectedRelativePaths = {"Games"};
+        first.DestinationRoot = "D:\\Dst";
+        first.ExpectedSourceIdentity = "c-drive";
+        auto multi = manager.add_task("Two drives", first, {{"E:\\", {"Media"}}});
+        check(multi.has_value() && !multi->Pinned && multi->Parts.size() == 1, "multi-part task saved");
+        check(ui::JobManagerService::part_count(*multi) == 2, "two parts");
+        const auto second = ui::JobManagerService::part_options(*multi, 1);
+        check(second.SourceRoot == "E:\\" && second.SelectedRelativePaths == std::vector<std::string>{"Media"} &&
+                  second.DestinationRoot == "D:\\Dst" && second.ExpectedSourceIdentity.empty(),
+              "part options swap the root and items, keep the rest, and drop the media binding");
+        check(ui::JobManagerService::find_part(*multi, second) == std::optional<std::size_t>(1),
+              "a running part is matched back to its index");
+        auto part_run = manager.create_run_for_job_part(multi->JobId, 1, "queued-manual", "entry-x", 1);
+        check(part_run.has_value() && part_run->DisplayName == "Two drives (part 2/2)" &&
+                  part_run->SourceRoot == "E:\\" && part_run->QueueEntryId == "entry-x",
+              "a part's run is named and rooted per part");
+        auto copy = manager.duplicate_job(multi->JobId, "Two drives (copy)");
+        check(copy.has_value() && copy->Parts.size() == 1 && !copy->Pinned, "duplicates keep parts and pin");
+        manager.delete_job(copy->JobId);
+        manager.delete_job(multi->JobId);
     }
     // Everything above was persisted through the signed catalog.
     ui::JobManagerService reopened(path);

@@ -349,8 +349,25 @@ public:
         return false;
     }
 
-    bool prompt_resume_after_crash() const { return get_bool("PromptResumeAfterCrash", true); }
-    bool auto_resume_after_crash() const { return get_bool("AutoResumeAfterCrash", false); }
+    // InterruptedRunsAtStartup ("ask" / "resume" / "history") replaced the
+    // PromptResumeAfterCrash / AutoResumeAfterCrash pair; the old keys still
+    // answer until the new one is written.
+    bool prompt_resume_after_crash() const {
+        if (contains("InterruptedRunsAtStartup")) {
+            return get_string("InterruptedRunsAtStartup", "ask") == "ask";
+        }
+        return get_bool("PromptResumeAfterCrash", true);
+    }
+    bool auto_resume_after_crash() const {
+        if (contains("InterruptedRunsAtStartup")) {
+            return get_string("InterruptedRunsAtStartup", "ask") == "resume";
+        }
+        return get_bool("AutoResumeAfterCrash", false);
+    }
+    // The new key's value equivalent to the old pair (for migration).
+    std::string interrupted_runs_at_startup() const {
+        return auto_resume_after_crash() ? "resume" : prompt_resume_after_crash() ? "ask" : "history";
+    }
     bool keep_resume_prompt_until_resolved() const {
         return get_bool("KeepResumePromptUntilResolved", true);
     }

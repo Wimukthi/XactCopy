@@ -708,12 +708,6 @@ private:
             edit_text(0, "Log font", "LogFontFamily", "Consolas");
             edit_int(0, "Log size (pt)", "LogFontSizePoints", 7, 20, 9);
             check(0, "Color-code log by severity", "UiColorizeLogBySeverity", true);
-            section(0, "Grid Appearance");
-            check(0, "Use alternating grid rows", "GridAlternatingRows", true);
-            edit_int(0, "Grid row height", "GridRowHeight", 18, 48, 24);
-            combo(0, "Grid header style", "GridHeaderStyle",
-                  {L"Default", L"Minimal", L"Prominent"}, {"default", "minimal", "prominent"},
-                  "default");
             section(0, "Status & Progress");
             check(0, "Show buffer status row", "ShowBufferStatusRow", true);
             check(0, "Show rescue status row", "ShowRescueStatusRow", true);
@@ -722,21 +716,18 @@ private:
                   {"thin", "standard", "thick"}, "standard");
 
             // --- Page 1: Copy Defaults ----------------------------------
-            section(1, "Default Run Behavior");
-            check(1, "Resume from journal", "DefaultResumeFromJournal", true);
-            check(1, "Salvage unreadable blocks", "DefaultSalvageUnreadableBlocks", false);
-            check(1, "Continue on file errors", "DefaultContinueOnFileError", false);
+            // The main window's own choices (profile, overwrite, verify, the
+            // Options toggles, buffer/retries/timeout, scan and read method)
+            // are saved with File > Save current settings as defaults, so they
+            // are not repeated here.
+            section(1, "Main-window choices: File > Save as defaults");
+            section(1, "File Handling");
             check(1, "Preserve source timestamps", "DefaultPreserveTimestamps", true);
             check(1, "Copy empty directories", "DefaultCopyEmptyDirectories", true);
-            check(1, "Wait forever for source/destination", "DefaultWaitForMediaAvailability",
-                  false);
             check(1, "Wait for lock/contention release", "DefaultWaitForFileLockRelease", false);
             check(1, "Treat Access Denied as contention", "DefaultTreatAccessDeniedAsContention",
                   false);
             section(1, "Policies");
-            combo(1, "Overwrite policy", "DefaultOverwritePolicy",
-                  {L"Overwrite existing", L"Skip existing", L"Overwrite if newer", L"Stop on conflict"},
-                  {"overwrite", "skip-existing", "overwrite-if-newer", "ask"}, "overwrite");
             combo(1, "Symlink handling", "DefaultSymlinkHandling",
                   {L"Skip symbolic links", L"Follow targets inside source only",
                    L"Follow external targets (expert)"},
@@ -748,29 +739,17 @@ private:
             combo(1, "Salvage fill pattern", "DefaultSalvageFillPattern",
                   {L"Zero-fill", L"0xFF-fill"}, {"zero", "ones"}, "zero");
             section(1, "Bad Range Map");
-            check(1, "Use bad-range map when available", "DefaultUseBadRangeMap", false);
-            check(1, "Skip known bad ranges during copy", "DefaultSkipKnownBadRanges", false);
-            check(1, "Update map from scan/copy runs", "DefaultUpdateBadRangeMapFromRun", false);
-            check(1, "Raw volume scan (local NTFS; Administrator)",
-                  "DefaultUseExperimentalRawDiskScan", false);
             edit_int(1, "Map max age (days, 0=never)", "DefaultBadRangeMapMaxAgeDays", 0, 3650,
                      30);
 
             // --- Page 2: Performance ------------------------------------
             section(2, "Transfer Tuning");
-            check(2, "Enable adaptive buffer by default", "DefaultUseAdaptiveBuffer", false);
             combo(2, "Transfer engine", "DefaultTransferEnginePolicy",
                   {L"Auto", L"Managed rescue", L"Native fast"}, {"auto", "managed", "native"},
                   "auto");
-            combo(2, "Scan profile", "DefaultScanPerformanceProfile",
-                  {L"Automatic assessment", L"Fast file assessment", L"Precise range assessment"},
-                  {"auto", "fast", "precise"}, "auto");
             combo(2, "Worker priority", "DefaultWorkerProcessPriorityClass",
                   {L"Idle", L"Below normal", L"Normal", L"Above normal", L"High"},
                   {"Idle", "BelowNormal", "Normal", "AboveNormal", "High"}, "Normal");
-            edit_int(2, "Manual buffer MB", "DefaultBufferSizeMb", 1, 256, 4);
-            edit_int(2, "Max retries", "DefaultMaxRetries", 0, 32, 2);
-            edit_int(2, "Operation timeout (sec)", "DefaultOperationTimeoutSeconds", 1, 3600, 10);
             edit_int(2, "Per-file timeout (sec, 0=off)", "DefaultPerFileTimeoutSeconds", 0, 86400,
                      0);
             edit_int(2, "Max throughput (MB/s, 0=off)", "DefaultMaxThroughputMbPerSecond", 0,
@@ -781,7 +760,6 @@ private:
             edit_int(2, "Small-file threshold KB", "DefaultSmallFileThresholdKb", 4, 1048576,
                      256);
             section(2, "Fragile Media Guard");
-            check(2, "Enable fragile media mode by default", "DefaultFragileMediaMode", false);
             check(2, "Skip file on first read error", "DefaultSkipFileOnFirstReadError", true);
             check(2, "Persist skips across resume", "DefaultPersistFragileSkipsAcrossResume",
                   true);
@@ -822,10 +800,7 @@ private:
             edit_int(3, "Always keep newest journals", "JournalKeepMinimum", 0, 1000, 10);
 
             // --- Page 4: Verification -----------------------------------
-            section(4, "Verification Defaults");
-            check(4, "Enable verification by default", "DefaultVerifyAfterCopy", true);
-            combo(4, "Verification mode", "DefaultVerificationMode",
-                  {L"Full hash", L"Sampled hash"}, {"full", "sampled"}, "full");
+            section(4, "Verification");
             combo(4, "Hash algorithm", "DefaultVerificationHashAlgorithm",
                   {L"SHA-256", L"SHA-512"}, {"sha256", "sha512"}, "sha256");
             section(4, "Sampled Mode");
@@ -836,18 +811,17 @@ private:
             // Update settings live in the About dialog, not here.
 
             // --- Page 5: Recovery & Startup -----------------------------
-            section(5, "Startup");
-            check(5, "Auto-start on next logon after interruption", "EnableRecoveryAutostart",
-                  true);
+            section(5, "Tasks");
             check(5, "Run the queue automatically on startup", "AutoRunQueuedJobsOnStartup",
                   false);
-            section(5, "Tasks");
             combo(5, "Unpinned tasks on exit", "TaskListOnExit",
                   {L"Ask", L"Keep", L"Discard"}, {"ask", "keep", "discard"}, "ask");
-            section(5, "Interrupted Run Handling");
-            check(5, "Prompt to resume interrupted runs", "PromptResumeAfterCrash", true);
-            check(5, "Auto-resume interrupted runs", "AutoResumeAfterCrash", false);
-            check(5, "Keep prompting until resolved", "KeepResumePromptUntilResolved", true);
+            section(5, "Interrupted Runs");
+            combo(5, "At startup", "InterruptedRunsAtStartup",
+                  {L"Ask", L"Resume automatically", L"Leave in History"},
+                  {"ask", "resume", "history"}, "ask");
+            check(5, "Auto-start on next logon after interruption", "EnableRecoveryAutostart",
+                  true);
             edit_int(5, "Heartbeat write interval (sec)", "RecoveryTouchIntervalSeconds", 1, 60,
                      2);
 
@@ -873,46 +847,28 @@ private:
         if (setting == "LogFontFamily") return L"Font family used by the operations log. A monospaced font such as Consolas keeps columns aligned.";
         if (setting == "LogFontSizePoints") return L"Point size used by the operations log on every monitor.";
         if (setting == "UiColorizeLogBySeverity") return L"Color errors, warnings, successful recovery, and supervisor messages so important events are easier to find.";
-        if (setting == "GridAlternatingRows") return L"Use alternating row backgrounds in Job Manager to make wide records easier to follow.";
-        if (setting == "GridRowHeight") return L"Logical Job Manager row height before monitor DPI and UI scale are applied.";
-        if (setting == "GridHeaderStyle") return L"Choose the visual emphasis used for Job Manager column headers.";
         if (setting == "ShowBufferStatusRow") return L"Show the active I/O buffer and adaptive-buffer status beneath the progress bars.";
         if (setting == "ShowRescueStatusRow") return L"Show rescue pass, unreadable-region, and recovery information beneath the progress bars.";
         if (setting == "ProgressBarShowPercentage") return L"Draw a numeric percentage inside progress bars when the selected bar height has enough room.";
         if (setting == "ProgressBarStyle") return L"Choose the visual height of current-file and overall progress bars.";
 
-        if (setting == "DefaultResumeFromJournal") return L"Load matching journal state by default. Completed files still require the configured validation before reuse.";
-        if (setting == "DefaultSalvageUnreadableBlocks") return L"When bytes remain unreadable, write the selected fill pattern and report recovery instead of abandoning all readable data.";
-        if (setting == "DefaultContinueOnFileError") return L"Continue processing later files after an error. The run remains failed or incomplete when any file is lost or skipped.";
         if (setting == "DefaultPreserveTimestamps") return L"Apply source creation, access, and last-write times to the staged destination before publication.";
         if (setting == "DefaultCopyEmptyDirectories") return L"Create source directories that contain no copied files. Disable when only file content matters.";
-        if (setting == "DefaultWaitForMediaAvailability") return L"Wait indefinitely for a missing source or destination volume to return instead of failing immediately.";
         if (setting == "DefaultWaitForFileLockRelease") return L"Probe and wait for sharing violations or locks to clear. Cancel remains available while waiting.";
         if (setting == "DefaultTreatAccessDeniedAsContention") return L"Treat Access Denied like a temporary lock and retry it. Use cautiously: permissions errors can otherwise wait indefinitely.";
-        if (setting == "DefaultOverwritePolicy") return L"Default action when a destination file exists. Stop on conflict leaves the existing file untouched and marks the run incomplete.";
         if (setting == "DefaultSymlinkHandling") return L"Internal-only follows links whose resolved target remains beneath the source. External following can copy unrelated folders or another volume and requires an attended run.";
         if (setting == "DefaultAllowRecoveredOverwriteExisting") return L"Expert override: permit a file containing synthetic salvage bytes to replace an existing destination. Leave disabled so recovery output is published as a clearly named sidecar.";
         if (setting == "DefaultAllowDecryptedDestination") return L"Permit EFS-encrypted source data to be published without encryption. Leave disabled unless plaintext output is an explicit requirement.";
         if (setting == "DefaultSalvageFillPattern") return L"Bytes written where source data could not be recovered. The result is always marked non-exact regardless of pattern.";
-        if (setting == "DefaultUseBadRangeMap") return L"Load remembered unreadable ranges for the same source so repeated runs can make safer decisions.";
-        if (setting == "DefaultSkipKnownBadRanges") return L"Avoid rereading compatible map ranges already known to be bad. This reduces media stress but cannot reconstruct those bytes.";
-        if (setting == "DefaultUpdateBadRangeMapFromRun") return L"Persist unreadable ranges found during scans or copies for later runs. Disable for a read-only, non-updating map policy.";
-        if (setting == "DefaultUseExperimentalRawDiskScan") return L"Read local NTFS file extents through the raw volume when running as Administrator. Unsupported layouts safely fall back to file reads.";
         if (setting == "DefaultBadRangeMapMaxAgeDays") return L"Reject old map entries as skip hints after this many days. Zero never expires them and should be used only for stable media.";
 
-        if (setting == "DefaultUseAdaptiveBuffer") return L"Adjust buffer size from observed throughput and failures instead of keeping the manual size fixed.";
         if (setting == "DefaultTransferEnginePolicy") return L"Auto selects a safe engine for the active policies. Managed enables rescue behavior; Native Fast attempts CopyFileEx first.";
-        if (setting == "DefaultScanPerformanceProfile") return L"Fast uses parallel file reads with precise fallback around failures. Precise performs detailed unreadable-range detection. Automatic currently chooses Fast.";
         if (setting == "DefaultWorkerProcessPriorityClass") return L"Windows scheduling priority for the isolated worker process. High can reduce responsiveness of other applications.";
-        if (setting == "DefaultBufferSizeMb") return L"Base I/O buffer in MiB. Larger values favor healthy throughput; smaller values isolate damaged areas more precisely.";
-        if (setting == "DefaultMaxRetries") return L"Additional application-level attempts for retry-capable I/O. Windows and the device may already retry internally; large values can heavily stress failing media.";
-        if (setting == "DefaultOperationTimeoutSeconds") return L"Timeout for one I/O operation. This is not a whole-file or whole-job timeout.";
         if (setting == "DefaultPerFileTimeoutSeconds") return L"Optional total processing deadline for one file. Zero disables the per-file deadline.";
         if (setting == "DefaultMaxThroughputMbPerSecond") return L"Throttle aggregate transfer throughput to reduce device load. Zero removes the throughput cap.";
         if (setting == "DefaultParallelSmallFileWorkers") return L"Concurrent workers used for eligible small-file Native Fast copies. Zero uses one worker on seek-based disks and up to eight on non-seek storage.";
         if (setting == "DefaultParallelScanWorkers") return L"Concurrent workers used by Fast assessments. Zero uses one worker on seek-based disks and up to eight on non-seek storage; explicit higher values can stress media.";
         if (setting == "DefaultSmallFileThresholdKb") return L"Largest file eligible for the parallel small-file path. Files above this size use the regular staged pipeline.";
-        if (setting == "DefaultFragileMediaMode") return L"Enable conservative behavior for unstable media, including clustered-failure protection and reduced read pressure.";
         if (setting == "DefaultSkipFileOnFirstReadError") return L"In fragile mode, stop reading a file after its first read error instead of running aggressive rescue passes.";
         if (setting == "DefaultPersistFragileSkipsAcrossResume") return L"Remember fragile-mode file skips in the journal so a resumed run does not immediately stress them again.";
         if (setting == "DefaultFragileFailureWindowSeconds") return L"Time window used to detect a cluster of failures that may indicate the whole device is becoming unstable.";
@@ -939,18 +895,14 @@ private:
         if (setting == "JournalRetentionDays") return L"Delete eligible old journal sets after this many days. Zero keeps them indefinitely.";
         if (setting == "JournalKeepMinimum") return L"Always retain at least this many newest journal sets even when they exceed the age limit.";
 
-        if (setting == "DefaultVerifyAfterCopy") return L"Enable post-copy verification by default. Verification occurs against the staged file before it replaces the destination.";
-        if (setting == "DefaultVerificationMode") return L"Full hashes all bytes; Sampled checks selected chunks and is faster but provides weaker detection.";
         if (setting == "DefaultVerificationHashAlgorithm") return L"Hash used for verification. SHA-256 is faster and sufficient for copy integrity; SHA-512 provides a larger digest.";
         if (setting == "DefaultSampleVerificationChunkKb") return L"Size of each region compared in Sampled verification mode.";
         if (setting == "DefaultSampleVerificationChunkCount") return L"Number of distributed regions compared in Sampled mode. More samples improve coverage and cost more reads.";
 
         if (setting == "EnableRecoveryAutostart") return L"Register XactCopy to start at the next logon after an interrupted run so recovery can be offered.";
         if (setting == "AutoRunQueuedJobsOnStartup") return L"Start the queue when XactCopy starts instead of holding it. Tasks with attended-only settings are skipped and stay queued.";
+        if (setting == "InterruptedRunsAtStartup") return L"What happens when XactCopy starts after a run was interrupted: ask, resume it automatically (only when it meets the unattended policy), or leave it in History to resume whenever you like.";
         if (setting == "TaskListOnExit") return L"What happens to tasks you have not pinned when XactCopy closes: ask each time, always keep them, or discard them. Pinned tasks always stay.";
-        if (setting == "PromptResumeAfterCrash") return L"Offer to resume a journaled run after XactCopy or the worker ended unexpectedly.";
-        if (setting == "AutoResumeAfterCrash") return L"Resume an interrupted run without asking. Leave disabled when source or destination media may have changed.";
-        if (setting == "KeepResumePromptUntilResolved") return L"Continue showing the recovery prompt on later launches until the interrupted run is resumed or dismissed.";
         if (setting == "RecoveryTouchIntervalSeconds") return L"How often the active-run recovery marker is refreshed. Shorter intervals reduce stale-state uncertainty but write more often.";
         if (setting == "EnableExplorerContextMenu") return L"Add XactCopy copy and scan commands to Windows Explorer for selected files and folders.";
 
@@ -1248,41 +1200,11 @@ private:
     void sync_page_dependencies() {
         if (current_page_ == 0) {
             set_field_enabled("AccentColorHex", staged_combo("AccentColorMode") == "custom");
-        } else if (current_page_ == 1) {
-            const bool salvage = staged_check("DefaultSalvageUnreadableBlocks");
-            set_field_enabled("DefaultAllowRecoveredOverwriteExisting", salvage);
-            set_field_enabled("DefaultSalvageFillPattern", salvage);
-            const int access_denied_index =
-                field_index_for_key("DefaultTreatAccessDeniedAsContention");
-            if (salvage && staged_check("DefaultTreatAccessDeniedAsContention")) {
-                staged_bools_["DefaultTreatAccessDeniedAsContention"] = false;
-                auto live = page_checks_.find(access_denied_index);
-                if (live != page_checks_.end()) {
-                    live->second = false;
-                    InvalidateRect(page_controls_[access_denied_index], nullptr, FALSE);
-                }
-            }
-            set_field_enabled("DefaultTreatAccessDeniedAsContention", !salvage);
-            const bool map = staged_check("DefaultUseBadRangeMap");
-            set_field_enabled("DefaultSkipKnownBadRanges", map);
-            set_field_enabled("DefaultBadRangeMapMaxAgeDays", map);
-        } else if (current_page_ == 2) {
-            const bool fragile = staged_check("DefaultFragileMediaMode");
-            for (std::string_view key : {"DefaultSkipFileOnFirstReadError",
-                                         "DefaultPersistFragileSkipsAcrossResume",
-                                         "DefaultFragileFailureWindowSeconds",
-                                         "DefaultFragileFailureThreshold",
-                                         "DefaultFragileCooldownSeconds"}) {
-                set_field_enabled(key, fragile);
-            }
-        } else if (current_page_ == 4) {
-            const bool verify = staged_check("DefaultVerifyAfterCopy");
-            set_field_enabled("DefaultVerificationMode", verify);
-            set_field_enabled("DefaultVerificationHashAlgorithm", verify);
-            const bool sampled = verify && staged_combo("DefaultVerificationMode") == "sampled";
-            set_field_enabled("DefaultSampleVerificationChunkKb", sampled);
-            set_field_enabled("DefaultSampleVerificationChunkCount", sampled);
         }
+        // Salvage, the bad-range map, fragile mode, and verification are
+        // main-window choices now, so the settings that refine them stay
+        // editable here and apply whenever the task turns those on. The
+        // Salvage / Access-Denied conflict is resolved when a task is built.
     }
 
     bool harvest_current_page(bool validate = false) {

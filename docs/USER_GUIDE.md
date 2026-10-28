@@ -42,16 +42,19 @@ to the automatic split.
 
 Add files and folders with **+ Files**, **+ Folder**, **Paste** (files copied in
 Explorer, or paths copied as text, one per line), by dropping them on the
-window, or through the Explorer context menu. Each item is one row, with its
-folder and size (sizes are counted in the background). **Del** removes the
-selected rows and **Clear** empties the list.
+window, or through the Explorer context menu. Everything one action adds is
+one row: three folders picked in one **+ Folder** dialog show as "3 folders"
+with their names and combined size (sizes are counted in the background).
+**Del** removes the selected rows and **Clear** empties the list.
 
 Every item is copied *as itself*: a folder `Photos` lands as
 `Destination\Photos`, exactly as Explorer would place it. To copy only what is
 inside a folder, right-click it and choose **Copy folder contents only**.
-Items do not need to share a folder. Items from different folders (or drives)
-become separate tasks, one per folder, and XactCopy warns before adding them if
-two of them would write the same name into the destination.
+Items do not need to share a folder. **Add to tasks** (beside the list) turns
+each selected row, or every row when none is selected, into one task. A row
+whose items come from several folders or drives becomes one task with several
+parts, run back to back; XactCopy warns first if two of them would write the
+same name into the destination. Ctrl+Enter adds the rows and queues them.
 
 ### Destination and options
 
@@ -64,35 +67,41 @@ and numeric tuning fields sit in the **Options** section, which is collapsed by
 default and shows a one-line summary of what the next task will use. Expanding
 it grows the window if it needs the room.
 
-The values are per-task. Use **File → Save current settings as defaults** to
+The values are per-task. Use **File → Save as defaults** to
 persist the reusable engine, overwrite, verification, resilience, buffer,
 retry, and timeout choices for future runs.
 
-### Tasks, Queue, and History
+### Tasks and History
 
-**Add to tasks** turns the items into tasks (one per source folder) and empties
-the list; **Add to queue** (Ctrl+Enter) also queues them. The destination and
-options stay for the next batch. The right column switches between three views:
+The right column switches between two views.
 
-- **Tasks** — everything you have set up, in the order you added it. Each row
-  shows whether the task is ready, queued, or running, or how its last run ended.
-  **Run** starts the selected task now, or next if another task is running;
-  **Queue** adds it to the end of the queue. Right-click to pin, rename,
-  duplicate, edit in the builder (also a double-click), open the destination,
-  or remove a task (<kbd>Del</kbd>).
-- **Queue** — the running task on top, then what waits, in order. Tasks run one
-  at a time. **Start now** runs the selected task next; **Stop** cancels the
-  running task (it can resume from its journal later) or takes a waiting one off
-  the queue. Tick **Hold** to let the current task finish and then wait. Run and
-  Start now still start the task you picked while the queue is held; the hold
-  keeps covering the rest. Reorder with the right-click menu or
-  <kbd>Ctrl</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd>.
-- **History** — every run, newest first. Selecting a run shows its details in
-  the space below the list, including its authenticated checkpoint: completed and
-  pending counts and every unreadable, recovered, or failed file. **Resume**
-  continues an interrupted, cancelled, incomplete, or failed run from its journal;
-  **Journal** exports a readable JSON view of it and opens that. Right-click for
-  a CSV report, the bad-range map, or to delete runs.
+**Tasks** lists the running task first, then the queued tasks in the order they
+will run, then everything else. Each row shows its state (ready, queued with its
+position, running with progress, or how its last run ended) and, for a task
+with several parts, which part is running. The two buttons above the list act
+on the selected row:
+
+| Selected row | Buttons |
+| --- | --- |
+| Not queued | **Run** (now, or next if another task is running) · **Queue** (add to the end) |
+| Queued | **Start now** (run it next) · **Unqueue** |
+| Running | **Pause** / **Resume** · **Stop** (it can resume from its journal later; a multi-part task stops entirely) |
+
+Tasks run one at a time. Tick **Hold** to let the current task finish and then
+wait; Run and Start now still start the task you picked, and the hold keeps
+covering the rest. Reorder queued tasks with the right-click menu or
+<kbd>Ctrl</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd>. The right-click menu also pins,
+renames, duplicates, edits in the builder (also a double-click), opens the
+destination, or removes a task (<kbd>Del</kbd>). <kbd>Enter</kbd> does what the
+first button does.
+
+**History** lists every run, newest first, including interrupted ones.
+Selecting a run shows its details in the space below the list, with its
+authenticated checkpoint: completed and pending counts and every unreadable,
+recovered, or failed file. The toolbar has **Resume** (for an interrupted,
+cancelled, incomplete, or failed run with journal state), **Journal** (a
+readable JSON view), **Report...** (CSV), **Range map**, and **Delete**, as
+many as the column has room for; the right-click menu has them all.
 
 **Pinned tasks** always stay. Tasks you add from the builder start unpinned, and
 when XactCopy closes it asks whether to keep them, with a **Remember my choice**
@@ -108,13 +117,16 @@ verification, Continue on error off, and both recovered-overwrite/plaintext
 expert overrides off; tasks outside that policy are skipped, stay queued, and
 say why.
 
-Below the list, the running task's detail is headed with its name and the
-**Pause** and **Cancel** buttons, then shows the current file, the **File**
-and **Overall** progress bars, counters, throughput with a running average, an
-**ETA**, buffer and rescue telemetry, and the run's **Journal** path. When
-nothing runs, the heading shows how the last task ended. The first Cancel requests cooperative
-shutdown; a second click force-stops a worker that is stuck inside a Windows or
-device I/O call.
+Below the list, the running task's detail is headed with its name, then shows
+the current file, the **File** and **Overall** progress bars, counters,
+throughput with a running average, an **ETA**, buffer and rescue telemetry, and
+the run's **Journal** path. When nothing runs, the heading shows how the last
+task ended. The first Stop requests cooperative shutdown; a second force-stops
+a worker that is stuck inside a Windows or device I/O call.
+
+When you close XactCopy with a task running, or with unpinned tasks, one prompt
+covers both: it says whether a copy or an assessment would stop and asks what
+to do with the unpinned tasks.
 
 The operations log can be filtered by severity, searched (Ctrl+F, F3), copied,
 and saved; it scrolls horizontally for long paths.
@@ -271,16 +283,18 @@ as an empty successful scan.
 Maps are signed, age-limited, and bound to the source volume plus each file's
 identity, size, last-write time, NTFS change time, and fingerprint. A skip hint
 is trusted only after the same bad range is observed twice. Synthetic
-salvage-filled ranges are not promoted into future skip hints. **Settings → Copy
-Defaults** controls whether runs update the map and how old a map may be before
-it is ignored.
+salvage-filled ranges are not promoted into future skip hints. The main window
+chooses whether a task uses, skips, or updates the map (Options and Findings);
+**Settings → Copy Defaults** sets how old a map may be before it is ignored.
 
 ## Crash recovery
 
 Because every run is journaled, XactCopy can recover from an unclean shutdown. If
 a run was active when XactCopy or Windows went down, the next launch detects the
-interrupted run and offers to **Resume** it — continuing from the journal —
-**Discard** it, or decide **Later**.
+interrupted run and offers to **Resume** it, continuing from the journal. Choose
+**Not now** to leave it for later: it stays in **History**, where **Resume**
+picks it up whenever you like, and the startup prompt does not return for it.
+Tick **Don't ask at startup** to rely on History alone.
 
 Resume restores the task definition captured when the run started, not the
 current main-window defaults: copy versus assessment mode, selected files,
@@ -290,10 +304,9 @@ Older journals created before task definitions were embedded remain readable;
 when their exact settings cannot be reconstructed, XactCopy identifies the
 run as legacy and requires review rather than silently guessing.
 
-**Settings → Recovery & Startup** controls whether you are prompted, whether
-interrupted runs resume automatically, whether the prompt keeps reappearing until
-resolved, and whether XactCopy restarts itself at the next logon after an
-interruption. Auto-resume uses the same strict unattended policy as the queue;
+**Settings → Recovery & Startup → Interrupted runs** chooses what happens at
+startup (Ask, Resume automatically, or Leave in History) and whether XactCopy
+restarts itself at the next logon after an interruption. Auto-resume uses the same strict unattended policy as the queue;
 otherwise XactCopy requires a person to review and confirm the run.
 
 ## Explorer integration
@@ -320,8 +333,11 @@ selection to the running window rather than starting a second copy.
 
 ![XactCopy settings](images/settings.png)
 
-**Tools → Settings…** opens seven pages. Everything here sets *defaults* for new
-jobs; the main window's controls override them per run.
+**Tools → Settings…** opens seven pages. Each setting lives in one place: the
+choices the main window shows (profile, overwrite, verify, read method, scan,
+findings, the Options toggles, buffer, retries, timeout) are saved as defaults
+with **File → Save as defaults**, and Settings holds everything
+else.
 
 ### Appearance
 
@@ -329,18 +345,17 @@ Theme mode (Dark, Light, System, Classic), accent source (Auto, System, Custom)
 and a custom accent colour, and window chrome (themed or standard title bar).
 Layout covers UI density and 50–250% application scale in addition to each
 monitor's Windows DPI. The Operations Log section sets the log font, size, and
-severity colouring. Grid Appearance covers alternating rows, row height, and
-header style. Status & Progress toggles the buffer and rescue status rows,
+severity colouring. Status & Progress toggles the buffer and rescue status rows,
 percentage text on progress bars, and distinct thin, standard, or thick progress
 bars.
 
 ### Copy Defaults
 
-Default run behaviour — resume from journal, salvage, continue on file errors,
-preserve source timestamps, copy empty directories, wait for source/destination,
-wait for lock release, and whether *Access Denied* counts as contention.
+File handling: preserve source timestamps, copy empty directories, wait for
+lock release, and whether *Access Denied* counts as contention (never together
+with salvage; a task that salvages turns it off).
 
-Policies — overwrite policy, symlink handling (skip or follow), and the
+Policies: symlink handling (skip or follow), and the
 deterministic fill pattern used for unrecoverable bytes (zero or `0xFF`). Legacy
 jobs that request random fill are rejected because non-deterministic bytes make
 recovery boundaries harder to audit.
@@ -352,26 +367,25 @@ for unattended execution. Without the first override, recovery output always
 uses a visibly named sidecar. Without the second, EFS encryption must be
 preserved or the file fails safely.
 
-Bad Range Map — whether maps are used and updated, whether known-bad ranges are
-skipped, and the maximum age of a map before it is ignored. **Raw volume scan**
-reads allocated file extents directly from a local NTFS
-volume when XactCopy is running elevated. It remains scan-only, does not scan
-free or unallocated space, and automatically falls back to standard file reads
-for unsupported layouts or unavailable raw access.
+Bad Range Map: the maximum age of a map before it is ignored. Whether a task
+uses, skips, or updates the map is chosen in the main window (Options and
+Findings), as is the direct NTFS **Read method**, which reads allocated file
+extents from a local NTFS volume with administrator rights, never scans free or
+unallocated space, and falls back to standard file reads when raw access is
+unavailable.
 
 ### Performance
 
-Transfer tuning — adaptive buffer, transfer engine policy, scan profile, worker
-process priority, manual buffer size, retry count, operation and per-file
-timeouts, a throughput cap, small-file worker count and threshold, and scan
+Transfer tuning: transfer engine policy, worker process priority, the per-file
+timeout, a throughput cap, small-file worker count and threshold, and scan
 worker count.
 With worker count set to `0` (Auto), seek-based disks use one worker while
 non-seek storage uses up to eight based on processor count. Explicit values up
 to 64 remain available for measured expert tuning.
 
-Fragile Media Guard — enable fragile mode by default, skip a file on the first
-read error, persist those skips across a resume, and the failure window,
-threshold, and cooldown that trigger the guard.
+Fragile Media Guard: how fragile mode behaves when a task turns it on. Skip a
+file on the first read error, persist those skips across a resume, and the
+failure window, threshold, and cooldown that trigger the guard.
 
 Contention & Source Mutation — lock-probe interval, and what to do when the
 source changes mid-run (fail the file, skip it, or wait for it to reappear).
@@ -389,14 +403,15 @@ run completes, how long journals are kept, and how many are always retained.
 
 ### Verification
 
-Whether verification is on by default, full or sampled mode, SHA-256 or SHA-512,
-and the sampled-mode chunk size and count.
+SHA-256 or SHA-512, and the sampled-mode chunk size and count. Whether a task
+verifies, and how, is the main window's **Verify** choice.
 
 ### Recovery & Startup
 
-Auto-start at the next logon after an interruption, automatically run queued jobs
-at startup, prompt to resume interrupted runs, auto-resume without prompting,
-keep prompting until resolved, and the heartbeat write interval.
+Tasks: run the queue automatically on startup, and what happens to unpinned
+tasks on exit (Ask, Keep, Discard). Interrupted runs: what happens at startup
+(Ask, Resume automatically, or Leave in History), auto-start at the next logon
+after an interruption, and the heartbeat write interval.
 
 ### Explorer Integration
 
@@ -444,9 +459,9 @@ package file against the extracted SHA-256 before restarting.
 
 | Menu | Items |
 | --- | --- |
-| **File** | Start · Add to tasks · Pause / Resume / Cancel Operation · Save current settings as defaults · Open Journal Folder · Open Crash Folder · Exit |
+| **File** | Add and Queue (Ctrl+Enter) · Add to tasks · Pause / Resume / Cancel Operation · Save as defaults · Open Journal Folder · Open Crash Folder · Exit |
 | **Tools** | Assess Readable Files… · Inspect/Clear Source Bad-Range Map… · Settings… · Check for Updates… |
-| **Tasks** | Save Current Options As Pinned Task… · Show Tasks / Queue / History · Start the Queue · Resume Interrupted Run |
+| **Tasks** | Save Current Options As Pinned Task… · Show Tasks / History · Start the Queue · Resume Interrupted Run |
 | **Help** | About XactCopy |
 
 ## Command line

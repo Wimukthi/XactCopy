@@ -378,6 +378,67 @@ public:
         return saved;
     }
 
+    // Adds a task from the main window's builder: unpinned unless asked, with
+    // any further source parts it reads into the same destination.
+    std::optional<storage::ManagedJob> add_task(const std::string& name,
+                                                const models::CopyJobOptions& options,
+                                                std::vector<storage::ManagedJobPart> parts,
+                                                bool pinned = false) {
+        auto saved = save_job(name, options, std::string(), pinned);
+        if (!saved.has_value() || parts.empty()) return saved;
+        std::lock_guard<std::mutex> lock(mutex_);
+        storage::ManagedJob* job = find_job_by_id_locked(saved->JobId);
+        if (job == nullptr) return std::nullopt;
+        job->Parts = std::move(parts);
+        storage::ManagedJob result = *job;
+        if (!save_catalog_locked()) return std::nullopt;
+        return result;
+    }
+
+    static std::size_t part_count(const storage::ManagedJob& job) { return 1 + job.Parts.size(); }
+
+    // The options one part of a job runs with (part 0 is the job's own).
+    static models::CopyJobOptions part_options(const storage::ManagedJob& job, std::size_t part) {
+        models::CopyJobOptions options = job.Options;
+        if (part > 0 && part <= job.Parts.size()) {
+            options.SourceRoot = job.Parts[part - 1].SourceRoot;
+            options.SelectedRelativePaths = job.Parts[part - 1].SelectedRelativePaths;
+            options.ExpectedSourceIdentity.clear(); // each root has its own media
+        }
+        return options;
+    }
+
+    // The part of `job` that `options` reads (matched by source root and
+    // items), or nullopt.
+    static std::optional<std::size_t> find_part(const storage::ManagedJob& job,
+                                                const models::CopyJobOptions& options) {
+        for (std::size_t part = 0; part < part_count(job); ++part) {
+            const auto candidate = part_options(job, part);
+            if (models::detail::equals_ignore_case(candidate.SourceRoot, options.SourceRoot) &&
+                candidate.SelectedRelativePaths == options.SelectedRelativePaths) {
+                return part;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // A run of one part, named "Name (part 2/3)" when the job has several.
+    std::optional<storage::ManagedJobRun> create_run_for_job_part(
+        const std::string& job_id, std::size_t part, const std::string& trigger,
+        const std::string& queue_entry_id = std::string(), std::int32_t queue_attempt = 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const storage::ManagedJob* job = find_job_by_id_locked(job_id);
+        if (job == nullptr || part >= part_count(*job)) return std::nullopt;
+        std::string name = storage::catalog_detail::is_blank(job->Name) ? std::string("Saved Job") : job->Name;
+        if (part_count(*job) > 1) {
+            name += " (part " + std::to_string(part + 1) + "/" + std::to_string(part_count(*job)) + ")";
+        }
+        storage::ManagedJobRun run = create_run_locked(job->JobId, name, part_options(*job, part), trigger,
+                                                       queue_entry_id, queue_attempt);
+        if (!save_catalog_locked()) return std::nullopt;
+        return run;
+    }
+
     bool set_job_pinned(const std::string& job_id, bool pinned) {
         std::lock_guard<std::mutex> lock(mutex_);
         storage::ManagedJob* job = find_job_by_id_locked(job_id);
@@ -440,6 +501,8 @@ public:
         duplicate.JobId = storage::detail::new_guid_n();
         duplicate.Name = storage::catalog_detail::trim_copy(new_name);
         duplicate.Options = source_job->Options;
+        duplicate.Parts = source_job->Parts;
+        duplicate.Pinned = source_job->Pinned;
         duplicate.CreatedUtc = now_utc;
         duplicate.UpdatedUtc = now_utc;
 
