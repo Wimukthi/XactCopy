@@ -1208,8 +1208,16 @@ public:
         return hash.substr(0, 20);
     }
 
-    static std::wstring get_default_journal_path(const std::string& job_id) {
-        std::wstring root = fsutil::local_app_data() + L"\\XactCopy\\journals";
+    static std::wstring default_journals_root() {
+        return fsutil::local_app_data() + L"\\XactCopy\\journals";
+    }
+
+    // `directory` is the configured journal folder; empty means the default.
+    static std::wstring get_default_journal_path(const std::string& job_id,
+                                                 const std::wstring& directory = std::wstring()) {
+        std::wstring root = fsutil::trim(directory);
+        while (root.size() > 3 && (root.back() == L'\\' || root.back() == L'/')) root.pop_back();
+        if (root.empty()) root = default_journals_root();
         fsutil::create_directories(root);
         return root + L"\\job-" + fsutil::utf8_to_wide(job_id) + L".json";
     }

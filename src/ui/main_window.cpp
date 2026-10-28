@@ -95,6 +95,7 @@ constexpr int IdLogList = 1016;
 constexpr int IdSettingsButton = 1017;
 constexpr int IdContinueCheck = 1019;
 constexpr int IdSkipKnownBadCheck = 1020;
+constexpr int IdRawReadsCheck = 1097; // copy mode: direct NTFS reads
 constexpr int IdWaitMediaCheck = 1021;
 constexpr int IdFragileCheck = 1022;
 constexpr int IdBufferEdit = 1023;
@@ -478,6 +479,9 @@ private:
     HWND adaptive_check_ = nullptr;
     HWND continue_check_ = nullptr;
     HWND skip_known_bad_check_ = nullptr;
+    HWND raw_reads_check_ = nullptr;
+    // The Scan choice while Fragile-media mode forces Precise (Assess mode).
+    int scan_profile_before_lock_ = -1;
     HWND wait_media_check_ = nullptr;
     HWND fragile_check_ = nullptr;
     HWND buffer_label_ = nullptr;
@@ -1087,6 +1091,7 @@ private:
             clear_selection_,  mode_combo_,          engine_combo_,
             overwrite_combo_,  verify_combo_,        salvage_check_,    resume_check_,
             map_check_,        adaptive_check_,      continue_check_,   skip_known_bad_check_,
+            raw_reads_check_,
             wait_media_check_, fragile_check_,       buffer_label_,     buffer_edit_,
             retries_label_,    retries_edit_,        timeout_label_,    timeout_edit_,
             start_button_,     pause_button_,        cancel_button_,    settings_button_,
@@ -1227,13 +1232,17 @@ private:
                                 WS_TABSTOP | BS_OWNERDRAW, IdSalvageCheck);
         resume_check_ =
             create(L"BUTTON", L"Resume from journal", WS_TABSTOP | BS_OWNERDRAW, IdResumeCheck);
-        map_check_ = create(L"BUTTON", L"Use bad-range map", WS_TABSTOP | BS_OWNERDRAW, IdMapCheck);
+        // Copy mode: whether this run records the bad ranges it finds. (Using
+        // the map only matters together with skipping, so Skip covers both.)
+        map_check_ = create(L"BUTTON", L"Record bad ranges", WS_TABSTOP | BS_OWNERDRAW, IdMapCheck);
         adaptive_check_ =
             create(L"BUTTON", L"Adaptive buffer", WS_TABSTOP | BS_OWNERDRAW, IdAdaptiveCheck);
         continue_check_ = create(L"BUTTON", L"Continue on error", WS_TABSTOP | BS_OWNERDRAW,
                                  IdContinueCheck);
         skip_known_bad_check_ = create(L"BUTTON", L"Skip known-bad ranges",
                                        WS_TABSTOP | BS_OWNERDRAW, IdSkipKnownBadCheck);
+        raw_reads_check_ = create(L"BUTTON", L"Direct NTFS reads (admin)",
+                                  WS_TABSTOP | BS_OWNERDRAW, IdRawReadsCheck);
         wait_media_check_ = create(L"BUTTON", L"Wait for media", WS_TABSTOP | BS_OWNERDRAW,
                                    IdWaitMediaCheck);
         fragile_check_ = create(L"BUTTON", L"Fragile-media mode", WS_TABSTOP | BS_OWNERDRAW,
@@ -1392,10 +1401,11 @@ private:
 
         add(salvage_check_, L"If source blocks remain unreadable, write the configured fill pattern so readable data can still be recovered. The result is reported as recovered/incomplete, never as an exact copy.");
         add(resume_check_, L"Load the matching journal and continue interrupted work. Completed files are reused only after the configured validation allows it.");
-        add(map_check_, L"Load remembered bad ranges for the same source. Only fresh, identity-matching entries are trusted as skip hints.");
+        add(map_check_, L"Record the bad ranges this copy finds in the source's bad-range map, so later runs can skip them. (Assess mode sets this with Findings.)");
+        add(raw_reads_check_, L"Read file data straight from the NTFS volume instead of through the filesystem: reads that hang on failing media are abandoned at the timeout. Needs administrator rights (XactCopy asks to restart elevated). Files whose layout cannot be read exactly (compressed, encrypted, stored inside the file table, or pre-allocated) use standard reads.");
         add(adaptive_check_, L"Let XactCopy grow or shrink I/O buffers from observed performance and failures instead of using one fixed size.");
         add(continue_check_, L"Continue with later files after an error. Failed or skipped files remain visible and the run cannot be reported as an exact success.");
-        add(skip_known_bad_check_, L"Avoid ranges already marked bad in a compatible map. This reduces repeated stress on failing media but does not recover the skipped bytes by itself.");
+        add(skip_known_bad_check_, L"Don't read ranges a compatible bad-range map has seen fail twice. Spares failing media; the skipped bytes are not read (a copy fills them only with Salvage on).");
         add(wait_media_check_, L"Keep waiting if the source or destination disappears, such as a removable drive being reconnected. Cancel remains available.");
         add(fragile_check_, L"Use conservative reads and stop stressing files/media after clustered failures. Recommended for unstable devices; slower on healthy storage.");
 
@@ -1727,16 +1737,21 @@ private:
         if (copy_profile_index_ == 2) return;
 
         applying_copy_profile_ = true;
+        // Verified Copy: healthy media, exact result, nothing unusual.
+        // Recover Media: get as much off a failing drive as possible without
+        // hanging on it: salvage and keep going, fragile pacing, direct NTFS
+        // reads (abandoned at the timeout instead of stalling in the
+        // filesystem), and record what fails for later passes.
         const bool recovery = copy_profile_index_ == 1;
         set_check(IdSalvageCheck, recovery);
         set_check(IdContinueCheck, recovery);
         set_check(IdFragileCheck, recovery);
         set_check(IdAdaptiveCheck, recovery);
         set_check(IdWaitMediaCheck, recovery);
-        if (recovery) {
-            set_check(IdMapCheck, true);
-            set_check(IdSkipKnownBadCheck, false);
-        }
+        set_check(IdMapCheck, recovery);
+        set_check(IdRawReadsCheck, recovery);
+        set_check(IdSkipKnownBadCheck, false);
+        set_check(IdResumeCheck, true);
         copy_verify_index_ = 2;
         SendMessageW(verify_combo_, CB_SETCURSEL, copy_verify_index_, 0);
         SetWindowTextW(buffer_edit_, recovery ? L"1" : L"4");
@@ -1775,6 +1790,15 @@ private:
     }
 
     void apply_mode_ui(bool user_changed) {
+        // Release a Fragile-forced Precise first, so the scan choice saved
+        // below is the user's own.
+        if (scan_profile_before_lock_ >= 0 && engine_combo_ != nullptr) {
+            EnableWindow(engine_combo_, TRUE);
+            if (active_mode_index_ == 1) {
+                SendMessageW(engine_combo_, CB_SETCURSEL, scan_profile_before_lock_, 0);
+            }
+            scan_profile_before_lock_ = -1;
+        }
         int requested = static_cast<int>(SendMessageW(mode_combo_, CB_GETCURSEL, 0, 0));
         if (requested != 1) requested = 0;
 
@@ -1829,6 +1853,7 @@ private:
         SetWindowTextW(profile_label_, scan ? L"Scan" : L"Profile");
         SetWindowTextW(policy_label_, scan ? L"Read method" : L"If file exists");
         SetWindowTextW(verify_label_, scan ? L"Findings" : L"Verify");
+        sync_scan_profile_lock();
         InvalidateRect(mode_copy_tab_, nullptr, FALSE);
         InvalidateRect(mode_scan_tab_, nullptr, FALSE);
         layout();
@@ -1855,12 +1880,14 @@ private:
         sync_mode_ui();
         set_check(IdSalvageCheck, defaults.SalvageUnreadableBlocks);
         set_check(IdResumeCheck, defaults.ResumeFromJournal);
-        set_check(IdMapCheck, defaults.UseBadRangeMap);
+        set_check(IdMapCheck, defaults.UpdateBadRangeMapFromRun);
+        set_check(IdRawReadsCheck, defaults.UseExperimentalRawDiskScan);
         set_check(IdAdaptiveCheck, defaults.UseAdaptiveBufferSizing);
         set_check(IdContinueCheck, defaults.ContinueOnFileError);
-        set_check(IdSkipKnownBadCheck, defaults.SkipKnownBadRanges);
+        set_check(IdSkipKnownBadCheck, defaults.UseBadRangeMap && defaults.SkipKnownBadRanges);
         set_check(IdWaitMediaCheck, defaults.WaitForMediaAvailability);
         set_check(IdFragileCheck, defaults.FragileMediaMode);
+        sync_scan_profile_lock();
         sync_bad_range_controls();
 
         int buffer_mb = std::max(1, defaults.BufferSizeBytes / (1024 * 1024));
@@ -1908,19 +1935,37 @@ private:
         if (control != nullptr) InvalidateRect(control, nullptr, FALSE);
     }
 
+    // Skip known-bad ranges stands on its own now (it turns the map on), so
+    // there is no dependency left to enforce.
     void sync_bad_range_controls() {
-        if (skip_known_bad_check_ == nullptr) return;
-        bool enabled = get_check(IdMapCheck);
-        // A running job disables all parameter inputs. Preserve that state when
-        // the dependency is refreshed after a checkbox click or job completion.
-        if (map_check_ != nullptr && !IsWindowEnabled(map_check_)) enabled = false;
-        EnableWindow(skip_known_bad_check_, enabled ? TRUE : FALSE);
+        if (skip_known_bad_check_ != nullptr) EnableWindow(skip_known_bad_check_, TRUE);
+    }
+
+    // In Assess mode, Fragile-media mode always scans precisely; show that by
+    // locking the Scan choice on Precise, and give the user's choice back when
+    // Fragile is turned off or the mode changes.
+    void sync_scan_profile_lock() {
+        if (engine_combo_ == nullptr) return;
+        const bool lock = is_scan_mode() && get_check(IdFragileCheck);
+        const bool locked = scan_profile_before_lock_ >= 0;
+        if (lock && !locked) {
+            scan_profile_before_lock_ =
+                std::max(0, static_cast<int>(SendMessageW(engine_combo_, CB_GETCURSEL, 0, 0)));
+            SendMessageW(engine_combo_, CB_SETCURSEL, 2, 0); // Precise
+            EnableWindow(engine_combo_, FALSE);
+        } else if (!lock && locked) {
+            const int restore = scan_profile_before_lock_;
+            scan_profile_before_lock_ = -1;
+            EnableWindow(engine_combo_, TRUE);
+            if (is_scan_mode()) SendMessageW(engine_combo_, CB_SETCURSEL, restore, 0);
+        }
     }
 
     static bool is_checkbox_id(int id) {
         return id == IdSalvageCheck || id == IdResumeCheck || id == IdMapCheck ||
                id == IdAdaptiveCheck || id == IdContinueCheck || id == IdSkipKnownBadCheck ||
-               id == IdWaitMediaCheck || id == IdFragileCheck || id == IdPauseListCheck;
+               id == IdWaitMediaCheck || id == IdFragileCheck || id == IdPauseListCheck ||
+               id == IdRawReadsCheck;
     }
 
     static bool is_button_id(int id) {
@@ -4027,9 +4072,16 @@ private:
         const int header_height = one_row ? row_height : row_height * 2 + scale(4);
 
         // ---- Left column: returns its height for a given list height ----
-        HWND option_checks[] = {salvage_check_,    resume_check_,   map_check_,
-                                adaptive_check_,   continue_check_, skip_known_bad_check_,
-                                wait_media_check_, fragile_check_};
+        // Each mode's options, in display order (two per row).
+        HWND option_checks[] = {salvage_check_,    resume_check_,    map_check_,
+                                skip_known_bad_check_, adaptive_check_, continue_check_,
+                                wait_media_check_, fragile_check_,   raw_reads_check_};
+        auto copy_only = [&](HWND control) {
+            return control == salvage_check_ || control == map_check_ || control == raw_reads_check_;
+        };
+        // Both modes reserve the larger mode's rows, so switching never moves
+        // the controls below.
+        const int option_rows = (static_cast<int>(std::size(option_checks)) + 1) / 2;
         HWND option_fields[] = {buffer_label_,  buffer_edit_,   retries_label_,
                                 retries_edit_,  timeout_label_, timeout_edit_};
         auto left_column = [&](int sources_height) {
@@ -4115,7 +4167,7 @@ private:
             if (options_expanded_) {
                 std::vector<HWND> visible;
                 for (HWND control : option_checks) {
-                    if (control == salvage_check_ && scan) continue;
+                    if (scan && copy_only(control)) continue;
                     visible.push_back(control);
                 }
                 const int half = (width - gap) / 2;
@@ -4126,6 +4178,9 @@ private:
                         show(visible[i + 1], true);
                         place(visible[i + 1], half + gap, half);
                     }
+                    y += row_height + scale(4);
+                }
+                for (int row = static_cast<int>((visible.size() + 1) / 2); row < option_rows; ++row) {
                     y += row_height + scale(4);
                 }
                 y += scale(4);
@@ -4397,7 +4452,7 @@ private:
         }
         if (is_checkbox_id(id) && notification == BN_CLICKED) {
             set_check(id, !get_check(id));
-            if (id == IdMapCheck) sync_bad_range_controls();
+            if (id == IdFragileCheck) sync_scan_profile_lock();
             mark_copy_profile_custom();
             return;
         }
@@ -4483,8 +4538,7 @@ private:
                 supervisor_.cancel_job("");
                 break;
             case IdMenuOpenJournals:
-                open_folder_in_explorer(storage::fsutil::local_app_data() +
-                                        L"\\XactCopy\\journals");
+                open_folder_in_explorer(current_journals_root());
                 break;
             case IdMenuOpenCrash:
                 open_folder_in_explorer(storage::fsutil::local_app_data() +
@@ -4938,13 +4992,15 @@ private:
 
         set_check(IdSalvageCheck, options.SalvageUnreadableBlocks);
         set_check(IdResumeCheck, true);
-        set_check(IdMapCheck, options.UseBadRangeMap);
+        set_check(IdMapCheck, options.UpdateBadRangeMapFromRun);
+        set_check(IdRawReadsCheck, options.UseExperimentalRawDiskScan);
         set_check(IdAdaptiveCheck, options.UseAdaptiveBufferSizing);
         set_check(IdContinueCheck, options.ContinueOnFileError);
         set_check(IdSkipKnownBadCheck,
                   options.UseBadRangeMap && options.SkipKnownBadRanges);
         set_check(IdWaitMediaCheck, options.WaitForMediaAvailability);
         set_check(IdFragileCheck, options.FragileMediaMode);
+        sync_scan_profile_lock();
         sync_bad_range_controls();
 
         const int buffer_mb = std::clamp(
@@ -4986,14 +5042,8 @@ private:
                 profile == 0   ? models::TransferEnginePolicy::Auto
                 : profile == 1 ? models::TransferEnginePolicy::ManagedRescue
                                : custom_transfer_engine_;
-            if (profile == 1) {
-                options.UpdateBadRangeMapFromRun = true;
-                // Access-denied-as-contention is an expert lock policy that is
-                // intentionally incompatible with salvage. The Recover Media
-                // profile must remain runnable even if an older custom default
-                // left that hidden setting enabled.
-                options.TreatAccessDeniedAsContention = false;
-            }
+            options.UpdateBadRangeMapFromRun = get_check(IdMapCheck);
+            options.UseExperimentalRawDiskScan = get_check(IdRawReadsCheck);
             int overwrite = static_cast<int>(
                 SendMessageW(overwrite_combo_, CB_GETCURSEL, 0, 0));
             options.OverwritePolicyValue = static_cast<models::OverwritePolicy>(
@@ -5009,9 +5059,11 @@ private:
         }
 
         options.ResumeFromJournal = get_check(IdResumeCheck);
-        bool use_map = get_check(IdMapCheck);
-        options.UseBadRangeMap = use_map;
-        options.SkipKnownBadRanges = use_map && get_check(IdSkipKnownBadCheck);
+        // Using the map only changes reads together with skipping, so one
+        // checkbox carries both.
+        const bool skip_known_bad = get_check(IdSkipKnownBadCheck);
+        options.UseBadRangeMap = skip_known_bad;
+        options.SkipKnownBadRanges = skip_known_bad;
         options.UseAdaptiveBufferSizing = get_check(IdAdaptiveCheck);
         options.ContinueOnFileError = get_check(IdContinueCheck);
         options.WaitForMediaAvailability = get_check(IdWaitMediaCheck);
@@ -5082,9 +5134,7 @@ private:
                 return;
             }
             // Declined or failed, and the user chose standard file reads.
-        } else if (!raw_unsupported.empty() &&
-                   options.OperationMode == models::JobOperationMode::ScanOnly &&
-                   options.UseExperimentalRawDiskScan) {
+        } else if (!raw_unsupported.empty() && options.UseExperimentalRawDiskScan) {
             append_log("Direct NTFS reads are not available: " + raw_unsupported +
                        ". Standard file reads will be used.");
         }
@@ -5120,6 +5170,9 @@ private:
             }
         }
         bind_media_identities(options);
+        // Every run (a new task, a queued one, a resume) writes its journal to
+        // the folder configured now, not the one its task was created with.
+        options.JournalDirectory = settings_.journal_directory();
 
         SendMessageW(log_list_, LB_RESETCONTENT, 0, 0);
         reset_log_horizontal_extent();
@@ -5233,10 +5286,9 @@ private:
                                       const std::string& reason) {
         append_log("WARNING: " + reason);
         if (confirm_box(storage::fsutil::utf8_to_wide(
-                            reason + "\n\nRun this assessment with standard file reads instead? "
-                                     "Results are equivalent for readable data, but unreadable "
-                                     "regions are located through the filesystem rather than "
-                                     "the raw volume."),
+                            reason + "\n\nRun with standard file reads instead? Readable data "
+                                     "is the same, but reads go through the filesystem, which "
+                                     "can stall longer on failing media."),
                         L"XactCopy - Direct NTFS reads unavailable", ui::MessageIcon::Question)) {
             options.UseExperimentalRawDiskScan = false;
             append_log("Continuing with standard file reads for this run.");
@@ -5380,7 +5432,8 @@ private:
         std::string job_id = storage::JobJournalStore::build_job_id(
             storage::fsutil::utf8_to_wide(options.SourceRoot),
             storage::fsutil::utf8_to_wide(destination));
-        return storage::fsutil::wide_to_utf8(storage::JobJournalStore::get_default_journal_path(job_id));
+        return storage::fsutil::wide_to_utf8(storage::JobJournalStore::get_default_journal_path(
+            job_id, storage::fsutil::utf8_to_wide(options.JournalDirectory)));
     }
 
     static bool ui_is_blank(const std::string& text) {
@@ -5998,26 +6051,43 @@ private:
             }
         }
 
-        if (options.retention_days > 0) {
-            storage::JobJournalStore::PruneResult result =
-                storage::JobJournalStore::prune(options);
-            if (result.journals_removed > 0) {
-                append_log("Journal retention: removed " + std::to_string(result.journals_removed) +
-                           " journal(s) older than " + std::to_string(options.retention_days) +
-                           " days, reclaiming " + format_bytes_short(result.bytes_reclaimed) + ".");
-            }
-        }
+        // The configured folder, and the default one too when they differ, so
+        // journals written before a folder change are still maintained.
+        std::vector<std::wstring> roots{current_journals_root()};
+        const std::wstring default_root = storage::JobJournalStore::default_journals_root();
+        if (_wcsicmp(roots.front().c_str(), default_root.c_str()) != 0) roots.push_back(default_root);
 
-        // Reclaim rotations left behind by runs that finished earlier; only the
-        // still-resumable journals keep their backups.
-        if (compact) {
-            std::int64_t reclaimed =
-                storage::JobJournalStore::compact_all(options.protected_paths);
-            if (reclaimed > 0) {
-                append_log("Journal maintenance: reclaimed " + format_bytes_short(reclaimed) +
-                           " of backup rotations.");
+        for (const auto& root : roots) {
+            options.journals_root = root;
+            if (options.retention_days > 0) {
+                storage::JobJournalStore::PruneResult result =
+                    storage::JobJournalStore::prune(options);
+                if (result.journals_removed > 0) {
+                    append_log("Journal retention: removed " + std::to_string(result.journals_removed) +
+                               " journal(s) older than " + std::to_string(options.retention_days) +
+                               " days, reclaiming " + format_bytes_short(result.bytes_reclaimed) + ".");
+                }
+            }
+
+            // Reclaim rotations left behind by runs that finished earlier; only
+            // the still-resumable journals keep their backups.
+            if (compact) {
+                std::int64_t reclaimed =
+                    storage::JobJournalStore::compact_all(options.protected_paths, root);
+                if (reclaimed > 0) {
+                    append_log("Journal maintenance: reclaimed " + format_bytes_short(reclaimed) +
+                               " of backup rotations.");
+                }
             }
         }
+    }
+
+    // Where new journals go: the Settings folder, or the default.
+    std::wstring current_journals_root() const {
+        std::wstring folder = storage::fsutil::trim(
+            storage::fsutil::utf8_to_wide(settings_.journal_directory()));
+        while (folder.size() > 3 && (folder.back() == L'\\' || folder.back() == L'/')) folder.pop_back();
+        return folder.empty() ? storage::JobJournalStore::default_journals_root() : folder;
     }
 
     // ---- Recovery prompt ---------------------------------------------------

@@ -393,6 +393,25 @@ void test_task_model() {
     const std::wstring file = make_work_dir() + L"\\session-tasks.json";
     check(storage::fsutil::write_atomic_bytes(file, legacy) && ui::load_pending_tasks(file).size() == 1,
           "the legacy file loads from disk");
+
+    // Journal folder: serialized only when set; the path follows it.
+    models::CopyJobOptions journal_options;
+    json::Writer plain(false);
+    journal_options.to_json(plain);
+    check(plain.take().find("JournalDirectory") == std::string::npos,
+          "default runs keep the journal folder out of the wire format");
+    journal_options.JournalDirectory = "D:\\Journals";
+    json::Writer custom(false);
+    journal_options.to_json(custom);
+    check(models::CopyJobOptions::from_json(json::parse(custom.take())).JournalDirectory == "D:\\Journals",
+          "a custom journal folder round-trips");
+    const std::wstring journals = make_work_dir() + L"\\journals here";
+    check(storage::JobJournalStore::get_default_journal_path("abc", journals + L"\\") ==
+              journals + L"\\job-abc.json",
+          "the journal path follows the configured folder");
+    check(storage::JobJournalStore::get_default_journal_path("abc").find(L"\\XactCopy\\journals\\job-abc.json") !=
+              std::wstring::npos,
+          "an empty folder means the default location");
 }
 
 void test_elevation_handoff() {
@@ -452,8 +471,12 @@ void test_elevation_handoff() {
     el::HandoffRequest copy_request = request;
     copy_request.Options.OperationMode = models::JobOperationMode::Copy;
     token = el::write_handoff(copy_request);
+    check(el::consume_handoff(token, loaded) == el::HandoffStatus::Ok,
+          "a copy with direct NTFS reads may be handed to the elevated window");
+    copy_request.Options.UseExperimentalRawDiskScan = false;
+    token = el::write_handoff(copy_request);
     check(el::consume_handoff(token, loaded) == el::HandoffStatus::NotRawScan,
-          "elevation never starts a copy job");
+          "elevation never starts a run that does not read the raw volume");
 
     check(el::consume_handoff("../../evil", loaded) == el::HandoffStatus::Invalid,
           "a malformed token cannot name another file");
@@ -475,8 +498,11 @@ void test_elevation_handoff() {
           "a UNC source never prompts for elevation and explains why");
     raw.SourceRoot = storage::fsutil::wide_to_utf8(windows_dir);
     raw.OperationMode = models::JobOperationMode::Copy;
+    check(el::raw_scan_requires_elevation(raw, false, unsupported),
+          "a copy with direct NTFS reads needs elevation too");
+    raw.UseExperimentalRawDiskScan = false;
     check(!el::raw_scan_requires_elevation(raw, false, unsupported),
-          "copy jobs never request elevation");
+          "a copy with standard reads never requests elevation");
 }
 
 // Freezes every thread of a process, as a system sleep does, or thaws it.

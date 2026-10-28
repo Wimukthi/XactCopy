@@ -710,7 +710,8 @@ public:
         }
 
         std::string job_id = storage::JobJournalStore::build_job_id(source_root, destination_root);
-        std::wstring default_journal_path = storage::JobJournalStore::get_default_journal_path(job_id);
+        std::wstring default_journal_path = storage::JobJournalStore::get_default_journal_path(
+            job_id, utf8_to_wide(options_.JournalDirectory));
         std::wstring journal_path = resolve_writable_journal_path(job_id, default_journal_path);
 
         std::optional<JobJournal> existing;
@@ -1236,13 +1237,17 @@ private:
 
     void initialize_raw_disk_scan_context(bool scan_only, const std::wstring& source_root) {
         raw_disk_scan_context_.reset();
-        if (!scan_only || !options_.UseExperimentalRawDiskScan) return;
+        if (!options_.UseExperimentalRawDiskScan) return;
+        const char* backend = scan_only ? "Assessment backend" : "Read backend";
 
         std::string reason;
         try {
             auto context = RawDiskScanContext::try_create(source_root, reason);
             if (context) {
-                emit_log("Assessment backend: Raw volume direct reads enabled. Sector size " +
+                // A copy must reproduce the bytes exactly, so files whose valid
+                // data length does not cover them are read through Windows.
+                context->set_require_valid_data_length(!scan_only);
+                emit_log(std::string(backend) + ": Raw volume direct reads enabled. Sector size " +
                          format_bytes(context->sector_size_bytes()) + ", cluster size " +
                          format_bytes(context->cluster_size_bytes()) + ".");
                 raw_disk_scan_context_ = std::move(context);
@@ -1253,7 +1258,7 @@ private:
         }
 
         if (reason.empty()) reason = "unsupported source or media.";
-        emit_log("Assessment backend: Raw volume unavailable (" + reason +
+        emit_log(std::string(backend) + ": Raw volume unavailable (" + reason +
                  "); using standard file reads.");
     }
 
@@ -1657,6 +1662,12 @@ private:
         add(detail::trim_trailing_separators(hinted).empty() ? std::wstring() : hinted);
         add(active_path);
         add(default_path);
+        // A run started before the journal folder was changed resumes from
+        // the default folder rather than starting over.
+        if (!options_.JournalDirectory.empty()) {
+            add(storage::JobJournalStore::default_journals_root() + L"\\" +
+                storage::fsutil::get_file_name(default_path));
+        }
         return candidates;
     }
 
@@ -2598,6 +2609,8 @@ private:
 
     bool is_native_acceleration_allowed() const {
         if (options_.TransferEnginePolicyValue == models::TransferEnginePolicy::ManagedRescue) return false;
+        // Direct NTFS reads exist only on the managed read path.
+        if (options_.UseExperimentalRawDiskScan) return false;
         if (fault_injector_.has_value()) return false;
         // Auto must honor the configured managed retry/rescue policy. Native
         // acceleration remains available as an explicit NativeFast choice.

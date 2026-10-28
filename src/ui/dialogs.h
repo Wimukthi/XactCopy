@@ -795,6 +795,7 @@ private:
             edit_int(3, "Diagnostics refresh (ms)", "UiDiagnosticsRefreshMs", 100, 5000, 250);
             edit_int(3, "Virtual log max lines", "UiMaxLogLines", 1000, 1000000, 50000);
             section(3, "Journal Storage");
+            edit_text(3, "Journal folder (empty = default)", "JournalDirectory", "");
             check(3, "Discard backups after a run completes", "CompactJournalsOnCompletion", true);
             edit_int(3, "Delete journals after (days, 0=keep)", "JournalRetentionDays", 0, 3650, 30);
             edit_int(3, "Always keep newest journals", "JournalKeepMinimum", 0, 1000, 10);
@@ -901,6 +902,7 @@ private:
 
         if (setting == "EnableRecoveryAutostart") return L"Register XactCopy to start at the next logon after an interrupted run so recovery can be offered.";
         if (setting == "AutoRunQueuedJobsOnStartup") return L"Start the queue when XactCopy starts instead of holding it. Tasks with attended-only settings are skipped and stay queued.";
+        if (setting == "JournalDirectory") return L"Where run journals are written. Leave empty for %LOCALAPPDATA%\\XactCopy\\journals. A second (mirror) copy always stays in your profile, so a failing journal drive cannot take both. New runs use the new folder; runs started before the change still resume from the old one.";
         if (setting == "InterruptedRunsAtStartup") return L"What happens when XactCopy starts after a run was interrupted: ask, resume it automatically (only when it meets the unattended policy), or leave it in History to resume whenever you like.";
         if (setting == "TaskListOnExit") return L"What happens to tasks you have not pinned when XactCopy closes: ask each time, always keep them, or discard them. Pinned tasks always stay.";
         if (setting == "RecoveryTouchIntervalSeconds") return L"How often the active-run recovery marker is refreshed. Shorter intervals reduce stale-state uncertainty but write more often.";

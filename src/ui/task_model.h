@@ -172,6 +172,7 @@ inline std::string summarize_options(const models::CopyJobOptions& options) {
     if (options.OperationMode == models::JobOperationMode::ScanOnly) {
         parts.push_back(options.UseExperimentalRawDiskScan ? "direct NTFS reads" : "file reads");
     } else {
+        if (options.UseExperimentalRawDiskScan) parts.push_back("direct NTFS reads");
         const auto verification = options.VerificationModeValue;
         if (!options.VerifyAfterCopy || verification == models::VerificationMode::None) {
             parts.push_back("no verification");

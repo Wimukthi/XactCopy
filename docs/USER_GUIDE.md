@@ -139,8 +139,8 @@ Copies everything under **Source** into **Destination**, resiliently.
 
 | Profile | Behaviour |
 | --- | --- |
-| **Verified Copy** *(default)* | Full verification, conservative retries, and no synthetic salvage or continue-on-error policy. |
-| **Recover Media** | Managed rescue, fragile/adaptive behavior, map updates, and non-exact sidecar publication for failing media. |
+| **Verified Copy** *(default)* | Healthy media and an exact result: full verification, 2 retries, 4 MB buffer, and no salvage, continue-on-error, fragile pacing, map recording, or direct reads. |
+| **Recover Media** | Failing media: salvage and keep going, fragile pacing, adaptive 1 MB reads, wait for the drive, record bad ranges, and **direct NTFS reads**, which go to the raw volume and are abandoned at the timeout instead of stalling inside the filesystem (XactCopy restarts elevated for them). Output that is not exact gets a `.recovery.json` sidecar. |
 | **Custom** | Uses the detailed engine and policy defaults from Settings. Editing a profile-controlled main-window option switches the run to Custom. |
 
 **Overwrite** controls what happens when a destination file already exists:
@@ -164,16 +164,25 @@ assessment performs an additional pass over the source and may spend limited
 device life without copying any bytes. Assess first only when the medium is
 stable enough and the map will be reused across later recovery passes.
 
-Scanning runs in a precise profile or a faster parallel one (**Settings →
-Performance → Scan profile**); the fast profile falls back to precise reads
-around any fault it finds, so the resulting map stays accurate.
+Scanning runs in a precise profile or a faster parallel one (the **Scan**
+choice); the fast profile falls back to precise reads around any fault it finds,
+so the resulting map stays accurate, and does its own fallback instead of
+using **Retries**. **Fragile-media mode** always scans precisely, so turning it
+on locks **Scan** on *Precise*.
 
 The three assessment choices are **Scan** (Auto/Fast/Precise), **Read method**
 (standard file reads or direct NTFS allocated-extent reads), and **Findings**
 (whether this run updates the bad-range map). Direct NTFS reads require
 administrator access; XactCopy asks to restart elevated when a task needs them,
 and falls back visibly to standard file reads rather than claiming a raw scan
-it did not do.
+it did not do. On unstable media, direct reads together with Fragile-media mode
+keep a scan moving: a read that hangs is abandoned at the timeout.
+
+Copies can read the same way: **Direct NTFS reads (admin)** in Options (on in
+the Recover Media profile). A copy needs the exact bytes, so a file is read
+directly only when its whole length is backed by written data; compressed,
+encrypted, very small (stored inside the file table), and pre-allocated files
+are read through Windows, and the log names each one once.
 
 ## Resilience options
 
@@ -183,8 +192,9 @@ These toggles shape how XactCopy handles trouble.
 | --- | --- |
 | **Salvage unreadable blocks** | When a region can't be read cleanly, preserve readable ranges and fill isolated unreadable ranges deterministically. The run is **Incomplete**, not successful. Non-exact output preserves the original extension and receives an adjacent `.recovery.json` manifest unless the expert overwrite override is enabled. |
 | **Resume from journal** | Continue an interrupted job from its journal instead of restarting. On by default; every job is journaled either way. |
-| **Use bad-range map** | Consult a saved map of known-bad regions for this source. Updating the map is a separate default under Settings. See [Bad-range maps](#bad-range-maps). |
-| **Skip known-bad ranges** | Don't re-read ranges that have the same file/media identity and were observed bad in at least two matching scans. This makes a later pass faster without trusting a one-off error. |
+| **Record bad ranges** *(copy)* | Add the bad ranges this copy finds to the source's map. Assessments set this with **Findings**. See [Bad-range maps](#bad-range-maps). |
+| **Skip known-bad ranges** | Don't re-read ranges that have the same file/media identity and were observed bad in at least two matching runs. This makes a later pass faster without trusting a one-off error. |
+| **Direct NTFS reads (admin)** *(copy)* | Read file data from the raw volume, as the assessment Read method does. See [Assess Readable Files mode](#assess-readable-files-mode). |
 | **Adaptive buffer** | Size the read buffer dynamically from measured throughput and latency, backing off on slow or high-latency media. |
 | **Continue on error** | Keep going past a file that ultimately can't be copied. Earlier files may already have been atomically published, so the destination can contain a mixed, incomplete generation; the run cannot be a clean success. |
 | **Wait for media** | If the source or destination disappears — a drive spins down, a disc is ejected — pause and wait for it to come back rather than failing. |
@@ -262,7 +272,7 @@ consequence. The **Verified Copy** profile clears all of them.
 
 A **bad-range map** records which byte ranges of a particular source file are
 unreadable. Build one with **Assess Readable Files**, or let a copy populate it as it
-goes. On later runs, enable **Use bad-range map** and **Skip known-bad ranges** so
+goes. On later runs, enable **Skip known-bad ranges** so
 XactCopy spends its effort on recoverable data instead of grinding on sectors it
 already knows are dead.
 
@@ -398,8 +408,11 @@ for each; leave these alone unless you are tuning for a specific drive.
 
 Worker telemetry profile (Normal, Verbose, Debug), progress interval, and a log
 rate cap. UI diagnostics strip and its refresh interval, and the maximum number
-of lines the log keeps. Journal storage — whether backups are discarded when a
-run completes, how long journals are kept, and how many are always retained.
+of lines the log keeps. Journal storage: the **Journal folder** (empty means
+the default under your profile; the mirror copy always stays there, and runs
+started before a change still resume from the old folder), whether backups are
+discarded when a run completes, how long journals are kept, and how many are
+always retained.
 
 ### Verification
 
@@ -495,7 +508,8 @@ Everything lives under `%LOCALAPPDATA%\XactCopy\`:
 
 | Path | Contents |
 | --- | --- |
-| `journals\` | Per-run journals, their rotating backups, and mirrors; snapshots over 64 KB may be compressed XCJZ containers |
+| `journals\` | Per-run journals and their rotating backups (or the folder set in **Settings → Diagnostics → Journal folder**); snapshots over 64 KB may be compressed XCJZ containers |
+| `journals-mirror\` | A second copy of each journal, always kept here so a failing journal drive cannot take both |
 | `journal-views\` | Readable JSON views exported on demand by the History view's **Journal** action |
 | `badmaps\` | Bad-range maps |
 | `jobs\catalog.json` / `jobs-mirror\` | Signed saved jobs, queue, run history, rotations, and mirror |
@@ -503,7 +517,7 @@ Everything lives under `%LOCALAPPDATA%\XactCopy\`:
 | `security\` | HMAC keys — legacy-compatible raw journal key; current-user DPAPI-protected map/catalog keys |
 | `settings.json` | Application settings |
 
-**File → Open Journal Folder** opens `journals\` and **File → Open Crash Folder**
+**File → Open Journal Folder** opens the journal folder and **File → Open Crash Folder**
 opens `runtime\`. Journals are HMAC-signed and hash-chained; bad-range maps and
 the saved-job catalog use signed envelopes and trusted fallback snapshots. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the formats.

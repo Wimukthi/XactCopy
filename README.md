@@ -111,7 +111,7 @@ its original extension and receives an adjacent `.recovery.json` manifest.
 | **Profile** | Verified Copy · Recover Media · Custom | Apply a coherent safe-copy or recovery preset, or use expert defaults |
 | **Conflict** | Overwrite · Skip existing · Overwrite if newer · Stop on conflict | How existing destination files are handled |
 | **Verify** | None · Sampled · Full | Post-copy SHA-256/512 integrity check; Full is the safe default |
-| **Salvage · Resume · Bad-range map · Adaptive buffer** | toggles | Core resilience behaviours |
+| **Salvage · Resume · Record / skip bad ranges · Adaptive buffer · Direct NTFS reads** | toggles | Core resilience behaviours (salvage, recording, and direct reads in Options are copy settings; assessments choose the read method and findings directly) |
 | **Continue on error · Skip known-bad · Wait for media · Fragile mode** | toggles | Error-handling behaviour |
 | **Buffer (MB) · Retries · Timeout (s)** | numbers | Performance and persistence tuning |
 

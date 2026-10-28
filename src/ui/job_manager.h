@@ -902,7 +902,9 @@ private:
                                                        run.DestinationRoot));
         if (source.empty() || destination.empty()) return std::string();
         const std::wstring candidate = storage::JobJournalStore::get_default_journal_path(
-            storage::JobJournalStore::build_job_id(source, destination));
+            storage::JobJournalStore::build_job_id(source, destination),
+            run.Options.has_value() ? storage::fsutil::utf8_to_wide(run.Options->JournalDirectory)
+                                    : std::wstring());
         return storage::fsutil::file_exists(candidate)
                    ? storage::fsutil::wide_to_utf8(candidate)
                    : std::string();

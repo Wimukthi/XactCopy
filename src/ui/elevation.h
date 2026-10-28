@@ -97,10 +97,7 @@ inline bool raw_scan_requires_elevation(const models::CopyJobOptions& options,
                                         bool process_elevated,
                                         std::string& unsupported_reason) {
     unsupported_reason.clear();
-    if (options.OperationMode != models::JobOperationMode::ScanOnly ||
-        !options.UseExperimentalRawDiskScan) {
-        return false;
-    }
+    if (!options.UseExperimentalRawDiskScan) return false;
     std::wstring source =
         storage::fsutil::get_full_path(storage::fsutil::utf8_to_wide(options.SourceRoot));
     if (source.size() < 2 || source[1] != L':') {
@@ -260,10 +257,7 @@ inline HandoffStatus consume_handoff(const std::string& token, HandoffRequest& o
     if (out.CreatedUnixMs <= 0 || age < -60'000 || age > HandoffMaximumAgeMs) {
         return HandoffStatus::Expired;
     }
-    if (out.Options.OperationMode != models::JobOperationMode::ScanOnly ||
-        !out.Options.UseExperimentalRawDiskScan) {
-        return HandoffStatus::NotRawScan;
-    }
+    if (!out.Options.UseExperimentalRawDiskScan) return HandoffStatus::NotRawScan;
     return HandoffStatus::Ok;
 }
 

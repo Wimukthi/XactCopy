@@ -157,9 +157,13 @@ public:
 
     // ---- Job option defaults (mirrors the MainForm settings->options map) --
 
+    // The configured journal folder (empty = default).
+    std::string journal_directory() const { return get_string("JournalDirectory", ""); }
+
     models::CopyJobOptions build_default_options() const {
         using namespace models;
         CopyJobOptions options;
+        options.JournalDirectory = journal_directory();
 
         options.OverwritePolicyValue = parse_kebab<OverwritePolicy>(
             get_string("DefaultOverwritePolicy", "overwrite"),
@@ -323,8 +327,9 @@ public:
                           ? "precise"
                           : "auto";
             set_string("DefaultScanPerformanceProfile", scan_profile);
-            set_bool("DefaultUseExperimentalRawDiskScan", options.UseExperimentalRawDiskScan);
         }
+        // One read-method default serves both modes.
+        set_bool("DefaultUseExperimentalRawDiskScan", options.UseExperimentalRawDiskScan);
         set_bool("DefaultResumeFromJournal", options.ResumeFromJournal);
         set_bool("DefaultContinueOnFileError", options.ContinueOnFileError);
         set_bool("DefaultUseBadRangeMap", options.UseBadRangeMap);

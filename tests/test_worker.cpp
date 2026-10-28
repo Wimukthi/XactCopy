@@ -3124,6 +3124,69 @@ void test_raw_disk_elevated_integration() {
         } else {
             std::printf("  sparse FSCTL integration skipped on this volume\n");
         }
+
+        // A pre-allocated file: 64 KiB written, end of file at 256 KiB. Past
+        // the valid data length Windows reads zeros while the raw clusters may
+        // hold stale bytes, so a copy must not raw-read it.
+        std::wstring prealloc_file = source + L"\\preallocated.bin";
+        write_pattern_file(prealloc_file, 64 * 1024, 1704);
+        HANDLE prealloc = CreateFileW(prealloc_file.c_str(), GENERIC_WRITE, 0, nullptr,
+                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (prealloc != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER end{};
+            end.QuadPart = 256 * 1024;
+            SetFilePointerEx(prealloc, end, nullptr, FILE_BEGIN);
+            SetEndOfFile(prealloc);
+            CloseHandle(prealloc);
+        }
+        auto copy_context = RawDiskScanContext::try_create(source, reason);
+        if (copy_context) {
+            copy_context->set_require_valid_data_length(true);
+            std::vector<unsigned char> tail(256 * 1024);
+            RawDiskReadResult prealloc_result = copy_context->read_chunk(
+                prealloc_file, "preallocated.bin", 0, static_cast<std::int32_t>(tail.size()),
+                tail.data(), 10000, read_cancel);
+            check(prealloc_result.state != RawDiskReadResult::State::Success,
+                  "copy-mode raw reads refuse a file whose valid data length is short");
+            std::vector<unsigned char> whole(128 * 1024);
+            RawDiskReadResult whole_result = copy_context->read_chunk(
+                file, "payload.bin", 0, static_cast<std::int32_t>(whole.size()), whole.data(),
+                10000, read_cancel);
+            check(whole_result.state == RawDiskReadResult::State::Success,
+                  "copy-mode raw reads accept a fully written file (valid data length known)");
+        }
+
+        // End to end: a copy through direct reads is byte-identical, including
+        // the pre-allocated file's zero tail.
+        std::wstring destination = work + L"\\destination";
+        models::CopyJobOptions copy_options;
+        copy_options.SourceRoot = storage::fsutil::wide_to_utf8(source);
+        copy_options.DestinationRoot = storage::fsutil::wide_to_utf8(destination);
+        copy_options.UseExperimentalRawDiskScan = true;
+        copy_options.TransferEnginePolicyValue = models::TransferEnginePolicy::ManagedRescue;
+        copy_options.ResumeFromJournal = false;
+        copy_options.UseBadRangeMap = false;
+        copy_options.UpdateBadRangeMapFromRun = false;
+        copy_options.VerifyAfterCopy = true;
+        copy_options.VerificationModeValue = models::VerificationMode::Full;
+        std::atomic<bool> copy_cancel{false};
+        ExecutionControl copy_control;
+        std::vector<std::string> copy_logs;
+        ResilientCopyEngine copy_engine(copy_options, &copy_control, nullptr,
+                                        [&copy_logs](const std::string& m) { copy_logs.push_back(m); });
+        const models::CopyJobResult copied = copy_engine.run(copy_cancel);
+        bool raw_backend_logged = false;
+        for (const auto& line : copy_logs) {
+            if (line.find("Read backend: Raw volume direct reads enabled") != std::string::npos) {
+                raw_backend_logged = true;
+            }
+        }
+        check(copied.Succeeded, "a copy with direct NTFS reads succeeds");
+        check(raw_backend_logged, "the copy used the raw volume backend");
+        check(files_equal(file, destination + L"\\payload.bin") &&
+                  files_equal(prealloc_file, destination + L"\\preallocated.bin"),
+              "direct-read copies match the source byte for byte, pre-allocated tail included");
+        remove_result_journal(copied);
     } else {
         std::printf("  raw context reason: %s\n", reason.c_str());
     }

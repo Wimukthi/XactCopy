@@ -246,6 +246,10 @@ struct CopyJobOptions {
 
     std::string ResumeJournalPathHint;
     bool AllowJournalRootRemap = false;
+    // Folder for this run's journal; empty means the default
+    // (%LOCALAPPDATA%\XactCopy\journals). Serialized only when set, so the
+    // wire format of default runs is unchanged.
+    std::string JournalDirectory;
 
     std::vector<std::string> SelectedRelativePaths;
 
@@ -326,6 +330,9 @@ struct CopyJobOptions {
         w.key("ScanPerformanceProfile"); w.value(to_string(ScanPerformanceProfileValue));
         w.key("ResumeJournalPathHint"); w.value(ResumeJournalPathHint);
         w.key("AllowJournalRootRemap"); w.value(AllowJournalRootRemap);
+        if (!JournalDirectory.empty()) {
+            w.key("JournalDirectory"); w.value(JournalDirectory);
+        }
         detail::write_string_array(w, "SelectedRelativePaths", SelectedRelativePaths);
         w.key("OverwritePolicy"); w.value(to_string(OverwritePolicyValue));
         w.key("SymlinkHandling"); w.value(to_string(SymlinkHandling));
@@ -397,6 +404,7 @@ struct CopyJobOptions {
         o.ScanPerformanceProfileValue = parse_ScanPerformanceProfile(obj->find("ScanPerformanceProfile"), o.ScanPerformanceProfileValue);
         detail::read(obj, "ResumeJournalPathHint", o.ResumeJournalPathHint);
         detail::read(obj, "AllowJournalRootRemap", o.AllowJournalRootRemap);
+        detail::read(obj, "JournalDirectory", o.JournalDirectory);
         detail::read(obj, "SelectedRelativePaths", o.SelectedRelativePaths);
         o.OverwritePolicyValue = parse_OverwritePolicy(obj->find("OverwritePolicy"), o.OverwritePolicyValue);
         o.SymlinkHandling = parse_SymlinkHandlingMode(obj->find("SymlinkHandling"), o.SymlinkHandling);

@@ -416,7 +416,8 @@ private:
         const std::string journal_id =
             storage::JobJournalStore::build_job_id(source, destination);
         return storage::fsutil::wide_to_utf8(
-            storage::JobJournalStore::get_default_journal_path(journal_id));
+            storage::JobJournalStore::get_default_journal_path(
+                journal_id, storage::fsutil::utf8_to_wide(options.JournalDirectory)));
     }
 
     void apply_last_progress(models::CopyJobResult& result) {

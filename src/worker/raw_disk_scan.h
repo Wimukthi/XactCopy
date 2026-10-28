@@ -4,7 +4,10 @@
 //          volumes. The backend maps file offsets to volume offsets through
 //          FSCTL_GET_RETRIEVAL_POINTERS, reads sector-aligned ranges from the
 //          volume handle, and reports unsupported layouts separately so the
-//          engine can fall back to ordinary file I/O.
+//          engine can fall back to ordinary file I/O. Copies additionally
+//          require the file's valid data length to cover the whole file:
+//          past it, Windows returns zeros while the raw clusters still hold
+//          stale bytes, so such files are read through the filesystem.
 // -----------------------------------------------------------------------------
 
 #pragma once
@@ -356,6 +359,11 @@ public:
         }
     }
 
+    // Copies need byte-exact data, so a file is raw-readable only when its
+    // valid data length is known to cover the whole file. Assessments only
+    // test readability and do not need this.
+    void set_require_valid_data_length(bool required) noexcept { require_vdl_ = required; }
+
     std::int32_t sector_size_bytes() const noexcept { return sector_size_bytes_; }
     std::int32_t cluster_size_bytes() const noexcept { return cluster_size_bytes_; }
     std::uint32_t volume_serial() const noexcept { return volume_serial_; }
@@ -703,6 +711,17 @@ private:
             reason = "file volume identity changed during raw extent discovery.";
             return layout;
         }
+        if (require_vdl_ && layout.FileLength > 0) {
+            const std::optional<std::int64_t> vdl = query_valid_data_length(layout.FileIndex);
+            if (!vdl.has_value()) {
+                reason = "valid data length unavailable (needs Windows 10 2004 or later).";
+                return layout;
+            }
+            if (*vdl < layout.FileLength) {
+                reason = "valid data length is shorter than the file (pre-allocated tail).";
+                return layout;
+            }
+        }
         layout.Extents = normalize_extents(extents, layout.FileLength, reason);
         if (!reason.empty()) return layout;
         layout.IsSupported = true;
@@ -896,6 +915,117 @@ private:
         }
     }
 
+    // Valid data length of the file's default $DATA stream, read through
+    // FSCTL_QUERY_FILE_LAYOUT on the volume handle (Windows 10 2004+ reports
+    // it). nullopt when the volume or OS cannot say. The structures are laid
+    // out here rather than taken from winioctl.h, whose DataStream member is
+    // gated on the SDK's NTDDI_VERSION.
+    std::optional<std::int64_t> query_valid_data_length(std::uint64_t file_reference) const {
+        struct QueryInput {
+            DWORD FilterEntryCount;
+            DWORD Flags;
+            DWORD FilterType;
+            DWORD Reserved;
+            DWORDLONG StartingFileReferenceNumber;
+            DWORDLONG EndingFileReferenceNumber;
+        } input{};
+        constexpr DWORD Restart = 0x00000001;
+        constexpr DWORD IncludeStreams = 0x00000004;
+        constexpr DWORD IncludeStreamInformation = 0x00000080;
+        constexpr DWORD StreamInformationForData = 0x00002000;
+        constexpr DWORD FilterTypeFileId = 2;
+        constexpr DWORD StreamHasInformation = 0x00000010;
+        constexpr DWORD DataAttributeType = 0x80;
+        input.FilterEntryCount = 1;
+        input.Flags = Restart | IncludeStreams | IncludeStreamInformation | StreamInformationForData;
+        input.FilterType = FilterTypeFileId;
+        input.StartingFileReferenceNumber = file_reference;
+        input.EndingFileReferenceNumber = file_reference;
+
+        std::vector<unsigned char> output(64 * 1024);
+        OVERLAPPED overlapped{};
+        overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (overlapped.hEvent == nullptr) return std::nullopt;
+        DWORD returned = 0;
+        BOOL ok = DeviceIoControl(volume_.get(), FSCTL_QUERY_FILE_LAYOUT, &input, sizeof(input),
+                                  output.data(), static_cast<DWORD>(output.size()), &returned,
+                                  &overlapped);
+        if (!ok && GetLastError() == ERROR_IO_PENDING) {
+            // Metadata only; bounded so a sick volume cannot hold the copy.
+            if (WaitForSingleObject(overlapped.hEvent, 10000) != WAIT_OBJECT_0) {
+                CancelIoEx(volume_.get(), &overlapped);
+                GetOverlappedResult(volume_.get(), &overlapped, &returned, TRUE);
+                CloseHandle(overlapped.hEvent);
+                return std::nullopt;
+            }
+            ok = GetOverlappedResult(volume_.get(), &overlapped, &returned, FALSE);
+        }
+        CloseHandle(overlapped.hEvent);
+        if (!ok) return std::nullopt;
+
+        auto read32 = [&](std::size_t offset, DWORD& value) {
+            if (offset > returned || returned - offset < sizeof(DWORD)) return false;
+            std::memcpy(&value, output.data() + offset, sizeof(DWORD));
+            return true;
+        };
+        DWORD entry_count = 0;
+        DWORD first_file = 0;
+        if (!read32(0, entry_count) || !read32(4, first_file) || entry_count == 0) return std::nullopt;
+        // FILE_LAYOUT_ENTRY: Version, NextFileOffset, Flags, FileAttributes,
+        // FileReferenceNumber (8), FirstNameOffset, FirstStreamOffset, ...
+        const std::size_t file_entry = first_file;
+        DWORDLONG reported_reference = 0;
+        if (file_entry > returned || returned - file_entry < 32) return std::nullopt;
+        std::memcpy(&reported_reference, output.data() + file_entry + 16, sizeof(reported_reference));
+        // Compare the 48-bit record number; the high word is a sequence number.
+        if ((reported_reference & 0x0000FFFFFFFFFFFFULL) != (file_reference & 0x0000FFFFFFFFFFFFULL)) {
+            return std::nullopt;
+        }
+        DWORD first_stream = 0;
+        if (!read32(file_entry + 28, first_stream) || first_stream == 0) return std::nullopt;
+
+        // STREAM_LAYOUT_ENTRY: Version, NextStreamOffset, Flags,
+        // ExtentInformationOffset, AllocationSize (8), EndOfFile (8),
+        // StreamInformationOffset, AttributeTypeCode, AttributeFlags,
+        // StreamIdentifierLength, StreamIdentifier[].
+        std::size_t stream = file_entry + first_stream;
+        for (int guard = 0; guard < 64; ++guard) {
+            DWORD next = 0, flags = 0, info_offset = 0, type = 0, id_length = 0;
+            if (!read32(stream + 4, next) || !read32(stream + 8, flags) ||
+                !read32(stream + 32, info_offset) || !read32(stream + 36, type) ||
+                !read32(stream + 44, id_length)) {
+                return std::nullopt;
+            }
+            bool default_stream = false;
+            if (type == DataAttributeType) {
+                if (id_length == 0) {
+                    default_stream = true;
+                } else if (stream + 48 <= returned && returned - (stream + 48) >= id_length) {
+                    std::wstring identifier(reinterpret_cast<const wchar_t*>(output.data() + stream + 48),
+                                            id_length / sizeof(wchar_t));
+                    default_stream = identifier == L"::$DATA";
+                }
+            }
+            if (default_stream) {
+                if ((flags & StreamHasInformation) == 0 || info_offset == 0) return std::nullopt;
+                // STREAM_INFORMATION_ENTRY: Version, Flags, then DataStream
+                // { WORD Length; WORD Flags; DWORD Reserved; DWORDLONG Vdl; }.
+                const std::size_t info = stream + info_offset;
+                if (info > returned || returned - info < 24) return std::nullopt;
+                WORD data_length = 0;
+                std::memcpy(&data_length, output.data() + info + 8, sizeof(data_length));
+                if (data_length < 16) return std::nullopt;
+                DWORDLONG vdl = 0;
+                std::memcpy(&vdl, output.data() + info + 16, sizeof(vdl));
+                return static_cast<std::int64_t>(vdl);
+            }
+            if (next == 0) break;
+            stream += next;
+        }
+        return std::nullopt;
+    }
+
+    bool require_vdl_ = false;
     std::wstring source_root_;
     std::wstring volume_root_;
     ScopedHandle volume_;
