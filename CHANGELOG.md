@@ -5,7 +5,7 @@ All notable changes to XactCopy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions are four-part (`major.minor.build.revision`) and tagged `v<version>`.
 
-## [Unreleased]
+## [2.1.4.0] — 2026-10-29
 
 ### Fixed
 
