@@ -117,6 +117,13 @@ cancelled, incomplete, or failed run with journal state), **Journal** (a
 readable JSON view), **Report...** (CSV), **Range map**, and **Delete**, as
 many as the column has room for; the right-click menu has them all.
 
+**Range map** draws, for each file in the run's journal, which byte ranges were
+read, recovered, unreadable, or skipped as known-bad; hover the bar for offsets
+and lengths. Files with unreadable or recovered bytes are listed first. It shows
+this one run; the source's durable bad-range map, built up across runs, is under
+**Tools → Inspect Bad-Range Map**. Fast and direct-NTFS assessments record
+ranges only for files with unreadable areas, so a clean assessment has no map.
+
 **Pinned tasks** always stay. Tasks you add from the builder start unpinned, and
 when XactCopy closes it asks whether to keep them, with a **Remember my choice**
 box. **Settings → Recovery & Startup → Unpinned tasks on exit** (Ask / Keep /

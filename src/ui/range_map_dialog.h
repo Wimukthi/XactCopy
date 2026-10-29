@@ -16,6 +16,15 @@ struct RangeMapFile {
     std::wstring path;
     std::int64_t size = 0;
     std::vector<storage::RescueRange> ranges;
+
+    // Unreadable or recovered bytes: the files worth looking at first.
+    bool has_findings() const {
+        return std::any_of(ranges.begin(), ranges.end(), [](const storage::RescueRange& range) {
+            return range.State == storage::RescueRangeState::Bad ||
+                   range.State == storage::RescueRangeState::KnownBad ||
+                   range.State == storage::RescueRangeState::Recovered;
+        });
+    }
 };
 
 class RangeMapDialog {
@@ -193,7 +202,14 @@ private:
                     SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
                     return child;
                 };
-                label_ = create(L"STATIC", L"Files with rescue ranges:", SS_NOPREFIX, 0);
+                const auto findings = static_cast<std::size_t>(std::count_if(
+                    files_.begin(), files_.end(), [](const RangeMapFile& file) { return file.has_findings(); }));
+                const std::wstring heading =
+                    std::to_wstring(files_.size()) + (files_.size() == 1 ? L" file" : L" files") +
+                    L" with recorded ranges; " +
+                    (findings == 0 ? std::wstring(L"none unreadable or recovered.")
+                                   : std::to_wstring(findings) + L" with unreadable or recovered bytes, listed first.");
+                label_ = create(L"STATIC", heading.c_str(), SS_NOPREFIX, 0);
                 list_ = create(L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | WS_BORDER |
                     LBS_NODATA | LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT | LBS_NOTIFY, IdFiles);
                 SendMessageW(list_, LB_SETITEMHEIGHT, 0, scale(22));

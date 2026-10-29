@@ -330,7 +330,10 @@ public:
             ui::elevation::HandoffRequest request = std::move(*incoming_handoff_);
             incoming_handoff_.reset();
             append_log("Running with administrator rights for direct NTFS volume reads.");
-            apply_run_options_to_ui(request.Options);
+            // The list is the one the other window had, not the run's items:
+            // those already live in their task.
+            restore_handed_off_builder(request.Builder);
+            apply_run_settings_to_ui(request.Options);
             start_job_with(request.Options, request.FromRecovery, request.ManagedRunId,
                            request.DisplayName);
         }
@@ -1410,7 +1413,7 @@ private:
         add(primary_task_button_, L"For the selected task: Run (now, or next if one is running), Start now (a queued task), or Pause / Resume (the running task).");
         add(secondary_task_button_, L"For the selected task: Queue (add to the end), Unqueue (take it off the queue), or Stop (the running task; it can resume from its journal later).");
         add(history_report_button_, L"Export the selected run's journal as a CSV report.");
-        add(history_map_button_, L"Show the selected run's bad-range map.");
+        add(history_map_button_, L"Show the byte ranges the selected run's journal recorded for each file: read, recovered, or unreadable.");
         add(history_delete_button_, L"Delete the selected run's history record. Journals and copied files are not touched.");
         add(hold_queue_check_, L"Let the current task finish, then wait instead of starting the next one.");
         add(history_resume_button_, L"Resume the selected run from its journal.");
@@ -3577,8 +3580,14 @@ private:
         if (history_resume_button_ != nullptr) {
             EnableWindow(history_resume_button_, run != nullptr && idle && run_history_->can_resume(*run));
         }
-        if (history_journal_button_ != nullptr) {
-            EnableWindow(history_journal_button_, run != nullptr && !run_history_->busy());
+        const bool readable = run != nullptr && !run_history_->busy();
+        for (HWND button : {history_journal_button_, history_report_button_, history_map_button_}) {
+            if (button != nullptr) EnableWindow(button, readable);
+        }
+        if (history_delete_button_ != nullptr) {
+            EnableWindow(history_delete_button_,
+                         run != nullptr && run->Status != storage::ManagedJobRunStatus::Running &&
+                             run->Status != storage::ManagedJobRunStatus::Paused);
         }
     }
 
@@ -4204,6 +4213,22 @@ private:
                 item.destination = storage::fsutil::utf8_to_wide(job.Options.DestinationRoot);
                 items.push_back(std::move(item));
             }
+        }
+        set_sources(std::move(items));
+    }
+
+    // An elevated relaunch takes over the list the other window was building.
+    void restore_handed_off_builder(const std::vector<ui::elevation::HandoffBuilderItem>& builder) {
+        std::vector<ui::SourceItem> items;
+        for (const auto& saved : builder) {
+            ui::SourceItem item;
+            item.path = storage::fsutil::utf8_to_wide(saved.Path);
+            item.is_directory = saved.IsDirectory;
+            item.contents_only = saved.ContentsOnly;
+            item.batch = saved.Batch;
+            item.destination = storage::fsutil::utf8_to_wide(saved.Destination);
+            next_source_batch_ = std::max(next_source_batch_, saved.Batch + 1);
+            items.push_back(std::move(item));
         }
         set_sources(std::move(items));
     }
@@ -5147,7 +5172,7 @@ private:
         }
         options.ResumeFromJournal = true;
         options.ResumeJournalPathHint = journal_path;
-        apply_run_options_to_ui(options);
+        apply_run_settings_to_ui(options);
         append_log("Resuming run '" + run->DisplayName + "' from " + journal_path + ".");
         start_job_with(options, true, run->RunId, run->DisplayName);
     }
@@ -5477,6 +5502,9 @@ private:
         }
     }
 
+    // Replaces the builder's list with the run's items, then applies its
+    // settings. Only for putting a run back up for review: starting or
+    // resuming a run must leave the list alone (apply_run_settings_to_ui).
     void apply_run_options_to_ui(const models::CopyJobOptions& options) {
         {
             auto items = ui::items_from_options(options);
@@ -5487,7 +5515,10 @@ private:
         }
         SetWindowTextW(destination_edit_,
                        storage::fsutil::utf8_to_wide(options.DestinationRoot).c_str());
+        apply_run_settings_to_ui(options);
+    }
 
+    void apply_run_settings_to_ui(const models::CopyJobOptions& options) {
         custom_transfer_engine_ = options.TransferEnginePolicyValue;
         copy_profile_index_ = 2; // exact persisted options, not a mutable preset
         copy_overwrite_index_ = std::clamp(static_cast<int>(options.OverwritePolicyValue), 0, 3);
@@ -5761,6 +5792,11 @@ private:
         request.RecoveryRunId = from_recovery ? pending_recovery_run_id_ : std::string();
         request.UserSid = ui::elevation::current_user_sid();
         request.CreatedUnixMs = ui::elevation::unix_now_ms();
+        for (const auto& item : sources_) {
+            request.Builder.push_back({storage::fsutil::wide_to_utf8(item.path), item.is_directory,
+                                       item.contents_only, item.batch,
+                                       storage::fsutil::wide_to_utf8(item.destination)});
+        }
 
         append_log("Direct NTFS volume reads need administrator rights. Asking Windows for approval...");
         const std::string token = ui::elevation::write_handoff(request);
@@ -6646,7 +6682,7 @@ private:
         models::CopyJobOptions options = run.Options;
         options.ResumeFromJournal = true;
         if (!run.JournalPath.empty()) options.ResumeJournalPathHint = run.JournalPath;
-        apply_run_options_to_ui(options);
+        apply_run_settings_to_ui(options);
         append_log("Restored exact " +
                    std::string(options.OperationMode == models::JobOperationMode::ScanOnly
                                    ? "assessment"

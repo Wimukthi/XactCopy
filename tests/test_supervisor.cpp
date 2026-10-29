@@ -431,6 +431,8 @@ void test_elevation_handoff() {
     request.RecoveryRunId = "recovery-1";
     request.UserSid = sid;
     request.CreatedUnixMs = el::unix_now_ms();
+    request.Builder = {{"C:\\Data\\pending", true, false, 7, "E:\\Backup"},
+                       {"D:\\Disk", true, true, 9, ""}};
 
     std::string token = el::write_handoff(request);
     check(el::is_handoff_token(token), "handoff token is a SHA-256 hex digest");
@@ -443,6 +445,12 @@ void test_elevation_handoff() {
               loaded.ManagedRunId == "managed-1" && loaded.DisplayName == "Nightly assessment" &&
               loaded.RecoveryRunId == "recovery-1",
           "handoff round-trips the exact run request");
+    check(loaded.Builder.size() == 2 && loaded.Builder[0].Path == "C:\\Data\\pending" &&
+              loaded.Builder[0].IsDirectory && !loaded.Builder[0].ContentsOnly &&
+              loaded.Builder[0].Batch == 7 && loaded.Builder[0].Destination == "E:\\Backup" &&
+              loaded.Builder[1].ContentsOnly && loaded.Builder[1].Batch == 9 &&
+              loaded.Builder[1].Destination.empty(),
+          "handoff carries the other window's builder list");
     check(el::consume_handoff(token, loaded) == el::HandoffStatus::Missing,
           "a consumed handoff cannot be replayed");
 

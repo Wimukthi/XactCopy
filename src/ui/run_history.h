@@ -145,7 +145,12 @@ public:
         }
         if (result->kind == ExportResult::Kind::RangeMap) {
             if (result->map_files.empty()) {
-                MessageDialog::show(owner_, theme, L"XactCopy", L"This journal has no rescue ranges.");
+                MessageDialog::show(owner_, theme, L"XactCopy",
+                                    L"This run's journal recorded no byte ranges, so there is no map to show.\n\n"
+                                    L"Fast and direct-NTFS assessments record ranges only for files with "
+                                    L"unreadable areas, and a file that failed as a whole (for example, one "
+                                    L"that could not be opened) has none. The run's details list every "
+                                    L"failed file.");
             } else {
                 RangeMapDialog::show(owner_, theme, std::move(result->map_files));
             }
@@ -327,6 +332,8 @@ private:
                             file.ranges = std::move(entry.RescueRanges);
                             result->map_files.push_back(std::move(file));
                         }
+                        std::stable_partition(result->map_files.begin(), result->map_files.end(),
+                                              [](const RangeMapFile& file) { return file.has_findings(); });
                         result->exported = true;
                     } else {
                         const auto journal_path = manager_.get_resume_journal_path(run_id);

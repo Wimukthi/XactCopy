@@ -5,6 +5,20 @@ All notable changes to XactCopy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions are four-part (`major.minor.build.revision`) and tagged `v<version>`.
 
+## [Unreleased]
+
+### Fixed
+
+- Running a task that needs direct NTFS reads no longer puts its files and
+  folders back on the left-hand list. The administrator window that takes over
+  now shows the list the first window had, so rows not yet added to tasks are
+  kept too. Resuming a run no longer replaces the list either.
+- History's **Report…**, **Range map**, and **Delete** are now disabled until a
+  run is selected instead of doing nothing when clicked.
+- **Range map** lists files with unreadable or recovered bytes first, with a
+  count, so in a copy they are no longer buried among fully read files. When a
+  run recorded no ranges it explains why instead of only saying so.
+
 ## [2.1.3.0] — 2026-10-28
 
 ### Added
