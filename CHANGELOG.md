@@ -5,6 +5,45 @@ All notable changes to XactCopy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions are four-part (`major.minor.build.revision`) and tagged `v<version>`.
 
+## [Unreleased]
+
+### Changed
+
+- **Edit in builder** (and double-clicking a task) adds the task to the list
+  as one more row instead of replacing the list, and adding that row again
+  updates the task instead of making a copy. Its folders show as folders and
+  its own Resume setting is kept.
+- **Stop** holds the queue instead of starting the next task. A task that fails
+  to start goes back to the front of a held queue; a later part of a
+  multi-part task waits to run from that part.
+- Tools **Assess Readable Files…** is now **Queue as Assessment Tasks** and no
+  longer leaves the window in Assess mode. Tasks **Save Current Options As
+  Pinned Task…** is now **Add as Pinned Tasks**, which is what it did.
+- Leaving Verified Copy or Recover Media by changing one option keeps that
+  profile's engine. Verified Copy no longer carries the plaintext or
+  recovered-overwrite overrides from Settings.
+
+### Fixed
+
+- History: Del no longer deletes the run in progress, and Clear history waits
+  for it to finish. Older runs of the same source and destination no longer
+  show the latest run's journal, report, or range map, and a run whose journal
+  retention removed offers no Resume. Runs that finished with skipped, failed,
+  or recovered files can be resumed.
+- Stop works while waiting for administrator approval; a late approval then
+  starts nothing.
+- Stop, Clear history, Resume Interrupted Run, Check for Updates, and the
+  bad-range map tools are enabled only when they can act, including while a
+  worker starts. The pane's Pause / Resume button follows the run's state.
+- Inspect and Clear Source Bad-Range Map act on the selected row and name the
+  source.
+- A long Source box is read in full instead of being cut at 4,096 characters.
+- Ctrl+A and right-click in the list update the Source and Destination boxes;
+  right-clicking below the last task no longer acts on the previous selection.
+- If a task cannot be saved, rows that were not saved stay in the list.
+- Adding items that are already listed or do not exist says so instead of
+  doing nothing.
+
 ## [2.1.4.0] — 2026-10-29
 
 ### Fixed

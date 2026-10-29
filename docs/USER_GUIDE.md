@@ -99,23 +99,38 @@ on the selected row:
 | --- | --- |
 | Not queued | **Run** (now, or next if another task is running) · **Queue** (add to the end) |
 | Queued | **Start now** (run it next) · **Unqueue** |
-| Running | **Pause** / **Resume** · **Stop** (it can resume from its journal later; a multi-part task stops entirely) |
+| Running | **Pause** / **Resume** · **Stop** (it can resume from its journal later; a multi-part task stops entirely, and the queue holds) |
 
 Tasks run one at a time. Tick **Hold** to let the current task finish and then
 wait; Run and Start now still start the task you picked, and the hold keeps
-covering the rest. Reorder queued tasks with the right-click menu or
+covering the rest. Stop also holds the queue, and so does a task that fails to
+start: it goes back to the front (a later part of a multi-part task waits to
+run from that part) until you untick Hold. While XactCopy waits for
+administrator approval for direct NTFS reads, Stop withdraws the request. Reorder queued tasks with the right-click menu or
 <kbd>Ctrl</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd>. The right-click menu also pins,
 renames, duplicates, edits in the builder (also a double-click), opens the
-destination, or removes a task (<kbd>Del</kbd>). <kbd>Enter</kbd> does what the
+destination, or removes a task (<kbd>Del</kbd>). **Edit in builder** adds the
+task to the list as one more row, sets the options to the task's, and leaves
+the other rows alone; adding that row to tasks again updates the task instead
+of making a copy. <kbd>Enter</kbd> does what the
 first button does.
 
 **History** lists every run, newest first, including interrupted ones.
 Selecting a run shows its details in the space below the list, with its
 authenticated checkpoint: completed and pending counts and every unreadable,
 recovered, or failed file. The toolbar has **Resume** (for an interrupted,
-cancelled, incomplete, or failed run with journal state), **Journal** (a
-readable JSON view), **Report...** (CSV), **Range map**, and **Delete**, as
-many as the column has room for; the right-click menu has them all.
+cancelled, incomplete, or failed run, or one that finished with skipped,
+failed, or recovered files), **Journal** (a readable JSON view), **Report...**
+(CSV), **Range map**, and **Delete**, as many as the column has room for; the
+right-click menu has them all. The run in progress cannot be deleted, and
+**Clear history** waits until it has finished.
+
+A journal is named after its source and destination, so every run of the same
+task shares one journal, which holds the latest of them. On an older run,
+Resume, Journal, Report, and Range map say so instead of showing the later
+run's data. Journal retention (Settings, **Delete journals after**) deletes
+journals of runs older than the set number of days; their rows stay in History
+without those actions.
 
 **Range map** draws, for each file in the run's journal, which byte ranges were
 read, recovered, unreadable, or skipped as known-bad; hover the bar for offsets
@@ -127,16 +142,18 @@ ranges only for files with unreadable areas, so a clean assessment has no map.
 **Pinned tasks** always stay. Tasks you add from the builder start unpinned, and
 when XactCopy closes it asks whether to keep them, with a **Remember my choice**
 box. **Settings → Recovery & Startup → Unpinned tasks on exit** (Ask / Keep /
-Discard) changes that later. **Tasks → Save Current Options As Pinned Task…**
-adds a pinned task directly. Tasks, the queue, and history live in XactCopy's
+Discard) changes that later. **Tasks → Add as Pinned Tasks** turns the
+selected rows (all rows when none is selected) into pinned tasks directly. Tasks, the queue, and history live in XactCopy's
 signed job catalog, so they survive a crash or power loss either way.
 
 After a restart the queue is held, so nothing starts on its own, unless
 **Settings → Recovery & Startup → Run the queue automatically on startup** is
 on. That automatic run requires bound source/destination media identities, full
 verification, Continue on error off, and both recovered-overwrite/plaintext
-expert overrides off; tasks outside that policy are skipped, stay queued, and
-say why.
+expert overrides off. It also skips tasks that wait for media or for file locks,
+retry more than three times, follow symbolic links, run the worker at High
+priority, or (assessments) use direct NTFS reads or more than eight scan
+workers. Tasks outside that policy are skipped, stay queued, and say why.
 
 Below the list, the running task's detail is headed with its name, then shows
 the current file, the **File** and **Overall** progress bars, counters,
@@ -160,9 +177,9 @@ Copies everything under **Source** into **Destination**, resiliently.
 
 | Profile | Behaviour |
 | --- | --- |
-| **Verified Copy** *(default)* | Healthy media and an exact result: full verification, 2 retries, 4 MB buffer, and no salvage, continue-on-error, fragile pacing, map recording, or direct reads. |
+| **Verified Copy** | Healthy media and an exact result: full verification, 2 retries, 4 MB buffer, and no salvage, continue-on-error, fragile pacing, map recording, or direct reads. The plaintext and recovered-overwrite overrides from Settings are not used. |
 | **Recover Media** | Failing media: salvage and keep going, fragile pacing, adaptive 1 MB reads, wait for the drive, record bad ranges, and **direct NTFS reads**, which go to the raw volume and are abandoned at the timeout instead of stalling inside the filesystem (XactCopy restarts elevated for them). Output that is not exact gets a `.recovery.json` sidecar. |
-| **Custom** | Uses the detailed engine and policy defaults from Settings. Editing a profile-controlled main-window option switches the run to Custom. |
+| **Custom** | The main-window options as they are. XactCopy starts in Custom with your saved defaults, and its engine is **Settings → Transfer engine**. Editing an option of Verified Copy or Recover Media switches to Custom but keeps that profile's engine. |
 
 **Overwrite** controls what happens when a destination file already exists:
 
@@ -305,7 +322,8 @@ identity. Missing files, locks, access denial, and an offline device are kept as
 ordinary run failures and are never promoted to physical range evidence.
 
 **Tools → Inspect Bad-Range Map** reports both the durable map and the latest
-matching assessment journal. Every filename is written to the main log. The
+matching assessment journal for the selected row's source (or the only row's);
+**Clear Source Bad-Range Map** names the source before it removes anything. Every filename is written to the main log. The
 journal section can therefore show files that failed or were skipped even when
 no byte range could safely be localized; those files are not silently presented
 as an empty successful scan.
@@ -488,8 +506,8 @@ package file against the extracted SHA-256 before restarting.
 | Menu | Items |
 | --- | --- |
 | **File** | Add and Queue (Ctrl+Enter) · Add to tasks · Pause / Resume / Cancel Operation · Save as defaults · Open Journal Folder · Open Crash Folder · Exit |
-| **Tools** | Assess Readable Files… · Inspect/Clear Source Bad-Range Map… · Settings… · Check for Updates… |
-| **Tasks** | Save Current Options As Pinned Task… · Show Tasks / History · Start the Queue · Resume Interrupted Run |
+| **Tools** | Queue as Assessment Tasks · Inspect/Clear Source Bad-Range Map… · Settings… · Check for Updates… |
+| **Tasks** | Add as Pinned Tasks · Show Tasks / History · Start the Queue · Resume Interrupted Run |
 | **Help** | About XactCopy |
 
 ## Command line

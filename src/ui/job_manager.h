@@ -170,10 +170,53 @@ public:
         return std::nullopt;
     }
 
+    enum class RunJournalState { Available, NotFound, Removed, Replaced };
+
+    // Whether a run's own journal can still be shown or resumed. Journals are
+    // named from the source and destination roots, so every run of the same
+    // pair writes one file: it belongs to whichever of them ran last. Only
+    // checks that files exist; the journal itself is authenticated on load.
+    RunJournalState run_journal_state(const storage::ManagedJobRun& run) {
+        const std::string path = resolve_run_journal_path(run);
+        if (path.empty()) return RunJournalState::NotFound;
+        const std::wstring wide = storage::fsutil::utf8_to_wide(path);
+        if (!storage::fsutil::file_exists(wide) &&
+            !storage::fsutil::file_exists(
+                storage::detail::build_mirror_path(wide, L"journals-mirror", L"journal"))) {
+            return RunJournalState::Removed;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& other : catalog_.Runs) {
+            if (models::detail::equals_ignore_case(other.RunId, run.RunId)) continue;
+            if (other.LastUpdatedUtc.utc_ticks() <= run.LastUpdatedUtc.utc_ticks()) continue;
+            // Recorded paths only: resolving a legacy run's path touches disk.
+            if (storage::catalog_detail::is_blank(other.JournalPath)) continue;
+            if (storage::fsutil::normalize_path(storage::fsutil::utf8_to_wide(other.JournalPath)) ==
+                storage::fsutil::normalize_path(wide)) {
+                return RunJournalState::Replaced;
+            }
+        }
+        return RunJournalState::Available;
+    }
+
+    static std::string describe(RunJournalState state) {
+        switch (state) {
+            case RunJournalState::NotFound: return "No journal could be located for this run.";
+            case RunJournalState::Removed:
+                return "This run's journal was removed (journal retention deletes journals "
+                       "older than the number of days set in Settings).";
+            case RunJournalState::Replaced:
+                return "A later run of the same source and destination has replaced this "
+                       "run's journal. Select the later run instead.";
+            default: return std::string();
+        }
+    }
+
     std::string get_resume_journal_path(const std::string& run_id,
                                         bool validate_roots = false) {
         auto run = get_run_by_id(run_id);
         if (!run.has_value()) return std::string();
+        if (run_journal_state(*run) != RunJournalState::Available) return std::string();
         const std::string path = resolve_run_journal_path(*run);
         if (path.empty() || !validate_roots) return path;
         try {
@@ -192,6 +235,7 @@ public:
     std::optional<storage::JobJournal> load_run_journal(const std::string& run_id) {
         auto run = get_run_by_id(run_id);
         if (!run.has_value()) return std::nullopt;
+        if (run_journal_state(*run) != RunJournalState::Available) return std::nullopt;
         const auto path = resolve_run_journal_path(*run);
         if (path.empty()) return std::nullopt;
         storage::JobJournalStore store;
@@ -208,12 +252,11 @@ public:
             inspection.ErrorMessage = "The selected run no longer exists.";
             return inspection;
         }
-        const std::string journal_path = resolve_run_journal_path(*run);
-        if (journal_path.empty()) {
-            inspection.ErrorMessage =
-                "No resumable journal could be located for this run.";
+        if (const auto state = run_journal_state(*run); state != RunJournalState::Available) {
+            inspection.ErrorMessage = describe(state);
             return inspection;
         }
+        const std::string journal_path = resolve_run_journal_path(*run);
 
         storage::JobJournalStore journal_store;
         std::optional<storage::JobJournal> journal;
@@ -379,13 +422,19 @@ public:
     }
 
     // Adds a task from the main window's builder: unpinned unless asked, with
-    // any further source parts it reads into the same destination.
+    // any further source parts it reads into the same destination. With
+    // `replace_job_id` (a task edited in the builder) that task is updated in
+    // place instead, keeping its name, pin, and queue entries.
     std::optional<storage::ManagedJob> add_task(const std::string& name,
                                                 const models::CopyJobOptions& options,
                                                 std::vector<storage::ManagedJobPart> parts,
-                                                bool pinned = false) {
-        auto saved = save_job(name, options, std::string(), pinned);
-        if (!saved.has_value() || parts.empty()) return saved;
+                                                bool pinned = false,
+                                                const std::string& replace_job_id = std::string()) {
+        const auto existing = get_job_by_id(replace_job_id);
+        auto saved = existing.has_value()
+                         ? save_job(existing->Name, options, existing->JobId)
+                         : save_job(name, options, std::string(), pinned);
+        if (!saved.has_value() || (parts.empty() && saved->Parts.empty())) return saved;
         std::lock_guard<std::mutex> lock(mutex_);
         storage::ManagedJob* job = find_job_by_id_locked(saved->JobId);
         if (job == nullptr) return std::nullopt;

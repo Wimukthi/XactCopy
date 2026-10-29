@@ -1592,8 +1592,47 @@ void test_job_manager_tasks() {
               "a part's run is named and rooted per part");
         auto copy = manager.duplicate_job(multi->JobId, "Two drives (copy)");
         check(copy.has_value() && copy->Parts.size() == 1 && !copy->Pinned, "duplicates keep parts and pin");
+
+        // A task edited in the builder and added again updates itself.
+        manager.set_job_pinned(copy->JobId, true);
+        models::CopyJobOptions edited = first;
+        edited.SelectedRelativePaths = {"Games", "Saves"};
+        const std::size_t before = manager.get_jobs_in_order().size();
+        auto updated = manager.add_task("Generated title", edited, {}, /*pinned*/ false, copy->JobId);
+        check(updated.has_value() && updated->JobId == copy->JobId &&
+                  manager.get_jobs_in_order().size() == before,
+              "adding an edited task updates it instead of making another");
+        check(updated->Name == "Two drives (copy)" && updated->Pinned && updated->Parts.empty() &&
+                  updated->Options.SelectedRelativePaths.size() == 2,
+              "the update keeps the name and pin and takes the new items and parts");
+        auto orphan = manager.add_task("Orphan", edited, {}, /*pinned*/ false, "no-such-job");
+        check(orphan.has_value() && orphan->JobId != copy->JobId && !orphan->Pinned,
+              "an edit of a task removed meanwhile becomes a new unpinned task");
+        manager.delete_job(orphan->JobId);
         manager.delete_job(copy->JobId);
         manager.delete_job(multi->JobId);
+
+        // Runs of one source and destination share a journal: the latest owns it.
+        const std::wstring journal = work + L"\\job-shared.json";
+        write_pattern_file(journal, 16, 7);
+        const std::string journal_utf8 = storage::fsutil::wide_to_utf8(journal);
+        auto older = manager.create_run_for_job(task_b->JobId, "manual");
+        manager.mark_run_running(older->RunId, journal_utf8);
+        Sleep(20);
+        auto newer = manager.create_run_for_job(task_b->JobId, "manual");
+        manager.mark_run_running(newer->RunId, journal_utf8);
+        using JournalState = ui::JobManagerService::RunJournalState;
+        check(manager.run_journal_state(*manager.get_run_by_id(newer->RunId)) == JournalState::Available,
+              "the latest run owns the shared journal");
+        check(manager.run_journal_state(*manager.get_run_by_id(older->RunId)) == JournalState::Replaced,
+              "an older run of the same pair reports its journal as replaced");
+        check(manager.get_resume_journal_path(older->RunId).empty(),
+              "an older run does not resume from the later run's journal");
+        DeleteFileW(journal.c_str());
+        check(manager.run_journal_state(*manager.get_run_by_id(newer->RunId)) == JournalState::Removed,
+              "a deleted journal reports as removed");
+        manager.delete_run(older->RunId);
+        manager.delete_run(newer->RunId);
     }
     // Everything above was persisted through the signed catalog.
     ui::JobManagerService reopened(path);

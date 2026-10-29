@@ -29,6 +29,7 @@
 #include "job_manager.h"
 #include "journal_report.h"
 #include "range_map_dialog.h"
+#include "task_model.h"
 
 namespace xact::ui {
 
@@ -68,16 +69,22 @@ public:
     // A journal export is in flight (one at a time).
     bool busy() const { return journal_worker_.joinable(); }
 
-    // A run can be resumed when it stopped short and has journal state.
+    // A run can be resumed when it stopped short, or finished with skipped,
+    // failed, or recovered files, and its own journal is still there.
     bool can_resume(const storage::ManagedJobRun& run) const {
         using storage::ManagedJobRunStatus;
-        if (run.Status == ManagedJobRunStatus::Completed ||
-            run.Status == ManagedJobRunStatus::Running ||
+        if (run.Status == ManagedJobRunStatus::Running ||
             run.Status == ManagedJobRunStatus::Paused ||
             run.Status == ManagedJobRunStatus::Queued) {
             return false;
         }
-        if (!storage::catalog_detail::is_blank(run.JournalPath)) return true;
+        if (run.Status == ManagedJobRunStatus::Completed) {
+            const TaskState shown = state_from_run(run);
+            if (shown != TaskState::Incomplete && shown != TaskState::CompletedWithRecovery) return false;
+        }
+        if (!storage::catalog_detail::is_blank(run.JournalPath)) {
+            return manager_.run_journal_state(run) == JobManagerService::RunJournalState::Available;
+        }
         // Legacy paths are discovered by the findings worker, never on the
         // UI thread.
         return findings_cache_.has_value() && findings_cache_->Loaded &&
@@ -95,7 +102,7 @@ public:
                 auto journal = manager_.load_run_journal(run_id);
                 const auto path = manager_.get_resume_journal_path(run_id);
                 if (!journal.has_value() || path.empty()) {
-                    result->error = "No authenticated journal matching this run could be loaded.";
+                    result->error = journal_error(run_id);
                 } else {
                     const std::wstring file_name = storage::fsutil::get_file_name(
                         storage::fsutil::utf8_to_wide(path));
@@ -138,7 +145,7 @@ public:
         if (result == nullptr || owner_ == nullptr) return;
         if (!result->exported) {
             MessageDialog::show(owner_, theme, L"XactCopy",
-                                L"The journal could not be validated and exported:\n\n" +
+                                L"This run's journal could not be opened:\n\n" +
                                     storage::fsutil::utf8_to_wide(result->error),
                                 MessageIcon::Warning);
             return;
@@ -261,6 +268,17 @@ private:
     ULONGLONG findings_cache_loaded_tick_ = 0;
     std::string findings_loading_row_id_;
 
+    // Why a run's journal could not be loaded, for the message the user sees.
+    std::string journal_error(const std::string& run_id) {
+        if (auto run = manager_.get_run_by_id(run_id)) {
+            const auto state = manager_.run_journal_state(*run);
+            if (state != JobManagerService::RunJournalState::Available) {
+                return JobManagerService::describe(state);
+            }
+        }
+        return "No authenticated journal matching this run could be loaded.";
+    }
+
     template <typename Result>
     void post(HWND owner, UINT message, std::unique_ptr<Result> result) {
         if (!closing_.load() &&
@@ -304,7 +322,7 @@ private:
             try {
                 auto journal = manager_.load_run_journal(run_id);
                 if (!journal.has_value()) {
-                    result->error = "No authenticated journal matching this run could be loaded.";
+                    result->error = journal_error(run_id);
                 } else {
                     // Older journals may omit options even when the signed run
                     // record retains them; those options disambiguate legacy ranges.

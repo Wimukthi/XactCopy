@@ -864,7 +864,7 @@ private:
         if (setting == "DefaultSalvageFillPattern") return L"Bytes written where source data could not be recovered. The result is always marked non-exact regardless of pattern.";
         if (setting == "DefaultBadRangeMapMaxAgeDays") return L"Reject old map entries as skip hints after this many days. Zero never expires them and should be used only for stable media.";
 
-        if (setting == "DefaultTransferEnginePolicy") return L"Auto selects a safe engine for the active policies. Managed enables rescue behavior; Native Fast attempts CopyFileEx first.";
+        if (setting == "DefaultTransferEnginePolicy") return L"The engine for the Custom profile. Verified Copy uses Auto and Recover Media uses Managed. Auto selects a safe engine for the active policies; Managed enables rescue behavior; Native Fast attempts CopyFileEx first.";
         if (setting == "DefaultWorkerProcessPriorityClass") return L"Windows scheduling priority for the isolated worker process. High can reduce responsiveness of other applications.";
         if (setting == "DefaultPerFileTimeoutSeconds") return L"Optional total processing deadline for one file. Zero disables the per-file deadline.";
         if (setting == "DefaultMaxThroughputMbPerSecond") return L"Throttle aggregate transfer throughput to reduce device load. Zero removes the throughput cap.";
@@ -902,7 +902,7 @@ private:
         if (setting == "DefaultSampleVerificationChunkCount") return L"Number of distributed regions compared in Sampled mode. More samples improve coverage and cost more reads.";
 
         if (setting == "EnableRecoveryAutostart") return L"Register XactCopy to start at the next logon after an interrupted run so recovery can be offered.";
-        if (setting == "AutoRunQueuedJobsOnStartup") return L"Start the queue when XactCopy starts instead of holding it. Tasks with attended-only settings are skipped and stay queued.";
+        if (setting == "AutoRunQueuedJobsOnStartup") return L"Start the queue when XactCopy starts instead of holding it. Tasks with attended-only settings are skipped and stay queued: no full verification, continue on error, waiting for media or file locks, more than 3 retries, following symlinks, High worker priority, the expert overrides, or (assessments) direct NTFS reads or more than 8 scan workers.";
         if (setting == "JournalDirectory") return L"Where run journals are written. Leave empty for %LOCALAPPDATA%\\XactCopy\\journals. A second (mirror) copy always stays in your profile, so a failing journal drive cannot take both. New runs use the new folder; runs started before the change still resume from the old one.";
         if (setting == "InterruptedRunsAtStartup") return L"What happens when XactCopy starts after a run was interrupted: ask, resume it automatically (only when it meets the unattended policy), or leave it in History to resume whenever you like.";
         if (setting == "TaskListOnExit") return L"What happens to tasks you have not pinned when XactCopy closes: ask each time, always keep them, or discard them. Pinned tasks always stay.";
