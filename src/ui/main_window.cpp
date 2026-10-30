@@ -42,6 +42,7 @@
 #include "app_icon.h"
 #include "dialogs.h"
 #include "elevation.h"
+#include "task_file.h"
 #include "task_model.h"
 #include "explorer_integration.h"
 #include "job_manager.h"
@@ -76,6 +77,7 @@ constexpr UINT WM_APP_APPLY_LAUNCH = WM_APP + 8; // deferred apply_explorer_laun
 constexpr UINT WM_APP_LOG_TASK = WM_APP + 9;
 constexpr UINT WM_APP_SOURCE_SIZE = WM_APP + 10;   // lParam: new SourceSizeResult*
 constexpr UINT WM_APP_RUN_NEXT_TASK = WM_APP + 11; // start the next queued session task
+constexpr UINT WM_APP_SAVE_TASK = WM_APP + 12;     // save the settings panel's edits to its task
 
 constexpr int IdSourceBrowse = 1002;
 constexpr int IdDestinationEdit = 1003;
@@ -84,7 +86,7 @@ constexpr int IdSourcePathEdit = 1005;
 constexpr int IdSourcePathBrowse = 1099;
 constexpr int IdSourcePickFolders = 1170;
 constexpr int IdSourcePickFiles = 1171;
-constexpr int IdModeCombo = 1005;
+constexpr int IdModeCombo = 1050;
 constexpr int IdEngineCombo = 1006;
 constexpr int IdOverwriteCombo = 1007;
 constexpr int IdVerifyCombo = 1008;
@@ -92,7 +94,6 @@ constexpr int IdSalvageCheck = 1009;
 constexpr int IdResumeCheck = 1010;
 constexpr int IdMapCheck = 1011;
 constexpr int IdAdaptiveCheck = 1012;
-constexpr int IdStartButton = 1013;
 constexpr int IdPauseButton = 1014;
 constexpr int IdCancelButton = 1015;
 constexpr int IdLogList = 1016;
@@ -122,10 +123,8 @@ constexpr int IdMenuCancelCopy = 1104;
 constexpr int IdMenuOpenJournals = 1105;
 constexpr int IdMenuOpenCrash = 1106;
 constexpr int IdMenuExit = 1107;
-constexpr int IdMenuScanBadBlocks = 1108;
 constexpr int IdMenuSettings = 1109;
 constexpr int IdMenuCheckUpdates = 1110;
-constexpr int IdMenuSaveAsJob = 1111;
 constexpr int IdMenuResumeInterrupted = 1113;
 constexpr int IdMenuRunNextQueued = 1114;
 constexpr int IdMenuAbout = 1115;
@@ -134,16 +133,15 @@ constexpr int IdMenuInspectBadMap = 1117;
 constexpr int IdMenuClearBadMap = 1118;
 
 constexpr int IdSourceAddFiles = 1040;
-constexpr int IdClearSelection = 1041;
+constexpr int IdContentsCheck = 1041; // the shown task copies its folder's contents
 constexpr int IdSourcePaste = 1042;
-constexpr int IdSourcesList = 1043;
 constexpr int IdTasksList = 1044;
-constexpr int IdAddTaskButton = 1045;
-constexpr int IdOptionsToggle = 1046;
+constexpr int IdAddModeCombo = 1045; // what the next add does: copy or assess
+constexpr int IdTaskRemoveButton = 1043;
+constexpr int IdMenuImportTasks = 1108;
+constexpr int IdMenuExportTasks = 1111;
 constexpr int IdRecentDestinations = 1047;
 constexpr int IdPauseListCheck = 1048; // "Hold" (the queue)
-constexpr int IdModeCopyTab = 1050;
-constexpr int IdModeScanTab = 1051;
 constexpr int IdTasksTab = 1052;
 constexpr int IdHistoryTab = 1054;
 constexpr int IdTaskRunButton = 1080;
@@ -155,17 +153,12 @@ constexpr int IdHistoryResumeButton = 1084;
 constexpr int IdHistoryJournalButton = 1085;
 constexpr int IdHistoryDetails = 1086;
 // Context-menu commands for the sources and tasks lists.
-constexpr int IdSourceRemove = 1060;
-constexpr int IdSourceContentsOnly = 1061;
-constexpr int IdSourceOpenLocation = 1062;
-constexpr int IdSourceCopyPath = 1063;
 // Pane context-menu commands.
 constexpr int IdCtxRun = 1130;
 constexpr int IdCtxQueue = 1131;
 constexpr int IdCtxPin = 1132;
 constexpr int IdCtxRename = 1133;
 constexpr int IdCtxDuplicate = 1134;
-constexpr int IdCtxEdit = 1135;
 constexpr int IdCtxOpenDestination = 1136;
 constexpr int IdCtxRemove = 1137;
 constexpr int IdCtxStartNow = 1138;
@@ -330,10 +323,6 @@ public:
             ui::elevation::HandoffRequest request = std::move(*incoming_handoff_);
             incoming_handoff_.reset();
             append_log("Running with administrator rights for direct NTFS volume reads.");
-            // The list is the one the other window had, not the run's items:
-            // those already live in their task.
-            restore_handed_off_builder(request.Builder);
-            apply_run_settings_to_ui(request.Options);
             start_job_with(request.Options, request.FromRecovery, request.ManagedRunId,
                            request.DisplayName);
         }
@@ -369,8 +358,7 @@ private:
     HWND destination_browse_ = nullptr;
     HWND recent_destinations_button_ = nullptr;
 
-    // "What to copy" panel: one row per source item (see task_model.h).
-    HWND sources_list_ = nullptr;
+    // The shown task's items (see "Settings panel" and task_model.h).
     HWND sources_footer_ = nullptr;
     HWND source_paste_ = nullptr;
     std::vector<ui::SourceItem> sources_;
@@ -381,10 +369,25 @@ private:
         bool size_incomplete = false; // some entries could not be read
     };
     std::vector<SourceRowInfo> source_rows_;
-    std::vector<ui::SourceBatch> source_batches_; // list rows: one per add action
-    std::uint32_t next_source_batch_ = 1;
-    // Rows loaded with "Edit in builder": adding one updates its task.
-    std::map<std::uint32_t, std::string> edited_task_rows_; // batch -> job id
+    std::vector<ui::SourceBatch> source_batches_; // the shown task's items: one batch
+    // The settings panel (see "Settings panel"): the task it shows, or none
+    // for the New task settings, which are kept here while a task is shown.
+    struct NewTaskSettings {
+        models::CopyJobOptions options;
+        int copy_profile = 2;
+        std::wstring destination;
+        bool stored = false;
+    };
+    NewTaskSettings new_task_settings_;
+    std::string shown_job_id_;           // empty: the New task settings
+    std::string shown_name_;
+    std::int64_t shown_updated_ticks_ = 0; // the job's UpdatedUtc when loaded or saved
+    bool shown_locked_ = false;          // the running task: read-only
+    bool shown_auto_name_ = false;       // its name follows its items
+    bool loading_panel_ = false;         // control changes are not edits
+    bool save_pending_ = false;
+    bool new_task_scan_ = false;         // the toolbar's Action: what the next add does
+    bool card_busy_ = false;             // whether layout() last placed a running card
     // pending_part_ is a part that failed to start: it waits while the queue
     // is held instead of starting with the next thing that runs the queue.
     bool pending_part_waits_ = false;
@@ -395,6 +398,7 @@ private:
         std::int64_t bytes = 0;
         std::int64_t files = 0;
         bool incomplete = false;
+        bool directory = false;
     };
     // Background folder sizing: one long-lived thread, newest request wins.
     std::mutex sizer_lock_;
@@ -405,9 +409,9 @@ private:
     std::thread sizer_thread_;
 
     // Options section collapses to one summary line.
-    HWND options_toggle_ = nullptr;
-    bool options_expanded_ = false;
-    HWND add_task_button_ = nullptr;
+    HWND add_mode_combo_ = nullptr;
+    HWND remove_task_button_ = nullptr;
+    HWND contents_check_ = nullptr;
 
     // One row of the Tasks list: a job (by index into pane_jobs_), maybe its
     // queue entry, or the running job when it has no saved task (a history
@@ -457,10 +461,8 @@ private:
     // that ends at once); the late start notification must not revive it.
     bool result_applied_since_start_ = false;
 
-    // Copy / Assess segmented switch. mode_combo_ stays as the hidden source
-    // of truth so every existing mode read/write keeps working.
-    HWND mode_copy_tab_ = nullptr;
-    HWND mode_scan_tab_ = nullptr;
+    // The panel's Action (mode_combo_): copy or assess, for the shown task.
+    HWND mode_label_ = nullptr;
     // Captions for the three mode-dependent combos.
     HWND profile_label_ = nullptr;
     HWND policy_label_ = nullptr;
@@ -481,6 +483,7 @@ private:
     enum class SplitterDrag { None, Log, Columns };
     RECT log_splitter_{};
     RECT column_splitter_{};
+    RECT card_separator_{}; // the line between a task's settings and the Now running card
     SplitterDrag splitter_drag_ = SplitterDrag::None;
     int splitter_grab_offset_ = 0;
     int log_area_logical_ = 0;
@@ -508,7 +511,6 @@ private:
     HWND retries_edit_ = nullptr;
     HWND timeout_label_ = nullptr;
     HWND timeout_edit_ = nullptr;
-    HWND start_button_ = nullptr;
     HWND settings_button_ = nullptr;
     HWND pause_button_ = nullptr;
     HWND cancel_button_ = nullptr;
@@ -603,14 +605,13 @@ private:
     // burst ends, whether to switch mode and ask for a destination.
     bool selection_timer_active_ = false;
     bool selection_wants_destination_ = false;
-    std::vector<std::uint32_t> selection_batches_; // rows a coalescing burst added
+    std::vector<std::wstring> selection_paths_; // paths a coalescing burst brought
     std::wstring source_box_shown_;      // what the Source box shows for the row
     std::wstring destination_box_shown_; // what the Destination box shows
     bool committing_paths_ = false;
     std::vector<std::uint32_t> short_batches_; // rows whose destination lacks space
     std::vector<std::wstring> space_warned_;   // shortfalls already logged
     HWND source_add_files_ = nullptr;
-    HWND clear_selection_ = nullptr;
     std::map<int, bool> check_states_;
     int active_mode_index_ = -1;
     int copy_profile_index_ = 2; // Custom preserves advanced saved defaults.
@@ -882,6 +883,9 @@ private:
             case WM_APP_RUN_NEXT_TASK:
                 on_run_next_task();
                 return 0;
+            case WM_APP_SAVE_TASK:
+                if (save_pending_) save_shown_task();
+                return 0;
             case ui::RunHistory::ExportDoneMessage:
                 run_history_->finish_export(lparam, theme_);
                 update_pane_toolbar();
@@ -925,10 +929,6 @@ private:
                 for (const auto& raw : forwarded.explorer_source_paths) {
                     paths.push_back(resolve_full_path(raw));
                 }
-                if (!forwarded.explorer_scan_mode) {
-                    SendMessageW(mode_combo_, CB_SETCURSEL, 0, 0);
-                    sync_mode_ui();
-                }
                 queue_selection(paths, forwarded.explorer_scan_mode, /*want_destination*/ true);
                 return TRUE;
             }
@@ -971,7 +971,13 @@ private:
                     }
                 }
                 DragFinish(drop);
-                queue_selection(paths, /*scan_mode*/ false, /*want_destination*/ false);
+                // Tasks files are imported; anything else becomes a task.
+                std::vector<std::wstring> items;
+                for (auto& path : paths) {
+                    if (ui::is_task_file_path(path)) import_tasks(path);
+                    else items.push_back(std::move(path));
+                }
+                queue_selection(items, /*scan_mode*/ false, /*want_destination*/ false);
                 return 0;
             }
             case WM_CLOSE: {
@@ -1104,23 +1110,24 @@ private:
         // GDI fallback (looks bold/wrong). Owner-drawn buttons/checks/combos read
         // their font via WM_GETFONT, so they need it set too.
         HWND ui_controls[] = {
-            source_label_,     destination_label_,   destination_edit_,  sources_list_,
+            source_label_,     destination_label_,   destination_edit_,  contents_check_,
             source_path_label_, source_path_edit_, source_path_browse_,
             source_browse_,    destination_browse_,  source_add_files_,  source_paste_,
-            sources_footer_,   recent_destinations_button_, options_toggle_, add_task_button_,
+            sources_footer_,   recent_destinations_button_, add_mode_combo_,
             tasks_tab_,        history_tab_,         tasks_list_,        pane_footer_,
-            primary_task_button_, secondary_task_button_, hold_queue_check_, history_resume_button_,
+            primary_task_button_, secondary_task_button_, remove_task_button_, hold_queue_check_,
+            history_resume_button_,
             history_journal_button_, history_report_button_, history_map_button_, history_delete_button_,
             history_details_,
-            detail_label_,     mode_copy_tab_,       mode_scan_tab_,     profile_label_,
+            detail_label_,     mode_label_,          profile_label_,
             policy_label_,     verify_label_,        scan_info_label_,
-            clear_selection_,  mode_combo_,          engine_combo_,
+            mode_combo_,       engine_combo_,
             overwrite_combo_,  verify_combo_,        salvage_check_,    resume_check_,
             map_check_,        adaptive_check_,      continue_check_,   skip_known_bad_check_,
             read_method_combo_, read_method_label_,
             wait_media_check_, fragile_check_,       buffer_label_,     buffer_edit_,
             retries_label_,    retries_edit_,        timeout_label_,    timeout_edit_,
-            start_button_,     pause_button_,        cancel_button_,    settings_button_,
+            pause_button_,     cancel_button_,       settings_button_,
             log_filter_,       log_find_,            log_find_button_,
             current_label_,    file_progress_label_, overall_progress_label_,
             stats_label_,      status_label_,
@@ -1142,17 +1149,13 @@ private:
             SendMessageW(log_list_, LB_SETITEMHEIGHT, 0,
                          MulDiv(log_points + 6, effective_dpi(), 72));
         }
-        // Sources: one line (icon, name, folder, size). Tasks: two lines plus a
-        // thin inline progress bar.
-        if (sources_list_ != nullptr) {
-            SendMessageW(sources_list_, LB_SETITEMHEIGHT, 0, MulDiv(24, effective_dpi(), 96));
-        }
+        // Tasks: two lines plus a thin inline progress bar.
         if (tasks_list_ != nullptr) {
             SendMessageW(tasks_list_, LB_SETITEMHEIGHT, 0, MulDiv(46, effective_dpi(), 96));
         }
         const int combo_item_height = MulDiv(22, effective_dpi(), 96);
-        for (HWND combo : {mode_combo_, engine_combo_, overwrite_combo_, verify_combo_, read_method_combo_,
-                           log_filter_}) {
+        for (HWND combo : {mode_combo_, add_mode_combo_, engine_combo_, overwrite_combo_, verify_combo_,
+                           read_method_combo_, log_filter_}) {
             if (combo == nullptr) continue;
             SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), combo_item_height);
             SendMessageW(combo, CB_SETITEMHEIGHT, 0, combo_item_height);
@@ -1204,22 +1207,15 @@ private:
         rebuild_fonts(monitor_dpi_);
         int log_points = settings_.get_int("LogFontSizePoints", 7, 20, 9);
 
-        // ---- What to copy ----
-        source_label_ = create(L"STATIC", L"What to copy", SS_NOPREFIX | SS_CENTERIMAGE, 0);
+        // ---- Settings panel: the shown task, or the New task settings ----
+        source_label_ = create(L"STATIC", L"New task settings", SS_NOPREFIX | SS_CENTERIMAGE | SS_ENDELLIPSIS, 0);
         source_add_files_ =
             create(L"BUTTON", L"+ Files", WS_TABSTOP | BS_OWNERDRAW, IdSourceAddFiles);
         source_browse_ = create(L"BUTTON", L"+ Folder", WS_TABSTOP | BS_OWNERDRAW, IdSourceBrowse);
         source_paste_ = create(L"BUTTON", L"Paste", WS_TABSTOP | BS_OWNERDRAW, IdSourcePaste);
-        clear_selection_ =
-            create(L"BUTTON", L"Clear", WS_TABSTOP | BS_OWNERDRAW, IdClearSelection);
-        // Owner-data list (LBS_NODATA): rows are painted from sources_.
-        sources_list_ = create(L"LISTBOX", L"",
-                               WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOINTEGRALHEIGHT |
-                                   LBS_NODATA | LBS_OWNERDRAWFIXED | LBS_EXTENDEDSEL |
-                                   LBS_NOTIFY,
-                               IdSourcesList);
-        SetWindowSubclass(sources_list_, &panel_list_subclass, 2, reinterpret_cast<DWORD_PTR>(this));
         sources_footer_ = create(L"STATIC", L"", SS_ENDELLIPSIS | SS_NOPREFIX, 0);
+        contents_check_ = create(L"BUTTON", L"Copy the folder's contents, not the folder",
+                                 WS_TABSTOP | BS_OWNERDRAW, IdContentsCheck);
         {
             SHFILEINFOW info{};
             system_small_icons_ = reinterpret_cast<HIMAGELIST>(SHGetFileInfoW(
@@ -1251,13 +1247,14 @@ private:
             SendMessageW(read_method_combo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
         }
         SendMessageW(read_method_combo_, CB_SETCURSEL, 0, 0);
-        for (const wchar_t* item : {L"Verified Copy / Recovery", L"Assess Readable Files"}) {
-            SendMessageW(mode_combo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+        add_mode_combo_ = create(L"COMBOBOX", L"", combo_style, IdAddModeCombo);
+        for (HWND combo : {mode_combo_, add_mode_combo_}) {
+            for (const wchar_t* item : {L"Copy", L"Assess readability"}) {
+                SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+            }
+            SendMessageW(combo, CB_SETCURSEL, 0, 0);
         }
-        ShowWindow(mode_combo_, SW_HIDE);
-        mode_copy_tab_ = create(L"BUTTON", L"Copy", WS_TABSTOP | BS_OWNERDRAW, IdModeCopyTab);
-        mode_scan_tab_ =
-            create(L"BUTTON", L"Assess readability", WS_TABSTOP | BS_OWNERDRAW, IdModeScanTab);
+        mode_label_ = create(L"STATIC", L"Action", SS_NOPREFIX | SS_CENTERIMAGE, 0);
         profile_label_ = create(L"STATIC", L"Profile", SS_NOPREFIX | SS_CENTERIMAGE, 0);
         policy_label_ = create(L"STATIC", L"If file exists", SS_NOPREFIX | SS_CENTERIMAGE, 0);
         verify_label_ = create(L"STATIC", L"Verify", SS_NOPREFIX | SS_CENTERIMAGE, 0);
@@ -1295,30 +1292,25 @@ private:
         timeout_edit_ = create(L"EDIT", L"", WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL | WS_BORDER,
                                IdTimeoutEdit);
 
-        options_toggle_ = create(L"BUTTON", L"", WS_TABSTOP | BS_OWNERDRAW, IdOptionsToggle);
-        options_expanded_ = settings_.get_bool("UiOptionsExpanded", false);
         if (!settings_.contains("InterruptedRunsAtStartup")) {
             settings_.set_string("InterruptedRunsAtStartup", settings_.interrupted_runs_at_startup());
         }
         log_area_logical_ = settings_.get_int("UiLogAreaHeight", 0, 8000, 0);
         left_column_permille_ = settings_.get_int("UiLeftColumnPermille", 0, 900, 0);
 
-        add_task_button_ =
-            create(L"BUTTON", L"Add to tasks", WS_TABSTOP | BS_OWNERDRAW, IdAddTaskButton);
+        // Pause / Stop for the running task, on the Now running card.
         pause_button_ = create(L"BUTTON", L"Pause", WS_TABSTOP | BS_OWNERDRAW, IdPauseButton);
-        cancel_button_ = create(L"BUTTON", L"Cancel", WS_TABSTOP | BS_OWNERDRAW, IdCancelButton);
+        cancel_button_ = create(L"BUTTON", L"Stop", WS_TABSTOP | BS_OWNERDRAW, IdCancelButton);
         EnableWindow(pause_button_, FALSE);
         EnableWindow(cancel_button_, FALSE);
-        // Pause / Stop live on the Tasks toolbar now (they follow the selected
-        // row); these stay as hidden targets for the menu and keyboard.
-        ShowWindow(pause_button_, SW_HIDE);
-        ShowWindow(cancel_button_, SW_HIDE);
+
 
         // ---- Tasks | Queue | History ----
         tasks_tab_ = create(L"BUTTON", L"Tasks", WS_TABSTOP | BS_OWNERDRAW, IdTasksTab);
         history_tab_ = create(L"BUTTON", L"History", WS_TABSTOP | BS_OWNERDRAW, IdHistoryTab);
         primary_task_button_ = create(L"BUTTON", L"Run", WS_TABSTOP | BS_OWNERDRAW, IdTaskRunButton);
         secondary_task_button_ = create(L"BUTTON", L"Queue", WS_TABSTOP | BS_OWNERDRAW, IdTaskQueueButton);
+        remove_task_button_ = create(L"BUTTON", L"Remove", WS_TABSTOP | BS_OWNERDRAW, IdTaskRemoveButton);
         hold_queue_check_ = create(L"BUTTON", L"Hold", WS_TABSTOP | BS_OWNERDRAW, IdPauseListCheck);
         history_resume_button_ =
             create(L"BUTTON", L"Resume", WS_TABSTOP | BS_OWNERDRAW, IdHistoryResumeButton);
@@ -1403,21 +1395,20 @@ private:
     void configure_tooltips() {
         auto add = [this](HWND control, const wchar_t* text) { tooltips_.add(control, text); };
 
-        add(source_label_, L"The files and folders to copy or assess. Each item lands in the destination under its own name; items from different folders become separate tasks.");
-        add(sources_list_, L"Files and folders to copy. Drag items here, paste paths (Ctrl+V), press Del to remove, or right-click a folder to copy only its contents.");
-        add(source_browse_, L"Add one or more folders. Each folder is copied as itself unless you choose \"Copy folder contents only\" from its right-click menu.");
-        add(source_add_files_, L"Add one or more files.");
-        add(source_paste_, L"Add files copied in Explorer, or paths copied as text (one per line).");
-        add(clear_selection_, L"Remove every item from the list.");
-        add(sources_footer_, L"Item count and total size. Sizes are counted in the background.");
+        add(source_label_, L"The selected task's settings: changes are saved to it. With no task selected, the New task settings used for the next add.");
+        add(source_browse_, L"Make a task from one or more folders, with the New task settings. Each folder is copied as itself.");
+        add(source_add_files_, L"Make a task from one or more files, with the New task settings.");
+        add(source_paste_, L"Make a task from files copied in Explorer, or paths copied as text (one per line).");
+        add(sources_footer_, L"What the task holds and its total size, counted in the background.");
+        add(contents_check_, L"Copy what is inside the folder into the destination, instead of the folder itself.");
         add(recent_destinations_button_, L"Pick a recently used destination.");
-        add(options_toggle_, L"Show or hide the detailed options. The summary shows what the next task will use.");
-        add(add_task_button_, L"Turn the selected rows (or all rows when none is selected) into tasks: one task per row. Ctrl+Enter adds and queues them.");
+        add(add_mode_combo_, L"What the next add does: copy the items to a destination, or assess them (read them and record unreadable ranges). The new task's own Action can be changed on the right.");
         add(tasks_tab_, L"Your tasks: the running one first, then the queue in run order, then the rest. Pinned tasks always stay; the others follow your on-exit choice.");
         add(history_tab_, L"Every run, newest first, with its journal, report, and range map.");
-        add(tasks_list_, L"Enter runs the selected task (Queue view: starts it now; History: resumes it). Del removes. Right-click for more.");
+        add(tasks_list_, L"Select a task to see and change its settings on the right. Enter runs it (History: resumes the run), Del removes it, Esc shows the New task settings. Right-click for more.");
         add(primary_task_button_, L"For the selected task: Run (now, or next if one is running), Start now (a queued task), or Pause / Resume (the running task).");
         add(secondary_task_button_, L"For the selected task: Queue (add to the end), Unqueue (take it off the queue), or Stop (the running task; it can resume from its journal later).");
+        add(remove_task_button_, L"Remove the selected task (Del). Its run history stays.");
         add(history_report_button_, L"Export the selected run's journal as a CSV report.");
         add(history_map_button_, L"Show the byte ranges the selected run's journal recorded for each file: read, recovered, or unreadable.");
         add(history_delete_button_, L"Delete the selected run's history record. Journals and copied files are not touched.");
@@ -1433,8 +1424,7 @@ private:
         add(destination_edit_, L"The selected row's destination folder. XactCopy stages and verifies each file beside its final path before replacement. The box cannot be left empty.");
         add(destination_browse_, L"Choose the destination folder.");
 
-        add(mode_copy_tab_, L"Copy or recover the listed items into a destination, with verification.");
-        add(mode_scan_tab_, L"Read the listed items without copying them and record which ranges are unreadable. Nothing is written except the optional bad-range map.");
+        add(mode_combo_, L"Copy: copy or recover the items into a destination, with verification. Assess readability: read them without copying and record which ranges are unreadable; nothing is written except the optional bad-range map.");
         add(engine_combo_, L"In copy mode choose a safe workflow profile. In assessment mode choose Auto, Fast, or Precise scanning. Low-level engine selection remains under Settings.");
         add(overwrite_combo_, L"What to do when a destination file already exists.");
         add(verify_combo_, L"In copy mode choose destination verification. In assessment mode choose whether findings are saved to the source-specific bad-range map.");
@@ -1480,11 +1470,16 @@ private:
     // Mirrors the .NET MainForm menu strip (File / Tools / Jobs / Help).
     void build_menu_bar() {
         HMENU file_menu = CreatePopupMenu();
-        AppendMenuW(file_menu, MF_STRING, IdMenuStartCopy, L"Add and &Queue\tCtrl+Enter");
-        AppendMenuW(file_menu, MF_STRING, IdAddTaskButton, L"&Add to tasks");
+        AppendMenuW(file_menu, MF_STRING, IdSourceAddFiles, L"New Task from &Files...\tCtrl+O");
+        AppendMenuW(file_menu, MF_STRING, IdSourceBrowse, L"New Task from F&older...\tCtrl+Shift+O");
+        AppendMenuW(file_menu, MF_STRING, IdSourcePaste, L"New Task from &Paste");
+        AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(file_menu, MF_STRING, IdMenuImportTasks, L"&Import Tasks...");
+        AppendMenuW(file_menu, MF_STRING, IdMenuExportTasks, L"E&xport Tasks...");
+        AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(file_menu, MF_STRING, IdMenuPauseCopy, L"&Pause Operation");
         AppendMenuW(file_menu, MF_STRING, IdMenuResumeCopy, L"&Resume Operation");
-        AppendMenuW(file_menu, MF_STRING, IdMenuCancelCopy, L"&Cancel Operation");
+        AppendMenuW(file_menu, MF_STRING, IdMenuCancelCopy, L"S&top Operation");
         AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(file_menu, MF_STRING, IdMenuSaveDefaults,
                     L"Save as &defaults (main-window choices)");
@@ -1494,7 +1489,6 @@ private:
         AppendMenuW(file_menu, MF_STRING, IdMenuExit, L"E&xit");
 
         HMENU tools_menu = CreatePopupMenu();
-        AppendMenuW(tools_menu, MF_STRING, IdMenuScanBadBlocks, L"Queue as &Assessment Tasks");
         AppendMenuW(tools_menu, MF_STRING, IdMenuInspectBadMap, L"Inspect Source &Bad-Range Map...");
         AppendMenuW(tools_menu, MF_STRING, IdMenuClearBadMap, L"Clear Source Bad-Range &Map...");
         AppendMenuW(tools_menu, MF_SEPARATOR, 0, nullptr);
@@ -1502,7 +1496,7 @@ private:
         AppendMenuW(tools_menu, MF_STRING, IdMenuCheckUpdates, L"Check for &Updates...");
 
         HMENU jobs_menu = CreatePopupMenu();
-        AppendMenuW(jobs_menu, MF_STRING, IdMenuSaveAsJob, L"Add as &Pinned Tasks");
+        AppendMenuW(jobs_menu, MF_STRING, IdMenuStartCopy, L"&Queue Selected Task\tCtrl+Enter");
         AppendMenuW(jobs_menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(jobs_menu, MF_STRING, IdMenuViewTasks, L"Show &Tasks");
         AppendMenuW(jobs_menu, MF_STRING, IdMenuViewHistory, L"Show &History");
@@ -1532,10 +1526,10 @@ private:
         // an administrator window blocks it.
         const bool handing_off = outgoing_handoff_.has_value();
         const bool busy = task_busy();
+        set_enabled(IdSourceAddFiles, !handing_off);
+        set_enabled(IdSourceBrowse, !handing_off);
+        set_enabled(IdSourcePaste, !handing_off);
         set_enabled(IdMenuStartCopy, !handing_off);
-        set_enabled(IdAddTaskButton, !handing_off);
-        set_enabled(IdMenuScanBadBlocks, !handing_off);
-        set_enabled(IdMenuSaveAsJob, !handing_off);
         // The running task may be reading or writing the map.
         set_enabled(IdMenuInspectBadMap, !busy);
         set_enabled(IdMenuClearBadMap, !busy);
@@ -1558,11 +1552,10 @@ private:
     // The bad-range map is keyed by the root a job reads from: the first
     // source group's root (the folder holding the first item, or a
     // contents-only folder itself).
-    // The source the bad-range map tools act on: the selected row's (the
-    // first folder of it when its items come from several), or the only row's.
+    // The source the bad-range map tools act on: the shown task's (the first
+    // folder of it when its items come from several).
     std::string primary_source_root() const {
-        auto rows = selected_source_rows();
-        if (rows.empty() && source_batches_.size() == 1) rows.push_back(0);
+        const auto rows = selected_source_rows();
         if (rows.size() != 1) return std::string();
         std::vector<ui::SourceItem> items;
         for (std::size_t index : source_batches_[rows[0]].items) items.push_back(sources_[index]);
@@ -1573,13 +1566,9 @@ private:
     std::optional<std::wstring> selected_source_map_path() {
         std::string source = primary_source_root();
         if (ui_is_blank(source)) {
-            if (sources_.empty()) {
-                info_box(L"Add the source whose bad-range map you want, or select a run in History "
-                         L"and use Range map to see what that run found.",
-                         L"Bad-range map");
-            } else {
-                info_box(L"Select the one row whose source's bad-range map you want.", L"Bad-range map");
-            }
+            info_box(L"Select the task whose source's bad-range map you want, or select a run in "
+                     L"History and use Range map to see what that run found.",
+                     L"Bad-range map");
             return std::nullopt;
         }
         return storage::BadRangeMapStore::get_default_map_path(
@@ -1770,12 +1759,12 @@ private:
         edit_brush_ = CreateSolidBrush(theme_.edit);
 
         ui::attach_theme_window(hwnd_);
-        for (HWND control : {log_list_, log_find_, sources_list_, tasks_list_, destination_edit_,
+        for (HWND control : {log_list_, log_find_, tasks_list_, destination_edit_,
                              source_path_edit_, buffer_edit_, retries_edit_, timeout_edit_}) {
             ui::apply_control_theme(control, theme_.dark);
         }
-        for (HWND combo : {mode_combo_, engine_combo_, overwrite_combo_, verify_combo_, read_method_combo_,
-                           log_filter_}) {
+        for (HWND combo : {mode_combo_, add_mode_combo_, engine_combo_, overwrite_combo_, verify_combo_,
+                           read_method_combo_, log_filter_}) {
             ui::apply_combo_theme(combo, theme_.dark);
         }
         InvalidateRect(current_bar_, nullptr, FALSE);
@@ -1915,17 +1904,20 @@ private:
         for (HWND control : {policy_label_, overwrite_combo_}) {
             if (control != nullptr) ShowWindow(control, scan ? SW_HIDE : SW_SHOW);
         }
-        SetWindowTextW(source_label_, scan ? L"What to assess" : L"What to copy");
-        if (sources_list_ != nullptr) update_space_warnings(); // destinations apply in Copy only
-        if (sources_list_ != nullptr) InvalidateRect(sources_list_, nullptr, FALSE);
+        update_panel_heading();
+        update_space_warnings(); // destinations apply in Copy only
         SetWindowTextW(profile_label_, scan ? L"Scan" : L"Profile");
         SetWindowTextW(verify_label_, scan ? L"Findings" : L"Verify");
         sync_scan_profile_lock();
-        InvalidateRect(mode_copy_tab_, nullptr, FALSE);
-        InvalidateRect(mode_scan_tab_, nullptr, FALSE);
+        // The New task settings' Action is the toolbar's.
+        if (!showing_task() && !loading_panel_) set_new_task_scan(scan);
         layout();
         ensure_window_fits_layout(); // the Options section shows/hides salvage per mode
-        if (options_toggle_ != nullptr) InvalidateRect(options_toggle_, nullptr, TRUE);
+    }
+
+    void set_new_task_scan(bool scan) {
+        new_task_scan_ = scan;
+        if (add_mode_combo_ != nullptr) SendMessageW(add_mode_combo_, CB_SETCURSEL, scan ? 1 : 0, 0);
     }
 
     void apply_settings_defaults() {
@@ -2030,18 +2022,19 @@ private:
     static bool is_checkbox_id(int id) {
         return id == IdSalvageCheck || id == IdResumeCheck || id == IdMapCheck ||
                id == IdAdaptiveCheck || id == IdContinueCheck || id == IdSkipKnownBadCheck ||
-               id == IdWaitMediaCheck || id == IdFragileCheck || id == IdPauseListCheck;
+               id == IdWaitMediaCheck || id == IdFragileCheck || id == IdPauseListCheck ||
+               id == IdContentsCheck;
     }
 
     static bool is_button_id(int id) {
-        return id == IdTaskRunButton || id == IdTaskQueueButton || id == IdHistoryResumeButton ||
+        return id == IdTaskRunButton || id == IdTaskQueueButton || id == IdTaskRemoveButton ||
+               id == IdHistoryResumeButton ||
                id == IdHistoryJournalButton || id == IdHistoryReportButton || id == IdHistoryMapButton ||
                id == IdHistoryDeleteButton ||
                id == IdSourceBrowse || id == IdDestinationBrowse || id == IdSourcePathBrowse ||
-               id == IdStartButton ||
                id == IdPauseButton || id == IdCancelButton || id == IdSettingsButton ||
-               id == IdSourceAddFiles || id == IdClearSelection || id == IdLogFindNext ||
-               id == IdSourcePaste || id == IdAddTaskButton || id == IdRecentDestinations ||
+               id == IdSourceAddFiles || id == IdLogFindNext ||
+               id == IdSourcePaste || id == IdRecentDestinations ||
                false;
     }
 
@@ -2063,10 +2056,6 @@ private:
             draw_log_item(draw);
             return true;
         }
-        if (draw.CtlType == ODT_LISTBOX && id == IdSourcesList) {
-            draw_source_item(draw);
-            return true;
-        }
         if (draw.CtlType == ODT_LISTBOX && id == IdTasksList) {
             draw_pane_item(draw);
             return true;
@@ -2076,14 +2065,7 @@ private:
             draw_mode_tab(draw, view == pane_view_);
             return true;
         }
-        if (draw.CtlType == ODT_BUTTON && id == IdOptionsToggle) {
-            draw_options_toggle(draw);
-            return true;
-        }
-        if (draw.CtlType == ODT_BUTTON && (id == IdModeCopyTab || id == IdModeScanTab)) {
-            draw_mode_tab(draw, (id == IdModeScanTab) == is_scan_mode());
-            return true;
-        }
+
         if (draw.CtlType == ODT_STATIC && (id == IdCurrentBar || id == IdOverallBar)) {
             draw_progress_bar(draw, id == IdCurrentBar ? current_permille_ : overall_permille_);
             return true;
@@ -2222,119 +2204,12 @@ private:
         sync_bad_range_controls();
     }
 
+    // The Now running card grows while a task starts or runs and shrinks to
+    // its heading when idle.
     void update_action_buttons() {
-        const BOOL can_queue = outgoing_handoff_.has_value() ? FALSE : TRUE;
-        if (add_task_button_ != nullptr) EnableWindow(add_task_button_, can_queue);
-        if (start_button_ != nullptr) {
-            const bool busy = supervisor_.is_job_running() || starting_;
-            (void)busy;
-            SetWindowTextW(start_button_, L"Add to queue");
-            InvalidateRect(start_button_, nullptr, FALSE);
-        }
+        if (task_busy() != card_busy_) layout();
     }
-
     // ---- Sources panel -----------------------------------------------------
-
-    void draw_source_item(const DRAWITEMSTRUCT& draw) {
-        const bool selected = (draw.itemState & ODS_SELECTED) != 0;
-        ui::themedraw::fill_rect(draw.hDC, draw.rcItem, selected ? theme_.selection : theme_.edit);
-        if (draw.itemID == static_cast<UINT>(-1) || draw.itemID >= source_batches_.size()) return;
-        const ui::SourceBatch& batch = source_batches_[draw.itemID];
-        const ui::SourceItem& item = sources_[batch.items.front()];
-        // A batch of several items shows as one row: a count, the names, and
-        // the combined size.
-        SourceRowInfo info = source_rows_[batch.items.front()];
-        int batch_folders = item.is_directory ? 1 : 0;
-        for (std::size_t k = 1; k < batch.items.size(); ++k) {
-            const SourceRowInfo& part = source_rows_[batch.items[k]];
-            if (sources_[batch.items[k]].is_directory) ++batch_folders;
-            if (part.bytes < 0 || info.bytes < 0) info.bytes = -1;
-            else info.bytes += part.bytes;
-            info.files += part.files;
-            info.size_incomplete = info.size_incomplete || part.size_incomplete;
-        }
-        const bool multiple = batch.items.size() > 1;
-        const int dpi = effective_dpi();
-        auto scale = [dpi](int value) { return MulDiv(value, dpi, 96); };
-        RECT rect = draw.rcItem;
-        rect.left += scale(6);
-        rect.right -= scale(6);
-
-        const int icon_size = GetSystemMetricsForDpi(SM_CXSMICON, static_cast<UINT>(dpi));
-        if (system_small_icons_ != nullptr && info.icon >= 0) {
-            ImageList_DrawEx(system_small_icons_, info.icon, draw.hDC, rect.left,
-                             rect.top + (rect.bottom - rect.top - icon_size) / 2, icon_size,
-                             icon_size, CLR_NONE, CLR_NONE, ILD_TRANSPARENT);
-        }
-        rect.left += icon_size + scale(8);
-
-        HGDIOBJ old_font = SelectObject(draw.hDC, font_);
-        SetBkMode(draw.hDC, TRANSPARENT);
-        const COLORREF text = selected ? theme_.selection_text : theme_.text;
-        const COLORREF muted = selected ? theme_.selection_text : theme_.muted_text;
-
-        // Right: size or item count.
-        std::wstring size_text;
-        if (info.bytes < 0) {
-            size_text = L"counting\x2026";
-        } else {
-            size_text = storage::fsutil::utf8_to_wide(format_bytes_short(info.bytes));
-            if (item.is_directory || multiple) {
-                size_text = std::to_wstring(info.files) + (info.files == 1 ? L" file, " : L" files, ") +
-                            size_text;
-            }
-            if (info.size_incomplete) size_text += L"+";
-        }
-        const bool short_of_space = batch_short_of_space(batch.id);
-        if (short_of_space) size_text = L"\x26A0 Not enough space \x00B7 " + size_text;
-        RECT size_rect = rect;
-        SetTextColor(draw.hDC, short_of_space ? theme_.log_warning : muted);
-        DrawTextW(draw.hDC, size_text.c_str(), -1, &size_rect,
-                  DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        SIZE size_extent{};
-        GetTextExtentPoint32W(draw.hDC, size_text.c_str(), static_cast<int>(size_text.size()),
-                              &size_extent);
-        rect.right -= size_extent.cx + scale(12);
-
-        // Name, then the containing folder (muted, path-ellipsized).
-        std::wstring name = storage::fsutil::get_file_name(item.path);
-        if (name.empty()) name = item.path;
-        if (item.contents_only) name += L"\\*  (contents)";
-        if (multiple) {
-            const std::size_t count = batch.items.size();
-            const int files = static_cast<int>(count) - batch_folders;
-            name = batch_folders == 0 ? std::to_wstring(count) + L" files"
-                   : files == 0       ? std::to_wstring(count) + L" folders"
-                                      : std::to_wstring(count) + L" items";
-        }
-        SetTextColor(draw.hDC, text);
-        RECT name_rect = rect;
-        DrawTextW(draw.hDC, name.c_str(), -1, &name_rect,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        SIZE name_extent{};
-        GetTextExtentPoint32W(draw.hDC, name.c_str(), static_cast<int>(name.size()), &name_extent);
-        RECT folder_rect = rect;
-        folder_rect.left = std::min<LONG>(rect.right, rect.left + name_extent.cx + scale(10));
-        std::wstring folder = item.contents_only ? item.path
-                                                 : storage::fsutil::get_directory_name(item.path);
-        if (multiple) {
-            folder.clear();
-            for (std::size_t index : batch.items) {
-                std::wstring leaf = storage::fsutil::get_file_name(sources_[index].path);
-                if (leaf.empty()) leaf = sources_[index].path;
-                if (!folder.empty()) folder += L", ";
-                folder += leaf;
-            }
-        }
-        const bool show_destination = !is_scan_mode() && !item.destination.empty();
-        if (show_destination) folder += L"  \x2192  " + item.destination;
-        SetTextColor(draw.hDC, muted);
-        DrawTextW(draw.hDC, folder.c_str(), -1, &folder_rect,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX |
-                      (multiple || show_destination ? DT_END_ELLIPSIS : DT_PATH_ELLIPSIS));
-        SelectObject(draw.hDC, old_font);
-        if ((draw.itemState & ODS_FOCUS) != 0) DrawFocusRect(draw.hDC, &draw.rcItem);
-    }
 
     static ui::SourceItem make_source_item(const std::wstring& raw) {
         ui::SourceItem item;
@@ -2349,126 +2224,432 @@ private:
         return item;
     }
 
-    // Adds existing paths that are not already listed. Returns how many were added.
-    // One call is one add action: everything it adds becomes one row (a batch)
-    // and later one task.
-    int add_sources(const std::vector<std::wstring>& paths, bool contents_only = false,
-                    const std::wstring& destination = {}) {
-        int added = 0;
-        const std::uint32_t batch = next_source_batch_++;
-        for (const auto& raw : paths) {
-            if (storage::fsutil::trim(raw).empty()) continue;
-            ui::SourceItem item = make_source_item(raw);
-            if (item.path.empty() ||
-                GetFileAttributesW(storage::fsutil::long_path(item.path).c_str()) ==
-                    INVALID_FILE_ATTRIBUTES) {
-                append_log("Not added (not found): " + storage::fsutil::wide_to_utf8(raw));
-                continue;
-            }
-            if (contents_only && item.is_directory) item.contents_only = true;
-            item.batch = batch;
-            item.destination = destination;
-            const bool duplicate = std::any_of(sources_.begin(), sources_.end(),
-                                               [&](const ui::SourceItem& existing) {
-                                                   return _wcsicmp(existing.path.c_str(),
-                                                                   item.path.c_str()) == 0;
-                                               });
-            if (duplicate) {
-                append_log("Already in the list: " + storage::fsutil::wide_to_utf8(item.path));
-                continue;
-            }
-            sources_.push_back(std::move(item));
-            ++added;
-        }
-        if (added > 0) {
-            sources_changed();
-            select_source_batches({batch});
-        }
-        return added;
-    }
-
-    // True when at least one path exists and is not listed yet, so asking
-    // for a destination is worth it.
-    bool has_new_source(const std::vector<std::wstring>& paths) const {
-        for (const auto& raw : paths) {
-            if (storage::fsutil::trim(raw).empty()) continue;
-            const ui::SourceItem item = make_source_item(raw);
-            if (item.path.empty() ||
-                GetFileAttributesW(storage::fsutil::long_path(item.path).c_str()) ==
-                    INVALID_FILE_ATTRIBUTES) {
-                continue;
-            }
-            const bool listed = std::any_of(sources_.begin(), sources_.end(),
-                                            [&](const ui::SourceItem& existing) {
-                                                return _wcsicmp(existing.path.c_str(),
-                                                                item.path.c_str()) == 0;
-                                            });
-            if (!listed) return true;
-        }
-        return false;
-    }
-
-    // One add action from the pickers, Paste, or the Explorer folder verb. A
-    // copy asks where the items go first; cancelling that adds nothing.
-    int add_sources_asking(const std::vector<std::wstring>& paths, bool contents_only = false) {
-        if (!has_new_source(paths)) {
-            add_sources(paths, contents_only); // logs each path it skips
-            explain_nothing_added(paths);
-            return 0;
-        }
-        std::wstring destination;
-        if (!is_scan_mode()) {
-            auto picked = pick_destination(L"Choose where to copy these items");
-            if (!picked.has_value()) {
-                append_log("Nothing added: no destination was chosen.");
-                return 0;
-            }
-            destination = std::move(*picked);
-        }
-        return add_sources(paths, contents_only, destination);
-    }
-
-    // An add that brought nothing in: say why, and select the rows that
-    // already hold those items. A path is listed once, so the same folder
-    // cannot go to two destinations at the same time.
-    void explain_nothing_added(const std::vector<std::wstring>& paths) {
-        std::wstring listed_names, missing_names;
-        std::vector<std::uint32_t> listed_batches;
-        int listed = 0, missing = 0;
+    // Every add (+ Files, + Folder, Paste, a drop, an Explorer verb) makes one
+    // task from its items with the New task settings and selects it. A copy
+    // goes to the New task destination, or asks where when there is none.
+    int add_task_from_paths(const std::vector<std::wstring>& paths, bool contents_only = false) {
+        show_new_task_settings_for_add();
+        std::vector<ui::SourceItem> items;
+        std::wstring missing;
+        int missing_count = 0;
         for (const auto& raw : paths) {
             const std::wstring trimmed = storage::fsutil::trim(raw);
             if (trimmed.empty()) continue;
-            const ui::SourceItem item = make_source_item(trimmed);
-            const auto existing = std::find_if(sources_.begin(), sources_.end(),
-                                               [&](const ui::SourceItem& other) {
-                                                   return !item.path.empty() &&
-                                                          _wcsicmp(other.path.c_str(), item.path.c_str()) == 0;
-                                               });
-            if (existing != sources_.end()) {
-                // Names, not full paths: a long path does not wrap in the box.
-                if (++listed <= 5) listed_names += L"\n  \x2022 " + storage::fsutil::get_file_name(item.path);
-                listed_batches.push_back(existing->batch);
-            } else if (++missing <= 5) {
-                const std::wstring name = storage::fsutil::get_file_name(trimmed);
-                missing_names += L"\n  \x2022 " + (name.empty() ? trimmed : name);
+            ui::SourceItem item = make_source_item(trimmed);
+            if (item.path.empty() ||
+                GetFileAttributesW(storage::fsutil::long_path(item.path).c_str()) ==
+                    INVALID_FILE_ATTRIBUTES) {
+                append_log("Not added (not found): " + storage::fsutil::wide_to_utf8(trimmed));
+                if (++missing_count <= 5) {
+                    const std::wstring name = storage::fsutil::get_file_name(trimmed);
+                    missing += L"\n  \x2022 " + (name.empty() ? trimmed : name);
+                }
+                continue;
             }
+            const bool repeated = std::any_of(items.begin(), items.end(), [&](const ui::SourceItem& other) {
+                return _wcsicmp(other.path.c_str(), item.path.c_str()) == 0;
+            });
+            if (repeated) continue;
+            if (contents_only && item.is_directory) item.contents_only = true;
+            item.batch = 1;
+            items.push_back(std::move(item));
         }
-        if (listed + missing == 0) return;
-        std::wstring text = L"Nothing was added.";
-        if (listed > 0) {
-            text += L"\n\nAlready in the list (selected for you):" + listed_names;
-            if (listed > 5) text += L"\n  \x2026 and " + std::to_wstring(listed - 5) + L" more";
-            text += L"\n\nAn item can be listed once. To copy it somewhere else as well, add it "
-                    L"to tasks first, then add it again.";
+        if (items.empty()) {
+            if (missing_count > 0) {
+                if (missing_count > 5) missing += L"\n  \x2026 and " + std::to_wstring(missing_count - 5) + L" more";
+                info_box(L"Nothing was added. Not found:" + missing);
+            }
+            return 0;
         }
-        if (missing > 0) {
-            text += L"\n\nNot found:" + missing_names;
-            if (missing > 5) text += L"\n  \x2026 and " + std::to_wstring(missing - 5) + L" more";
+        const bool scan = is_scan_mode();
+        std::wstring destination;
+        if (!scan) {
+            destination = storage::fsutil::trim(window_text_wide(destination_edit_));
+            if (!destination.empty()) {
+                destination = normalize_destination(destination);
+            } else {
+                auto picked = pick_destination(L"Choose where to copy these items");
+                if (!picked.has_value()) {
+                    append_log("Nothing added: no destination was chosen.");
+                    return 0;
+                }
+                destination = std::move(*picked);
+            }
+            for (auto& item : items) item.destination = destination;
         }
-        if (!listed_batches.empty()) select_source_batches(listed_batches);
-        info_box(text);
+        const auto groups = ui::group_sources(items);
+        if (groups.empty()) return 0;
+        if (!scan) {
+            const auto collisions = ui::find_destination_collisions(groups);
+            if (!collisions.empty()) {
+                std::wstring names;
+                for (const auto& name : collisions) names += L"\n  \x2022 " + name;
+                if (!confirm_box(L"These names come from more than one source folder and would be "
+                                 L"written to the same place in the destination:" + names +
+                                     L"\n\nThe later part would overwrite or merge into the earlier "
+                                     L"one, as the overwrite policy decides. Add anyway?",
+                                 L"XactCopy - Name collision", ui::MessageIcon::Warning)) {
+                    return 0;
+                }
+            }
+            remember_destination(storage::fsutil::wide_to_utf8(destination));
+        }
+        models::CopyJobOptions options;
+        try {
+            options = collect_options();
+        } catch (const std::exception& ex) {
+            warn_box(storage::fsutil::utf8_to_wide(ex.what()), L"Invalid run setting");
+            return 0;
+        }
+        options.DestinationRoot = scan ? std::string() : storage::fsutil::wide_to_utf8(destination);
+        options.SourceRoot = storage::fsutil::wide_to_utf8(groups[0].root);
+        options.SelectedRelativePaths = groups[0].relative_paths;
+        std::vector<storage::ManagedJobPart> parts;
+        for (std::size_t g = 1; g < groups.size(); ++g) {
+            parts.push_back({storage::fsutil::wide_to_utf8(groups[g].root), groups[g].relative_paths});
+        }
+        auto saved = job_manager_.add_task(ui::task_title_for_parts(options, items.size(), groups.size()),
+                                           options, std::move(parts));
+        if (!saved.has_value()) {
+            warn_box(L"The task could not be saved to the job catalog." +
+                         (job_manager_.load_warning().empty()
+                              ? std::wstring()
+                              : L"\n\n" + storage::fsutil::utf8_to_wide(job_manager_.load_warning())),
+                     L"XactCopy");
+            return 0;
+        }
+        append_log("Added task '" + saved->Name + "'.");
+        set_pane_view(PaneView::Tasks);
+        refresh_pane_data();
+        select_task(saved->JobId);
+        return static_cast<int>(items.size());
     }
 
+    // ---- Settings panel ----------------------------------------------------
+    //
+    // The right column shows the selected task's settings, and every change
+    // is saved back to it (WM_APP_SAVE_TASK). With no task selected it holds
+    // the New task settings, which the next add uses. sources_ is the shown
+    // task's items as one batch, so the Source and Destination boxes and the
+    // size counting work on it; it is empty for the New task settings.
+
+    bool showing_task() const { return !shown_job_id_.empty(); }
+    bool shown_task_editable() const { return showing_task() && !shown_locked_; }
+
+    void keep_new_task_settings() {
+        if (showing_task()) return;
+        try {
+            new_task_settings_.options = collect_options();
+        } catch (const std::exception&) {
+            return; // a field holds an invalid number: the last good settings stay
+        }
+        new_task_settings_.copy_profile = copy_profile_index_;
+        new_task_settings_.destination = storage::fsutil::trim(window_text_wide(destination_edit_));
+        new_task_settings_.stored = true;
+    }
+
+    void show_new_task_settings() {
+        if (!showing_task()) return;
+        if (save_pending_) save_shown_task();
+        shown_job_id_.clear();
+        shown_name_.clear();
+        shown_locked_ = false;
+        loading_panel_ = true;
+        set_sources({});
+        if (new_task_settings_.stored) {
+            apply_run_settings_to_ui(new_task_settings_.options);
+            copy_profile_index_ = new_task_settings_.copy_profile;
+            if (!is_scan_mode()) SendMessageW(engine_combo_, CB_SETCURSEL, copy_profile_index_, 0);
+        }
+        select_mode(new_task_scan_);
+        destination_box_shown_ = new_task_settings_.destination;
+        SetWindowTextW(destination_edit_, destination_box_shown_.c_str());
+        loading_panel_ = false;
+        set_panel_enabled(true);
+        update_panel_heading();
+        update_sources_footer();
+        layout();
+    }
+
+    // An add uses the New task settings whatever task is shown, and the
+    // list follows: nothing selected while the new task is made.
+    void show_new_task_settings_for_add() {
+        if (!showing_task()) return;
+        SendMessageW(tasks_list_, LB_SETCURSEL, static_cast<WPARAM>(-1), 0);
+        update_pane_toolbar();
+        show_new_task_settings();
+    }
+
+    // Loads a task into the panel; the running one is shown locked. `job` is
+    // null for a run that has no task (a History resume, crash recovery).
+    void show_task(const storage::ManagedJob* job, bool locked) {
+        if (save_pending_) save_shown_task();
+        keep_new_task_settings();
+        const models::CopyJobOptions& options = job != nullptr ? job->Options : active_->options;
+        const std::size_t part_count = job != nullptr ? ui::JobManagerService::part_count(*job) : 1;
+        std::vector<ui::SourceItem> items;
+        for (std::size_t part = 0; part < part_count; ++part) {
+            const models::CopyJobOptions part_options =
+                job != nullptr ? ui::JobManagerService::part_options(*job, part) : options;
+            // Folders show as folders once the background count has looked
+            // (on_source_size): reading the media here could stall the window.
+            for (auto item : ui::items_from_options(part_options)) {
+                item.batch = 1;
+                item.destination = storage::fsutil::utf8_to_wide(options.DestinationRoot);
+                items.push_back(std::move(item));
+            }
+        }
+        loading_panel_ = true;
+        shown_job_id_ = job != nullptr ? job->JobId : std::string("<active>");
+        shown_name_ = job != nullptr ? job->Name
+                      : active_->display_name.empty() ? ui::task_title(options)
+                                                      : active_->display_name;
+        shown_locked_ = locked;
+        shown_updated_ticks_ = job != nullptr ? job->UpdatedUtc.utc_ticks() : 0;
+        shown_auto_name_ =
+            job != nullptr && job->Name == ui::task_title_for_parts(options, items.size(), part_count);
+        apply_run_settings_to_ui(options);
+        set_sources(std::move(items));
+        loading_panel_ = false;
+        set_panel_enabled(!locked);
+        update_panel_heading();
+        layout();
+    }
+
+    // After the selection or the catalog changed: show what is selected,
+    // reloading only when it is another task or the task changed elsewhere.
+    void sync_panel_to_selection() {
+        if (pane_view_ != PaneView::Tasks || loading_panel_) return;
+        const TaskRowRef* ref = selected_task_row();
+        const storage::ManagedJob* job =
+            ref != nullptr && ref->job >= 0 ? &pane_jobs_[static_cast<std::size_t>(ref->job)] : nullptr;
+        if (ref == nullptr || (job == nullptr && !(ref->active && active_.has_value()))) {
+            show_new_task_settings();
+            return;
+        }
+        const bool locked = ref->active;
+        const std::string id = job != nullptr ? job->JobId : std::string("<active>");
+        const std::int64_t ticks = job != nullptr ? job->UpdatedUtc.utc_ticks() : 0;
+        if (id == shown_job_id_ && ticks == shown_updated_ticks_) {
+            if (locked != shown_locked_) {
+                shown_locked_ = locked;
+                set_panel_enabled(!locked);
+                update_panel_heading();
+            }
+            return;
+        }
+        show_task(job, locked);
+    }
+
+    void deselect_task() {
+        SendMessageW(tasks_list_, LB_SETCURSEL, static_cast<WPARAM>(-1), 0);
+        update_pane_toolbar();
+        sync_panel_to_selection();
+    }
+
+    void select_task(const std::string& job_id) {
+        restore_selection(job_id);
+        update_pane_toolbar();
+        sync_panel_to_selection();
+    }
+
+    void request_task_save() {
+        if (!shown_task_editable() || loading_panel_ || save_pending_) return;
+        save_pending_ = true;
+        PostMessageW(hwnd_, WM_APP_SAVE_TASK, 0, 0);
+    }
+
+    // Writes the panel to the shown task. Several changes from one action
+    // are saved once (request_task_save posts this).
+    void save_shown_task() {
+        save_pending_ = false;
+        if (!shown_task_editable() || loading_panel_ || is_active_job(shown_job_id_)) return;
+        const auto job = job_manager_.get_job_by_id(shown_job_id_);
+        if (!job.has_value()) return;
+        models::CopyJobOptions options;
+        try {
+            options = collect_options();
+        } catch (const std::exception& ex) {
+            warn_box(storage::fsutil::utf8_to_wide(ex.what()) + L"\n\nThe task keeps its previous value.",
+                     L"Invalid run setting");
+            return;
+        }
+        const auto groups = ui::group_sources(sources_);
+        if (groups.empty()) return;
+        options.SourceRoot = storage::fsutil::wide_to_utf8(groups[0].root);
+        options.SelectedRelativePaths = groups[0].relative_paths;
+        options.DestinationRoot = is_scan_mode() ? std::string()
+                                                 : storage::fsutil::wide_to_utf8(sources_.front().destination);
+        std::vector<storage::ManagedJobPart> parts;
+        for (std::size_t g = 1; g < groups.size(); ++g) {
+            parts.push_back({storage::fsutil::wide_to_utf8(groups[g].root), groups[g].relative_paths});
+        }
+        const std::string name = shown_auto_name_
+                                     ? ui::task_title_for_parts(options, sources_.size(), groups.size())
+                                     : job->Name;
+        auto saved = job_manager_.add_task(name, options, std::move(parts), false, job->JobId);
+        if (!saved.has_value()) {
+            warn_box(L"The task's changes could not be saved to the job catalog.", L"XactCopy");
+            return;
+        }
+        if (saved->Name != name) job_manager_.rename_job(saved->JobId, name);
+        if (const auto fresh = job_manager_.get_job_by_id(saved->JobId)) {
+            shown_updated_ticks_ = fresh->UpdatedUtc.utc_ticks();
+            shown_name_ = fresh->Name;
+        }
+        update_panel_heading();
+        refresh_pane_data();
+    }
+
+    // Everything in the panel that edits the task. The running task's
+    // settings are shown but cannot change.
+    void set_panel_enabled(bool enabled) {
+        for (HWND control : {mode_combo_, destination_edit_, destination_browse_,
+                             recent_destinations_button_, engine_combo_, overwrite_combo_, verify_combo_,
+                             read_method_combo_, salvage_check_, resume_check_, map_check_, adaptive_check_,
+                             continue_check_, skip_known_bad_check_, wait_media_check_, fragile_check_,
+                             buffer_edit_, retries_edit_, timeout_edit_, contents_check_}) {
+            if (control != nullptr) EnableWindow(control, enabled ? TRUE : FALSE);
+        }
+        sync_path_boxes();
+        if (enabled) {
+            sync_bad_range_controls();
+            // Fragile mode keeps the Scan choice locked on Precise.
+            if (scan_profile_before_lock_ >= 0) EnableWindow(engine_combo_, FALSE);
+        }
+    }
+
+    void update_panel_heading() {
+        std::wstring title = L"New task settings";
+        if (showing_task()) {
+            title = storage::fsutil::utf8_to_wide(shown_name_);
+            if (shown_locked_) title += L"  \x00B7  running, settings locked";
+        }
+        SetWindowTextW(source_label_, title.c_str());
+        update_sources_footer(); // the New task settings' hint, or the task's size
+        update_contents_check();
+    }
+
+    // "Copy the folder's contents" applies to a task of one folder (not a
+    // drive root, which always copies its contents).
+    void update_contents_check() {
+        if (contents_check_ == nullptr) return;
+        const bool applies = pane_view_ == PaneView::Tasks && sources_.size() == 1 &&
+                             (sources_[0].is_directory || sources_[0].contents_only) &&
+                             sources_[0].path.size() > 3;
+        set_check(IdContentsCheck, applies && sources_[0].contents_only);
+        ShowWindow(contents_check_, applies ? SW_SHOW : SW_HIDE);
+    }
+
+    // ---- Tasks files (task_file.h) ------------------------------------------
+
+    // File > Import Tasks, or a dropped *.xctasks: adds the tasks it lists,
+    // not queued, so their settings can be checked before they run.
+    void import_tasks(const std::wstring& path) {
+        auto bytes = storage::fsutil::read_all_bytes(path, 16ULL * 1024ULL * 1024ULL);
+        if (!bytes.has_value()) {
+            warn_box(L"The tasks file could not be read:\n" + path, L"Import tasks");
+            return;
+        }
+        std::string text(bytes->begin(), bytes->end());
+        if (text.rfind("\xEF\xBB\xBF", 0) == 0) text.erase(0, 3); // saved by Notepad with a BOM
+        const auto contents = ui::read_task_file(text, settings_.build_default_options());
+        if (!contents.error.empty()) {
+            warn_box(storage::fsutil::utf8_to_wide(contents.error) + L"\n\n" + path, L"Import tasks");
+            return;
+        }
+        show_new_task_settings_for_add();
+        int added = 0;
+        std::string last;
+        for (const auto& task : contents.tasks) {
+            auto saved = job_manager_.add_task(task.name, task.options, task.parts, task.pinned);
+            if (!saved.has_value()) break;
+            ++added;
+            last = saved->JobId;
+        }
+        append_log("Imported " + std::to_string(added) + " of " + std::to_string(contents.tasks.size()) +
+                   " task(s) from " + storage::fsutil::wide_to_utf8(path) + ".");
+        for (const auto& problem : contents.problems) append_log("Not imported: " + problem);
+        set_pane_view(PaneView::Tasks);
+        refresh_pane_data();
+        if (!last.empty()) select_task(last);
+        std::wstring message = std::to_wstring(added) + (added == 1 ? L" task was" : L" tasks were") +
+                               L" imported. They are not queued: check their settings, then Run or Queue them.";
+        if (added < static_cast<int>(contents.tasks.size())) {
+            message += L"\n\nThe job catalog could not save the rest.";
+        }
+        if (!contents.problems.empty()) {
+            message += L"\n\nSkipped:";
+            for (std::size_t i = 0; i < contents.problems.size() && i < 8; ++i) {
+                message += L"\n  \x2022 " + storage::fsutil::utf8_to_wide(contents.problems[i]);
+            }
+            if (contents.problems.size() > 8) {
+                message += L"\n  \x2026 and " + std::to_wstring(contents.problems.size() - 8) +
+                           L" more (see the log)";
+            }
+        }
+        info_box(message, L"Import tasks");
+    }
+
+    // File > Export Tasks: every task, in list order.
+    void export_tasks() {
+        const auto jobs = job_manager_.get_jobs_in_order();
+        if (jobs.empty()) {
+            info_box(L"There are no tasks to export.", L"Export tasks");
+            return;
+        }
+        const auto path = pick_task_file(/*save*/ true);
+        if (!path.has_value()) return;
+        if (!storage::fsutil::write_atomic_bytes(*path, ui::write_task_file(jobs))) {
+            warn_box(L"The tasks file could not be written:\n" + *path, L"Export tasks");
+            return;
+        }
+        append_log("Exported " + std::to_string(jobs.size()) + " task(s) to " +
+                   storage::fsutil::wide_to_utf8(*path) + ".");
+    }
+
+    std::optional<std::wstring> pick_task_file(bool save) {
+        std::optional<std::wstring> result;
+        if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) return result;
+        IFileDialog* dialog = nullptr;
+        if (SUCCEEDED(CoCreateInstance(save ? CLSID_FileSaveDialog : CLSID_FileOpenDialog, nullptr,
+                                       CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) {
+            const COMDLG_FILTERSPEC filters[] = {{L"XactCopy tasks", L"*.xctasks"},
+                                                 {L"JSON files", L"*.json"},
+                                                 {L"All files", L"*.*"}};
+            dialog->SetFileTypes(3, filters);
+            dialog->SetDefaultExtension(L"xctasks");
+            dialog->SetTitle(save ? L"Export tasks" : L"Import tasks");
+            if (save) dialog->SetFileName(L"XactCopy tasks.xctasks");
+            DWORD options = 0;
+            dialog->GetOptions(&options);
+            dialog->SetOptions(options | FOS_FORCEFILESYSTEM | (save ? FOS_OVERWRITEPROMPT : FOS_FILEMUSTEXIST));
+            if (SUCCEEDED(dialog->Show(hwnd_))) {
+                IShellItem* item = nullptr;
+                if (SUCCEEDED(dialog->GetResult(&item))) {
+                    PWSTR picked = nullptr;
+                    if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &picked))) {
+                        result = picked;
+                        CoTaskMemFree(picked);
+                    }
+                    item->Release();
+                }
+            }
+            dialog->Release();
+        }
+        CoUninitialize();
+        return result;
+    }
+
+    // Tasks > Queue Selected Task (Ctrl+Enter).
+    void queue_selected_task() {
+        if (active_row_selected() || selected_queue_entry() != nullptr) return;
+        if (const auto* job = selected_job()) {
+            queue_task(*job);
+        } else {
+            info_box(L"Select a task to queue.");
+        }
+    }
     // Folder picker for a copy destination, opening at the destination box's
     // folder or the most recent one. nullopt when cancelled.
     std::optional<std::wstring> pick_destination(const wchar_t* title) {
@@ -2598,14 +2779,13 @@ private:
                 space_warned_.push_back(key);
                 append_log("WARNING: " + storage::fsutil::wide_to_utf8(volume.root) + " has " +
                            format_bytes_short(static_cast<std::int64_t>(*free)) +
-                           " free, but the rows copying there need " +
+                           " free, but this task needs " +
                            format_bytes_short(static_cast<std::int64_t>(volume.need)) +
                            ". The copy may run out of space.");
             }
         }
         if (short_ids != short_batches_) {
             short_batches_ = std::move(short_ids);
-            InvalidateRect(sources_list_, nullptr, FALSE);
             update_sources_footer();
         }
     }
@@ -2615,29 +2795,16 @@ private:
     // They show the selected row. Edits apply when the box loses focus; an
     // emptied box, or a source path that does not exist, is put back.
 
+    // The shown task's items are one batch (row 0); the New task settings
+    // have none.
     std::vector<std::size_t> selected_source_rows() const {
-        std::vector<std::size_t> rows;
-        for (int index : selected_list_indices(sources_list_)) {
-            if (index >= 0 && static_cast<std::size_t>(index) < source_batches_.size()) {
-                rows.push_back(static_cast<std::size_t>(index));
-            }
-        }
-        return rows;
+        if (source_batches_.empty()) return {};
+        return {0};
     }
-
-    void select_source_batches(const std::vector<std::uint32_t>& ids) {
-        SendMessageW(sources_list_, LB_SETSEL, FALSE, -1);
-        int last = -1;
-        for (std::size_t row = 0; row < source_batches_.size(); ++row) {
-            if (std::find(ids.begin(), ids.end(), source_batches_[row].id) == ids.end()) continue;
-            SendMessageW(sources_list_, LB_SETSEL, TRUE, static_cast<LPARAM>(row));
-            last = static_cast<int>(row);
-        }
-        if (last >= 0) SendMessageW(sources_list_, LB_SETCARETINDEX, last, FALSE);
+    void select_source_batches(const std::vector<std::uint32_t>& /*ids*/) {
         update_sources_footer();
         sync_path_boxes();
     }
-
     std::wstring row_source_text(std::size_t row) const {
         std::wstring text;
         for (std::size_t index : source_batches_[row].items) {
@@ -2652,17 +2819,19 @@ private:
         const auto rows = selected_source_rows();
         std::wstring source;
         if (rows.size() == 1) source = row_source_text(rows[0]);
-        EnableWindow(source_path_edit_, rows.size() == 1 ? TRUE : FALSE);
-        EnableWindow(source_path_browse_, rows.size() == 1 ? TRUE : FALSE);
+        const bool editable = rows.size() == 1 && !shown_locked_;
+        EnableWindow(source_path_edit_, editable ? TRUE : FALSE);
+        EnableWindow(source_path_browse_, editable ? TRUE : FALSE);
         SendMessageW(source_path_edit_, EM_SETCUEBANNER, FALSE,
-                     reinterpret_cast<LPARAM>(rows.size() > 1 ? L"Several rows selected"
-                                                              : L"Select a row to edit its source"));
+                     reinterpret_cast<LPARAM>(L"Each add makes a task: + Files, + Folder, Paste, or drag here"));
         source_box_shown_ = source;
         if (window_text_wide(source_path_edit_) != source) {
             SetWindowTextW(source_path_edit_, source.c_str());
         }
         if (rows.empty()) {
-            // Keeps the folder the next add's picker opens at.
+            // The New task destination: empty means each add asks.
+            SendMessageW(destination_edit_, EM_SETCUEBANNER, TRUE,
+                         reinterpret_cast<LPARAM>(L"Ask each time"));
             destination_box_shown_ = storage::fsutil::trim(window_text_wide(destination_edit_));
             return;
         }
@@ -2704,8 +2873,8 @@ private:
         }
         destination_box_shown_ = destination;
         if (text != destination) SetWindowTextW(destination_edit_, destination.c_str());
-        InvalidateRect(sources_list_, nullptr, FALSE);
         update_space_warnings();
+        request_task_save();
     }
 
     // Browse for the selected row: pick folders or files instead of its
@@ -2812,6 +2981,7 @@ private:
         sources_changed();
         select_source_batches({batch.id});
         committing_paths_ = false;
+        request_task_save();
     }
 
     void set_sources(std::vector<ui::SourceItem> items) {
@@ -2842,18 +3012,21 @@ private:
             sizer_generation_.fetch_add(1);
         }
         sizer_ready_.notify_one();
-        SendMessageW(sources_list_, LB_SETCOUNT, source_batches_.size(), 0);
-        InvalidateRect(sources_list_, nullptr, TRUE);
         update_sources_footer();
+        update_contents_check();
         sync_path_boxes();
         update_space_warnings();
     }
 
+    // The line under Source: what the shown task holds and whether its
+    // destination has room, or what the New task settings are for.
     void update_sources_footer() {
         if (sources_footer_ == nullptr) return;
         if (sources_.empty()) {
             SetWindowTextW(sources_footer_,
-                           L"Add files or folders: + Files, + Folder, Paste, or drag them here.");
+                           showing_task() ? L""
+                                          : L"Each add (+ Files, + Folder, Paste, or a drop) makes a "
+                                            L"task with these settings.");
             return;
         }
         int folders = 0;
@@ -2865,23 +3038,16 @@ private:
             else bytes += source_rows_[i].bytes;
         }
         const int files = static_cast<int>(sources_.size()) - folders;
-        std::string text = std::to_string(sources_.size()) +
-                           (sources_.size() == 1 ? " item" : " items");
-        text += " \xC2\xB7 " + std::to_string(folders) + (folders == 1 ? " folder, " : " folders, ") +
-                std::to_string(files) + (files == 1 ? " file" : " files");
-        text += " \xC2\xB7 " + (counting ? std::string("counting\xE2\x80\xA6")
-                                         : format_bytes_short(bytes));
-        if (source_batches_.size() > 1) {
-            const int selected = static_cast<int>(SendMessageW(sources_list_, LB_GETSELCOUNT, 0, 0));
-            text += " \xC2\xB7 " + (selected > 0 ? std::to_string(selected) + " of " : std::string()) +
-                    std::to_string(source_batches_.size()) + " rows";
+        std::string text;
+        if (folders > 0) text += std::to_string(folders) + (folders == 1 ? " folder" : " folders");
+        if (files > 0) {
+            if (!text.empty()) text += ", ";
+            text += std::to_string(files) + (files == 1 ? " file" : " files");
         }
-        if (!short_batches_.empty()) {
-            text += " \xC2\xB7 \xE2\x9A\xA0 destination may run out of space";
-        }
+        text += " \xC2\xB7 " + (counting ? std::string("counting\xE2\x80\xA6") : format_bytes_short(bytes));
+        if (!short_batches_.empty()) text += " \xC2\xB7 \xE2\x9A\xA0 the destination may run out of space";
         SetWindowTextW(sources_footer_, storage::fsutil::utf8_to_wide(text).c_str());
     }
-
     void on_source_size(const SourceSizeResult& result) {
         if (result.generation != sizer_generation_.load()) return;
         for (std::size_t i = 0; i < sources_.size(); ++i) {
@@ -2889,20 +3055,12 @@ private:
             source_rows_[i].bytes = result.bytes;
             source_rows_[i].files = result.files;
             source_rows_[i].size_incomplete = result.incomplete;
-            for (std::size_t b = 0; b < source_batches_.size(); ++b) {
-                const auto& members = source_batches_[b].items;
-                if (std::find(members.begin(), members.end(), i) == members.end()) continue;
-                RECT row{};
-                if (SendMessageW(sources_list_, LB_GETITEMRECT, b, reinterpret_cast<LPARAM>(&row)) !=
-                    LB_ERR) {
-                    InvalidateRect(sources_list_, &row, FALSE);
-                }
-            }
+            if (result.directory) sources_[i].is_directory = true;
         }
         update_sources_footer();
+        update_contents_check();
         update_space_warnings();
     }
-
     // Sizes each requested path on this background thread. A newer request
     // (generation bump) abandons the current walk at the next entry.
     void sizer_loop() {
@@ -2943,6 +3101,7 @@ private:
             result.files = 1;
             return;
         }
+        result.directory = true;
         std::vector<std::wstring> pending{path};
         while (!pending.empty()) {
             if (generation != sizer_generation_.load() || sizer_stopping_) return;
@@ -2996,28 +3155,6 @@ private:
         return indices;
     }
 
-    // Items of the selected rows (each row is one batch), in list order.
-    std::vector<std::size_t> selected_source_items() const {
-        std::vector<std::size_t> items;
-        for (int row : selected_list_indices(sources_list_)) {
-            if (row < 0 || static_cast<std::size_t>(row) >= source_batches_.size()) continue;
-            const auto& members = source_batches_[static_cast<std::size_t>(row)].items;
-            items.insert(items.end(), members.begin(), members.end());
-        }
-        return items;
-    }
-
-    void remove_selected_sources() {
-        auto items = selected_source_items();
-        if (items.empty()) return;
-        std::sort(items.rbegin(), items.rend());
-        for (std::size_t index : items) {
-            if (index < sources_.size()) sources_.erase(sources_.begin() + static_cast<std::ptrdiff_t>(index));
-        }
-        SendMessageW(sources_list_, LB_SETSEL, FALSE, -1);
-        sources_changed();
-    }
-
     void paste_sources() {
         std::vector<std::wstring> paths;
         if (!OpenClipboard(hwnd_)) return;
@@ -3054,91 +3191,7 @@ private:
             info_box(L"The clipboard has no file paths. Copy files in Explorer, or copy one path per line.");
             return;
         }
-        const int added = add_sources_asking(paths);
-        if (added > 0) append_log("Pasted " + std::to_string(added) + " source item(s).");
-    }
-
-    void show_sources_context_menu(LPARAM screen_point) {
-        POINT point{GET_X_LPARAM(screen_point), GET_Y_LPARAM(screen_point)};
-        if (point.x == -1 && point.y == -1) GetCursorPos(&point);
-        const auto indices = selected_source_items();
-        const bool has_selection = !indices.empty();
-        const bool single_folder = indices.size() == 1 &&
-                                   static_cast<std::size_t>(indices[0]) < sources_.size() &&
-                                   sources_[static_cast<std::size_t>(indices[0])].is_directory;
-        HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING | (has_selection ? 0 : MF_GRAYED), IdSourceRemove,
-                    L"&Remove\tDel");
-        if (single_folder) {
-            const auto& item = sources_[static_cast<std::size_t>(indices[0])];
-            AppendMenuW(menu, MF_STRING | (item.contents_only ? MF_CHECKED : 0) |
-                                  (item.path.size() <= 3 ? MF_GRAYED : 0),
-                        IdSourceContentsOnly, L"Copy folder &contents only");
-        }
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING | (indices.size() == 1 ? 0 : MF_GRAYED), IdSourceOpenLocation,
-                    L"&Open location");
-        AppendMenuW(menu, MF_STRING | (has_selection ? 0 : MF_GRAYED), IdSourceCopyPath,
-                    L"Copy &path");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, IdSourcePaste, L"P&aste paths\tCtrl+V");
-        AppendMenuW(menu, MF_STRING | (sources_.empty() ? MF_GRAYED : 0), IdClearSelection,
-                    L"C&lear all");
-        TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd_, nullptr);
-        DestroyMenu(menu);
-    }
-
-    void copy_text_to_clipboard(const std::wstring& text) {
-        if (!OpenClipboard(hwnd_)) return;
-        EmptyClipboard();
-        const std::size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-        if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
-            if (void* target = GlobalLock(memory)) {
-                memcpy(target, text.c_str(), bytes);
-                GlobalUnlock(memory);
-                if (SetClipboardData(CF_UNICODETEXT, memory) == nullptr) GlobalFree(memory);
-            } else {
-                GlobalFree(memory);
-            }
-        }
-        CloseClipboard();
-    }
-
-    void on_source_command(int id) {
-        const auto indices = selected_source_items();
-        switch (id) {
-            case IdSourceRemove:
-                remove_selected_sources();
-                break;
-            case IdSourceContentsOnly:
-                if (indices.size() == 1 && indices[0] < sources_.size()) {
-                    auto& item = sources_[indices[0]];
-                    if (item.is_directory && item.path.size() > 3) {
-                        item.contents_only = !item.contents_only;
-                        sources_changed();
-                    }
-                }
-                break;
-            case IdSourceOpenLocation:
-                if (indices.size() == 1 && indices[0] < sources_.size()) {
-                    const auto& item = sources_[indices[0]];
-                    ui::elevation::open_as_user(hwnd_, L"explorer.exe",
-                                                L"/select,\"" + item.path + L"\"");
-                }
-                break;
-            case IdSourceCopyPath: {
-                std::wstring text;
-                for (std::size_t index : indices) {
-                    if (index >= sources_.size()) continue;
-                    if (!text.empty()) text += L"\r\n";
-                    text += sources_[index].path;
-                }
-                if (!text.empty()) copy_text_to_clipboard(text);
-                break;
-            }
-            default:
-                break;
-        }
+        add_task_from_paths(paths);
     }
 
     // ---- Mode switch --------------------------------------------------------
@@ -3174,46 +3227,6 @@ private:
     }
 
     // ---- Options section ----------------------------------------------------
-
-    void draw_options_toggle(const DRAWITEMSTRUCT& draw) {
-        const bool focused = (draw.itemState & ODS_FOCUS) != 0;
-        ui::themedraw::fill_rect(draw.hDC, draw.rcItem, theme_.window);
-        RECT rect = draw.rcItem;
-        rect.left += MulDiv(2, effective_dpi(), 96);
-        HGDIOBJ old_font = SelectObject(draw.hDC, font_);
-        SetBkMode(draw.hDC, TRANSPARENT);
-        std::wstring heading = options_expanded_ ? L"\x25BE  Options" : L"\x25B8  Options";
-        SetTextColor(draw.hDC, theme_.accent);
-        DrawTextW(draw.hDC, heading.c_str(), -1, &rect,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        if (!options_expanded_) {
-            SIZE extent{};
-            GetTextExtentPoint32W(draw.hDC, heading.c_str(), static_cast<int>(heading.size()), &extent);
-            RECT summary_rect = rect;
-            summary_rect.left += extent.cx + MulDiv(12, effective_dpi(), 96);
-            std::wstring summary;
-            try {
-                summary = storage::fsutil::utf8_to_wide(ui::summarize_options(collect_options()));
-            } catch (const std::exception&) {
-                summary = L"(check the option values)";
-            }
-            SetTextColor(draw.hDC, theme_.muted_text);
-            DrawTextW(draw.hDC, summary.c_str(), -1, &summary_rect,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        }
-        SelectObject(draw.hDC, old_font);
-        if (focused) DrawFocusRect(draw.hDC, &draw.rcItem);
-    }
-
-    void set_options_expanded(bool expanded) {
-        options_expanded_ = expanded;
-        settings_.set_bool("UiOptionsExpanded", expanded);
-        with_redraw_suspended([&] {
-            layout();
-            ensure_window_fits_layout();
-            InvalidateRect(options_toggle_, nullptr, TRUE);
-        });
-    }
 
     // ---- Recent destinations ------------------------------------------------
 
@@ -3567,10 +3580,10 @@ private:
         if (pane_view_ == PaneView::Tasks) {
             const std::size_t queued = pane_queue_.size();
             if (pane_rows_.empty()) {
-                footer = L"No tasks yet. Add items on the left, then Add to tasks.";
+                footer = L"No tasks yet. + Files, + Folder, Paste, or drag files here: each add makes a task.";
             } else if (queued == 0) {
                 footer = active_.has_value() ? L"One task running; nothing queued."
-                                             : L"Select a task, then Run it or Queue it.";
+                                             : L"Select a task to change its settings, then Run or Queue it.";
             } else {
                 footer = std::to_wstring(queued) + (queued == 1 ? L" task queued" : L" tasks queued") +
                          (queue_held_ ? L", held (untick Hold, or Start now)." : L", runs one at a time.");
@@ -3581,6 +3594,8 @@ private:
         SetWindowTextW(pane_footer_, footer.c_str());
         update_pane_toolbar();
         if (pane_view_ == PaneView::History) refresh_history_details();
+        else sync_panel_to_selection();
+        update_action_buttons();
     }
 
     void invalidate_active_row() {
@@ -3659,6 +3674,10 @@ private:
             set(primary_task_button_, L"Run", any);
             set(secondary_task_button_, L"Queue", any);
         }
+        if (remove_task_button_ != nullptr) {
+            EnableWindow(remove_task_button_, selected_job() != nullptr && !active_row_selected());
+            InvalidateRect(remove_task_button_, nullptr, FALSE);
+        }
         const storage::ManagedJobRun* run = selected_run();
         const bool idle = !task_busy();
         if (history_resume_button_ != nullptr) {
@@ -3714,165 +3733,6 @@ private:
         if (top > 0) SendMessageW(history_details_, LB_SETTOPINDEX, top, 0);
         SendMessageW(history_details_, WM_SETREDRAW, TRUE, 0);
         InvalidateRect(history_details_, nullptr, TRUE);
-    }
-
-    // ---- Adding tasks from the builder ----
-
-    // Turns the selected source rows (all rows when none is selected) into
-    // tasks: one task per row, with one part per source folder or drive in
-    // it. Optionally queues them. Returns how many tasks were added.
-    int add_tasks_from_builder(bool queue, bool pinned = false) {
-        // A box still being edited (menu or accelerator) applies first.
-        commit_source_box();
-        commit_destination_box();
-        if (sources_.empty()) {
-            info_box(L"Add files or folders first: + Files, + Folder, Paste, or drag them "
-                     L"onto the list.");
-            return 0;
-        }
-        models::CopyJobOptions base;
-        try {
-            base = collect_options();
-        } catch (const std::exception& ex) {
-            warn_box(storage::fsutil::utf8_to_wide(ex.what()), L"Invalid run setting");
-            return 0;
-        }
-        const bool scan = base.OperationMode == models::JobOperationMode::ScanOnly;
-        std::vector<std::size_t> rows;
-        for (int index : selected_list_indices(sources_list_)) {
-            if (index >= 0 && static_cast<std::size_t>(index) < source_batches_.size()) {
-                rows.push_back(static_cast<std::size_t>(index));
-            }
-        }
-        if (rows.empty()) {
-            for (std::size_t i = 0; i < source_batches_.size(); ++i) rows.push_back(i);
-        }
-        // Each row copies to its own destination. A row added in Assess mode
-        // has none yet, so ask; cancelling adds nothing.
-        if (!scan) {
-            for (std::size_t row : rows) {
-                const auto& items = source_batches_[row].items;
-                if (!sources_[items.front()].destination.empty()) continue;
-                auto picked = pick_destination(L"Choose where to copy this row");
-                if (!picked.has_value()) {
-                    append_log("Nothing added: no destination was chosen.");
-                    return 0;
-                }
-                for (std::size_t index : items) sources_[index].destination = *picked;
-            }
-            InvalidateRect(sources_list_, nullptr, FALSE);
-            sync_path_boxes();
-            update_space_warnings();
-        }
-        struct Pending {
-            std::vector<ui::SourceGroup> groups;
-            std::size_t items = 0;
-            std::wstring destination;
-            std::uint32_t batch = 0;
-            std::string replaces; // job id of the task this row was loaded from
-        };
-        std::vector<Pending> pending;
-        for (std::size_t row : rows) {
-            std::vector<ui::SourceItem> items;
-            for (std::size_t index : source_batches_[row].items) items.push_back(sources_[index]);
-            Pending task;
-            task.batch = source_batches_[row].id;
-            if (auto edited = edited_task_rows_.find(task.batch); edited != edited_task_rows_.end()) {
-                // A running task keeps its definition; the edit becomes a new task.
-                if (!is_active_job(edited->second)) task.replaces = edited->second;
-            }
-            task.groups = ui::group_sources(items);
-            task.items = items.size();
-            if (!scan) task.destination = items.front().destination;
-            if (task.groups.empty()) continue;
-            pending.push_back(std::move(task));
-        }
-        if (pending.empty()) return 0;
-        if (!scan) {
-            // Only parts that land in the same destination can collide.
-            std::vector<std::wstring> collisions;
-            std::vector<std::wstring> checked;
-            for (const auto& task : pending) {
-                auto same = [&](const std::wstring& other) {
-                    return _wcsicmp(other.c_str(), task.destination.c_str()) == 0;
-                };
-                if (std::any_of(checked.begin(), checked.end(), same)) continue;
-                checked.push_back(task.destination);
-                std::vector<ui::SourceGroup> groups;
-                for (const auto& other : pending) {
-                    if (!same(other.destination)) continue;
-                    groups.insert(groups.end(), other.groups.begin(), other.groups.end());
-                }
-                for (auto& name : ui::find_destination_collisions(groups)) {
-                    collisions.push_back(std::move(name));
-                }
-            }
-            if (!collisions.empty()) {
-                std::wstring names;
-                for (const auto& name : collisions) names += L"\n  \x2022 " + name;
-                if (!confirm_box(L"These names come from more than one source folder and would be "
-                                 L"written to the same place in the destination:" + names +
-                                     L"\n\nThe later part would overwrite or merge into the earlier "
-                                     L"one, as the overwrite policy decides. Add anyway?",
-                                 L"XactCopy - Name collision", ui::MessageIcon::Warning)) {
-                    return 0;
-                }
-            }
-            for (auto it = checked.rbegin(); it != checked.rend(); ++it) {
-                remember_destination(storage::fsutil::wide_to_utf8(*it));
-            }
-        }
-        int added = 0;
-        int updated = 0;
-        std::vector<std::uint32_t> used; // rows that became (or updated) a task
-        for (const auto& task : pending) {
-            models::CopyJobOptions options = base;
-            if (!scan) options.DestinationRoot = storage::fsutil::wide_to_utf8(task.destination);
-            options.SourceRoot = storage::fsutil::wide_to_utf8(task.groups[0].root);
-            options.SelectedRelativePaths = task.groups[0].relative_paths;
-            std::vector<storage::ManagedJobPart> parts;
-            for (std::size_t g = 1; g < task.groups.size(); ++g) {
-                parts.push_back({storage::fsutil::wide_to_utf8(task.groups[g].root),
-                                 task.groups[g].relative_paths});
-            }
-            auto saved = job_manager_.add_task(
-                ui::task_title_for_parts(options, task.items, task.groups.size()), options, std::move(parts),
-                pinned, task.replaces);
-            if (!saved.has_value()) {
-                warn_box(L"The task could not be saved to the job catalog." +
-                             (job_manager_.load_warning().empty()
-                                  ? std::wstring()
-                                  : L"\n\n" + storage::fsutil::utf8_to_wide(job_manager_.load_warning())),
-                         L"XactCopy");
-                break;
-            }
-            if (queue) job_manager_.enqueue_job(saved->JobId, /*front*/ false, "builder");
-            if (!task.replaces.empty() && saved->JobId == task.replaces) ++updated;
-            else ++added;
-            used.push_back(task.batch);
-            edited_task_rows_.erase(task.batch);
-        }
-        if (used.empty()) return 0;
-        // The rows now live in their tasks; take them off the list. Rows whose
-        // task could not be saved stay, as do other rows, the destination, and
-        // the options ("Edit in builder" brings a task's items back).
-        std::erase_if(sources_, [&](const ui::SourceItem& item) {
-            return std::find(used.begin(), used.end(), item.batch) != used.end();
-        });
-        SendMessageW(sources_list_, LB_SETSEL, FALSE, -1);
-        sources_changed();
-        if (added > 0) {
-            append_log("Added " + std::to_string(added) + (added == 1 ? " task" : " tasks") +
-                       (queue ? " to the queue." : "."));
-        }
-        if (updated > 0) {
-            append_log("Updated " + std::to_string(updated) + (updated == 1 ? " task" : " tasks") +
-                       " edited in the builder" + (queue ? " and queued them." : "."));
-        }
-        set_pane_view(PaneView::Tasks);
-        refresh_pane_data();
-        if (queue) run_next_in_queue();
-        return added + updated;
     }
 
     // ---- Running the queue ----
@@ -4059,7 +3919,7 @@ private:
         active_->managed_run_id = active_managed_run_id_;
         active_->state = paused_ ? ui::TaskState::Paused : ui::TaskState::Running;
         active_->progress = 0.0;
-        set_detail_heading(L"Running: " + storage::fsutil::utf8_to_wide(
+        set_detail_heading(L"Now running: " + storage::fsutil::utf8_to_wide(
                                               active_->display_name.empty()
                                                   ? ui::task_title(active_->options)
                                                   : active_->display_name));
@@ -4199,7 +4059,6 @@ private:
                         L"P&in (always keep)");
             AppendMenuW(menu, flag(any), IdCtxRename, L"Re&name...");
             AppendMenuW(menu, flag(any), IdCtxDuplicate, L"D&uplicate");
-            AppendMenuW(menu, flag(any), IdCtxEdit, L"&Edit in builder");
             AppendMenuW(menu, flag(any && job->Options.OperationMode == models::JobOperationMode::Copy),
                         IdCtxOpenDestination, L"&Open destination");
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -4281,14 +4140,6 @@ private:
                     refresh_pane_data();
                 }
                 return;
-            case IdCtxEdit:
-                if (const auto* job = selected_job()) {
-                    const std::string name = job->Name;
-                    load_task_into_builder(*job);
-                    append_log("Loaded '" + name + "' into the builder with its options. "
-                               "Add it to tasks again to update it.");
-                }
-                return;
             case IdCtxOpenDestination:
                 if (const auto* job = selected_job(); job != nullptr && !ui_is_blank(job->Options.DestinationRoot)) {
                     open_folder_in_explorer(storage::fsutil::utf8_to_wide(job->Options.DestinationRoot));
@@ -4359,69 +4210,6 @@ private:
             default:
                 return;
         }
-    }
-
-    // Puts every part of a task into the builder as one more row and sets the
-    // options to the task's. Rows already in the list stay. Adding that row
-    // again updates this task instead of making a second one.
-    void load_task_into_builder(const storage::ManagedJob& job) {
-        for (const auto& [batch, job_id] : edited_task_rows_) {
-            const bool listed = std::any_of(sources_.begin(), sources_.end(),
-                                            [batch = batch](const ui::SourceItem& item) {
-                                                return item.batch == batch;
-                                            });
-            if (listed && job_id == job.JobId) {
-                select_source_batches({batch});
-                return;
-            }
-        }
-        std::vector<ui::SourceItem> items;
-        const std::uint32_t batch = next_source_batch_++;
-        for (std::size_t part = 0; part < ui::JobManagerService::part_count(job); ++part) {
-            for (auto item : ui::items_from_options(ui::JobManagerService::part_options(job, part))) {
-                const auto already = std::find_if(sources_.begin(), sources_.end(),
-                                                  [&](const ui::SourceItem& other) {
-                                                      return _wcsicmp(other.path.c_str(), item.path.c_str()) == 0;
-                                                  });
-                if (already != sources_.end()) {
-                    info_box(L"This task's item is already in the list:\n" + item.path +
-                             L"\n\nRemove that row first, then edit the task again.");
-                    return;
-                }
-                // The task stores names only; whether each is a folder is read now.
-                if (!item.contents_only) {
-                    const DWORD attributes =
-                        GetFileAttributesW(storage::fsutil::long_path(item.path).c_str());
-                    item.is_directory = attributes != INVALID_FILE_ATTRIBUTES &&
-                                        (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                }
-                item.batch = batch;
-                item.destination = storage::fsutil::utf8_to_wide(job.Options.DestinationRoot);
-                items.push_back(std::move(item));
-            }
-        }
-        apply_run_settings_to_ui(job.Options);
-        sources_.insert(sources_.end(), std::make_move_iterator(items.begin()),
-                        std::make_move_iterator(items.end()));
-        edited_task_rows_[batch] = job.JobId;
-        sources_changed();
-        select_source_batches({batch});
-    }
-
-    // An elevated relaunch takes over the list the other window was building.
-    void restore_handed_off_builder(const std::vector<ui::elevation::HandoffBuilderItem>& builder) {
-        std::vector<ui::SourceItem> items;
-        for (const auto& saved : builder) {
-            ui::SourceItem item;
-            item.path = storage::fsutil::utf8_to_wide(saved.Path);
-            item.is_directory = saved.IsDirectory;
-            item.contents_only = saved.ContentsOnly;
-            item.batch = saved.Batch;
-            item.destination = storage::fsutil::utf8_to_wide(saved.Destination);
-            next_source_batch_ = std::max(next_source_batch_, saved.Batch + 1);
-            items.push_back(std::move(item));
-        }
-        set_sources(std::move(items));
     }
 
     // Moves pre-catalog session tasks (session-tasks.json) into the catalog as
@@ -4531,21 +4319,16 @@ private:
         auto* self = reinterpret_cast<MainWindow*>(data);
         if (message == WM_KEYDOWN) {
             const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-            if (control == self->sources_list_) {
-                if (wparam == VK_DELETE) { self->remove_selected_sources(); return 0; }
-                if (wparam == 'V' && ctrl) {
+            if (control == self->tasks_list_) {
+                const bool tasks = self->pane_view_ == PaneView::Tasks;
+                if (wparam == VK_ESCAPE && tasks) {
+                    self->deselect_task();
+                    return 0;
+                }
+                if (wparam == 'V' && ctrl && tasks) {
                     self->paste_sources();
                     return 0;
                 }
-                if (wparam == 'A' && ctrl) {
-                    SendMessageW(control, LB_SETSEL, TRUE, -1);
-                    // LB_SETSEL sends no LBN_SELCHANGE; the boxes must follow.
-                    self->update_sources_footer();
-                    self->sync_path_boxes();
-                    return 0;
-                }
-            } else if (control == self->tasks_list_) {
-                const bool tasks = self->pane_view_ == PaneView::Tasks;
                 if (wparam == VK_DELETE) {
                     self->on_pane_command(tasks ? IdCtxRemove : IdCtxDeleteRun);
                     return 0;
@@ -4560,13 +4343,17 @@ private:
                 }
             }
         }
-        if (message == WM_GETDLGCODE && (wparam == VK_RETURN || wparam == VK_DELETE)) {
+        if (message == WM_GETDLGCODE && (wparam == VK_RETURN || wparam == VK_DELETE || wparam == VK_ESCAPE)) {
             return DLGC_WANTALLKEYS;
         }
         if (message == WM_CONTEXTMENU) {
-            if (control == self->sources_list_) self->show_sources_context_menu(lparam);
-            else self->show_pane_context_menu(lparam);
+            self->show_pane_context_menu(lparam);
             return 0;
+        }
+        if (message == WM_LBUTTONDOWN &&
+            HIWORD(SendMessageW(control, LB_ITEMFROMPOINT, 0, lparam)) != 0) {
+            // A click below the last row shows the New task settings.
+            if (self->pane_view_ == PaneView::Tasks) self->deselect_task();
         }
         if (message == WM_RBUTTONDOWN) {
             // Select the row under the cursor before the context menu opens.
@@ -4577,21 +4364,18 @@ private:
                     SendMessageW(control, LB_SETCURSEL, index, 0);
                     self->update_pane_toolbar();
                     if (self->pane_view_ == PaneView::History) self->refresh_history_details();
-                } else if (SendMessageW(control, LB_GETSEL, index, 0) <= 0) {
-                    SendMessageW(control, LB_SETSEL, FALSE, -1);
-                    SendMessageW(control, LB_SETSEL, TRUE, index);
-                    self->update_sources_footer();
-                    self->sync_path_boxes();
+                    else self->sync_panel_to_selection();
                 }
             } else if (control == self->tasks_list_) {
                 // Below the last row: the menu must not act on an earlier pick.
                 SendMessageW(control, LB_SETCURSEL, static_cast<WPARAM>(-1), 0);
                 self->update_pane_toolbar();
                 if (self->pane_view_ == PaneView::History) self->refresh_history_details();
+                else self->sync_panel_to_selection();
             }
         }
         if (message == WM_NCDESTROY) {
-            RemoveWindowSubclass(control, &panel_list_subclass, control == self->sources_list_ ? 2 : 3);
+            RemoveWindowSubclass(control, &panel_list_subclass, 3);
         }
         return DefSubclassProc(control, message, wparam, lparam);
     }
@@ -4685,18 +4469,20 @@ private:
         };
         draw(log_splitter_, true, splitter_drag_ == SplitterDrag::Log);
         draw(column_splitter_, false, splitter_drag_ == SplitterDrag::Columns);
+        // Not a splitter: a plain hairline above the Now running card.
+        ui::themedraw::fill_rect(dc, card_separator_, line);
     }
 
     // ---- Layout ------------------------------------------------------------
 
-    // Two columns above a full-width log. Left, the task builder: the Copy /
-    // Assess switch, the item list, destination (copy only), the three
-    // mode-specific choices with captions, the collapsible options, and the
-    // actions. Right, the task list and the running task's detail. Each
-    // column is laid out by one function that can measure without moving
-    // anything, so the fixed parts are known exactly and only the two lists
-    // and the log flex; required_client_height_ keeps the window from going
-    // below what the current mode and options need.
+    // Two columns above a full-width log. Left, the task list: Tasks |
+    // History, then the next add's Action, the add buttons, and the selected
+    // task's actions, then the list. Right, the selected task's settings
+    // (History: the selected run's details) above the Now running card, which
+    // sits at the bottom and holds a run's figures once one has started. Each column is laid out by one function that can
+    // measure without moving anything, so only the list, the run details, and
+    // the log flex; required_client_height_ keeps the window from going below
+    // what the current mode, options, and card need.
     void layout() {
         RECT client;
         GetClientRect(hwnd_, &client);
@@ -4708,20 +4494,22 @@ private:
         const int gap = scale(8);
         const int section_gap = scale(14);
         const int column_gap = scale(20);
-        const int button_height = scale(30);
         const int label_height = scale(18);
         const int tab_height = scale(30);
-        const int list_floor = scale(72);
+        const int list_floor = scale(120);
         const int client_width = static_cast<int>(client.right - client.left) - margin * 2;
         const int client_height = static_cast<int>(client.bottom - client.top);
         const bool scan = is_scan_mode();
+        const bool tasks_view = pane_view_ == PaneView::Tasks;
+        const bool busy = task_busy();
+        card_busy_ = busy;
 
-        const int min_left = scale(400);
-        const int max_left = std::max(min_left, client_width - column_gap - scale(380));
+        const int min_left = scale(700);
+        const int max_left = std::max(min_left, client_width - column_gap - scale(400));
         const int left_width =
             left_column_permille_ > 0
                 ? std::clamp(client_width * left_column_permille_ / 1000, min_left, max_left)
-                : std::clamp((client_width - column_gap) * 46 / 100, min_left, max_left);
+                : std::clamp((client_width - column_gap) * 50 / 100, min_left, max_left);
         const int right_width = std::max(scale(200), client_width - left_width - column_gap);
 
         int origin_x = margin;
@@ -4748,19 +4536,68 @@ private:
             if (commit && handle != nullptr) ShowWindow(handle, visible ? SW_SHOW : SW_HIDE);
         };
 
-        // Both lists start at the same height: the add buttons share a row
-        // with the "What to copy" heading when the column is wide enough, and
-        // the task list's toolbar row mirrors that.
-        const int files_width = scale(66);
-        const int folder_width = scale(78);
-        const int paste_width = scale(58);
-        const int clear_width = scale(56);
-        const int buttons_width = files_width + folder_width + paste_width + clear_width + gap * 3;
-        const bool one_row = left_width >= buttons_width + scale(104) + gap;
-        const int header_height = one_row ? row_height : row_height * 2 + scale(4);
-
         // ---- Left column: returns its height for a given list height ----
-        // Each mode's options, in display order (two per row).
+        auto left_column = [&](int list_height) {
+            origin_x = margin;
+            y = margin;
+            const int width = left_width;
+
+            const int tab_width = std::min(width / 2, scale(150));
+            place(tasks_tab_, 0, tab_width, tab_height);
+            place(history_tab_, tab_width - 1, tab_width + 1, tab_height);
+            y += tab_height + section_gap;
+
+            // Tasks: the add buttons, then the selected task's actions on the
+            // right. History: as many of its actions as fit, most important first.
+            for (HWND control : {add_mode_combo_, source_add_files_, source_browse_, source_paste_,
+                                 primary_task_button_, secondary_task_button_, remove_task_button_,
+                                 hold_queue_check_}) {
+                show(control, tasks_view);
+            }
+            if (tasks_view) {
+                const int action_combo_width = scale(140);
+                const int files_width = scale(66);
+                const int folder_width = scale(78);
+                const int paste_width = scale(58);
+                int x = 0;
+                place(add_mode_combo_, x, action_combo_width, row_height * 8);
+                x += action_combo_width + gap;
+                place(source_add_files_, x, files_width);
+                x += files_width + gap;
+                place(source_browse_, x, folder_width);
+                x += folder_width + gap;
+                place(source_paste_, x, paste_width);
+                const int action_width = scale(78);
+                const int hold_width = scale(60);
+                int right = width - hold_width;
+                place(hold_queue_check_, right, hold_width);
+                right -= gap + action_width;
+                place(remove_task_button_, right, action_width);
+                right -= gap + action_width;
+                place(secondary_task_button_, right, action_width);
+                right -= gap + action_width;
+                place(primary_task_button_, right, action_width);
+            }
+            const std::pair<HWND, int> history_buttons[] = {
+                {history_resume_button_, scale(86)}, {history_journal_button_, scale(86)},
+                {history_report_button_, scale(86)}, {history_map_button_, scale(96)},
+                {history_delete_button_, scale(78)}};
+            int hx = 0;
+            for (const auto& [button, button_width] : history_buttons) {
+                const bool fits = hx + button_width <= width;
+                show(button, !tasks_view && fits);
+                if (!tasks_view && fits) place(button, hx, button_width);
+                hx += button_width + gap;
+            }
+            y += row_height + scale(6);
+            place(tasks_list_, 0, width, list_height);
+            y += list_height + scale(3);
+            place(pane_footer_, 0, width, label_height);
+            y += label_height;
+            return y - margin;
+        };
+
+        // ---- Right column, top: the settings panel; returns its height ----
         HWND option_checks[] = {salvage_check_,    resume_check_,    map_check_,
                                 skip_known_bad_check_, adaptive_check_, continue_check_,
                                 wait_media_check_, fragile_check_};
@@ -4772,50 +4609,61 @@ private:
         const int option_rows = (static_cast<int>(std::size(option_checks)) + 1) / 2;
         HWND option_fields[] = {buffer_label_,  buffer_edit_,   retries_label_,
                                 retries_edit_,  timeout_label_, timeout_edit_};
-        auto left_column = [&](int sources_height) {
-            origin_x = margin;
+        HWND panel_controls[] = {source_label_, mode_label_, mode_combo_, sources_footer_,
+                                 profile_label_, engine_combo_, read_method_label_, read_method_combo_,
+                                 verify_label_, verify_combo_};
+        const bool task_shown = showing_task();
+        auto settings_panel = [&]() {
+            origin_x = margin + left_width + column_gap;
             y = margin;
-            const int width = left_width;
+            const int width = right_width;
+            for (HWND control : panel_controls) show(control, tasks_view);
+            for (HWND control : {source_path_label_, source_path_edit_, source_path_browse_}) {
+                show(control, tasks_view && task_shown);
+            }
+            for (HWND control : {destination_label_, destination_edit_, destination_browse_,
+                                 recent_destinations_button_, policy_label_, overwrite_combo_}) {
+                show(control, tasks_view && !scan);
+            }
+            show(scan_info_label_, tasks_view && scan);
+            if (!tasks_view) {
+                for (HWND control : option_checks) show(control, false);
+                for (HWND control : option_fields) show(control, false);
+                show(contents_check_, false);
+                return 0;
+            }
 
-            // Copy / Assess segmented switch.
-            const int tab_width = std::min(width / 2, scale(180));
-            place(mode_copy_tab_, 0, tab_width, tab_height);
-            place(mode_scan_tab_, tab_width - 1, tab_width + 1, tab_height);
+            // Heading (the task's name, or New task settings), level with the
+            // Tasks | History switch, then its Action, level with the toolbar.
+            place(source_label_, 0, width, tab_height);
             y += tab_height + section_gap;
+            const int label_width = scale(78);
+            const int browse_width = scale(84);
+            place(mode_label_, 0, label_width);
+            place(mode_combo_, label_width, std::min(scale(200), width - label_width), row_height * 8);
+            y += row_height + scale(6) + gap;
 
-            // Heading + add buttons; the buttons drop to their own row when
-            // the column is too narrow for both.
-            place(source_label_, 0, one_row ? width - buttons_width - gap : width, row_height);
-            if (!one_row) y += row_height + scale(4);
-            int x = width;
-            x -= clear_width;          place(clear_selection_, x, clear_width);
-            x -= gap + paste_width;    place(source_paste_, x, paste_width);
-            x -= gap + folder_width;   place(source_browse_, x, folder_width);
-            x -= gap + files_width;    place(source_add_files_, x, files_width);
-            y += row_height + scale(6);
-
-            place(sources_list_, 0, width, sources_height);
-            y += sources_height + scale(4);
-            // Footer text, with Add to tasks beside it: it acts on these rows.
-            const int add_width = scale(112);
-            place(sources_footer_, 0, std::max(0, width - add_width - gap), row_height);
-            place(add_task_button_, width - add_width, add_width);
-            y += row_height + section_gap;
-
-            // The destination row's slot is kept in Assess mode (a note
-            // fills it) so switching modes never moves the lists.
-            {
-                const int label_width = scale(78);
-                const int browse_width = scale(84);
+            if (task_shown) {
                 place(source_path_label_, 0, label_width);
                 place(source_path_edit_, label_width, width - label_width - browse_width - gap);
                 place(source_path_browse_, width - browse_width, browse_width);
+                y += row_height + scale(2);
+                // Size summary, with "contents only" beside it for a one-folder task.
+                const int contents_width = std::min(scale(270), width / 2);
+                place(sources_footer_, label_width, width - label_width - contents_width - gap,
+                      label_height + scale(4));
+                place(contents_check_, width - contents_width, contents_width, label_height + scale(4));
+                y += label_height + scale(4) + gap;
+            } else {
+                // The New task settings: what they are for, in the Source row.
+                place(sources_footer_, 0, width, row_height);
                 y += row_height + gap;
             }
+
+            // The destination row's slot is kept in Assess mode (a note
+            // fills it) so switching modes never moves the controls below.
             place(scan_info_label_, 0, width);
             {
-                const int label_width = scale(78);
-                const int browse_width = scale(84);
                 const int recent_width = scale(26);
                 const int edit_width = width - label_width - browse_width - recent_width - gap;
                 place(destination_label_, 0, label_width);
@@ -4859,12 +4707,9 @@ private:
             }
 
             y += scale(4);
-            place(options_toggle_, 0, width);
-            y += row_height + gap;
-
             for (HWND control : option_checks) show(control, false);
-            for (HWND control : option_fields) show(control, options_expanded_);
-            if (options_expanded_) {
+            for (HWND control : option_fields) show(control, true);
+            {
                 std::vector<HWND> visible;
                 for (HWND control : option_checks) {
                     if (scan && copy_only(control)) continue;
@@ -4897,64 +4742,41 @@ private:
                 place_field(timeout_label_, timeout_edit_);
                 y += row_height + gap;
             }
-
             return y - margin;
         };
 
-        // ---- Right column: returns its height for a given tasks height ----
-        auto right_column = [&](int tasks_height) {
+        // ---- Right column, bottom: the Now running card from `top`; returns
+        // its height. Its bars, figures, and telemetry are always shown (a
+        // finished run's stay until the next), with Pause / Stop while one
+        // runs. ----
+        const int bar_height = scale(bar_show_percentage_
+                                         ? std::max(progress_bar_height_logical_, 14)
+                                         : progress_bar_height_logical_);
+        auto run_card = [&](int top, bool running) {
             origin_x = margin + left_width + column_gap;
-            y = margin;
+            y = top;
             const int width = right_width;
-
-            // Tasks | History switch, level with Copy | Assess.
-            const int tab_width = std::min(width / 2, scale(150));
-            place(tasks_tab_, 0, tab_width, tab_height);
-            place(history_tab_, tab_width - 1, tab_width + 1, tab_height);
-            y += tab_height + section_gap;
-            // The view's actions, level with the add buttons opposite.
-            y += header_height - row_height;
-            {
-                const bool tasks_view = pane_view_ == PaneView::Tasks;
-                for (HWND control : {primary_task_button_, secondary_task_button_, hold_queue_check_}) {
-                    show(control, tasks_view);
-                }
-                const int narrow = scale(88);
-                if (tasks_view) {
-                    place(primary_task_button_, 0, narrow);
-                    place(secondary_task_button_, narrow + gap, narrow);
-                    const int hold_width = scale(70);
-                    place(hold_queue_check_, width - hold_width, hold_width);
-                }
-                // History: as many of its actions as fit, most important first.
-                const std::pair<HWND, int> history_buttons[] = {
-                    {history_resume_button_, scale(86)}, {history_journal_button_, scale(86)},
-                    {history_report_button_, scale(86)}, {history_map_button_, scale(96)},
-                    {history_delete_button_, scale(78)}};
-                int hx = 0;
-                for (const auto& [button, button_width] : history_buttons) {
-                    const bool fits = hx + button_width <= width;
-                    show(button, !tasks_view && fits);
-                    if (!tasks_view && fits) place(button, hx, button_width);
-                    hx += button_width + gap;
-                }
+            const int action_width = scale(76);
+            int heading_width = width;
+            show(pause_button_, running);
+            show(cancel_button_, running);
+            if (running) {
+                int right = width - action_width;
+                place(cancel_button_, right, action_width);
+                right -= gap + action_width;
+                place(pause_button_, right, action_width);
+                heading_width = right - gap;
             }
-            y += row_height + scale(6);
-            place(tasks_list_, 0, width, tasks_height);
-            y += tasks_height + scale(3);
-            place(pane_footer_, 0, width, label_height);
-            y += label_height + section_gap;
-            const int detail_top = y;
+            place(detail_label_, 0, heading_width, row_height + scale(6));
+            y += row_height + scale(6) + scale(4);
 
-            // Running task: heading, then detail (Pause / Stop are on the
-            // Tasks toolbar for the running row).
-            place(detail_label_, 0, width, button_height);
-            y += button_height + scale(4);
+            for (HWND control : {current_label_, file_progress_label_, current_bar_, overall_progress_label_,
+                                 overall_bar_, stats_label_, throughput_label_, eta_label_,
+                                 job_summary_label_, journal_label_}) {
+                show(control, true);
+            }
             place(current_label_, 0, width);
             y += row_height;
-            const int bar_height = scale(bar_show_percentage_
-                                             ? std::max(progress_bar_height_logical_, 14)
-                                             : progress_bar_height_logical_);
             const int progress_label_width = scale(56);
             const int progress_row_height = std::max(row_height, bar_height);
             for (auto [label, bar] : {std::pair<HWND, HWND>{file_progress_label_, current_bar_},
@@ -4965,15 +4787,18 @@ private:
                 place(bar, progress_label_width, width - progress_label_width, bar_height);
                 y += progress_row_height - offset + scale(4);
             }
-            place(stats_label_, 0, width, label_height);
-            y += label_height + scale(2);
             const int col_width = (width - gap) / 2;
             auto place_two = [&](HWND left, HWND right) {
                 place(left, 0, col_width, label_height);
                 place(right, col_width + gap, col_width, label_height);
                 y += label_height;
             };
+            place(stats_label_, 0, width, label_height);
+            y += label_height + scale(2);
             place_two(throughput_label_, eta_label_);
+            show(buffer_usage_label_, show_buffer_row_);
+            show(rescue_label_, show_rescue_row_);
+            show(diagnostics_label_, show_diagnostics_);
             if (show_buffer_row_ || show_rescue_row_) {
                 place_two(show_buffer_row_ ? buffer_usage_label_ : nullptr,
                           show_rescue_row_ ? rescue_label_ : nullptr);
@@ -4986,45 +4811,30 @@ private:
                 place(diagnostics_label_, 0, width, label_height);
                 y += label_height;
             }
-            // History shows the selected run in the same space instead.
-            const bool running_view = pane_view_ != PaneView::History;
-            show(pause_button_, false);
-            show(cancel_button_, false);
-            for (HWND control : {detail_label_, current_label_,
-                                 file_progress_label_, current_bar_, overall_progress_label_,
-                                 overall_bar_, stats_label_, throughput_label_, eta_label_,
-                                 job_summary_label_, journal_label_}) {
-                show(control, running_view);
-            }
-            show(buffer_usage_label_, running_view && show_buffer_row_);
-            show(rescue_label_, running_view && show_rescue_row_);
-            show(diagnostics_label_, running_view && show_diagnostics_);
-            show(history_details_, !running_view);
-            if (!running_view) {
-                const int detail_bottom = y;
-                y = detail_top;
-                place(history_details_, 0, width, std::max(scale(40), detail_bottom - detail_top));
-                y = detail_bottom;
-            }
-            return y - margin;
+            return y - top;
         };
 
         // ---- Measure, then split the height ----
         const int left_fixed = left_column(0);
-        const int right_fixed = right_column(0);
+        const int panel_height = settings_panel();
+        // Room is kept for the running card, so starting a task never needs
+        // a bigger window.
+        const int card_room = run_card(0, true);
+        const int history_floor = scale(120);
+        const int right_fixed =
+            (tasks_view ? panel_height : tab_height + section_gap + history_floor) + section_gap + card_room;
         const int status_height = row_height;
         const int log_toolbar_height = row_height;
         const int min_log = scale(100);
         const int bottom_fixed = gap + log_toolbar_height + gap + gap + status_height;
-        const int top_min = std::max(left_fixed, right_fixed) + list_floor;
+        const int top_min = std::max(left_fixed + list_floor, right_fixed);
         required_client_height_ = margin * 2 + top_min + bottom_fixed + min_log;
 
         const int body = client_height - margin * 2;
-        // The lists get a useful height (list_target) before the log grows
-        // past its minimum; beyond that the split is two-thirds / one-third.
-        const int list_target = scale(160);
-        int top_height = std::max({top_min, (body - bottom_fixed) * 66 / 100,
-                                   std::max(left_fixed, right_fixed) + list_target});
+        // The list gets a useful height before the log grows past its
+        // minimum; beyond that the split is two-thirds / one-third.
+        const int list_target = scale(220);
+        int top_height = std::max({top_min, (body - bottom_fixed) * 66 / 100, left_fixed + list_target});
         if (log_area_logical_ > 0) {
             top_height = client_height - margin * 2 - scale(log_area_logical_);
         }
@@ -5034,12 +4844,25 @@ private:
         column_splitter_ = {margin + left_width, margin, margin + left_width + column_gap,
                             margin + top_height};
 
-        // One height for both lists, so they line up top and bottom.
         commit = true;
-        const int list_height = std::max(list_floor, top_height - std::max(left_fixed, right_fixed));
-        left_column(list_height);
-        right_column(list_height);
-        show(mode_combo_, false);
+        left_column(std::max(scale(40), top_height - left_fixed));
+        settings_panel();
+        const int card_height = run_card(0, busy);
+        commit = false;
+        const int card_top = margin + top_height - card_height;
+        commit = true;
+        run_card(card_top, busy);
+        const int card_left = margin + left_width + column_gap;
+        card_separator_ = {card_left, card_top - section_gap / 2 - 1, card_left + right_width,
+                           card_top - section_gap / 2};
+        // History: the selected run's details fill the space above the card.
+        show(history_details_, !tasks_view);
+        if (!tasks_view) {
+            origin_x = margin + left_width + column_gap;
+            y = margin + tab_height + section_gap;
+            place(history_details_, 0, right_width, std::max(scale(40), card_top - section_gap - y));
+        }
+        update_contents_check();
 
         // ---- Bottom: log ----
         origin_x = margin;
@@ -5096,21 +4919,12 @@ private:
         if (id == IdLogCopySelected) { copy_log(false); return; }
         if (id == IdLogCopyAll) { copy_log(true); return; }
         if (id == IdLogSave) { save_log(); return; }
-        // The collapsed Options header summarises the current option values.
-        if (options_toggle_ != nullptr && !options_expanded_ && id != IdOptionsToggle) {
-            InvalidateRect(options_toggle_, nullptr, FALSE);
-        }
         if (id == IdPauseListCheck && notification == BN_CLICKED) {
             set_queue_held(!queue_held_);
             return;
         }
         if ((id == IdTasksTab || id == IdHistoryTab) && notification == BN_CLICKED) {
             set_pane_view(id == IdTasksTab ? PaneView::Tasks : PaneView::History);
-            return;
-        }
-        if (id == IdSourcesList && notification == LBN_SELCHANGE) {
-            update_sources_footer();
-            sync_path_boxes();
             return;
         }
         if (id == IdSourcePathEdit && notification == EN_KILLFOCUS) {
@@ -5124,11 +4938,11 @@ private:
         if (id == IdTasksList && notification == LBN_SELCHANGE) {
             update_pane_toolbar();
             if (pane_view_ == PaneView::History) refresh_history_details();
+            else sync_panel_to_selection();
             return;
         }
-        if (id == IdTasksList && notification == LBN_DBLCLK) {
-            // Safe on a double-click: never starts a copy.
-            if (pane_view_ == PaneView::Tasks) on_pane_command(IdCtxEdit);
+        if (id == IdTaskRemoveButton) {
+            on_pane_command(IdCtxRemove);
             return;
         }
         if (id == IdHistoryReportButton || id == IdHistoryMapButton || id == IdHistoryDeleteButton) {
@@ -5142,37 +4956,65 @@ private:
             on_pane_command(id);
             return;
         }
-        if (id >= IdSourceRemove && id <= IdSourceCopyPath) {
-            on_source_command(id);
+        if (id == IdAddModeCombo && notification == CBN_SELCHANGE) {
+            // The next add's Action; the panel follows when it shows the New
+            // task settings, and a shown task keeps its own.
+            const bool scan = SendMessageW(add_mode_combo_, CB_GETCURSEL, 0, 0) == 1;
+            new_task_scan_ = scan;
+            if (!showing_task()) select_mode(scan);
             return;
         }
         if (id == IdModeCombo && notification == CBN_SELCHANGE) {
+            const bool scan = is_scan_mode();
             sync_mode_ui(true);
+            // A task switched to Copy needs somewhere to copy to.
+            if (shown_task_editable() && !scan && !sources_.empty() && sources_.front().destination.empty()) {
+                auto picked = pick_destination(L"Choose where to copy this task");
+                if (!picked.has_value()) {
+                    select_mode(true);
+                    return;
+                }
+                for (auto& item : sources_) item.destination = *picked;
+                sync_path_boxes();
+                update_space_warnings();
+            }
+            request_task_save();
             return;
         }
-        if ((id == IdModeCopyTab || id == IdModeScanTab) && notification == BN_CLICKED) {
-            select_mode(id == IdModeScanTab);
+        if (id == IdContentsCheck && notification == BN_CLICKED) {
+            if (sources_.size() == 1 && sources_[0].path.size() > 3) {
+                sources_[0].contents_only = !sources_[0].contents_only;
+                sources_changed();
+                request_task_save();
+            }
             return;
         }
         if (id == IdEngineCombo && notification == CBN_SELCHANGE && !is_scan_mode()) {
             apply_copy_profile(static_cast<int>(
                 SendMessageW(engine_combo_, CB_GETCURSEL, 0, 0)));
+            request_task_save();
             return;
         }
         if (is_checkbox_id(id) && notification == BN_CLICKED) {
             set_check(id, !get_check(id));
             if (id == IdFragileCheck) sync_scan_profile_lock();
             mark_copy_profile_custom();
+            request_task_save();
             return;
         }
-        if (!is_scan_mode() && notification == CBN_SELCHANGE &&
-            (id == IdOverwriteCombo || id == IdVerifyCombo || id == IdReadMethodCombo)) {
-            mark_copy_profile_custom();
+        if (notification == CBN_SELCHANGE &&
+            (id == IdEngineCombo || id == IdOverwriteCombo || id == IdVerifyCombo || id == IdReadMethodCombo)) {
+            if (!is_scan_mode()) mark_copy_profile_custom();
+            request_task_save();
             return;
         }
         if (!is_scan_mode() && notification == EN_CHANGE &&
             (id == IdBufferEdit || id == IdRetriesEdit || id == IdTimeoutEdit)) {
             mark_copy_profile_custom();
+        }
+        if (notification == EN_KILLFOCUS && (id == IdBufferEdit || id == IdRetriesEdit || id == IdTimeoutEdit)) {
+            request_task_save();
+            return;
         }
         switch (id) {
             case IdSourceBrowse:
@@ -5184,9 +5026,6 @@ private:
             case IdSourcePaste:
                 paste_sources();
                 break;
-            case IdClearSelection:
-                set_sources({});
-                break;
             case IdSourcePathBrowse:
                 browse_row_sources();
                 break;
@@ -5196,15 +5035,6 @@ private:
                 break;
             case IdRecentDestinations:
                 show_recent_destinations();
-                break;
-            case IdOptionsToggle:
-                set_options_expanded(!options_expanded_);
-                break;
-            case IdAddTaskButton:
-                add_tasks_from_builder(/*queue*/ false);
-                break;
-            case IdStartButton:
-                start_job();
                 break;
             case IdPauseButton:
                 if (paused_) supervisor_.resume_job("");
@@ -5239,7 +5069,7 @@ private:
                 ui::AboutDialog::show(hwnd_, theme_, settings_, IdMenuCheckUpdates);
                 break;
             case IdMenuStartCopy:
-                start_job();
+                queue_selected_task();
                 break;
             case IdMenuPauseCopy:
                 supervisor_.pause_job("");
@@ -5260,9 +5090,6 @@ private:
             case IdMenuExit:
                 PostMessageW(hwnd_, WM_CLOSE, 0, 0);
                 break;
-            case IdMenuScanBadBlocks:
-                queue_assessment_tasks();
-                break;
             case IdMenuInspectBadMap:
                 inspect_source_bad_range_map();
                 break;
@@ -5279,9 +5106,6 @@ private:
                     resume_interrupted(*run);
                 }
                 break;
-            case IdMenuSaveAsJob:
-                save_current_as_job();
-                break;
             case IdMenuViewTasks:
                 set_pane_view(PaneView::Tasks);
                 break;
@@ -5294,6 +5118,12 @@ private:
                 break;
             case IdMenuCheckUpdates:
                 check_for_updates(/*show_dialog*/ true);
+                break;
+            case IdMenuImportTasks:
+                if (const auto path = pick_task_file(/*save*/ false)) import_tasks(*path);
+                break;
+            case IdMenuExportTasks:
+                export_tasks();
                 break;
             default:
                 break;
@@ -5321,29 +5151,6 @@ private:
         SetWindowTextW(status_label_, L"Status: Defaults saved");
         info_box(L"The current run settings were saved as defaults for future runs.");
     }
-
-    // Tasks > Add as Pinned Tasks: Add to tasks, pinned.
-    // Tools > Queue as Assessment Tasks: the selected rows (all when none is
-    // selected) become queued assessments, whatever mode the window is in.
-    void queue_assessment_tasks() {
-        if (sources_.empty()) {
-            info_box(L"Add files or folders to assess first: + Files, + Folder, Paste, or drag "
-                     L"them onto the list.");
-            return;
-        }
-        const bool was_copy = !is_scan_mode();
-        if (was_copy) {
-            SendMessageW(mode_combo_, CB_SETCURSEL, 1, 0);
-            sync_mode_ui();
-        }
-        start_job();
-        if (was_copy) {
-            SendMessageW(mode_combo_, CB_SETCURSEL, 0, 0);
-            sync_mode_ui();
-        }
-    }
-
-    void save_current_as_job() { add_tasks_from_builder(/*queue*/ false, /*pinned*/ true); }
 
     void resume_managed_run(const std::string& run_id) {
         if (task_busy()) {
@@ -5381,7 +5188,6 @@ private:
                              warning +
                              "\n\nThe source, destination, and operation type were recovered. Review the restored controls before continuing. Resume now?"),
                          L"Legacy run settings", ui::MessageIcon::Warning)) {
-            apply_run_options_to_ui(options);
             return;
         }
 
@@ -5393,7 +5199,6 @@ private:
         }
         options.ResumeFromJournal = true;
         options.ResumeJournalPathHint = journal_path;
-        apply_run_settings_to_ui(options);
         append_log("Resuming run '" + run->DisplayName + "' from " + journal_path + ".");
         start_job_with(options, true, run->RunId, run->DisplayName);
     }
@@ -5435,74 +5240,34 @@ private:
 
     // ---- Incoming items ------------------------------------------------------
 
-    // Single entry point for launch arguments, a second instance's forwarded
-    // command line, the pickers, and drag-and-drop. Items join the sources list
-    // immediately; a burst of Explorer launches (one per selected item) is
-    // coalesced only for the follow-up: switching to assessment mode and
-    // asking for a destination once.
     void queue_selection(const std::vector<std::wstring>& paths, bool scan_mode,
                          bool want_destination) {
         if (paths.empty()) return;
-        selection_batches_.push_back(next_source_batch_);
-        add_sources(paths);
+        selection_paths_.insert(selection_paths_.end(), paths.begin(), paths.end());
         if (scan_mode) launch_.explorer_scan_mode = true;
         if (want_destination) selection_wants_destination_ = true;
         SetTimer(hwnd_, IdSelectionTimer, SelectionCoalesceMs, nullptr);
         selection_timer_active_ = true;
     }
-
     void commit_selection() {
         KillTimer(hwnd_, IdSelectionTimer);
         selection_timer_active_ = false;
-        const bool want_destination = selection_wants_destination_;
+        const bool from_explorer = selection_wants_destination_;
         selection_wants_destination_ = false;
-        // An Explorer verb names its mode ("Copy with" / "Assess with"), so it
-        // wins over whatever mode the window was in; drops keep the mode.
-        if (want_destination || launch_.explorer_scan_mode) {
-            select_mode(launch_.explorer_scan_mode);
-        }
-        launch_.explorer_scan_mode = false;
+        std::vector<std::wstring> paths = std::move(selection_paths_);
+        selection_paths_.clear();
         if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
         SetForegroundWindow(hwnd_);
-        const auto batches = std::move(selection_batches_);
-        selection_batches_.clear();
-        ask_destination_for(batches);
+        // An Explorer verb names its mode ("Copy with" / "Assess with"), so it
+        // wins over the New task settings' mode; drops keep it.
+        show_new_task_settings_for_add();
+        if (from_explorer || launch_.explorer_scan_mode) select_mode(launch_.explorer_scan_mode);
+        launch_.explorer_scan_mode = false;
+        add_task_from_paths(paths);
     }
-
-    // Rows added by a drop or an Explorer launch: a copy asks once where they
-    // go; cancelling removes them again.
-    void ask_destination_for(const std::vector<std::uint32_t>& batches) {
-        auto in_batches = [&](const ui::SourceItem& item) {
-            return std::find(batches.begin(), batches.end(), item.batch) != batches.end();
-        };
-        const bool needed =
-            !is_scan_mode() &&
-            std::any_of(sources_.begin(), sources_.end(), [&](const ui::SourceItem& item) {
-                return in_batches(item) && item.destination.empty();
-            });
-        if (!needed) {
-            if (!batches.empty()) select_source_batches(batches);
-            return;
-        }
-        auto picked = pick_destination(L"Choose where to copy these items");
-        if (!picked.has_value()) {
-            std::erase_if(sources_, in_batches);
-            sources_changed();
-            append_log("Nothing added: no destination was chosen.");
-            return;
-        }
-        for (auto& item : sources_) {
-            if (in_batches(item) && item.destination.empty()) item.destination = *picked;
-        }
-        InvalidateRect(sources_list_, nullptr, FALSE);
-        select_source_batches(batches);
-        update_space_warnings();
-    }
-
     // Folder picker with multi-select; each folder is added as an item.
     void add_folders_to_sources() {
-        auto picked = pick_paths(/*folders*/ true, L"Add folders to copy");
-        add_sources_asking(picked);
+        add_task_from_paths(pick_paths(/*folders*/ true, L"Make a task from folders"));
     }
 
     // Multi-select shell picker for files or folders.
@@ -5545,7 +5310,7 @@ private:
     }
 
     void add_files_to_selection() {
-        add_sources_asking(pick_paths(/*folders*/ false, L"Add files to copy"));
+        add_task_from_paths(pick_paths(/*folders*/ false, L"Make a task from files"));
     }
 
     // ---- Explorer launch application (--from-explorer[-folder]) ------------
@@ -5574,11 +5339,11 @@ private:
                 append_log("Explorer folder path was not found: " + launch_.explorer_folder_path);
                 return;
             }
-            SendMessageW(mode_combo_, CB_SETCURSEL, launch_.explorer_scan_mode ? 1 : 0, 0);
-            sync_mode_ui();
+            show_new_task_settings_for_add();
+            select_mode(launch_.explorer_scan_mode);
             launch_.explorer_scan_mode = false;
             // The folder-background verb means "this folder's contents".
-            if (add_sources_asking({folder}, /*contents_only*/ true) > 0) {
+            if (add_task_from_paths({folder}, /*contents_only*/ true) > 0) {
                 append_log("Source set from Explorer background folder: " +
                            storage::fsutil::wide_to_utf8(folder));
             }
@@ -5730,22 +5495,6 @@ private:
         }
     }
 
-    // Replaces the builder's list with the run's items, then applies its
-    // settings. Only for putting a run back up for review: starting or
-    // resuming a run must leave the list alone (apply_run_settings_to_ui).
-    void apply_run_options_to_ui(const models::CopyJobOptions& options) {
-        {
-            auto items = ui::items_from_options(options);
-            for (auto& item : items) {
-                item.destination = storage::fsutil::utf8_to_wide(options.DestinationRoot);
-            }
-            set_sources(std::move(items));
-        }
-        SetWindowTextW(destination_edit_,
-                       storage::fsutil::utf8_to_wide(options.DestinationRoot).c_str());
-        apply_run_settings_to_ui(options);
-    }
-
     void apply_run_settings_to_ui(const models::CopyJobOptions& options) {
         custom_transfer_engine_ = options.TransferEnginePolicyValue;
         copy_profile_index_ = 2; // exact persisted options, not a mutable preset
@@ -5864,10 +5613,6 @@ private:
         }
         return options;
     }
-
-    // Start: add tasks for the builder's sources and run the list. While a
-    // task is running the new tasks simply queue behind it.
-    void start_job() { add_tasks_from_builder(/*queue*/ true); }
 
     static void bind_media_identities(models::CopyJobOptions& options) {
         if (options.ExpectedSourceIdentity.empty()) {
@@ -6026,11 +5771,6 @@ private:
         request.RecoveryRunId = from_recovery ? pending_recovery_run_id_ : std::string();
         request.UserSid = ui::elevation::current_user_sid();
         request.CreatedUnixMs = ui::elevation::unix_now_ms();
-        for (const auto& item : sources_) {
-            request.Builder.push_back({storage::fsutil::wide_to_utf8(item.path), item.is_directory,
-                                       item.contents_only, item.batch,
-                                       storage::fsutil::wide_to_utf8(item.destination)});
-        }
 
         append_log("Direct NTFS volume reads need administrator rights. Asking Windows for approval...");
         const std::string token = ui::elevation::write_handoff(request);
@@ -6052,7 +5792,6 @@ private:
         }
 
         outgoing_handoff_ = OutgoingHandoff{std::move(request), token, process, GetTickCount64()};
-        EnableWindow(start_button_, FALSE);
         set_inputs_enabled(false);
         update_menu_state();
         SetWindowTextW(status_label_, L"Status: Handing the run to the administrator window...");
@@ -6126,7 +5865,6 @@ private:
         ui::elevation::discard_handoff(handoff.token);
         ui::elevation::HandoffRequest request = std::move(handoff.request);
         outgoing_handoff_.reset();
-        EnableWindow(start_button_, TRUE);
         set_inputs_enabled(true);
         SetWindowTextW(status_label_, L"Status: Idle");
 
@@ -6167,7 +5905,6 @@ private:
         CloseHandle(handoff.process);
         ui::elevation::HandoffRequest request = std::move(handoff.request);
         outgoing_handoff_.reset();
-        EnableWindow(start_button_, TRUE);
         set_inputs_enabled(true);
         SetWindowTextW(status_label_, L"Status: Idle");
         abandon_handoff_request(request, "stopped while waiting for administrator approval");
@@ -6361,7 +6098,7 @@ private:
         if (message.message != WM_KEYDOWN) return false;
         const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-        if (control && message.wParam == VK_RETURN) { start_job(); return true; }
+        if (control && message.wParam == VK_RETURN) { queue_selected_task(); return true; }
         if (control && message.wParam == 'O') {
             if (shift) add_folders_to_sources();
             else add_files_to_selection();
@@ -6761,7 +6498,6 @@ private:
         set_inputs_enabled(true);
         finish_running_task(result);
         update_menu_state();
-        InvalidateRect(start_button_, nullptr, FALSE);
         InvalidateRect(pause_button_, nullptr, FALSE);
         InvalidateRect(cancel_button_, nullptr, FALSE);
 
@@ -6950,7 +6686,6 @@ private:
         models::CopyJobOptions options = run.Options;
         options.ResumeFromJournal = true;
         if (!run.JournalPath.empty()) options.ResumeJournalPathHint = run.JournalPath;
-        apply_run_settings_to_ui(options);
         append_log("Restored exact " +
                    std::string(options.OperationMode == models::JobOperationMode::ScanOnly
                                    ? "assessment"

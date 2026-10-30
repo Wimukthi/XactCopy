@@ -78,22 +78,23 @@ file next to every asset so you can verify the download.
 
 ## Quick start
 
-1. Launch **XactCopy**, add files and folders to **What to copy** (buttons,
-   paste, drag-and-drop, or Explorer's context menu), and choose a
-   **Destination**.
-2. Pick a mode with the switch at the top left:
+1. Launch **XactCopy**, choose the **Action** at the left of the toolbar, then
+   add files and folders with **+ Files**, **+ Folder**, **Paste**,
+   drag-and-drop, or Explorer's context menu:
    - **Copy**: copy and verify data from source to destination.
    - **Assess readability**: read allocated source files and map unreadable regions (no
      destination needed).
-3. Adjust options if you like (the defaults are sensible), press **Add to
-   tasks**, then select the task and press **Run** (Ctrl+Enter adds and queues
-   in one step). The **Tasks** list shows progress, throughput, and ETA; more
-   work can be queued while one task runs, and **Pause** and **Stop** act on the
-   running task.
+2. Each add makes a task and selects it; a copy asks where the items go (or set
+   a destination in the New task settings to skip the question). The selected
+   task's settings, including its own Action, are on the right.
+3. Adjust options if you like (the defaults are sensible; changes are saved to
+   the task), then press **Run**, or **Queue** to run it after the others. The
+   **Now running** card shows progress, throughput, and ETA with **Pause** and
+   **Stop**, and more tasks can be added and queued while one runs.
 
-The main-window choices are per-task overrides. Use **File → Save as defaults** when you
-want the reusable options to seed future runs; pin a task when the mode,
-paths, and complete option set must be retained together.
+Each task keeps its own settings. Use **File → Save as defaults** when you want
+the reusable options to seed new tasks; pin a task to keep it after XactCopy
+closes.
 
 For an actively failing drive, copy the irreplaceable data first with **Recover
 Media** and **Fragile-media mode**. A full assessment reads the source once

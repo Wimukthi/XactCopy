@@ -5,6 +5,47 @@ All notable changes to XactCopy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions are four-part (`major.minor.build.revision`) and tagged `v<version>`.
 
+## [Unreleased]
+
+### Changed
+
+- **One task list.** The separate "What to copy" list is gone. Every add
+  (+ Files, + Folder, Paste, a drop, Explorer) makes a task straight away and
+  selects it; the task list moved to the left.
+- **Settings beside the list.** The right column shows the selected task's
+  settings, and changes are saved to it as you make them. With no task
+  selected (click below the list, or Esc) it holds the **New task settings**
+  that the next add uses, including an optional destination that skips the
+  "where to?" question. Add to tasks, Edit in builder, and the Tools and Tasks
+  menu commands built on them are gone; File has **New Task from Files /
+  Folder / Paste**, and **Ctrl+Enter** queues the selected task.
+- **Action box.** The Copy / Assess readability tabs became an **Action** box at
+  the left of the toolbar, for what the next add does, and an Action box at
+  the top of each task's settings for what that task does.
+- **Now running card.** Progress, speed, ETA, Pause, and Stop sit on a card at
+  the bottom right that follows the running task whatever is selected, with
+  the buffer, rescue, journal, and diagnostics lines below. A finished run's
+  figures stay until the next run.
+- Options are always shown; the collapsible Options section is gone. The
+  Now running card always shows its bars and figures, below a line that
+  separates it from the task's settings.
+
+### Added
+
+- **Tasks files.** File → **Export Tasks…** saves every task to a readable
+  `.xctasks` JSON file, and **Import Tasks…** (or dropping one on the window)
+  adds the tasks it lists, unqueued. Files can be written by hand: options
+  left out come from your defaults. The format is in the User Guide.
+- **Remove** on the task toolbar removes the selected task.
+- A one-folder task has **Copy the folder's contents, not the folder** under
+  its Source, replacing the old right-click option.
+
+### Fixed
+
+- A null window handle was repainted when a run finished, which asked Windows
+  to redraw every window on the desktop.
+- The Source box and the (now visible) Action box shared a control ID.
+
 ## [2.1.5.0] — 2026-10-29
 
 ### Changed

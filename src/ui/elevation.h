@@ -122,16 +122,6 @@ inline bool raw_scan_requires_elevation(const models::CopyJobOptions& options,
     return !process_elevated;
 }
 
-// One row item of the unelevated window's task builder, carried over so the
-// elevated window shows the same list instead of an empty one.
-struct HandoffBuilderItem {
-    std::string Path;
-    bool IsDirectory = false;
-    bool ContentsOnly = false;
-    std::uint32_t Batch = 0;
-    std::string Destination;
-};
-
 // Everything the elevated instance needs to start the same run the user asked
 // for in the unelevated window.
 struct HandoffRequest {
@@ -142,7 +132,6 @@ struct HandoffRequest {
     std::string RecoveryRunId; // crash-recovery run this start resumes, if any
     std::string UserSid;
     std::int64_t CreatedUnixMs = 0;
-    std::vector<HandoffBuilderItem> Builder; // absent in older requests
 
     std::string to_json() const {
         json::Writer w;
@@ -155,18 +144,6 @@ struct HandoffRequest {
         w.key("RecoveryRunId"); w.value(RecoveryRunId);
         w.key("UserSid"); w.value(UserSid);
         w.key("CreatedUnixMs"); w.value(CreatedUnixMs);
-        w.key("Builder");
-        w.begin_array();
-        for (const auto& item : Builder) {
-            w.begin_object();
-            w.key("Path"); w.value(item.Path);
-            w.key("IsDirectory"); w.value(item.IsDirectory);
-            w.key("ContentsOnly"); w.value(item.ContentsOnly);
-            w.key("Batch"); w.value(static_cast<std::int64_t>(item.Batch));
-            w.key("Destination"); w.value(item.Destination);
-            w.end_object();
-        }
-        w.end_array();
         w.end_object();
         return w.take();
     }
@@ -194,30 +171,6 @@ struct HandoffRequest {
             out.UserSid = text_of("UserSid");
             const json::Value* created = root.find("CreatedUnixMs");
             out.CreatedUnixMs = created != nullptr ? created->as_int64() : 0;
-            out.Builder.clear();
-            if (const json::Value* builder = root.find("Builder"); builder != nullptr && builder->is_array()) {
-                for (const auto& entry : *builder->as_array()) {
-                    const json::Object* item = entry.as_object();
-                    if (item == nullptr) continue;
-                    auto item_text = [item](const char* key) {
-                        const json::Value* value = item->find(key);
-                        return value != nullptr && value->is_string() ? value->as_string() : std::string();
-                    };
-                    auto item_flag = [item](const char* key) {
-                        const json::Value* value = item->find(key);
-                        return value != nullptr && value->as_bool();
-                    };
-                    HandoffBuilderItem loaded;
-                    loaded.Path = item_text("Path");
-                    if (loaded.Path.empty()) continue;
-                    loaded.IsDirectory = item_flag("IsDirectory");
-                    loaded.ContentsOnly = item_flag("ContentsOnly");
-                    const json::Value* batch = item->find("Batch");
-                    loaded.Batch = batch != nullptr ? static_cast<std::uint32_t>(batch->as_int64()) : 0;
-                    loaded.Destination = item_text("Destination");
-                    out.Builder.push_back(std::move(loaded));
-                }
-            }
             return true;
         } catch (const std::exception&) {
             return false;

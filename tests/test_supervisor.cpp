@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "../src/ui/elevation.h"
+#include "../src/ui/task_file.h"
 #include "../src/ui/task_model.h"
 #include "../src/ui/job_manager.h"
 #include "../src/ui/journal_report.h"
@@ -431,8 +432,6 @@ void test_elevation_handoff() {
     request.RecoveryRunId = "recovery-1";
     request.UserSid = sid;
     request.CreatedUnixMs = el::unix_now_ms();
-    request.Builder = {{"C:\\Data\\pending", true, false, 7, "E:\\Backup"},
-                       {"D:\\Disk", true, true, 9, ""}};
 
     std::string token = el::write_handoff(request);
     check(el::is_handoff_token(token), "handoff token is a SHA-256 hex digest");
@@ -445,12 +444,6 @@ void test_elevation_handoff() {
               loaded.ManagedRunId == "managed-1" && loaded.DisplayName == "Nightly assessment" &&
               loaded.RecoveryRunId == "recovery-1",
           "handoff round-trips the exact run request");
-    check(loaded.Builder.size() == 2 && loaded.Builder[0].Path == "C:\\Data\\pending" &&
-              loaded.Builder[0].IsDirectory && !loaded.Builder[0].ContentsOnly &&
-              loaded.Builder[0].Batch == 7 && loaded.Builder[0].Destination == "E:\\Backup" &&
-              loaded.Builder[1].ContentsOnly && loaded.Builder[1].Batch == 9 &&
-              loaded.Builder[1].Destination.empty(),
-          "handoff carries the other window's builder list");
     check(el::consume_handoff(token, loaded) == el::HandoffStatus::Missing,
           "a consumed handoff cannot be replayed");
 
@@ -1522,6 +1515,88 @@ void test_job_manager_service() {
 
 } // namespace
 
+void test_task_file() {
+    std::printf("--- tasks file: export, import, and hand-written files ---\n");
+    models::CopyJobOptions defaults;
+    defaults.MaxRetries = 3;
+    defaults.BufferSizeBytes = 8 * 1024 * 1024;
+
+    // Export then import gives the same tasks back.
+    storage::ManagedJob copy;
+    copy.Name = "Photos";
+    copy.Pinned = true;
+    copy.Options.OperationMode = models::JobOperationMode::Copy;
+    copy.Options.SourceRoot = "D:\\Data";
+    copy.Options.SelectedRelativePaths = {"Photos", "notes.txt"};
+    copy.Options.DestinationRoot = "F:\\Backup";
+    copy.Options.MaxRetries = 1;
+    copy.Options.ExpectedSourceIdentity = "machine-specific";
+    copy.Parts = {{"E:\\Camera", {}}};
+    storage::ManagedJob scan;
+    scan.Name = "Check D";
+    scan.Pinned = false;
+    scan.Options.OperationMode = models::JobOperationMode::ScanOnly;
+    scan.Options.SourceRoot = "D:\\";
+    const std::string text = ui::write_task_file({copy, scan});
+    check(text.find("machine-specific") == std::string::npos && text.find("ExpectedSourceIdentity") == std::string::npos,
+          "export leaves out media identities and other machine-specific fields");
+    const auto back = ui::read_task_file(text, defaults);
+    check(back.error.empty() && back.problems.empty() && back.tasks.size() == 2, "an exported file imports cleanly");
+    if (back.tasks.size() == 2) {
+        const auto& photos = back.tasks[0];
+        check(photos.name == "Photos" && photos.pinned &&
+                  photos.options.OperationMode == models::JobOperationMode::Copy &&
+                  photos.options.SourceRoot == "D:\\Data" &&
+                  photos.options.SelectedRelativePaths == std::vector<std::string>{"Photos", "notes.txt"} &&
+                  photos.options.DestinationRoot == "F:\\Backup" && photos.options.MaxRetries == 1 &&
+                  photos.options.ExpectedSourceIdentity.empty(),
+              "a copy task round-trips its items, destination, pin, and options");
+        check(photos.parts.size() == 1 && photos.parts[0].SourceRoot == "E:\\Camera" &&
+                  photos.parts[0].SelectedRelativePaths.empty(),
+              "a contents-only folder part keeps its meaning");
+        check(back.tasks[1].options.OperationMode == models::JobOperationMode::ScanOnly &&
+                  back.tasks[1].options.SourceRoot == "D:\\" && back.tasks[1].options.DestinationRoot.empty() &&
+                  !back.tasks[1].pinned,
+              "an assessment of a drive round-trips");
+    }
+
+    // A hand-written file: missing options come from the defaults, and a
+    // file cannot set machine-specific fields through Options.
+    const std::string written = R"({
+      "Format": "XactCopy.Tasks", "Version": 1,
+      "Tasks": [
+        { "Sources": ["C:\\Work\\Projects\\"], "Destination": "G:\\Copy",
+          "Options": { "VerificationMode": "Full", "SourceRoot": "X:\\Evil", "ExpectedSourceIdentity": "x" } },
+        { "Action": "Assess", "Sources": [{ "Path": "C:\\Work", "ContentsOnly": true }] },
+        { "Sources": ["C:\\a.txt"] },
+        { "Action": "Delete", "Sources": ["C:\\a.txt"], "Destination": "D:\\" },
+        { "Destination": "D:\\" }
+      ]
+    })";
+    const auto read = ui::read_task_file(written, defaults);
+    check(read.error.empty() && read.tasks.size() == 2 && read.problems.size() == 3,
+          "valid tasks import and the three broken ones are reported");
+    if (read.tasks.size() == 2) {
+        const auto& first = read.tasks[0];
+        check(first.options.SourceRoot == "C:\\Work" &&
+                  first.options.SelectedRelativePaths == std::vector<std::string>{"Projects"} &&
+                  first.options.MaxRetries == 3 && first.options.BufferSizeBytes == 8 * 1024 * 1024 &&
+                  first.options.VerificationModeValue == models::VerificationMode::Full &&
+                  first.options.ExpectedSourceIdentity.empty() && !first.name.empty(),
+              "options merge over the defaults, paths come only from Sources, and a name is made");
+        check(read.tasks[1].options.SourceRoot == "C:\\Work" && read.tasks[1].options.SelectedRelativePaths.empty() &&
+                  read.tasks[1].options.OperationMode == models::JobOperationMode::ScanOnly,
+              "a ContentsOnly source becomes a whole-folder root");
+    }
+    check(!ui::read_task_file(R"({"Format":"Other","Version":1,"Tasks":[]})", defaults).error.empty(),
+          "a file of another format is refused");
+    check(!ui::read_task_file(R"({"Format":"XactCopy.Tasks","Version":2,"Tasks":[]})", defaults).error.empty(),
+          "a newer version is refused");
+    check(!ui::read_task_file("not json", defaults).error.empty(), "invalid JSON is refused");
+    check(ui::is_task_file_path(L"C:\\x\\My.XCTASKS") && !ui::is_task_file_path(L"C:\\x\\a.json"),
+          "tasks files are recognised by their extension");
+}
+
 void test_job_manager_tasks() {
     std::printf("--- job manager: tasks, pins, and the shared queue ---\n");
     std::wstring work = make_work_dir();
@@ -1654,6 +1729,7 @@ int main() {
     test_job_catalog_store();
     test_job_manager_service();
     test_job_manager_tasks();
+    test_task_file();
     test_clean_job();
     test_kill_recovery();
     test_sleep_resume_does_not_restart_worker();

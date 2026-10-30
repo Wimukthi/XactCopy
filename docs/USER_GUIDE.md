@@ -23,79 +23,81 @@ Quick Start in the [README](../README.md) is enough.
 
 ![The XactCopy main window](images/main-window.png)
 
-The window has two columns: on the left you build tasks, on the right the
-tasks run. The operations log spans the bottom.
-
-The **Copy | Assess readability** switch at the top left picks what the next
-task does. Copy writes the items to a destination and verifies them; Assess
-only reads them and records unreadable ranges, so the destination row
-disappears and the choices below relabel themselves for scanning. Switching
-remembers each mode's own choices.
+The window has two columns above the operations log. On the left is the task
+list; on the right are the selected task's settings and, at the bottom, the
+**Now running** card.
 
 Two splitters set the proportions: drag the bar above the log to trade log
-height for list height (both lists always stay the same size), or the line
-between the columns to widen one side. XactCopy remembers both, keeps the log
-height when the window is resized, and a double-click on a splitter returns it
-to the automatic split.
+height for list height, or the line between the columns to widen one side.
+XactCopy remembers both, keeps the log height when the window is resized, and a
+double-click on a splitter returns it to the automatic split.
 
-### What to copy
+### Adding a task
 
-Add files and folders with **+ Files**, **+ Folder**, **Paste** (files copied in
-Explorer, or paths copied as text, one per line), by dropping them on the
-window, or through the Explorer context menu. Everything one action adds is
-one row: three folders picked in one **+ Folder** dialog show as "3 folders"
-with their names and combined size (sizes are counted in the background).
-**Del** removes the selected rows and **Clear** empties the list.
+Every add makes a task: **+ Files**, **+ Folder**, **Paste** (files copied in
+Explorer, or paths copied as text, one per line), dropping files on the window,
+or the Explorer context menu. The **Action** box in front of the add buttons
+says what the new task does, **Copy** or **Assess readability**, so the toolbar
+reads left to right: choose the action, then add. Everything one action brings in is one task:
+three folders picked in one **+ Folder** dialog make one task that copies all
+three. The new task takes the **New task settings** and is selected, so its
+settings are on the right if you want to change anything before running it.
 
-In Copy mode every add asks where the items go: a folder picker opens at the
-current destination, and cancelling it adds nothing. Each row keeps its own
-destination, shown after an arrow in the list, so rows bound for different
-places can sit side by side and become tasks with different destinations. A row
-added in Assess mode is asked for one when it is added to tasks in Copy mode.
+The New task settings are what the right column shows when no task is selected
+(click below the last task, or press <kbd>Esc</kbd> in the list). Set the
+choices and options there once and every add uses them; their Action is the
+toolbar's. In Copy mode a new
+task copies to the New task **Destination**; leave it empty and each add asks
+where the items go (cancelling adds nothing).
 
 Every item is copied *as itself*: a folder `Photos` lands as
-`Destination\Photos`, exactly as Explorer would place it. To copy only what is
-inside a folder, right-click it and choose **Copy folder contents only**.
-Items do not need to share a folder. **Add to tasks** (beside the list) turns
-each selected row, or every row when none is selected, into one task. A row
-whose items come from several folders or drives becomes one task with several
-parts, run back to back; XactCopy warns first if two of them would write the
-same name into the destination. Ctrl+Enter adds the rows and queues them.
+`Destination\Photos`, exactly as Explorer would place it. For a task of one
+folder, **Copy the folder's contents, not the folder** under its Source copies
+only what is inside it. Items do not need to share a folder: a task whose items
+come from several folders or drives runs them as parts, back to back, and
+XactCopy warns when it is made if two of them would write the same name into
+the destination.
 
-### Source, destination, and options
+### A task's settings
 
-The **Source** and **Destination** boxes under the list edit the selected row.
-Type new paths into **Source** (separate several with semicolons) or use its
-*Browse…* to pick other folders or files; the row keeps its destination. Change
-**Destination** by typing, with *Browse…*, or from the recent list on the **▾**
-button; with several rows selected it changes all of them. Edits apply when you
-leave the box. Neither can be left empty, and a source path that does not exist
-is refused; in both cases the row is put back as it was. With no row selected,
-**Destination** holds the folder the next add's picker opens at.
+Selecting a task shows its settings on the right, and every change is saved to
+the task as you make it. Its **Action** picks what it does: Copy writes the
+items to a destination and verifies them; Assess readability only reads them
+and records unreadable ranges, so the destination row gives way to a note and
+the choices relabel themselves for scanning. Switching a task to Copy asks for
+a destination if it has none. A task's Action is its own: the toolbar's Action
+stays what the next add does.
+
+**Source** lists the task's items; type new paths (separate several with
+semicolons) or use its *Browse…* to pick other folders or files. The line under
+it shows what the task holds and its size, counted in the background, and warns
+when the destination may not have room. **Destination** changes by typing, with
+*Browse…*, or from the recent list on the **▾** button. Typed paths apply when
+you leave the box; neither box can be left empty, and a source path that does
+not exist is refused, putting the box back as it was.
 
 Below them are captioned choices. Copy mode shows **Profile**,
 **If file exists**, **Verify**, and **Read method**; assessment mode shows **Scan**
 (Auto/Fast/Precise), **Read method** (standard file reads or direct NTFS), and
 **Findings** (whether the bad-range map is updated). The resilience toggles
-and numeric tuning fields sit in the **Options** section, which is collapsed by
-default and shows a one-line summary of what the next task will use. Expanding
-it grows the window if it needs the room.
+and numeric tuning fields follow below them. The running task's settings are
+shown but cannot change until it ends.
 
-The values are per-task. Use **File → Save as defaults** to
-persist the reusable engine, overwrite, verification, resilience, buffer,
-retry, and timeout choices for future runs.
+**File → Save as defaults** saves the settings shown (engine, overwrite,
+verification, resilience, buffer, retry, and timeout) as the defaults the New
+task settings start from.
 
 ### Tasks and History
 
-The right column switches between two views.
+The left column switches between two views.
 
 **Tasks** lists the running task first, then the queued tasks in the order they
 will run, then everything else. Each row shows its state (ready, queued with its
-position, running with progress, or how its last run ended) and, for a task
-with several parts, which part is running. The two buttons above the list act
-on the selected row:
+position, running with a thin progress bar, or how its last run ended) and, for
+a task with several parts, which part is running. The two buttons above the
+list act on the selected task:
 
-| Selected row | Buttons |
+| Selected task | Buttons |
 | --- | --- |
 | Not queued | **Run** (now, or next if another task is running) · **Queue** (add to the end) |
 | Queued | **Start now** (run it next) · **Unqueue** |
@@ -106,22 +108,21 @@ wait; Run and Start now still start the task you picked, and the hold keeps
 covering the rest. Stop also holds the queue, and so does a task that fails to
 start: it goes back to the front (a later part of a multi-part task waits to
 run from that part) until you untick Hold. While XactCopy waits for
-administrator approval for direct NTFS reads, Stop withdraws the request. Reorder queued tasks with the right-click menu or
+administrator approval for direct NTFS reads, Stop withdraws the request.
+**Remove** (or <kbd>Del</kbd>) removes the selected task; its run history
+stays. Reorder queued tasks with the right-click menu or
 <kbd>Ctrl</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd>. The right-click menu also pins,
-renames, duplicates, edits in the builder (also a double-click), opens the
-destination, or removes a task (<kbd>Del</kbd>). **Edit in builder** adds the
-task to the list as one more row, sets the options to the task's, and leaves
-the other rows alone; adding that row to tasks again updates the task instead
-of making a copy. <kbd>Enter</kbd> does what the
-first button does.
+renames, duplicates, and opens the destination.
+<kbd>Enter</kbd> does what the first button does, and <kbd>Ctrl</kbd>+<kbd>Enter</kbd>
+queues the selected task.
 
 **History** lists every run, newest first, including interrupted ones.
-Selecting a run shows its details in the space below the list, with its
-authenticated checkpoint: completed and pending counts and every unreadable,
-recovered, or failed file. The toolbar has **Resume** (for an interrupted,
-cancelled, incomplete, or failed run, or one that finished with skipped,
-failed, or recovered files), **Journal** (a readable JSON view), **Report...**
-(CSV), **Range map**, and **Delete**, as many as the column has room for; the
+Selecting a run shows its details on the right, with its authenticated
+checkpoint: completed and pending counts and every unreadable, recovered, or
+failed file. The toolbar has **Resume** (for an interrupted, cancelled,
+incomplete, or failed run, or one that finished with skipped, failed, or
+recovered files), **Journal** (a readable JSON view), **Report...** (CSV),
+**Range map**, and **Delete**, as many as the column has room for; the
 right-click menu has them all. The run in progress cannot be deleted, and
 **Clear history** waits until it has finished.
 
@@ -139,12 +140,12 @@ this one run; the source's durable bad-range map, built up across runs, is under
 **Tools → Inspect Bad-Range Map**. Fast and direct-NTFS assessments record
 ranges only for files with unreadable areas, so a clean assessment has no map.
 
-**Pinned tasks** always stay. Tasks you add from the builder start unpinned, and
-when XactCopy closes it asks whether to keep them, with a **Remember my choice**
-box. **Settings → Recovery & Startup → Unpinned tasks on exit** (Ask / Keep /
-Discard) changes that later. **Tasks → Add as Pinned Tasks** turns the
-selected rows (all rows when none is selected) into pinned tasks directly. Tasks, the queue, and history live in XactCopy's
-signed job catalog, so they survive a crash or power loss either way.
+**Pinned tasks** always stay. Other tasks start unpinned, and when XactCopy
+closes it asks whether to keep them, with a **Remember my choice** box.
+**Settings → Recovery & Startup → Unpinned tasks on exit** (Ask / Keep /
+Discard) changes that later; pin a task from its right-click menu. Tasks, the
+queue, and history live in XactCopy's signed job catalog, so they survive a
+crash or power loss either way.
 
 After a restart the queue is held, so nothing starts on its own, unless
 **Settings → Recovery & Startup → Run the queue automatically on startup** is
@@ -155,12 +156,57 @@ retry more than three times, follow symbolic links, run the worker at High
 priority, or (assessments) use direct NTFS reads or more than eight scan
 workers. Tasks outside that policy are skipped, stay queued, and say why.
 
-Below the list, the running task's detail is headed with its name, then shows
-the current file, the **File** and **Overall** progress bars, counters,
-throughput with a running average, an **ETA**, buffer and rescue telemetry, and
-the run's **Journal** path. When nothing runs, the heading shows how the last
-task ended. The first Stop requests cooperative shutdown; a second force-stops
-a worker that is stuck inside a Windows or device I/O call.
+### Now running
+
+The card at the bottom of the right column follows the running task whatever
+is selected. It is headed with the task's name and has **Pause** / **Resume**
+and **Stop**; below are the current file, the **File** and **Overall** progress
+bars, counters, throughput with a running average, an **ETA**, the buffer and
+rescue telemetry, the job summary, and the run's **Journal** path. The bars and
+figures are always there: when a run ends the heading says how it ended and
+its figures stay until the next one. The first Stop requests cooperative
+shutdown; a second force-stops a worker that is stuck inside a Windows or
+device I/O call.
+
+### Tasks files
+
+**File → Export Tasks…** saves every task to a tasks file (`.xctasks`), and
+**File → Import Tasks…** (or dropping a `.xctasks` file on the window) adds the
+tasks a file lists. Imported tasks are not queued, so you can check their
+settings before running them. A tasks file is readable JSON and can be
+written by hand:
+
+```json
+{
+  "Format": "XactCopy.Tasks",
+  "Version": 1,
+  "Tasks": [
+    {
+      "Name": "Photos to backup",
+      "Action": "Copy",
+      "Sources": ["D:\\Photos", { "Path": "E:\\Camera", "ContentsOnly": true }],
+      "Destination": "F:\\Backup",
+      "Pinned": true,
+      "Options": { "VerificationMode": "Full", "MaxRetries": 2 }
+    },
+    { "Action": "Assess", "Sources": ["D:\\"] }
+  ]
+}
+```
+
+- **Action**: `Copy` (the default) or `Assess`.
+- **Sources**: full paths, at least one. A source written as
+  `{ "Path": …, "ContentsOnly": true }` copies what is in the folder rather
+  than the folder; a drive root always copies its contents.
+- **Destination**: required for `Copy`.
+- **Name** and **Pinned**: optional; a name is made from the items when there
+  is none.
+- **Options**: optional. Any task option, by the name an exported file uses;
+  everything left out comes from your saved defaults. Paths, media identities,
+  and the journal folder are never taken from Options.
+
+A task that cannot be used (no sources, a Copy without a destination, an
+unknown Action) is skipped, and the import says which and why.
 
 When you close XactCopy with a task running, or with unpinned tasks, one prompt
 covers both: it says whether a copy or an assessment would stop and asks what
@@ -322,7 +368,7 @@ identity. Missing files, locks, access denial, and an offline device are kept as
 ordinary run failures and are never promoted to physical range evidence.
 
 **Tools → Inspect Bad-Range Map** reports both the durable map and the latest
-matching assessment journal for the selected row's source (or the only row's);
+matching assessment journal for the selected task's source;
 **Clear Source Bad-Range Map** names the source before it removes anything. Every filename is written to the main log. The
 journal section can therefore show files that failed or were skipped even when
 no byte range could safely be localized; those files are not silently presented
@@ -362,13 +408,14 @@ otherwise XactCopy requires a person to review and confirm the run.
 Enable **Settings → Recovery & Startup → Context Menu** to add XactCopy to the Windows shell:
 
 - **Copy with XactCopy** — on files, folders, drives, and folder backgrounds. A
-  selected item is shown as the exact source and only that item is copied.
-  Multi-select copies the selected items together from their shared source
-  folder. The folder-background command copies the whole folder. XactCopy
-  opens in Copy mode.
+  selected item becomes a task that copies exactly that item. Multi-select
+  makes one task that copies the selected items together from their shared
+  source folder. The folder-background command copies the whole folder's
+  contents. The task is a copy, and XactCopy asks where it goes unless the New
+  task settings have a destination.
 - **Assess with XactCopy**: on the same files, folders, drives, and folder
-  backgrounds; XactCopy opens in Assess mode with those items listed, ready to
-  start. Either verb switches a running XactCopy to its mode.
+  backgrounds; the task is an assessment, selected and ready to run. Either
+  verb also sets the New task settings to its mode.
 - **Open with / drag-and-drop** — XactCopy is registered as an application, so
   you can drop files onto it or pick it from *Open with*.
 - **Send to → XactCopy**, and a **Run** dialog entry (`XactCopy`).
@@ -505,9 +552,9 @@ package file against the extracted SHA-256 before restarting.
 
 | Menu | Items |
 | --- | --- |
-| **File** | Add and Queue (Ctrl+Enter) · Add to tasks · Pause / Resume / Cancel Operation · Save as defaults · Open Journal Folder · Open Crash Folder · Exit |
-| **Tools** | Queue as Assessment Tasks · Inspect/Clear Source Bad-Range Map… · Settings… · Check for Updates… |
-| **Tasks** | Add as Pinned Tasks · Show Tasks / History · Start the Queue · Resume Interrupted Run |
+| **File** | New Task from Files… (Ctrl+O) · New Task from Folder… (Ctrl+Shift+O) · New Task from Paste · Import Tasks… · Export Tasks… · Pause / Resume / Stop Operation · Save as defaults · Open Journal Folder · Open Crash Folder · Exit |
+| **Tools** | Inspect/Clear Source Bad-Range Map… · Settings… · Check for Updates… |
+| **Tasks** | Queue Selected Task (Ctrl+Enter) · Show Tasks / History · Start the Queue · Resume Interrupted Run |
 | **Help** | About XactCopy |
 
 ## Command line
